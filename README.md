@@ -157,3 +157,8 @@ Interfaces and internal components may evolve, but core principles—**separatio
 Contributions, reviews, and audits are welcome.
 
 If you are evaluating Sentinel-43 for research, infrastructure, or public-interest use, you are encouraged to read the architecture documentation and threat model before deployment.
+
+## License
+
+This project is licensed under the Apache License, Version 2.0.
+See the LICENSE and NOTICE files for details.
