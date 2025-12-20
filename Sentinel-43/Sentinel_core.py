@@ -1,4 +1,7 @@
 """
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 Justin
+
 SENTINEL-43: Intelligent Log Triage & Response Orchestrator (Hardened Foundation)
 
 Fixes included (Murphy's Law / "internet goblin" hardening):
