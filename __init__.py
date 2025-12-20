@@ -1,6 +1,9 @@
 """
 SENTINEL-43 Package Initialization
 
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 Justin
+
 Purpose:
 - Single place to bootstrap config, paths, and logging
 - Provide factory functions for:
