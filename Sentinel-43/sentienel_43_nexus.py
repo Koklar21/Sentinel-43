@@ -1,6 +1,9 @@
 """
 SENTINEL-43 Nexus (sentinel43_nexus.py)
 
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 Justin
+
 Public-facing, Murphy's-Law-hardened security nexus core:
 - ThreatEvent ingestion (typed)
 - Policy evaluation (deterministic, testable)
