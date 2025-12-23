@@ -1,262 +1,396 @@
-/*
-Copyright 2025 Justin
+from __future__ import annotations
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+import base64
+import hashlib
+import hmac
+import json
+import os
+import sqlite3
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-    http://www.apache.org/licenses/LICENSE-2.0
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+# ---------------------------------------------------------------------
+# Paths / Identity
+# ---------------------------------------------------------------------
+try:
+    BASE_DIR = Path(__file__).resolve().parent
+except NameError:
+    BASE_DIR = Path.cwd()
 
-/*
-  Sentinel-43 Dashboard Script
-  ----------------------------
-  UI-only control surface.
-  - No enforcement logic
-  - No backend authority
-  - Backend remains source of truth
-*/
+DB_PATH = Path(os.getenv("SENTINEL_DB_PATH", str(BASE_DIR / "sentinel_secure.db")))
+SYSTEM_ID = os.getenv("SENTINEL_SYSTEM_ID", "SENTINEL-43-GATEWAY-01")
 
-/* =============================
-   DOM Bindings
-============================= */
-const logConsole     = document.getElementById("log-console");
-const threatFeed    = document.getElementById("threat-feed");
-const recordCountEl = document.getElementById("record-count");
+# ---------------------------------------------------------------------
+# Auth (Prototype JWT HS256)
+# ---------------------------------------------------------------------
+JWT_SECRET = os.getenv("SENTINEL_JWT_SECRET", "dev-only-change-me")
+JWT_ISSUER = os.getenv("SENTINEL_JWT_ISSUER", "sentinel")
+JWT_AUDIENCE = os.getenv("SENTINEL_JWT_AUDIENCE", "sentinel-remote")
 
-/* =============================
-   Runtime Flags
-============================= */
-const DEMO_MODE = (window.AEGIS_DEMO_MODE ?? true) === true;
+security = HTTPBearer(auto_error=False)
 
-/* =============================
-   Backend Interface (thin seam)
-============================= */
-const api = {
-  token() {
-    return sessionStorage.getItem("AEGIS_JWT") || null;
-  },
 
-  headers() {
-    const h = { "Content-Type": "application/json" };
-    const t = this.token();
-    if (t) h.Authorization = `Bearer ${t}`;
-    return h;
-  },
+@dataclass(frozen=True)
+class Principal:
+    sub: str
+    role: str  # viewer/operator/admin
 
-  async listPendingActions() {
-    if (DEMO_MODE) return demo.listPendingActions();
-    const r = await fetch("/api/v1/actions/pending", { headers: this.headers() });
-    if (!r.ok) throw new Error("pending actions fetch failed");
-    return r.json();
-  },
 
-  async veto(actionId, reason) {
-    if (DEMO_MODE) return demo.veto(actionId, reason);
-    const r = await fetch("/api/v1/oversight/veto", {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify({ action_id: actionId, reason }),
-    });
-    return r.ok;
-  },
+def _b64url_decode(data: str) -> bytes:
+    pad = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + pad)
 
-  async vaultStats() {
-    if (DEMO_MODE) return { records: null };
-    const r = await fetch("/api/v1/vault/stats", { headers: this.headers() });
-    return r.ok ? r.json() : { records: null };
-  },
-};
 
-/* =============================
-   Demo Backend (sandbox only)
-============================= */
-const demo = (() => {
-  const pending = new Map();
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
 
-  function makeAction(ip, threat, delaySec) {
-    const now = Date.now();
-    const id  = `ACT-${now.toString(36)}-${Math.random().toString(36).slice(2,8)}`.toUpperCase();
 
-    pending.set(id, {
-      action_id: id,
-      ip,
-      threat_type: threat,
-      created_at_ms: now,
-      execute_at_ms: now + delaySec * 1000,
-      status: "PENDING",
-    });
-  }
+def verify_jwt(token: str) -> Principal:
+    """
+    Minimal HS256 verification for prototype.
+    Production: use RS256 + JWKS (OIDC) + nonce/iat rules.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise ValueError("Bad token format")
 
-  function listPendingActions() {
-    const now = Date.now();
-    for (const [id, a] of pending.entries()) {
-      if (a.status === "PENDING" && now >= a.execute_at_ms) {
-        a.status = "EXECUTED";
-      }
-      if (a.status === "EXECUTED" && now - a.execute_at_ms > 3000) {
-        pending.delete(id);
-      }
-    }
-    return { actions: Array.from(pending.values()) };
-  }
+    header_b64, payload_b64, sig_b64 = parts
 
-  function veto(id, reason) {
-    const a = pending.get(id);
-    if (!a || a.status !== "PENDING") return false;
-    a.status = "VETOED";
-    a.veto_reason = reason;
-    setTimeout(() => pending.delete(id), 4000);
-    return true;
-  }
+    header = json.loads(_b64url_decode(header_b64).decode("utf-8"))
+    if header.get("typ") not in (None, "JWT"):
+        raise ValueError("Bad typ")
+    if header.get("alg") != "HS256":
+        raise ValueError("Unsupported alg")
 
-  setTimeout(() => makeAction("203.0.113.45", "SQL INJECTION PATTERN", 30), 3000);
-  setTimeout(() => makeAction("198.51.100.12", "DATA EXFILTRATION", 45), 15000);
+    signed = f"{header_b64}.{payload_b64}".encode("utf-8")
+    expected_sig = hmac.new(JWT_SECRET.encode("utf-8"), signed, hashlib.sha256).digest()
+    expected_sig_b64 = _b64url_encode(expected_sig)
 
-  return { listPendingActions, veto };
-})();
+    # Compare base64url text to avoid subtle decoding quirks
+    if not hmac.compare_digest(expected_sig_b64, sig_b64):
+        raise ValueError("Bad signature")
 
-/* =============================
-   UI Utilities
-============================= */
-function ts() {
-  return new Date().toISOString().split("T")[1].split(".")[0];
-}
+    payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
 
-function log(msg, level = "info") {
-  const d = document.createElement("div");
-  d.className = `log-entry ${level}`;
-  d.textContent = `[${ts()}] ${msg}`;
-  logConsole.appendChild(d);
-  logConsole.scrollTop = logConsole.scrollHeight;
-}
+    if payload.get("iss") != JWT_ISSUER:
+        raise ValueError("Bad issuer")
 
-function escapeHtml(v) {
-  return String(v)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
+    aud = payload.get("aud")
+    if aud != JWT_AUDIENCE:
+        raise ValueError("Bad audience")
 
-function fmtMMSS(sec) {
-  sec = Math.max(0, sec | 0);
-  return `${String(Math.floor(sec/60)).padStart(2,"0")}:${String(sec%60).padStart(2,"0")}`;
-}
+    exp = payload.get("exp")
+    if not isinstance(exp, int) or exp < int(time.time()):
+        raise ValueError("Expired token")
 
-/* =============================
-   Threat Card Renderer
-============================= */
-function renderThreat(a) {
-  const id = a.action_id;
-  let card = document.getElementById(id);
+    sub = payload.get("sub", "unknown")
+    role = payload.get("role", "viewer")
+    if role not in ("viewer", "operator", "admin"):
+        role = "viewer"
 
-  if (!card) {
-    card = document.createElement("div");
-    card.className = "threat-card";
-    card.id = id;
-    threatFeed.appendChild(card);
-  }
+    return Principal(sub=sub, role=role)
 
-  if (a.status === "VETOED") {
-    card.className = "threat-card vetoed-card";
-    card.innerHTML = `
-      <h3>Action Aborted</h3>
-      <p>${escapeHtml(a.veto_reason || "Operator override")}</p>
-      <small>${escapeHtml(id)}</small>
-    `;
-    return;
-  }
 
-  if (a.status === "EXECUTED") {
-    card.remove();
-    return;
-  }
+def get_principal(creds: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> Principal:
+    if creds is None or not creds.credentials:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
+    try:
+        return verify_jwt(creds.credentials)
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid token: {exc}")
 
-  const remain = Math.ceil((a.execute_at_ms - Date.now()) / 1000);
 
-  card.innerHTML = `
-    <div>
-      <h3>${escapeHtml(a.threat_type)}</h3>
-      <p>Source: ${escapeHtml(a.ip)}</p>
-      <small>ID: ${escapeHtml(id)}</small>
-    </div>
-    <div>
-      <span class="countdown">${fmtMMSS(remain)}</span>
-      <button class="veto-btn" data-id="${escapeHtml(id)}">Abort</button>
-    </div>
-  `;
-}
+def require_role(*allowed: str):
+    def _dep(p: Principal = Depends(get_principal)) -> Principal:
+        if p.role not in allowed:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient role")
+        return p
 
-/* =============================
-   Event Wiring
-============================= */
-threatFeed.addEventListener("click", e => {
-  const btn = e.target.closest(".veto-btn");
-  if (!btn) return;
+    return _dep
 
-  const id = btn.dataset.id;
-  const reason = prompt("Veto reason (required):", "False positive");
-  if (!reason) return;
 
-  api.veto(id, reason).then(ok => {
-    log(ok ? `Action ${id} vetoed.` : `Veto failed for ${id}.`, ok ? "warn" : "error");
-  });
-});
+# ---------------------------------------------------------------------
+# DB helpers / schema
+# ---------------------------------------------------------------------
+def db_conn() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
 
-/* =============================
-   Poll Loops
-============================= */
-async function refreshThreats() {
-  try {
-    const { actions = [] } = await api.listPendingActions();
-    const seen = new Set();
 
-    actions.forEach(a => {
-      seen.add(a.action_id);
-      renderThreat(a);
-    });
+def db_init() -> None:
+    with db_conn() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS event_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                level TEXT NOT NULL,
+                module TEXT NOT NULL,
+                message TEXT NOT NULL,
+                context_json TEXT
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL,                -- PENDING/APPROVED/VETOED/EXPIRED
+                decided_at TEXT,
+                decided_by TEXT,
+                decision_reason TEXT
+            );
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_actions(status);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_created ON pending_actions(created_at);")
 
-    [...threatFeed.children].forEach(el => {
-      if (!seen.has(el.id)) el.remove();
-    });
-  } catch (e) {
-    log(`Threat refresh failed: ${e}`, "warn");
-  }
-}
 
-async function refreshVault() {
-  try {
-    const s = await api.vaultStats();
-    if (typeof s.records === "number") {
-      recordCountEl.textContent = s.records.toLocaleString();
-    }
-  } catch {}
-}
+def _utc_ts() -> str:
+    import datetime as _dt
 
-/* =============================
-   Boot
-============================= */
-setInterval(refreshThreats, 750);
-setInterval(refreshVault, 10000);
+    return _dt.datetime.utcnow().isoformat(timespec="microseconds") + "Z"
 
-if (DEMO_MODE) {
-  setInterval(() => {
-    const msgs = [
-      "[WATCHTOWER] Heartbeat nominal",
-      "[AUDIT] Integrity unchanged",
-      "[API] Latency < 15ms",
-      "[RESOURCE] CPU steady"
-    ];
-    log(msgs[Math.floor(Math.random() * msgs.length)]);
-  }, 2000);
-}
 
-refreshThreats();
+def log_event(level: str, module: str, message: str, context: Optional[Dict[str, Any]] = None) -> None:
+    ctx = json.dumps(context, default=str) if context else None
+    with db_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO event_logs (timestamp, level, module, message, context_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (_utc_ts(), level, module, message, ctx),
+        )
+
+
+def read_tail(limit: int = 200) -> List[Dict[str, Any]]:
+    limit = max(1, min(limit, 1000))
+    with db_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, timestamp, level, module, message, context_json
+            FROM event_logs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    items: List[Dict[str, Any]] = []
+    for r in reversed(rows):
+        items.append(
+            {
+                "id": r["id"],
+                "timestamp": r["timestamp"],
+                "level": r["level"],
+                "module": r["module"],
+                "message": r["message"],
+                "context": json.loads(r["context_json"]) if r["context_json"] else None,
+            }
+        )
+    return items
+
+
+# ---------------------------------------------------------------------
+# API models
+# ---------------------------------------------------------------------
+class LogWrite(BaseModel):
+    level: str = "INFO"
+    module: str = "UI"
+    message: str
+    context: Optional[Dict[str, Any]] = None
+
+
+class PendingActionCreate(BaseModel):
+    """
+    Create a pending action that requires human approval.
+    action_type examples: FIREWALL_BLOCK, DISABLE_ACCOUNT, RATE_LIMIT, etc.
+    payload is arbitrary JSON.
+    """
+    id: Optional[str] = None
+    action_type: str = Field(..., min_length=1, max_length=80)
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class PendingActionDecision(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=500)
+
+
+class PendingActionOut(BaseModel):
+    id: str
+    created_at: str
+    created_by: str
+    action_type: str
+    payload: Dict[str, Any]
+    status: str
+    decided_at: Optional[str] = None
+    decided_by: Optional[str] = None
+    decision_reason: Optional[str] = None
+
+
+# ---------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------
+app = FastAPI(title="Sentinel Pending Actions Gateway", version="0.2.0")
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    db_init()
+    log_event("INFO", "BOOT", f"[BOOT] {SYSTEM_ID} started", {"db_path": str(DB_PATH)})
+
+
+@app.get("/api/v1/health")
+def health(_: Principal = Depends(require_role("viewer", "operator", "admin"))):
+    return {"ok": True, "system_id": SYSTEM_ID, "db_path": str(DB_PATH)}
+
+
+# -------------------------
+# Logs
+# -------------------------
+@app.get("/api/v1/logs/tail")
+def logs_tail(limit: int = 200, _: Principal = Depends(require_role("viewer", "operator", "admin"))):
+    try:
+        return {"items": read_tail(limit)}
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+
+@app.post("/api/v1/logs")
+def write_log(entry: LogWrite, p: Principal = Depends(require_role("operator", "admin"))):
+    log_event(entry.level, entry.module, entry.message, entry.context or {"operator": p.sub})
+    return {"ok": True}
+
+
+# -------------------------
+# Pending Actions (Persistent)
+# -------------------------
+def _action_id() -> str:
+    # Small, readable, collision-resistant enough for prototypes
+    raw = os.urandom(16)
+    return _b64url_encode(raw)
+
+
+def _row_to_action(r: sqlite3.Row) -> PendingActionOut:
+    return PendingActionOut(
+        id=r["id"],
+        created_at=r["created_at"],
+        created_by=r["created_by"],
+        action_type=r["action_type"],
+        payload=json.loads(r["payload_json"]),
+        status=r["status"],
+        decided_at=r["decided_at"],
+        decided_by=r["decided_by"],
+        decision_reason=r["decision_reason"],
+    )
+
+
+@app.post("/api/v1/actions", response_model=PendingActionOut)
+def create_action(body: PendingActionCreate, p: Principal = Depends(require_role("operator", "admin"))):
+    action_id = body.id or _action_id()
+    created_at = _utc_ts()
+    payload_json = json.dumps(body.payload, default=str)
+
+    with db_conn() as conn:
+        try:
+            conn.execute(
+                """
+                INSERT INTO pending_actions
+                (id, created_at, created_by, action_type, payload_json, status)
+                VALUES (?, ?, ?, ?, ?, 'PENDING')
+                """,
+                (action_id, created_at, p.sub, body.action_type, payload_json),
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(status_code=409, detail="Action id already exists")
+
+        row = conn.execute("SELECT * FROM pending_actions WHERE id = ?", (action_id,)).fetchone()
+
+    log_event("INFO", "ACTIONS", f"[ACTIONS] CREATED: {action_id} ({body.action_type})", {"id": action_id, "by": p.sub})
+    return _row_to_action(row)
+
+
+@app.get("/api/v1/actions", response_model=List[PendingActionOut])
+def list_actions(
+    status_filter: str = "PENDING",
+    limit: int = 200,
+    _: Principal = Depends(require_role("viewer", "operator", "admin")),
+):
+    limit = max(1, min(limit, 1000))
+    status_filter = status_filter.upper()
+
+    with db_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM pending_actions
+            WHERE status = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (status_filter, limit),
+        ).fetchall()
+
+    return [_row_to_action(r) for r in rows]
+
+
+@app.get("/api/v1/actions/{action_id}", response_model=PendingActionOut)
+def get_action(action_id: str, _: Principal = Depends(require_role("viewer", "operator", "admin"))):
+    with db_conn() as conn:
+        row = conn.execute("SELECT * FROM pending_actions WHERE id = ?", (action_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Action not found")
+    return _row_to_action(row)
+
+
+def _decide(action_id: str, p: Principal, new_status: str, reason: str) -> PendingActionOut:
+    decided_at = _utc_ts()
+    with db_conn() as conn:
+        row = conn.execute("SELECT * FROM pending_actions WHERE id = ?", (action_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Action not found")
+        if row["status"] != "PENDING":
+            raise HTTPException(status_code=409, detail=f"Action is not pending (current: {row['status']})")
+
+        conn.execute(
+            """
+            UPDATE pending_actions
+            SET status = ?, decided_at = ?, decided_by = ?, decision_reason = ?
+            WHERE id = ?
+            """,
+            (new_status, decided_at, p.sub, reason, action_id),
+        )
+        updated = conn.execute("SELECT * FROM pending_actions WHERE id = ?", (action_id,)).fetchone()
+
+    log_event(
+        "INFO",
+        "ACTIONS",
+        f"[ACTIONS] {new_status}: {action_id} by {p.sub}. Reason: {reason}",
+        {"id": action_id, "status": new_status, "by": p.sub, "reason": reason},
+    )
+    return _row_to_action(updated)
+
+
+@app.post("/api/v1/actions/{action_id}/approve", response_model=PendingActionOut)
+def approve_action(action_id: str, body: PendingActionDecision, p: Principal = Depends(require_role("operator", "admin"))):
+    return _decide(action_id, p, "APPROVED", body.reason)
+
+
+@app.post("/api/v1/actions/{action_id}/veto", response_model=PendingActionOut)
+def veto_action(action_id: str, body: PendingActionDecision, p: Principal = Depends(require_role("operator", "admin"))):
+    return _decide(action_id, p, "VETOED", body.reason)
