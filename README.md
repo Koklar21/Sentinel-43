@@ -1,164 +1,90 @@
-# Sentinel-43
-
-**Sentinel-43** is a modular, open, detection and response-planning engine designed to analyze events, assess risk, and recommend actions under clearly defined policy rules.
-
-It is **not** an autonomous enforcement system.  
-It is **not** a weapon, exploit framework, or intrusive monitoring tool.  
-It is a **decision-support and detection framework** built for transparency, auditability, and human oversight.
-
----
-
-## What Sentinel-43 Does
-
-Sentinel-43 performs four core functions:
-
-1. **Event Analysis**
-   - Ingests structured events from external systems
-   - Normalizes and validates inputs using stable schemas
-
-2. **Detection & Assessment**
-   - Applies deterministic rules and/or AI-assisted models
-   - Scores findings by severity, confidence, and risk
-   - Produces explainable assessments
-
-3. **Policy-Based Response Planning**
-   - Maps assessments to *recommended* actions
-   - Applies thresholds, rate limits, and escalation rules
-   - Supports human-gated decision workflows
-
-4. **Audit & Integrity**
-   - Maintains tamper-evident audit records
-   - Preserves decision lineage for review and compliance
-
-Sentinel-43 **decides and recommends**.  
-It does **not** directly execute real-world actions by default.
-
----
-
-## What Sentinel-43 Does *Not* Do
-
-Sentinel-43 deliberately does **not**:
-
-- Execute network blocks, bans, or takedowns on its own
-- Perform surveillance, spying, or data harvesting
-- Replace human judgment or legal authority
-- Contain hard-coded integrations to firewalls, IAMs, or external systems
-- Operate autonomously without explicit configuration
-
-Any real-world execution must be implemented **outside the core**, via adapters that are intentionally replaceable, reviewable, and optional.
-
----
-
-## Architecture Overview
-
-Sentinel-43 is built using a strict separation-of-concerns model:
-
-- **Core**
-  - Detection logic
-  - Scoring and assessment
-  - Policy and response planning
-  - Audit integrity mechanisms  
-  *(No network I/O, no direct execution)*
-
-- **Adapters**
-  - Optional integrations (databases, queues, external services)
-  - Swappable and environment-specific
-
-- **API / Ops / Dashboards**
-  - Human-facing interfaces
-  - Control planes and administrative tools
-  - Visualization and reporting
-
-This design ensures that:
-- The core remains testable and auditable
-- External integrations cannot silently change behavior
-- Failures in UI or infrastructure do not compromise decision logic
-
----
-
-## Default Behavior
-
-Out of the box, Sentinel-43 runs in a **non-operational advisory mode**:
-
-- Events are analyzed
-- Assessments are produced
-- Actions are *recommended*, not executed
-- All outputs are logged for inspection
-
-To enable execution or automation, users must **explicitly implement and wire adapters** and accept responsibility for their deployment context.
-
----
-
-## Intended Use Cases
-
-Sentinel-43 may be used as:
-
-- A detection and triage engine for security or compliance systems
-- A decision-support component in monitoring pipelines
-- A research or simulation platform for policy evaluation
-- A transparent alternative to opaque “black box” automation
-
-It is suitable for:
-- Open research
-- Public infrastructure tooling
-- Internal governance systems
-- Educational and experimental use
-
----
-
-## Non-Goals
-
-Sentinel-43 is **not** intended to be:
-
-- A turnkey security appliance
-- A drop-in SOC replacement
-- A covert monitoring tool
-- A system that bypasses laws, policy, or consent
-
----
-
-## Safety and Responsibility
-
-Sentinel-43 is designed with the assumption that:
-
-- Humans remain accountable
-- Decisions should be reviewable
-- Automation must be bounded
-- Abuse resistance matters more than raw power
-
-Users are responsible for ensuring compliance with all applicable laws, regulations, and ethical standards in their jurisdiction.
-
----
-
-## License
-
-Sentinel-43 is released into the **public domain** under the **Unlicense**.
-
-You are free to:
-- Use
-- Modify
-- Fork
-- Redistribute
-- Integrate
-
-No warranty is provided. Use at your own risk.
-
----
-
-## Status
-
-Sentinel-43 is an actively developed project.  
-Interfaces and internal components may evolve, but core principles—**separation, auditability, and human oversight**—are considered stable.
-
----
-
-## Contact / Contributions
-
-Contributions, reviews, and audits are welcome.
-
-If you are evaluating Sentinel-43 for research, infrastructure, or public-interest use, you are encouraged to read the architecture documentation and threat model before deployment.
-
-## License
-
+Sentinel-43
+Sentinel-43 is a modular detection and response-planning engine designed to analyze structured events, assess risk, and produce explainable, policy-bound recommendations under human oversight.
+It is not an autonomous enforcement system.
+It does not execute actions by default.
+It exists to think clearly, log decisions, and recommend responsibly.
+Project Goal
+Primary Goal:
+Provide a deterministic, auditable decision-support core that can evaluate events, score risk, and recommend responses without performing enforcement or direct action.
+Sentinel-43 exists to answer one question reliably:
+“Given this event and these rules, what should be considered, and why?”
+Everything else is secondary.
+Non-Negotiable Design Constraints
+Sentinel-43 is intentionally built with the following hard limits:
+No autonomous enforcement
+No covert surveillance or data harvesting
+No hidden integrations or side effects
+No opaque “black box” decisions
+No bypassing human, legal, or organizational authority
+If a feature violates one of these, it does not belong in the core.
+Core Capabilities
+1. Event Analysis
+Accepts structured event inputs
+Normalizes and validates data explicitly
+Rejects malformed or ambiguous inputs by default
+2. Detection & Risk Assessment
+Applies deterministic rules and optional AI-assisted analysis
+Produces severity, confidence, and risk scores
+Prioritizes explainability over raw prediction
+3. Policy-Bound Response Planning
+Maps assessments to recommended actions only
+Applies thresholds, escalation rules, and rate limits
+Supports human-gated workflows and review checkpoints
+4. Audit & Decision Integrity
+Records decision inputs, outputs, and rationale
+Preserves lineage for later inspection or dispute
+Separates analysis from execution by design
+What Sentinel-43 Does Not Do
+Sentinel-43 deliberately does not:
+Execute blocks, bans, takedowns, or mitigations
+Interface directly with firewalls, IAMs, or control planes
+Monitor users, traffic, or systems covertly
+Replace legal authority or human accountability
+Operate autonomously without explicit configuration
+Any execution must occur outside the core, via adapters that are optional, reviewable, and replaceable.
+Architectural Model
+Sentinel-43 follows strict separation of concerns:
+Core
+Detection logic
+Risk scoring
+Policy evaluation
+Audit logging
+(No network I/O, no enforcement)
+Adapters
+Optional integrations (queues, databases, services)
+Environment-specific and non-authoritative
+Interfaces
+Dashboards and visualizations
+Administrative and review tools
+Human-facing control surfaces
+This ensures the decision engine remains stable, testable, and trustworthy even when surrounding systems fail.
+Default Operating Mode
+Out of the box, Sentinel-43 runs in advisory mode:
+Events are analyzed
+Assessments are generated
+Responses are recommended, not executed
+All outputs are logged for inspection
+Automation or enforcement requires explicit adapter implementation and acceptance of responsibility by the deployer.
+Intended Use Cases
+Sentinel-43 is suited for:
+Security and compliance triage pipelines
+Governance and policy evaluation systems
+Simulation and research environments
+Transparent alternatives to opaque automation
+It is appropriate for internal, public-interest, and research contexts where auditability matters more than speed.
+Non-Goals
+Sentinel-43 is not intended to be:
+A turnkey SOC replacement
+A self-directing security appliance
+A covert monitoring platform
+A mechanism for bypassing law, consent, or oversight
+Project Status
+Sentinel-43 is under active development.
+Interfaces may evolve, but the following principles are considered stable:
+Separation of analysis and execution
+Human accountability
+Explainability
+Auditability
+License
 This project is licensed under the Apache License, Version 2.0.
-See the LICENSE and NOTICE files for details.
+See the LICENSE and NOTICE files for full terms.
