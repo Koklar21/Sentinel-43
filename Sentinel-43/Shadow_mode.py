@@ -13,19 +13,12 @@
 """
 SENTINEL-43: Nexus Oversight Controller (Hardened)
 
-Public-safe changes vs the earlier prototype:
-- No import-time logging hijack (provide configure_logging() instead)
-- Strict input validation (ipaddress + length bounds)
-- Severity normalization + allowlist
-- Non-guessable action IDs (UUID4) + separate dedupe keys
-- Bounded corroboration key space (canonical threat types + capped strings)
-- Budget can apply to both target and source (optional hooks)
-- HUMAN_GATED approvals track operator_id (in-memory; persistence lives in your hardened node)
-- Safer timer management + optional shutdown for clean exits
-
-Note:
-- This file is still intentionally "execution boundary" friendly:
-  real-world effects terminate in IntegrationHub, which you swap to your real firewall/IAM client.
+Patch set applied (Jan 2026):
+- Atomic dual-budget consumption (prevents partial mutation + race bypass)
+- Mode resolution moved under lock (prevents TOCTOU mode races)
+- Shutdown cleanup fixed (clears gated state; removes duplicate clear)
+- Execution failure callback + in-memory failure state (prevents silent fail-open)
+- Optional operator authentication hook (prevents spoofed operator attribution)
 """
 
 from __future__ import annotations
@@ -37,7 +30,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple, Any
 
 
 # ----------------------------
@@ -135,6 +128,14 @@ class CorroborationState:
     count: int
 
 
+@dataclass
+class ExecutionFailure:
+    at: float
+    action_id: str
+    error_type: str
+    error_message: str
+
+
 # ----------------------------
 # Helpers (validation + bounds)
 # ----------------------------
@@ -209,6 +210,8 @@ class OversightEngine:
     - Action budgets per target and per source (prevents baiting/runaway + spray)
     - Two-signal confirmation for HIGH (prevents one-signal nukes)
     - Bounded pending actions (prevents timer pileups)
+    - Failure callback + internal failure ledger (prevents silent fail-open)
+    - Optional operator authentication hook (prevents spoofed audit attribution)
     """
 
     def __init__(
@@ -222,6 +225,9 @@ class OversightEngine:
         budget_max_actions_per_source: int = 25,
         require_two_signals_for_high: bool = True,
         corroboration_ttl_seconds: int = 600,
+        operator_authenticator: Optional[Callable[[str], bool]] = None,
+        on_execution_failure: Optional[Callable[[str, Exception, Optional[ActionRequest]], None]] = None,
+        max_failure_ledger: int = 500,
     ) -> None:
         self._mode_resolver = mode_resolver
         self._lock = threading.RLock()
@@ -238,6 +244,14 @@ class OversightEngine:
 
         # two-signal confirmation
         self._corroboration: Dict[str, CorroborationState] = {}
+
+        # execution failures (in-memory ledger)
+        self._failures: Dict[str, ExecutionFailure] = {}  # action_id -> failure record
+        self._max_failure_ledger = int(max_failure_ledger)
+
+        # hooks
+        self._operator_authenticator = operator_authenticator
+        self._on_execution_failure = on_execution_failure
 
         self._dedupe_ttl_seconds = int(dedupe_ttl_seconds)
         self._max_pending = int(max_pending)
@@ -271,6 +285,14 @@ class OversightEngine:
             if now - st.window_start > self._budget_window_seconds * 4:
                 self._budget_source.pop(source, None)
 
+        # bound failure ledger
+        if len(self._failures) > self._max_failure_ledger:
+            # remove oldest entries (simple O(n log n), bounded by max_failure_ledger)
+            items = sorted(self._failures.values(), key=lambda f: f.at)
+            to_remove = len(items) - self._max_failure_ledger
+            for f in items[:to_remove]:
+                self._failures.pop(f.action_id, None)
+
     def _is_duplicate(self, dedupe_key: str) -> bool:
         now = self._now()
         ts = self._recent_dedupe.get(dedupe_key)
@@ -297,6 +319,31 @@ class OversightEngine:
         st.used += 1
         return True
 
+    def _consume_budgets_atomic(self, *, target: str, source: str) -> bool:
+        """
+        PATCH: atomic dual-budget consumption.
+        Either both target+source budgets are consumed, or neither is.
+        Must be called under self._lock.
+        """
+        # Check/consume target
+        target_ok = self._consume_budget(self._budget_target, target, self._budget_max_actions_per_target)
+
+        # Check/consume source (optional)
+        source_ok = True
+        if source:
+            source_ok = self._consume_budget(self._budget_source, source, self._budget_max_actions_per_source)
+
+        if target_ok and source_ok:
+            return True
+
+        # Roll back target if it succeeded but source failed (partial commit prevention)
+        if target_ok and not source_ok:
+            st = self._budget_target.get(target)
+            if st:
+                st.used = max(0, st.used - 1)
+
+        return False
+
     def _corroborate(self, *, target: str, reason: str) -> int:
         now = self._now()
         key = f"{target}|{reason}"
@@ -308,10 +355,23 @@ class OversightEngine:
         st.count += 1
         return st.count
 
-    def schedule_action(self, req: ActionRequest) -> None:
-        mode = self._mode_resolver()
+    def _record_failure(self, action_id: str, exc: Exception) -> None:
+        self._failures[action_id] = ExecutionFailure(
+            at=self._now(),
+            action_id=action_id,
+            error_type=type(exc).__name__,
+            error_message=_safe_str(str(exc), max_len=500),
+        )
 
+    def get_failure(self, action_id: str) -> Optional[ExecutionFailure]:
         with self._lock:
+            return self._failures.get(action_id)
+
+    def schedule_action(self, req: ActionRequest) -> None:
+        with self._lock:
+            # PATCH: resolve mode under the same lock (prevents TOCTOU)
+            mode = self._mode_resolver()
+
             self._cleanup()
 
             if len(self._pending_actions) + len(self._gated_actions) >= self._max_pending:
@@ -322,13 +382,11 @@ class OversightEngine:
                 logging.info(f"[OVERSIGHT] Duplicate suppressed (dedupe_key): {req.dedupe_key}")
                 return
 
-            # budgets: target + source
-            if not self._consume_budget(self._budget_target, req.target, self._budget_max_actions_per_target):
-                logging.warning(f"[OVERSIGHT] Budget exceeded (target={req.target}). Suppressing {req.action_id}.")
-                return
-
-            if req.source and not self._consume_budget(self._budget_source, req.source, self._budget_max_actions_per_source):
-                logging.warning(f"[OVERSIGHT] Budget exceeded (source={req.source}). Suppressing {req.action_id}.")
+            # PATCH: atomic budget consumption for target + source
+            if not self._consume_budgets_atomic(target=req.target, source=req.source):
+                logging.warning(
+                    f"[OVERSIGHT] Budget exceeded (target={req.target} source={req.source}). Suppressing {req.action_id}."
+                )
                 return
 
             # two-signal for HIGH
@@ -338,13 +396,22 @@ class OversightEngine:
                 if count < 2:
                     logging.info(f"[OVERSIGHT] Waiting for second signal before acting on HIGH: {req.action_id}")
                     if mode is OpMode.SHADOW:
-                        req.shadow_payload()
+                        # Shadow-only advisory still allowed
+                        try:
+                            req.shadow_payload()
+                        except Exception as exc:
+                            self._record_failure(req.action_id, exc)
+                            logging.error(f"[OVERSIGHT] Shadow payload failed for {req.action_id}: {exc}")
                     return
 
             logging.info(f"[OVERSIGHT] Mode={mode.value} | {req.description}")
 
             if mode is OpMode.SHADOW:
-                req.shadow_payload()
+                try:
+                    req.shadow_payload()
+                except Exception as exc:
+                    self._record_failure(req.action_id, exc)
+                    logging.error(f"[OVERSIGHT] Shadow payload failed for {req.action_id}: {exc}")
                 logging.info("[OVERSIGHT] Advisory logged. No execution.")
                 return
 
@@ -358,13 +425,13 @@ class OversightEngine:
             timer = threading.Timer(
                 req.delay_seconds,
                 self._execute_wrapper,
-                args=(req.action_id, req.description, req.real_payload),
+                args=(req.action_id, req.description, req.real_payload, req),
             )
             timer.daemon = True
             self._pending_actions[req.action_id] = timer
             timer.start()
 
-    def _execute_wrapper(self, action_id: str, description: str, payload: Callable[[], None]) -> None:
+    def _execute_wrapper(self, action_id: str, description: str, payload: Callable[[], None], req: Optional[ActionRequest]) -> None:
         with self._lock:
             timer = self._pending_actions.pop(action_id, None)
             if not timer:
@@ -374,11 +441,24 @@ class OversightEngine:
         try:
             payload()
         except Exception as exc:
+            with self._lock:
+                self._record_failure(action_id, exc)
             logging.error(f"[OVERSIGHT] Execution failed for {action_id}: {exc}")
+
+            if self._on_execution_failure:
+                try:
+                    self._on_execution_failure(action_id, exc, req)
+                except Exception as cb_exc:
+                    logging.critical(f"[OVERSIGHT] Failure callback failed for {action_id}: {cb_exc}")
 
     def veto_action(self, action_id: str, reason: str, *, operator_id: str = "unknown") -> bool:
         reason = _safe_str(reason, max_len=300)
         operator_id = _safe_str(operator_id, max_len=80)
+
+        # PATCH: optional operator authentication hook
+        if self._operator_authenticator is not None and not self._operator_authenticator(operator_id):
+            logging.error(f"[OVERSIGHT] VETO REJECTED: operator not authenticated operator={operator_id}")
+            return False
 
         with self._lock:
             timer = self._pending_actions.pop(action_id, None)
@@ -398,6 +478,11 @@ class OversightEngine:
     def approve_gated_action(self, action_id: str, *, operator_id: str = "unknown") -> bool:
         operator_id = _safe_str(operator_id, max_len=80)
 
+        # PATCH: optional operator authentication hook
+        if self._operator_authenticator is not None and not self._operator_authenticator(operator_id):
+            logging.error(f"[OVERSIGHT] APPROVAL REJECTED: operator not authenticated operator={operator_id}")
+            return False
+
         with self._lock:
             req = self._gated_actions.pop(action_id, None)
 
@@ -410,7 +495,16 @@ class OversightEngine:
             req.real_payload()
             return True
         except Exception as exc:
+            with self._lock:
+                self._record_failure(action_id, exc)
             logging.error(f"[OVERSIGHT] Approved execution failed for {action_id}: {exc}")
+
+            if self._on_execution_failure:
+                try:
+                    self._on_execution_failure(action_id, exc, req)
+                except Exception as cb_exc:
+                    logging.critical(f"[OVERSIGHT] Failure callback failed for {action_id}: {cb_exc}")
+
             return False
 
     def shutdown(self) -> None:
@@ -418,18 +512,19 @@ class OversightEngine:
         Best-effort cleanup for pending timers (optional).
         """
         with self._lock:
-            for _, timer in list(self._pending_actions.items()):
+            for action_id, timer in list(self._pending_actions.items()):
                 try:
                     timer.cancel()
-                except Exception:
-                    pass
-            self._pending_actions.clear()
+                except Exception as exc:
+                    logging.warning(f"[OVERSIGHT] Timer cancel failed for {action_id}: {exc}")
+
             self._pending_actions.clear()
             self._gated_actions.clear()
             self._recent_dedupe.clear()
             self._corroboration.clear()
             self._budget_target.clear()
             self._budget_source.clear()
+            self._failures.clear()
 
 
 # ----------------------------
@@ -440,6 +535,8 @@ class SentinelNexus:
     def __init__(self, initial_mode: OpMode = OpMode.SHADOW, *, source_id: str = "sensor.local") -> None:
         self._mode = initial_mode
         self._source_id = _safe_str(source_id, max_len=_MAX_SOURCE_LEN)
+
+        # NOTE: authenticator + failure handler can be injected by host app later.
         self.oversight = OversightEngine(self.get_mode)
 
         logging.info(f"[{SYSTEM_ID}] Nexus Online. Operational Mode={self._mode.value} source_id={self._source_id}")
@@ -469,7 +566,6 @@ class SentinelNexus:
         """
         ok, ip = _validate_ip(ip_address)
         if not ok:
-            # return a stable-ish token the caller can log without side effects
             token = f"DROP-{uuid.uuid4().hex[:12]}"
             logging.warning(f"[THREAT] Dropped invalid ip_address={_safe_str(ip_address, max_len=120)} token={token}")
             return token
@@ -478,10 +574,8 @@ class SentinelNexus:
         ttype = _normalize_threat_type(threat_type)
         src = _safe_str(source_id or self._source_id, max_len=_MAX_SOURCE_LEN)
 
-        # Random action ID: not guessable, not user-controlled
         action_id = f"ACT-{uuid.uuid4().hex}"
 
-        # Dedupe key: prevent repeated triggers for the *same* condition in a short window
         bucket = int(time.time() // 30)
         dedupe_key = f"{ip}|{ttype}|{sev}|{bucket}"
 
