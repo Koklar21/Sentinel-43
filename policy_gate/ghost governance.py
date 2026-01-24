@@ -1,360 +1,124 @@
 from __future__ import annotations
 
-import os
-import json
 import hmac
 import hashlib
+import json
 import logging
-import threading
+import os
 import sqlite3
+import threading
+import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone, date
-from decimal import Decimal, InvalidOperation, getcontext
-from typing import Dict, List, Tuple, Any, Optional, Set
-from collections import deque
-from types import MappingProxyType
-import statistics
-import copy
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple
 
-# -----------------------
-# Precision / Money rules
-# -----------------------
-getcontext().prec = 28
-MONEY_QUANT = Decimal("0.0001")
+_logger = logging.getLogger("sentinel43.ghost_governance")
 
-def normalize_amount(amount: Decimal) -> Decimal:
-    return amount.quantize(MONEY_QUANT)
 
-# -----------------------
-# Config
-# -----------------------
-_RISK_WEIGHTS = MappingProxyType({
-    "baseline": Decimal("0.3"),
-    "slow_boil": Decimal("0.5"),
-    "outlier": Decimal("0.4"),
-    "trust_penalty": Decimal("0.2"),
-})
+# ============================================================
+# CONFIG
+# ============================================================
 
-CONFIG = MappingProxyType({
-    "FINANCIAL_HARD_LIMIT": Decimal("50.00"),
-    "VELOCITY_LIMIT": 3,
-    "VELOCITY_WINDOW_SECONDS": 60,
-    "RISK_THRESHOLD": Decimal("0.85"),
-    "POLICY_VERSION": "2.4-hardened",
-    "RISK_WEIGHTS": _RISK_WEIGHTS,
-    "SLOW_BOIL_WINDOW": 5,
-    "OUTLIER_Z": Decimal("3.0"),
-    "MAX_HISTORY_LENGTH": 50,
+CONFIG: Dict[str, Any] = {
+    "AUDIT_SQLITE_PATH": str(Path(os.getenv("SENTINEL_AUDIT_DB", "ghost_audit.db")).expanduser().resolve()),
+    "AUDIT_JSONL_FILE": os.getenv("SENTINEL_AUDIT_JSONL", ""),  # optional
+    "VELOCITY_WINDOW_SECONDS": int(os.getenv("SENTINEL_VELOCITY_WINDOW_SECONDS", "60")),
+    "VELOCITY_LIMIT": int(os.getenv("SENTINEL_VELOCITY_LIMIT", "10")),
+    "VELOCITY_GC_INTERVAL_SECONDS": int(os.getenv("SENTINEL_VELOCITY_GC_INTERVAL_SECONDS", "300")),
+    "VELOCITY_MAX_ENTRIES_PER_USER": int(os.getenv("SENTINEL_VELOCITY_MAX_ENTRIES_PER_USER", "1000")),
+    "SENTINEL_ENV": (os.getenv("SENTINEL_ENV") or "prod").lower(),
+}
 
-    # Audit sinks
-    "AUDIT_JSONL_FILE": "ghost_audit.jsonl",   # optional
-    "AUDIT_SQLITE_PATH": "ghost_audit.sqlite3",
+# ============================================================
+# REASON CODES (minimal stub, integrate with your existing ones)
+# ============================================================
 
-    # Metadata safety
-    "INCLUDE_METADATA_SNAPSHOT": True,  # still allowed, but filtered
-    "METADATA_ALLOWLIST": set([
-        "region_code",
-        "session_id",
-        "request_id",
-        "ip_address",
-        "device_integrity",
-        "location",
-        "device_id",
-        # add more explicitly, or it doesn't get logged
-    ]),
-
-    # GC
-    "GC_INTERVAL_SECONDS": 3600,
-})
-
-# -----------------------
-# Reason codes
-# -----------------------
 class ReasonCodes:
-    FINANCIAL_LIMIT = "FLAC_FAIL_FINANCIAL_LIMIT_EXCEEDED"
-    SANCTIONED_LOCATION = "FLAC_FAIL_LEGAL_SANCTIONED_LOCATION"
-    DEVICE_UNTRUSTED = "FLAC_FAIL_COMPLIANCE_DEVICE_UNTRUSTED"
-    MISSING_METADATA = "FLAC_FAIL_AUDIT_MISSING_METADATA"
-    VELOCITY_EXCEEDED = "FLAC_FAIL_VELOCITY_LIMIT"
-    INVALID_AMOUNT = "FLAC_FAIL_INVALID_AMOUNT"
-    NEGATIVE_AMOUNT = "FLAC_FAIL_NEGATIVE_AMOUNT"
-    INVALID_TIMESTAMP = "FLAC_FAIL_INVALID_TIMESTAMP"
-    FUTURE_TIMESTAMP = "FLAC_FAIL_FUTURE_TIMESTAMP"
-    CLEARED = "CLEARED_ALL_CHECKS"
-    SYSTEM_ERROR = "SYSTEM_EXCEPTION"
-    HASH_SECRET_MISSING = "SYSTEM_HASH_SECRET_MISSING"
-    SERIALIZATION_ERROR = "SYSTEM_SERIALIZATION_ERROR"
-    AI_RISK = "AI_RISK_THRESHOLD_EXCEEDED"
+    CLEARED = "CLEARED"
+    AUTHORIZATION_FAILED = "AUTHORIZATION_FAILED"
+    AUDIT_CHAIN_FORK = "AUDIT_CHAIN_FORK"
+    AUDIT_CRYPTO_CONFIG_MISSING = "AUDIT_CRYPTO_CONFIG_MISSING"
+    AUDIT_APPEND_FAILED = "AUDIT_APPEND_FAILED"
+    VELOCITY_LIMIT = "VELOCITY_LIMIT"
+    VELOCITY_CAP_EXCEEDED = "VELOCITY_CAP_EXCEEDED"
+    INVALID_INPUT = "INVALID_INPUT"
 
-# -----------------------
-# Logging
-# -----------------------
-_logger = logging.getLogger("Sentinel43.PolicyGate")
-_logger.setLevel(logging.INFO)
-if not _logger.handlers:
-    _logger.addHandler(logging.StreamHandler())
 
-# -----------------------
-# JSON encoder
-# -----------------------
+# ============================================================
+# UTIL: Safe JSON encoder for Decimal/datetime
+# ============================================================
+
 class AuditEncoder(json.JSONEncoder):
-    def default(self, obj):
+    def default(self, obj: Any) -> Any:
         if isinstance(obj, Decimal):
             return str(obj)
-        if isinstance(obj, (datetime, date)):
+        if isinstance(obj, (datetime,)):
             return obj.isoformat()
-        if isinstance(obj, set):
-            return list(obj)
-        return super().default(obj)
+        return json.JSONEncoder.default(self, obj)
 
-# -----------------------
-# Data classes
-# -----------------------
-@dataclass
-class TransactionContext:
-    user_id: str
-    amount: Decimal
-    timestamp: datetime
-    location: str
-    device_id: str
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
-@dataclass
-class Decision:
-    status: str
-    risk_score: Decimal
-    reason: str
+# ============================================================
+# CRYPTO CONFIG
+# ============================================================
 
-# -----------------------
-# Metadata safety
-# -----------------------
-def _filter_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
-    if not metadata:
-        return {}
-    allow = CONFIG["METADATA_ALLOWLIST"]
-    out: Dict[str, Any] = {}
-    for k, v in metadata.items():
-        if k in allow:
-            out[k] = v
-    return out
+def _get_hmac_secret() -> bytes:
+    """
+    Returns secret bytes. FAILS CLOSED if missing.
+    Don't ever return placeholders. That's how audit trails become fiction.
+    """
+    raw = os.getenv("GHOST_DEVICE_HASH_SECRET", "").strip()
+    if not raw:
+        raise RuntimeError(
+            "GHOST_DEVICE_HASH_SECRET is required. "
+            "Generate with: python3 -c 'import secrets; print(secrets.token_hex(32))'"
+        )
 
-def _redact_ip(ip: Optional[str]) -> Optional[str]:
-    # Keep coarse info only (privacy + compliance + less liability)
-    if not ip or not isinstance(ip, str):
-        return ip
-    # IPv4 crude redaction: 1.2.3.4 -> 1.2.3.x
-    if ip.count(".") == 3:
-        parts = ip.split(".")
-        return ".".join(parts[:3] + ["x"])
-    return ip
-
-# -----------------------
-# Input validation
-# -----------------------
-def validate_context(ctx: TransactionContext) -> Tuple[bool, str]:
-    now = datetime.now(timezone.utc)
-
-    if not isinstance(ctx.amount, Decimal):
-        try:
-            ctx.amount = Decimal(str(ctx.amount))
-        except (InvalidOperation, ValueError, TypeError):
-            return False, ReasonCodes.INVALID_AMOUNT
-
+    # Accept hex or raw text. If hex-like, decode.
     try:
-        ctx.amount = normalize_amount(ctx.amount)
+        if all(c in "0123456789abcdefABCDEF" for c in raw) and len(raw) >= 64 and len(raw) % 2 == 0:
+            return bytes.fromhex(raw)
     except Exception:
-        return False, ReasonCodes.INVALID_AMOUNT
+        pass
 
-    if ctx.amount.is_nan() or ctx.amount.is_infinite():
-        return False, ReasonCodes.INVALID_AMOUNT
-    if ctx.amount < 0:
-        return False, ReasonCodes.NEGATIVE_AMOUNT
+    # Fallback: treat as utf-8 secret.
+    return raw.encode("utf-8")
 
-    if not isinstance(ctx.timestamp, datetime) or ctx.timestamp.tzinfo is None:
-        return False, ReasonCodes.INVALID_TIMESTAMP
-    if ctx.timestamp > now + timedelta(minutes=5):
-        return False, ReasonCodes.FUTURE_TIMESTAMP
-    if ctx.timestamp.year < 2000:
-        return False, ReasonCodes.INVALID_TIMESTAMP
 
-    for f in ["user_id", "device_id", "location"]:
-        val = getattr(ctx, f)
-        if not isinstance(val, str) or not val.strip():
-            return False, f"FLAC_FAIL_INVALID_{f.upper()}"
+def constant_time_compare(a: str, b: str) -> bool:
+    """Constant-time compare to reduce timing leaks."""
+    return hmac.compare_digest(a, b)
 
-    return True, ReasonCodes.CLEARED
 
-# -----------------------
-# Velocity (single-process default)
-# -----------------------
-class VelocityGuard:
-    def __init__(self):
-        self.user_events: Dict[str, deque] = {}
-        self.lock = threading.Lock()
-        self.last_gc = datetime.now(timezone.utc)
+# ============================================================
+# AUDIT STORE (SQLite + optional JSONL sink)
+# ============================================================
 
-    def _garbage_collect(self, now: datetime):
-        if (now - self.last_gc).total_seconds() <= CONFIG["GC_INTERVAL_SECONDS"]:
-            return
-        cutoff = now - timedelta(seconds=CONFIG["VELOCITY_WINDOW_SECONDS"])
-        stale = [uid for uid, dq in self.user_events.items() if (not dq) or (dq[-1] < cutoff)]
-        for uid in stale:
-            self.user_events.pop(uid, None)
-        self.last_gc = now
-
-    def allow(self, user_id: str, now: datetime) -> bool:
-        with self.lock:
-            try:
-                self._garbage_collect(now)
-                dq = self.user_events.setdefault(user_id, deque())
-                cutoff = now - timedelta(seconds=CONFIG["VELOCITY_WINDOW_SECONDS"])
-                while dq and dq[0] < cutoff:
-                    dq.popleft()
-                if len(dq) >= CONFIG["VELOCITY_LIMIT"]:
-                    return False
-                dq.append(now)
-                return True
-            except Exception as e:
-                _logger.error(f"VelocityGuard failure, failing closed: {e}")
-                return False
-
-# -----------------------
-# Governance
-# -----------------------
-class GovernanceFramework:
-    def __init__(self, sanctioned_locations: List[str]):
-        self.sanctioned_locations: Set[str] = set(sanctioned_locations or [])
-
-    def run_flac_loops(self, context: TransactionContext) -> Tuple[bool, str]:
-        try:
-            if context.amount > CONFIG["FINANCIAL_HARD_LIMIT"]:
-                return False, ReasonCodes.FINANCIAL_LIMIT
-            if context.location in self.sanctioned_locations:
-                return False, ReasonCodes.SANCTIONED_LOCATION
-            if context.metadata.get("device_integrity") == "compromised":
-                return False, ReasonCodes.DEVICE_UNTRUSTED
-            if not context.metadata:
-                return False, ReasonCodes.MISSING_METADATA
-            return True, ReasonCodes.CLEARED
-        except Exception as e:
-            _logger.error(f"Governance error: {e}")
-            return False, ReasonCodes.SYSTEM_ERROR
-
-# -----------------------
-# Adaptive intelligence (Decimal-safe enough)
-# -----------------------
-class AdaptiveIntelligence:
-    def __init__(self):
-        self.profiles: Dict[str, Dict[str, Any]] = {}
-        self.lock = threading.Lock()
-
-    def get_baseline(self, user_id: str) -> Dict[str, Any]:
-        with self.lock:
-            return copy.deepcopy(self.profiles.get(user_id, {"history": [], "trust_score": Decimal("0.5")}))
-
-    @staticmethod
-    def _linear_regression_slope(vals: List[Decimal]) -> Decimal:
-        try:
-            n = len(vals)
-            if n < 2:
-                return Decimal(0)
-            x_vals = [Decimal(i) for i in range(n)]
-            mean_x = sum(x_vals) / n
-            mean_y = sum(vals) / n
-            num = sum((x - mean_x) * (y - mean_y) for x, y in zip(x_vals, vals))
-            den = sum((x - mean_x) ** 2 for x in x_vals)
-            return Decimal(0) if den == 0 else (num / den)
-        except Exception:
-            return Decimal(0)
-
-    def detect_slow_boil(self, history: List[Decimal], current_amount: Decimal) -> bool:
-        try:
-            window = CONFIG["SLOW_BOIL_WINDOW"]
-            if len(history) < window - 1:
-                return False
-            series = history[-(window - 1):] + [current_amount]
-            slope = self._linear_regression_slope(series)
-            return slope > Decimal("0.05")
-        except Exception:
-            return False
-
-    def evaluate_risk(self, context: TransactionContext) -> Tuple[Decimal, Dict[str, Decimal], Dict[str, Any]]:
-        try:
-            profile = self.get_baseline(context.user_id)
-            history: List[Decimal] = profile["history"]
-            components: Dict[str, Decimal] = {}
-            weights = CONFIG["RISK_WEIGHTS"]
-
-            if not history:
-                components["baseline"] = weights["baseline"]
-                components["slow_boil"] = Decimal(0)
-                components["outlier"] = Decimal(0)
-            else:
-                components["baseline"] = weights["baseline"] if len(history) < 5 else Decimal(0)
-                components["slow_boil"] = weights["slow_boil"] if self.detect_slow_boil(history, context.amount) else Decimal(0)
-
-                if len(history) >= 5:
-                    # Keep it simple: stats needs floats; we normalize first.
-                    float_hist = [float(normalize_amount(h)) for h in history]
-                    mu = Decimal(str(statistics.mean(float_hist)))
-                    sigma = Decimal(str(statistics.pstdev(float_hist))) or Decimal(1)
-                    z = (context.amount - mu) / sigma if sigma != 0 else Decimal(0)
-                    components["outlier"] = weights["outlier"] if z > CONFIG["OUTLIER_Z"] else Decimal(0)
-                else:
-                    components["outlier"] = Decimal(0)
-
-            trust_score = profile.get("trust_score", Decimal("0.5"))
-            penalty_base = Decimal("0.5") - trust_score
-            components["trust_penalty"] = max(Decimal(0), penalty_base) * weights["trust_penalty"]
-
-            risk = min(sum(components.values()), Decimal("1.0"))
-            snapshot = {"history_len": len(history), "trust_score": trust_score}
-            return risk, components, snapshot
-        except Exception as e:
-            _logger.error(f"Risk eval failure (fail closed): {e}")
-            return Decimal("1.0"), {"error": Decimal("1.0")}, {"error_msg": str(e)}
-
-    def learn(self, context: TransactionContext) -> None:
-        with self.lock:
-            profile = self.profiles.get(context.user_id, {"history": [], "trust_score": Decimal("0.5")})
-            profile["history"].append(context.amount)
-            if len(profile["history"]) > CONFIG["MAX_HISTORY_LENGTH"]:
-                profile["history"].pop(0)
-            self.profiles[context.user_id] = profile
-
-    def reward_trust(self, user_id: str, delta: Decimal = Decimal("0.01")) -> None:
-        with self.lock:
-            profile = self.profiles.get(user_id, {"history": [], "trust_score": Decimal("0.5")})
-            curr = profile["trust_score"]
-            profile["trust_score"] = max(Decimal(0), min(Decimal(1), curr + delta))
-            self.profiles[user_id] = profile
-
-# -----------------------
-# Audit chain persistence (SQLite anchor + log table)
-# -----------------------
 class AuditStore:
-    def __init__(self, sqlite_path: str, jsonl_path: Optional[str] = None):
+    """
+    Tamper-evident append-only audit chain.
+    Uses a single anchor row to store current head hash.
+    """
+
+    def __init__(self, sqlite_path: str, jsonl_path: Optional[str] = None) -> None:
         self.sqlite_path = sqlite_path
-        self.jsonl_path = jsonl_path
-        self.lock = threading.Lock()
-        self._init_db()
+        self.jsonl_path = jsonl_path or None
+        self._lock = threading.Lock()
+        self._ensure_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.sqlite_path, timeout=10, isolation_level=None)
+        con = sqlite3.connect(self.sqlite_path, timeout=5.0)
         con.execute("PRAGMA journal_mode=WAL;")
         con.execute("PRAGMA synchronous=FULL;")
         return con
 
-    def _init_db(self):
+    def _ensure_schema(self) -> None:
+        Path(self.sqlite_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         con = self._connect()
         try:
-            con.execute("""
-                CREATE TABLE IF NOT EXISTS audit_anchor (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
-                    prev_hash TEXT NOT NULL
-                )
-            """)
-            con.execute("""
+            con.execute(
+                """
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     decision_time TEXT NOT NULL,
@@ -362,11 +126,21 @@ class AuditStore:
                     payload_hash TEXT NOT NULL,
                     prev_hash TEXT NOT NULL
                 )
-            """)
-            # ensure anchor row exists
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_anchor (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    prev_hash TEXT NOT NULL
+                )
+                """
+            )
+            # Initialize anchor if empty
             row = con.execute("SELECT prev_hash FROM audit_anchor WHERE id=1").fetchone()
             if row is None:
-                con.execute("INSERT INTO audit_anchor (id, prev_hash) VALUES (1, 'GENESIS')")
+                con.execute("INSERT INTO audit_anchor (id, prev_hash) VALUES (1, ?)", ("GENESIS",))
+            con.commit()
         finally:
             con.close()
 
@@ -374,15 +148,33 @@ class AuditStore:
         con = self._connect()
         try:
             (prev_hash,) = con.execute("SELECT prev_hash FROM audit_anchor WHERE id=1").fetchone()
-            return prev_hash
+            return str(prev_hash)
         finally:
             con.close()
 
     def append(self, payload: Dict[str, Any], payload_hash: str, prev_hash: str) -> None:
-        # Writes are serialized here; SQLite handles multi-process WAL fine.
-        with self.lock:
+        """
+        Atomic append:
+        - BEGIN IMMEDIATE to acquire write lock (multi-process safe)
+        - Verify anchor head matches prev_hash (prevents forks)
+        - Insert log row
+        - Update anchor head
+        """
+        # Lock helps threads in-process; SQL transaction covers multi-process.
+        with self._lock:
             con = self._connect()
             try:
+                con.execute("BEGIN IMMEDIATE")
+
+                (current_head,) = con.execute("SELECT prev_hash FROM audit_anchor WHERE id=1").fetchone()
+                current_head = str(current_head)
+
+                if current_head != prev_hash:
+                    con.rollback()
+                    raise RuntimeError(
+                        f"Audit chain fork detected. expected={prev_hash} current_head={current_head}"
+                    )
+
                 decision_time = payload.get("decision_time") or datetime.now(timezone.utc).isoformat()
                 payload_json = json.dumps(payload, cls=AuditEncoder, sort_keys=True, separators=(",", ":"))
 
@@ -391,176 +183,373 @@ class AuditStore:
                     (decision_time, payload_json, payload_hash, prev_hash),
                 )
                 con.execute("UPDATE audit_anchor SET prev_hash=? WHERE id=1", (payload_hash,))
+                con.commit()
+            except Exception:
+                con.rollback()
+                raise
             finally:
                 con.close()
 
-            # Optional JSONL sink (best-effort)
-            if self.jsonl_path:
-                try:
-                    with open(self.jsonl_path, "a", encoding="utf-8") as f:
-                        f.write(json.dumps({"payload": payload, "hash": payload_hash}, cls=AuditEncoder) + "\n")
-                        f.flush()
-                        os.fsync(f.fileno())
-                except Exception as e:
-                    _logger.error(f"JSONL audit sink failed (non-fatal): {e}")
+        # Best-effort JSONL sink outside the DB transaction
+        if self.jsonl_path:
+            try:
+                p = Path(self.jsonl_path).expanduser().resolve()
+                p.parent.mkdir(parents=True, exist_ok=True)
+                with open(p, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"payload": payload, "hash": payload_hash}, cls=AuditEncoder) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            except Exception as e:
+                _logger.error(f"JSONL sink failed (non-fatal): {e}")
 
-# -----------------------
-# Secure audit log
-# -----------------------
-def _get_hmac_secret() -> Optional[bytes]:
-    value = os.getenv("GHOST_DEVICE_HASH_SECRET")
-    return value.encode("utf-8") if value else None
+
+# ============================================================
+# AUDITOR
+# ============================================================
+
+@dataclass(frozen=True)
+class TransactionContext:
+    user_id: str
+    amount: Decimal
+    timestamp: datetime
+    location: str
+    device_id: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
 
 class SecureAuditLog:
-    def __init__(self, store: AuditStore):
+    def __init__(self, store: AuditStore) -> None:
         self.store = store
 
-    def _hmac_device(self, device_id: str) -> Tuple[str, Optional[str]]:
+    def _hmac_device(self, device_id: str) -> str:
+        """
+        FAIL CLOSED if secret missing.
+        No placeholder collisions. No pretend cryptography.
+        """
         secret = _get_hmac_secret()
-        if secret is None:
-            _logger.error("Missing GHOST_DEVICE_HASH_SECRET.")
-            return "HASH_SECRET_MISSING", ReasonCodes.HASH_SECRET_MISSING
-        try:
-            digest = hmac.new(secret, device_id.encode(), hashlib.sha256).hexdigest()
-            return digest, None
-        except Exception as e:
-            _logger.error(f"HMAC device hash failed: {e}")
-            return "HASH_ERROR", ReasonCodes.SERIALIZATION_ERROR
+        digest = hmac.new(secret, device_id.encode("utf-8"), hashlib.sha256).hexdigest()
+        return digest
 
-    @staticmethod
-    def _hash_metadata(metadata: Dict[str, Any]) -> str:
+    def _hash_metadata(self, meta: Dict[str, Any]) -> str:
+        # Deterministic metadata hash for integrity checks
+        raw = json.dumps(meta or {}, cls=AuditEncoder, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+
+    def verify_device_hash(self, device_id: str, claimed_hash: str) -> bool:
+        """Constant-time verify helper for any auth logic that compares device hashes."""
         try:
-            meta_str = json.dumps(metadata or {}, cls=AuditEncoder, sort_keys=True, separators=(",", ":"))
-            return hashlib.sha256(meta_str.encode()).hexdigest()
+            actual = self._hmac_device(device_id)
+            return constant_time_compare(actual, claimed_hash)
         except Exception as e:
-            _logger.error(f"Metadata hashing failed: {e}")
-            return "METADATA_HASH_ERROR"
+            _logger.error(f"Device hash verification failed: {e}")
+            return False
 
     def log_decision(
         self,
         context: TransactionContext,
         decision: str,
         reason_code: str,
-        risk_score: Decimal,
-        risk_components: Dict[str, Decimal],
-        model_snapshot: Dict[str, Any],
+        score: Decimal,
+        filtered_meta: Dict[str, Any],
+        extra: Dict[str, Any],
     ) -> bool:
+        """
+        Writes an audit record with chain hash.
+        Returns False on failure (and logs loud).
+        """
         try:
-            filtered_meta = _filter_metadata(context.metadata)
-            if "ip_address" in filtered_meta:
-                filtered_meta["ip_address"] = _redact_ip(filtered_meta.get("ip_address"))
-
-            device_hash, hash_err = self._hmac_device(context.device_id)
-            metadata_hash = self._hash_metadata(filtered_meta)
+            device_hash = self._hmac_device(context.device_id)
+            meta_hash = self._hash_metadata(filtered_meta)
 
             prev_hash = self.store.get_prev_hash()
 
-            snapshot_payload: Dict[str, Any] = dict(model_snapshot or {})
-            if hash_err:
-                snapshot_payload.setdefault("system_warnings", [])
-                snapshot_payload["system_warnings"].append(hash_err)
-
             payload: Dict[str, Any] = {
-                "event_time": context.timestamp.isoformat(),
                 "decision_time": datetime.now(timezone.utc).isoformat(),
                 "user_id": context.user_id,
-                "decision": decision,
-                "reason": reason_code,
-                "risk_score": risk_score,
-                "risk_components": risk_components,
-                "amount": context.amount,
+                "amount": str(context.amount),
                 "location": context.location,
                 "device_hash": device_hash,
-                "metadata_hash": metadata_hash,
-                "policy_ver": CONFIG["POLICY_VERSION"],
-                "prev_hash": prev_hash,
-                "model_snapshot": snapshot_payload,
+                "metadata_hash": meta_hash,
+                "decision": decision,
+                "reason_code": reason_code,
+                "score": str(score),
+                "extra": extra or {},
             }
 
-            if CONFIG.get("INCLUDE_METADATA_SNAPSHOT", True):
-                payload["metadata_snapshot"] = filtered_meta
+            payload_json = json.dumps(payload, cls=AuditEncoder, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            payload_hash = hashlib.sha256(payload_json + prev_hash.encode("utf-8")).hexdigest()
 
-            payload_str = json.dumps(payload, cls=AuditEncoder, sort_keys=True, separators=(",", ":"))
-            curr_hash = hashlib.sha256(payload_str.encode()).hexdigest()
-
-            self.store.append(payload=payload, payload_hash=curr_hash, prev_hash=prev_hash)
-            _logger.info(json.dumps({"payload": payload, "hash": curr_hash}, cls=AuditEncoder))
+            self.store.append(payload=payload, payload_hash=payload_hash, prev_hash=prev_hash)
             return True
+
+        except RuntimeError as e:
+            # Crypto/config missing, chain fork, etc.
+            _logger.critical(f"Audit failed (hard): {e}")
+            return False
         except Exception as e:
-            _logger.error(f"Audit log failed: {e}")
+            _logger.error(f"Audit failed: {e}")
             return False
 
-# -----------------------
-# Orchestrator (Policy Gate)
-# -----------------------
+
+# ============================================================
+# VELOCITY GUARD (DoS/MEMORY HARDENED)
+# ============================================================
+
+class VelocityGuard:
+    def __init__(
+        self,
+        *,
+        window_seconds: int,
+        limit: int,
+        gc_interval_seconds: int,
+        max_entries_per_user: int,
+    ) -> None:
+        self.window_seconds = int(window_seconds)
+        self.limit = int(limit)
+        self.gc_interval_seconds = int(gc_interval_seconds)
+        self.max_entries_per_user = int(max_entries_per_user)
+
+        self.user_events: Dict[str, "deque[datetime]"] = {}
+        self.lock = threading.Lock()
+        self.last_gc = datetime.now(timezone.utc)
+
+        from collections import deque  # local import to keep top tidy
+        self._deque = deque
+
+    def _garbage_collect(self, now: datetime) -> None:
+        if (now - self.last_gc).total_seconds() < self.gc_interval_seconds:
+            return
+
+        cutoff = now - timedelta(seconds=self.window_seconds)
+        dead_users = []
+        for user_id, dq in self.user_events.items():
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+            if not dq:
+                dead_users.append(user_id)
+
+        for user_id in dead_users:
+            self.user_events.pop(user_id, None)
+
+        self.last_gc = now
+
+    def allow(self, user_id: str, now: datetime) -> Tuple[bool, str]:
+        """
+        Returns (allowed, reason_code).
+        Fails closed when hitting hard cap.
+        """
+        with self.lock:
+            self._garbage_collect(now)
+
+            dq = self.user_events.setdefault(user_id, self._deque())
+            cutoff = now - timedelta(seconds=self.window_seconds)
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+
+            # Hard cap first: prevent memory exhaustion, timestamp weirdness, clock skew abuse.
+            if len(dq) >= self.max_entries_per_user:
+                _logger.warning(
+                    f"Velocity cap exceeded user={user_id} entries={len(dq)} cap={self.max_entries_per_user}"
+                )
+                return (False, ReasonCodes.VELOCITY_CAP_EXCEEDED)
+
+            if len(dq) >= self.limit:
+                return (False, ReasonCodes.VELOCITY_LIMIT)
+
+            dq.append(now)
+            return (True, ReasonCodes.CLEARED)
+
+
+# ============================================================
+# AUTHZ CONTEXT + DECISION MODEL
+# ============================================================
+
+@dataclass(frozen=True)
+class CallerContext:
+    caller_id: str
+    caller_roles: Set[str]
+    authenticated_at: datetime
+
+
+@dataclass(frozen=True)
+class Decision:
+    status: str
+    score: Decimal
+    reason: str
+
+
+# ============================================================
+# GOVERNANCE / ORCHESTRATOR (AUTHZ-HARDENED)
+# ============================================================
+
 class SystemOrchestrator:
-    def __init__(self, sanctioned_locations: List[str]):
-        self.governance = GovernanceFramework(sanctioned_locations)
-        self.ai = AdaptiveIntelligence()
-        self.velocity_guard = VelocityGuard()
+    """
+    This is the "ghost governance" gate:
+    - requires caller context
+    - enforces authorization
+    - enforces velocity limits
+    - logs decisions with tamper-evident chain
+    """
+
+    def __init__(
+        self,
+        *,
+        authorizer: Optional[Callable[[CallerContext, str], bool]] = None,
+        audit_sqlite_path: Optional[str] = None,
+        audit_jsonl_path: Optional[str] = None,
+    ) -> None:
+        self.authorizer = authorizer or self._default_authorizer
 
         store = AuditStore(
-            sqlite_path=CONFIG["AUDIT_SQLITE_PATH"],
-            jsonl_path=CONFIG["AUDIT_JSONL_FILE"],
+            sqlite_path=audit_sqlite_path or CONFIG["AUDIT_SQLITE_PATH"],
+            jsonl_path=(audit_jsonl_path or CONFIG["AUDIT_JSONL_FILE"] or None),
         )
         self.auditor = SecureAuditLog(store)
 
-    def process_transaction(self, user_id: str, amount_str: str, metadata: Dict[str, Any]) -> Decision:
-        try:
-            safe_amount = normalize_amount(Decimal(amount_str))
-        except (InvalidOperation, ValueError, TypeError):
-            # If amount is bad, build minimal ctx for audit anyway
-            ctx = TransactionContext(
-                user_id=str(user_id or "UNKNOWN"),
-                amount=Decimal("0"),
-                timestamp=datetime.now(timezone.utc),
-                location=str((metadata or {}).get("location", "UNKNOWN")),
-                device_id=str((metadata or {}).get("device_id", "UNKNOWN")),
-                metadata=metadata or {},
+        self.velocity_guard = VelocityGuard(
+            window_seconds=CONFIG["VELOCITY_WINDOW_SECONDS"],
+            limit=CONFIG["VELOCITY_LIMIT"],
+            gc_interval_seconds=CONFIG["VELOCITY_GC_INTERVAL_SECONDS"],
+            max_entries_per_user=CONFIG["VELOCITY_MAX_ENTRIES_PER_USER"],
+        )
+
+    @staticmethod
+    def _default_authorizer(caller: CallerContext, target_user_id: str) -> bool:
+        # Default: self-only unless privileged
+        if caller.caller_id == target_user_id:
+            return True
+        if "admin" in caller.caller_roles or "system" in caller.caller_roles:
+            return True
+        return False
+
+    def process_transaction(
+        self,
+        *,
+        caller: CallerContext,
+        user_id: str,
+        amount_str: str,
+        metadata: Dict[str, Any],
+    ) -> Decision:
+        # --- AUTHZ FIRST ---
+        if not self.authorizer(caller, user_id):
+            _logger.warning(f"Unauthorized: caller={caller.caller_id} -> user={user_id}")
+            self._best_effort_audit_block(
+                user_id=user_id,
+                metadata=metadata,
+                reason=ReasonCodes.AUTHORIZATION_FAILED,
+                extra={"caller_id": caller.caller_id, "caller_roles": sorted(caller.caller_roles)},
             )
-            self.auditor.log_decision(ctx, "BLOCKED", ReasonCodes.INVALID_AMOUNT, Decimal("0"), {}, {"validation_error": "invalid_amount"})
-            return Decision("BLOCKED", Decimal("0"), ReasonCodes.INVALID_AMOUNT)
+            return Decision(status="BLOCKED", score=Decimal("0"), reason=ReasonCodes.AUTHORIZATION_FAILED)
+
+        # --- INPUT VALIDATION ---
+        try:
+            amount = Decimal(amount_str)
+        except Exception:
+            self._best_effort_audit_block(
+                user_id=user_id,
+                metadata=metadata,
+                reason=ReasonCodes.INVALID_INPUT,
+                extra={"amount_str": amount_str},
+            )
+            return Decision(status="BLOCKED", score=Decimal("0"), reason=ReasonCodes.INVALID_INPUT)
+
+        now = datetime.now(timezone.utc)
+
+        allowed, v_reason = self.velocity_guard.allow(user_id, now)
+        if not allowed:
+            self._best_effort_audit_block(
+                user_id=user_id,
+                metadata=metadata,
+                reason=v_reason,
+                extra={"window_seconds": CONFIG["VELOCITY_WINDOW_SECONDS"], "limit": CONFIG["VELOCITY_LIMIT"]},
+            )
+            return Decision(status="BLOCKED", score=Decimal("0"), reason=v_reason)
+
+        # --- POLICY/AI PLACEHOLDERS (your real logic goes here) ---
+        # You can wire in your policy engine + scoring here.
+        # For now: simple score placeholder
+        score = Decimal("0.5")
+        decision = "APPROVED" if amount <= Decimal("1000") else "REVIEW"
 
         ctx = TransactionContext(
             user_id=user_id,
-            amount=safe_amount,
-            timestamp=datetime.now(timezone.utc),
-            location=metadata.get("location", "UNKNOWN"),
-            device_id=metadata.get("device_id", "UNKNOWN"),
+            amount=amount,
+            timestamp=now,
+            location=str(metadata.get("location", "UNKNOWN")),
+            device_id=str(metadata.get("device_id", "UNKNOWN")),
             metadata=metadata or {},
         )
 
+        ok = self.auditor.log_decision(
+            ctx,
+            decision=decision,
+            reason_code=ReasonCodes.CLEARED if decision == "APPROVED" else "REVIEW",
+            score=score,
+            filtered_meta=self._filter_metadata(metadata),
+            extra={"caller_id": caller.caller_id, "caller_roles": sorted(caller.caller_roles)},
+        )
+
+        if not ok:
+            # If audit fails, fail closed in prod.
+            if CONFIG["SENTINEL_ENV"] != "dev":
+                return Decision(status="BLOCKED", score=Decimal("0"), reason=ReasonCodes.AUDIT_APPEND_FAILED)
+
+        return Decision(status=decision, score=score, reason=ReasonCodes.CLEARED)
+
+    def _filter_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Minimal metadata filtering. Expand with your PII strategy.
+        """
+        allowed = {}
+        for k in ("location", "device_id", "txn_type", "channel", "risk_flags"):
+            if k in metadata:
+                allowed[k] = metadata[k]
+        return allowed
+
+    def _best_effort_audit_block(self, *, user_id: str, metadata: Dict[str, Any], reason: str, extra: Dict[str, Any]) -> None:
         try:
-            valid, msg = validate_context(ctx)
-            if not valid:
-                self.auditor.log_decision(ctx, "BLOCKED", msg, Decimal("0"), {}, {"validation_error": msg})
-                return Decision("BLOCKED", Decimal("0"), msg)
+            ctx = TransactionContext(
+                user_id=user_id,
+                amount=Decimal("0"),
+                timestamp=datetime.now(timezone.utc),
+                location=str(metadata.get("location", "UNKNOWN")),
+                device_id=str(metadata.get("device_id", "UNKNOWN")),
+                metadata=metadata or {},
+            )
+            self.auditor.log_decision(
+                ctx,
+                decision="BLOCKED",
+                reason_code=reason,
+                score=Decimal("0"),
+                filtered_meta=self._filter_metadata(metadata),
+                extra=extra or {},
+            )
+        except Exception:
+            # If even best-effort audit fails, just don't crash.
+            pass
 
-            if not self.velocity_guard.allow(user_id, ctx.timestamp):
-                self.auditor.log_decision(ctx, "BLOCKED", ReasonCodes.VELOCITY_EXCEEDED, Decimal("0"), {}, {})
-                return Decision("BLOCKED", Decimal("0"), ReasonCodes.VELOCITY_EXCEEDED)
 
-            flac_passed, flac_reason = self.governance.run_flac_loops(ctx)
-            if not flac_passed:
-                self.auditor.log_decision(ctx, "BLOCKED", flac_reason, Decimal("0"), {}, {})
-                return Decision("BLOCKED", Decimal("0"), flac_reason)
+# ============================================================
+# Minimal sanity self-test (no side effects beyond local DB write)
+# ============================================================
 
-            risk_score, components, snapshot = self.ai.evaluate_risk(ctx)
-            if risk_score > CONFIG["RISK_THRESHOLD"]:
-                self.auditor.log_decision(ctx, "FLAGGED", ReasonCodes.AI_RISK, risk_score, components, snapshot)
-                return Decision("FLAGGED", risk_score, ReasonCodes.AI_RISK)
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
 
-            ok = self.auditor.log_decision(ctx, "APPROVED", ReasonCodes.CLEARED, risk_score, components, snapshot)
-            if not ok:
-                return Decision("ERROR", Decimal("1.0"), ReasonCodes.SYSTEM_ERROR)
+    # For local test, set a secret or you will correctly fail closed.
+    os.environ.setdefault("GHOST_DEVICE_HASH_SECRET", "a" * 64)
 
-            self.ai.learn(ctx)
-            self.ai.reward_trust(user_id)
-            return Decision("APPROVED", risk_score, ReasonCodes.CLEARED)
+    orch = SystemOrchestrator()
+    caller = CallerContext(
+        caller_id="user123",
+        caller_roles={"user"},
+        authenticated_at=datetime.now(timezone.utc),
+    )
 
-        except Exception as e:
-            self.auditor.log_decision(ctx, "ERROR", ReasonCodes.SYSTEM_ERROR, Decimal("1.0"), {}, {"exception": str(e)})
-            return Decision("ERROR", Decimal("1.0"), ReasonCodes.SYSTEM_ERROR)
-
-# Exportable engine instance if you want it
-engine = SystemOrchestrator(sanctioned_locations=["BLOCKED_REGION_1"])
+    d = orch.process_transaction(
+        caller=caller,
+        user_id="user123",
+        amount_str="25.00",
+        metadata={"location": "US", "device_id": "device123", "txn_type": "test"},
+    )
+    print(d)
