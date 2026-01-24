@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import enum
+import hashlib
+import ipaddress
 import json
 import os
+import re
 import sqlite3
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 
 # ============================================================
@@ -18,6 +22,7 @@ try:
     BASE_DIR = Path(__file__).resolve().parent
 except NameError:
     BASE_DIR = Path.cwd()
+
 
 def _env(name: str, default: str) -> str:
     """
@@ -31,11 +36,19 @@ def _env(name: str, default: str) -> str:
     legacy = name.replace("SENTINEL_", "AEGIS_", 1)
     return os.getenv(legacy, default)
 
+
 DB_PATH = Path(_env("SENTINEL_DB_PATH", str(BASE_DIR / "sentinel_secure.db")))
 SYSTEM_ID = _env("SENTINEL_SYSTEM_ID", "SENTINEL-43-NEXUS-01")
 
-# How long we dedupe identical actions for (prevents queue DoS)
+# Dedupe TTL: prevents queue spam for identical directives
 DEFAULT_DEDUPE_TTL_SECONDS = int(_env("SENTINEL_ACTION_DEDUPE_TTL", "60"))
+
+# Log + action retention (prevents SQLite growth DoS)
+DEFAULT_LOG_RETENTION_DAYS = int(_env("SENTINEL_LOG_RETENTION_DAYS", "90"))
+DEFAULT_ACTION_RETENTION_DAYS = int(_env("SENTINEL_ACTION_RETENTION_DAYS", "30"))
+
+# Hash salt for privacy-safe logs (do not leave default in anything you ship)
+LOG_SALT = _env("SENTINEL_LOG_SALT", "CHANGE_ME_IN_PROD")
 
 
 # ============================================================
@@ -148,7 +161,7 @@ class ResponseDirective:
 
 
 # ============================================================
-# PERSISTED ACTION MODEL (what the UI + gateway should read)
+# PERSISTED ACTION MODEL
 # ============================================================
 
 class ActionStatus(str, enum.Enum):
@@ -187,6 +200,47 @@ class PendingAction:
 
 
 # ============================================================
+# HELPERS: privacy-safe logging + bounded keys
+# ============================================================
+
+_SAFE_COMPONENT_RE = re.compile(r"[^a-zA-Z0-9.:_\-@]")
+
+def sanitize_key_component(value: str, *, max_len: int = 200) -> str:
+    s = "" if value is None else str(value)
+    s = s.strip()
+    s = _SAFE_COMPONENT_RE.sub("", s)
+    if len(s) > max_len:
+        s = s[:max_len]
+    return s
+
+
+def pseudonymize(value: str) -> str:
+    v = "" if value is None else str(value)
+    v = v.strip()
+    if not v:
+        return "EMPTY"
+    h = hashlib.sha256(f"{LOG_SALT}:{v}".encode("utf-8")).hexdigest()
+    return h[:16]
+
+
+def normalize_ip(ip: str) -> str:
+    """
+    Canonicalize IP formatting if valid, else return stripped original.
+    We do NOT hard-fail because you may feed internal identifiers sometimes,
+    but we normalize when we can.
+    """
+    s = "" if ip is None else str(ip).strip()
+    try:
+        return str(ipaddress.ip_address(s))
+    except Exception:
+        return s
+
+
+def utc_iso() -> str:
+    return __import__("datetime").datetime.utcnow().isoformat(timespec="microseconds") + "Z"
+
+
+# ============================================================
 # STORAGE LAYER
 # ============================================================
 
@@ -195,6 +249,10 @@ class ActionStore(Protocol):
     def log_event(self, level: str, module: str, message: str, context: Optional[Dict[str, Any]] = None) -> None: ...
     def dedupe_check_and_set(self, key: str, ttl_seconds: int) -> bool: ...
     def insert_pending_action(self, pa: PendingAction) -> None: ...
+    def update_action_status(self, action_id: str, new_status: ActionStatus, *, operator_id: Optional[str], operator_reason: Optional[str], expected_status: ActionStatus) -> bool: ...
+    def get_action_status(self, action_id: str) -> Optional[str]: ...
+    def cleanup_old_logs(self, retention_days: int) -> int: ...
+    def cleanup_old_actions(self, retention_days: int) -> int: ...
 
 
 def _db_conn() -> sqlite3.Connection:
@@ -203,6 +261,7 @@ def _db_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
 
@@ -254,11 +313,20 @@ class SqliteActionStore:
                 """
             )
 
+            # hygiene: remove expired dedupe entries
             now_ms = int(time.time() * 1000)
-            conn.execute("DELETE FROM action_dedupe WHERE expires_at_ms < ?", (now_ms,))
+            conn.execute("DELETE FROM action_dedupe WHERE expires_at_ms <= ?", (now_ms,))
+
+        # cleanup on startup (best-effort)
+        try:
+            self.cleanup_old_logs(DEFAULT_LOG_RETENTION_DAYS)
+            self.cleanup_old_actions(DEFAULT_ACTION_RETENTION_DAYS)
+        except Exception:
+            # don't block boot on housekeeping failures
+            pass
 
     def log_event(self, level: str, module: str, message: str, context: Optional[Dict[str, Any]] = None) -> None:
-        ts = __import__("datetime").datetime.utcnow().isoformat(timespec="microseconds") + "Z"
+        ts = utc_iso()
         ctx = json.dumps(context, default=str) if context else None
         with _db_conn() as conn:
             conn.execute(
@@ -272,29 +340,32 @@ class SqliteActionStore:
     def dedupe_check_and_set(self, key: str, ttl_seconds: int) -> bool:
         """
         Returns True if allowed (not a duplicate in TTL window).
-        Returns False if suppressed.
+        Atomic under concurrency (no SELECT-then-act race).
         """
         now_ms = int(time.time() * 1000)
         exp_ms = now_ms + int(ttl_seconds * 1000)
 
+        # Hard cap to prevent key-bloat attacks
+        key = ("" if key is None else str(key)).strip()
+        if len(key) > 512:
+            key = key[:512]
+
         with _db_conn() as conn:
-            row = conn.execute(
-                "SELECT expires_at_ms FROM action_dedupe WHERE dedupe_key = ?",
-                (key,),
-            ).fetchone()
-
-            if row and int(row["expires_at_ms"]) > now_ms:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("DELETE FROM action_dedupe WHERE expires_at_ms <= ?", (now_ms,))
+                conn.execute(
+                    "INSERT INTO action_dedupe (dedupe_key, expires_at_ms) VALUES (?, ?)",
+                    (key, exp_ms),
+                )
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                conn.rollback()
                 return False
-
-            conn.execute(
-                """
-                INSERT INTO action_dedupe (dedupe_key, expires_at_ms)
-                VALUES (?, ?)
-                ON CONFLICT(dedupe_key) DO UPDATE SET expires_at_ms = excluded.expires_at_ms
-                """,
-                (key, exp_ms),
-            )
-            return True
+            except Exception:
+                conn.rollback()
+                raise
 
     def insert_pending_action(self, pa: PendingAction) -> None:
         with _db_conn() as conn:
@@ -330,6 +401,67 @@ class SqliteActionStore:
                 ),
             )
 
+    def get_action_status(self, action_id: str) -> Optional[str]:
+        with _db_conn() as conn:
+            row = conn.execute(
+                "SELECT status FROM pending_actions WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return str(row["status"])
+
+    def update_action_status(
+        self,
+        action_id: str,
+        new_status: ActionStatus,
+        *,
+        operator_id: Optional[str],
+        operator_reason: Optional[str],
+        expected_status: ActionStatus,
+    ) -> bool:
+        op = operator_id[:80] if operator_id else None
+        rsn = operator_reason[:300] if operator_reason else None
+
+        with _db_conn() as conn:
+            conn.execute(
+                """
+                UPDATE pending_actions
+                   SET status = ?, operator_id = ?, operator_reason = ?
+                 WHERE action_id = ?
+                   AND status = ?
+                """,
+                (new_status.value, op, rsn, action_id, expected_status.value),
+            )
+            return conn.total_changes > 0
+
+    def cleanup_old_logs(self, retention_days: int) -> int:
+        from datetime import datetime, timedelta, timezone
+        cutoff = datetime.now(timezone.utc) - timedelta(days=int(retention_days))
+        cutoff_iso = cutoff.isoformat(timespec="seconds")
+        with _db_conn() as conn:
+            cur = conn.execute("DELETE FROM event_logs WHERE timestamp < ?", (cutoff_iso,))
+            return int(cur.rowcount or 0)
+
+    def cleanup_old_actions(self, retention_days: int) -> int:
+        cutoff_ms = int((time.time() - (int(retention_days) * 86400)) * 1000)
+        with _db_conn() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM pending_actions
+                 WHERE created_at_ms < ?
+                   AND status IN (?, ?, ?, ?)
+                """,
+                (
+                    cutoff_ms,
+                    ActionStatus.VETOED.value,
+                    ActionStatus.APPROVED.value,
+                    ActionStatus.EXECUTED.value,
+                    ActionStatus.EXPIRED.value,
+                ),
+            )
+            return int(cur.rowcount or 0)
+
 
 # ============================================================
 # RESPONSE ENGINE (NO DETECTOR INSIDE)
@@ -338,11 +470,12 @@ class SqliteActionStore:
 class Sentinel43ResponseEngine:
     """
     Sentinel-43 response engine:
-      - consumes ThreatAssessment (from your detector layer)
+      - consumes ThreatAssessment (from detector layer)
       - produces ResponseDirective
       - stages/persists PendingAction according to mode
-      - logs everything
-      - dedupes action spam
+      - logs (PII-safe via hashing in event logs)
+      - dedupes action spam (atomic DB dedupe)
+      - provides authenticated approval/veto APIs
     """
 
     def __init__(
@@ -350,24 +483,33 @@ class Sentinel43ResponseEngine:
         store: Optional[ActionStore] = None,
         policy: Optional[ResponsePolicy] = None,
         dedupe_ttl_seconds: int = DEFAULT_DEDUPE_TTL_SECONDS,
+        *,
+        operator_authenticator: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self.store = store or SqliteActionStore()
         self.policy = policy or ResponsePolicy()
-        self.dedupe_ttl_seconds = dedupe_ttl_seconds
+        self.dedupe_ttl_seconds = int(dedupe_ttl_seconds)
+
+        # Fail-closed by default: if you want approvals, you must provide auth.
+        self._operator_authenticator = operator_authenticator or (lambda _op: False)
 
         self.store.ensure_schema()
         self.store.log_event("INFO", "BOOT", "Sentinel-43 Response Engine initialized.", {"system_id": SYSTEM_ID})
 
+    # ------------------------------
+    # PUBLIC ENTRY
+    # ------------------------------
     def handle_assessment(self, mode: SentinelMode, assessment: ThreatAssessment) -> Optional[PendingAction]:
         directive = self.plan_response(assessment)
 
+        # PII-safe: hash identity + ip in logs
         self.store.log_event(
             "INFO",
             "RESPONSE",
             "Response plan generated",
             {
-                "identity": directive.identity,
-                "ip": directive.source_ip,
+                "identity_hash": pseudonymize(directive.identity),
+                "ip_hash": pseudonymize(directive.source_ip),
                 "primary_action": directive.primary_action.name,
                 "additional_actions": [a.name for a in directive.additional_actions],
                 "score": directive.score,
@@ -375,7 +517,6 @@ class Sentinel43ResponseEngine:
                 "kind": directive.threat_kind.name,
                 "source_kind": directive.source_kind.name,
                 "expires_at": directive.expires_at,
-                "reason": directive.reason,
                 "mode": mode.value,
             },
         )
@@ -383,21 +524,91 @@ class Sentinel43ResponseEngine:
         return self.stage_directive(mode, directive)
 
     # ------------------------------
+    # OPERATOR CONTROLS
+    # ------------------------------
+    def approve_action(self, action_id: str, operator_id: str, reason: str = "") -> bool:
+        op = (operator_id or "").strip()[:80]
+        rsn = (reason or "").strip()[:300]
+
+        if not op or not self._operator_authenticator(op):
+            self.store.log_event("ERROR", "OVERSIGHT", "Unauthorized approval attempt",
+                                 {"action_id": action_id, "operator_id": op})
+            return False
+
+        ok = self.store.update_action_status(
+            action_id,
+            ActionStatus.APPROVED,
+            operator_id=op,
+            operator_reason=rsn,
+            expected_status=ActionStatus.STAGED,
+        )
+
+        self.store.log_event(
+            "WARN" if ok else "ERROR",
+            "OVERSIGHT",
+            "Action approved" if ok else "Approval failed",
+            {"action_id": action_id, "operator_id": op},
+        )
+        return ok
+
+    def veto_action(self, action_id: str, operator_id: str, reason: str) -> bool:
+        op = (operator_id or "").strip()[:80]
+        rsn = (reason or "").strip()[:300]
+
+        if not op or not self._operator_authenticator(op):
+            self.store.log_event("ERROR", "OVERSIGHT", "Unauthorized veto attempt",
+                                 {"action_id": action_id, "operator_id": op})
+            return False
+
+        ok = self.store.update_action_status(
+            action_id,
+            ActionStatus.VETOED,
+            operator_id=op,
+            operator_reason=rsn,
+            expected_status=ActionStatus.PENDING,
+        )
+
+        self.store.log_event(
+            "WARN" if ok else "ERROR",
+            "OVERSIGHT",
+            "Action vetoed" if ok else "Veto failed",
+            {"action_id": action_id, "operator_id": op},
+        )
+        return ok
+
+    # ------------------------------
     # PLANNING
     # ------------------------------
     def plan_response(self, assessment: ThreatAssessment) -> ResponseDirective:
-        effective_score = self._apply_automation_risk_adjustment(assessment)
+        # normalize IP for consistency
+        assessment_ip = normalize_ip(assessment.source_ip)
 
-        if assessment.severity == ThreatSeverity.LOW and effective_score < self.policy.medium_threshold:
-            return self._build_low(assessment, effective_score)
+        # Keep identity as provided; sanitize later for dedupe keys.
+        a = ThreatAssessment(
+            identity=assessment.identity,
+            source_ip=assessment_ip,
+            threat_kind=assessment.threat_kind,
+            severity=assessment.severity,
+            source_kind=assessment.source_kind,
+            score=float(assessment.score),
+            indicators=assessment.indicators,
+            supporting_tags=list(assessment.supporting_tags),
+            window_size=int(assessment.window_size),
+            generated_at=float(assessment.generated_at),
+        )
 
-        if assessment.severity in (ThreatSeverity.MEDIUM, ThreatSeverity.HIGH):
-            return self._build_mid_high(assessment, effective_score)
+        effective_score = self._apply_automation_risk_adjustment(a)
 
-        if assessment.severity == ThreatSeverity.CRITICAL:
-            return self._build_critical(assessment, effective_score)
+        if a.severity == ThreatSeverity.LOW and effective_score < self.policy.medium_threshold:
+            return self._build_low(a, effective_score)
 
-        return self._build_mid_high(assessment, effective_score)
+        if a.severity in (ThreatSeverity.MEDIUM, ThreatSeverity.HIGH):
+            return self._build_mid_high(a, effective_score)
+
+        if a.severity == ThreatSeverity.CRITICAL:
+            return self._build_critical(a, effective_score)
+
+        return self._build_mid_high(a, effective_score)
 
     def _apply_automation_risk_adjustment(self, assessment: ThreatAssessment) -> float:
         score = float(assessment.score)
@@ -410,7 +621,6 @@ class Sentinel43ResponseEngine:
 
     def _build_low(self, a: ThreatAssessment, score: float) -> ResponseDirective:
         actions = [ResponseAction.LOG_ONLY]
-
         if a.threat_kind in (ThreatKind.MALWARE_DELIVERY, ThreatKind.SPYWARE_ACTIVITY):
             actions.append(ResponseAction.FLAG_SUSPICIOUS)
 
@@ -497,9 +707,26 @@ class Sentinel43ResponseEngine:
         if d.primary_action == ResponseAction.LOG_ONLY and not d.additional_actions:
             return None
 
-        target_type, target_value = self._pick_primary_target(d)
+        target_type, raw_target_value = self._pick_primary_target(d)
 
-        dedupe_key = f"{target_type}:{target_value}:{d.primary_action.name}:{d.threat_kind.name}"
+        # Sanitize dedupe inputs (prevents keyspace abuse and keeps DB tidy)
+        target_value = sanitize_key_component(raw_target_value, max_len=200)
+        if not target_value:
+            self.store.log_event(
+                "ERROR",
+                "RESPONSE",
+                "Invalid target_value after sanitization",
+                {"target_type": target_type, "target_hash": pseudonymize(raw_target_value)},
+            )
+            return None
+
+        dedupe_key = (
+            f"{sanitize_key_component(target_type, max_len=16)}:"
+            f"{target_value}:"
+            f"{sanitize_key_component(d.primary_action.name, max_len=40)}:"
+            f"{sanitize_key_component(d.threat_kind.name, max_len=40)}"
+        )
+
         if not self.store.dedupe_check_and_set(dedupe_key, self.dedupe_ttl_seconds):
             self.store.log_event(
                 "INFO",
@@ -531,13 +758,14 @@ class Sentinel43ResponseEngine:
             default=str,
         )
 
+        # Store raw target_value in pending_actions (needed for real execution downstream).
         pa = PendingAction(
             action_id=action_id,
             created_at_ms=now_ms,
             execute_at_ms=execute_at_ms,
             status=status,
             target_type=target_type,
-            target_value=target_value,
+            target_value=raw_target_value,
             primary_action=d.primary_action.name,
             actions_json=actions_json,
             severity=d.threat_severity.name,
@@ -550,6 +778,7 @@ class Sentinel43ResponseEngine:
 
         self.store.insert_pending_action(pa)
 
+        # PII-safe staging log: hash target, do not dump raw target into event_logs
         self.store.log_event(
             "INFO",
             "OVERSIGHT",
@@ -559,8 +788,9 @@ class Sentinel43ResponseEngine:
                 "status": pa.status.value,
                 "mode": mode.value,
                 "target_type": pa.target_type,
-                "target_value": pa.target_value,
+                "target_hash": pseudonymize(pa.target_value),
                 "primary_action": pa.primary_action,
+                "execute_at_ms": pa.execute_at_ms,
             },
         )
 
@@ -576,15 +806,21 @@ class Sentinel43ResponseEngine:
         return ("identity", d.identity)
 
     def _new_action_id(self) -> str:
-        return f"ACT-{int(time.time() * 1000):x}-{os.urandom(3).hex()}".upper()
+        # Non-guessable and collision-resistant
+        return f"ACT-{uuid.uuid4().hex}".upper()
 
 
 # ============================================================
-# SIMPLE SELF-TEST (does not need detector)
+# SIMPLE SELF-TEST
 # ============================================================
 
 if __name__ == "__main__":
-    engine = Sentinel43ResponseEngine()
+    # Example authenticator: allow only IDs listed in env
+    allowed = {s.strip() for s in _env("SENTINEL_ALLOWED_OPERATORS", "admin,ops").split(",") if s.strip()}
+
+    engine = Sentinel43ResponseEngine(
+        operator_authenticator=lambda op: op in allowed
+    )
 
     a = ThreatAssessment(
         identity="ai-bot-777",
@@ -599,3 +835,10 @@ if __name__ == "__main__":
 
     pa = engine.handle_assessment(SentinelMode.ACTIVE, a)
     print("Staged:", pa)
+
+    # Demonstrate approval flow (would only make sense for HUMAN_GATED)
+    pa2 = engine.handle_assessment(SentinelMode.HUMAN_GATED, a)
+    if pa2:
+        print("Staged (gated):", pa2.action_id)
+        ok = engine.approve_action(pa2.action_id, operator_id="admin", reason="reviewed")
+        print("Approved:", ok)
