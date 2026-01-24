@@ -27,7 +27,9 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import Callable, Dict, Optional, Tuple, Any, List
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 
 SYSTEM_ID = "SENTINEL-43-NEXUS-01"
@@ -83,7 +85,16 @@ class Evidence:
     sensor: str
     observed_at: int
     confidence: float
-    details: Dict[str, Any] = field(default_factory=dict)
+    _details: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @property
+    def details(self) -> MappingProxyType:
+        # Immutable view for callers
+        return MappingProxyType(self._details)
+
+    def __post_init__(self) -> None:
+        # Prevent external dict mutation from changing frozen object content
+        object.__setattr__(self, "_details", dict(self._details))
 
 
 @dataclass(frozen=True)
@@ -118,6 +129,7 @@ class ActionRequest:
     reason: str
     reason_code: ReasonCode
     evidence: Evidence
+    cooldown_seconds: int
     real_payload: Callable[[], None]
     shadow_payload: Callable[[], None]
 
@@ -128,11 +140,21 @@ def _json_dumps(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def stable_fingerprint(*, target: str, threat_type: str, reason_code: ReasonCode, reason: str, extra: Dict[str, Any]) -> str:
+def stable_fingerprint(
+    *,
+    target: str,
+    threat_type: str,
+    reason_code: ReasonCode,
+    severity: Severity,
+    reason: str,
+    extra: Dict[str, Any],
+) -> str:
+    # Include severity so LOW events don't suppress CRITICAL events.
     payload = {
         "target": target,
         "threat_type": threat_type,
         "reason_code": reason_code.value,
+        "severity": severity.value,
         "reason": reason,
         "extra": extra or {},
     }
@@ -184,24 +206,42 @@ class StateStore:
     - budget windows per target
     - cooldown per target (optional)
     - audit chain state (prev hash)
+
+    IMPORTANT:
+    - SQLite strongly prefers a single writer.
+    - We use one shared connection + a lock + real transactions.
     """
 
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
         self._lock = threading.RLock()
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+
+        self._conn = self._create_connection()
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path, timeout=30, isolation_level=None)
+    def _create_connection(self) -> sqlite3.Connection:
+        # No isolation_level=None -> enables transactional behavior.
+        conn = sqlite3.connect(
+            self._db_path,
+            timeout=30,
+            check_same_thread=False,
+        )
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
         return conn
 
+    def close(self) -> None:
+        with self._lock:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
     def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
+        with self._lock, self._conn:
+            self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS dedupe (
                     fingerprint TEXT PRIMARY KEY,
@@ -209,7 +249,7 @@ class StateStore:
                 )
                 """
             )
-            conn.execute(
+            self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS corroboration (
                     fingerprint TEXT PRIMARY KEY,
@@ -219,7 +259,7 @@ class StateStore:
                 )
                 """
             )
-            conn.execute(
+            self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS budget (
                     target TEXT PRIMARY KEY,
@@ -228,7 +268,7 @@ class StateStore:
                 )
                 """
             )
-            conn.execute(
+            self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS cooldown (
                     target TEXT PRIMARY KEY,
@@ -236,7 +276,7 @@ class StateStore:
                 )
                 """
             )
-            conn.execute(
+            self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS audit_chain (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -244,13 +284,12 @@ class StateStore:
                 )
                 """
             )
-            # initialize audit_chain row if missing
-            cur = conn.execute("SELECT prev_hash FROM audit_chain WHERE id=1")
+            cur = self._conn.execute("SELECT prev_hash FROM audit_chain WHERE id=1")
             row = cur.fetchone()
             if not row:
-                conn.execute("INSERT INTO audit_chain (id, prev_hash) VALUES (1, ?)", ("0" * 64,))
+                self._conn.execute("INSERT INTO audit_chain (id, prev_hash) VALUES (1, ?)", ("0" * 64,))
 
-            conn.execute(
+            self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS audit_events (
                     ts INTEGER NOT NULL,
@@ -261,39 +300,44 @@ class StateStore:
                 )
                 """
             )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts)")
+
+            # Indexes that match cleanup/query patterns
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_events(ts)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_dedupe_first_seen ON dedupe(first_seen)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_corr_last_seen ON corroboration(last_seen)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_cooldown_until ON cooldown(until_ts)")
 
     # ---- Dedupe ----
 
     def dedupe_seen(self, fingerprint: str, *, now_ts: int, ttl_seconds: int) -> bool:
         """Returns True if duplicate within TTL, else records and returns False."""
-        with self._lock, self._connect() as conn:
-            cur = conn.execute("SELECT first_seen FROM dedupe WHERE fingerprint=?", (fingerprint,))
+        with self._lock, self._conn:
+            cur = self._conn.execute("SELECT first_seen FROM dedupe WHERE fingerprint=?", (fingerprint,))
             row = cur.fetchone()
             if row:
                 first_seen = int(row[0])
                 if now_ts - first_seen <= ttl_seconds:
                     return True
-                # expired -> replace timestamp
-                conn.execute("UPDATE dedupe SET first_seen=? WHERE fingerprint=?", (now_ts, fingerprint))
+                self._conn.execute("UPDATE dedupe SET first_seen=? WHERE fingerprint=?", (now_ts, fingerprint))
                 return False
 
-            conn.execute("INSERT INTO dedupe (fingerprint, first_seen) VALUES (?, ?)", (fingerprint, now_ts))
+            self._conn.execute("INSERT INTO dedupe (fingerprint, first_seen) VALUES (?, ?)", (fingerprint, now_ts))
             return False
 
     def dedupe_cleanup(self, *, now_ts: int, ttl_seconds: int) -> None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._conn:
             cutoff = now_ts - ttl_seconds
-            conn.execute("DELETE FROM dedupe WHERE first_seen < ?", (cutoff,))
+            self._conn.execute("DELETE FROM dedupe WHERE first_seen < ?", (cutoff,))
 
     # ---- Corroboration ----
 
     def corroborate(self, fingerprint: str, *, now_ts: int, ttl_seconds: int) -> int:
-        with self._lock, self._connect() as conn:
-            cur = conn.execute("SELECT first_seen, last_seen, count FROM corroboration WHERE fingerprint=?", (fingerprint,))
+        # This must be atomic (SELECT+UPDATE/INSERT).
+        with self._lock, self._conn:
+            cur = self._conn.execute("SELECT first_seen, last_seen, count FROM corroboration WHERE fingerprint=?", (fingerprint,))
             row = cur.fetchone()
             if not row:
-                conn.execute(
+                self._conn.execute(
                     "INSERT INTO corroboration (fingerprint, first_seen, last_seen, count) VALUES (?, ?, ?, ?)",
                     (fingerprint, now_ts, now_ts, 1),
                 )
@@ -301,51 +345,50 @@ class StateStore:
 
             first_seen, last_seen, count = int(row[0]), int(row[1]), int(row[2])
             if now_ts - last_seen > ttl_seconds:
-                # expired window -> reset
-                conn.execute(
+                self._conn.execute(
                     "UPDATE corroboration SET first_seen=?, last_seen=?, count=? WHERE fingerprint=?",
                     (now_ts, now_ts, 1, fingerprint),
                 )
                 return 1
 
             count += 1
-            conn.execute(
+            self._conn.execute(
                 "UPDATE corroboration SET last_seen=?, count=? WHERE fingerprint=?",
                 (now_ts, count, fingerprint),
             )
             return count
 
     def corroboration_cleanup(self, *, now_ts: int, ttl_seconds: int) -> None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._conn:
             cutoff = now_ts - ttl_seconds
-            conn.execute("DELETE FROM corroboration WHERE last_seen < ?", (cutoff,))
+            self._conn.execute("DELETE FROM corroboration WHERE last_seen < ?", (cutoff,))
 
     # ---- Budget ----
 
     def consume_budget(self, target: str, *, now_ts: int, window_seconds: int, max_actions: int) -> bool:
-        with self._lock, self._connect() as conn:
-            cur = conn.execute("SELECT window_start, used FROM budget WHERE target=?", (target,))
+        with self._lock, self._conn:
+            cur = self._conn.execute("SELECT window_start, used FROM budget WHERE target=?", (target,))
             row = cur.fetchone()
             if not row:
-                conn.execute("INSERT INTO budget (target, window_start, used) VALUES (?, ?, ?)", (target, now_ts, 1))
+                self._conn.execute("INSERT INTO budget (target, window_start, used) VALUES (?, ?, ?)", (target, now_ts, 1))
                 return True
 
             window_start, used = int(row[0]), int(row[1])
             if now_ts - window_start > window_seconds:
-                conn.execute("UPDATE budget SET window_start=?, used=? WHERE target=?", (now_ts, 1, target))
+                self._conn.execute("UPDATE budget SET window_start=?, used=? WHERE target=?", (now_ts, 1, target))
                 return True
 
             if used >= max_actions:
                 return False
 
-            conn.execute("UPDATE budget SET used=? WHERE target=?", (used + 1, target))
+            self._conn.execute("UPDATE budget SET used=? WHERE target=?", (used + 1, target))
             return True
 
     # ---- Cooldown ----
 
     def in_cooldown(self, target: str, *, now_ts: int) -> bool:
-        with self._lock, self._connect() as conn:
-            cur = conn.execute("SELECT until_ts FROM cooldown WHERE target=?", (target,))
+        with self._lock, self._conn:
+            cur = self._conn.execute("SELECT until_ts FROM cooldown WHERE target=?", (target,))
             row = cur.fetchone()
             if not row:
                 return False
@@ -353,8 +396,8 @@ class StateStore:
             return now_ts < until_ts
 
     def set_cooldown(self, target: str, *, until_ts: int) -> None:
-        with self._lock, self._connect() as conn:
-            conn.execute(
+        with self._lock, self._conn:
+            self._conn.execute(
                 "INSERT INTO cooldown (target, until_ts) VALUES (?, ?) "
                 "ON CONFLICT(target) DO UPDATE SET until_ts=excluded.until_ts",
                 (target, until_ts),
@@ -364,16 +407,19 @@ class StateStore:
 
     def append_audit_event(self, *, ts: int, event_type: str, payload: Dict[str, Any]) -> str:
         payload_json = _json_dumps(payload)
-        with self._lock, self._connect() as conn:
-            cur = conn.execute("SELECT prev_hash FROM audit_chain WHERE id=1")
-            prev_hash = cur.fetchone()[0]
+        with self._lock, self._conn:
+            cur = self._conn.execute("SELECT prev_hash FROM audit_chain WHERE id=1")
+            prev_hash_row = cur.fetchone()
+            prev_hash = prev_hash_row[0] if prev_hash_row else ("0" * 64)
+
             raw = (prev_hash + "|" + str(ts) + "|" + event_type + "|" + payload_json).encode("utf-8")
             h = hashlib.sha256(raw).hexdigest()
-            conn.execute(
+
+            self._conn.execute(
                 "INSERT INTO audit_events (ts, event_type, payload_json, prev_hash, hash) VALUES (?, ?, ?, ?, ?)",
                 (ts, event_type, payload_json, prev_hash, h),
             )
-            conn.execute("UPDATE audit_chain SET prev_hash=? WHERE id=1", (h,))
+            self._conn.execute("UPDATE audit_chain SET prev_hash=? WHERE id=1", (h,))
             return h
 
 
@@ -392,6 +438,10 @@ class Scheduler:
     """
     Single scheduler thread running a heap of due actions.
     This avoids spawning tons of Timer threads.
+
+    Cancel semantics:
+    - Best effort. If an action is due but not yet executed, cancel will stop it.
+    - If it is already executing, cancel may not stop it (depends on payload behavior).
     """
 
     def __init__(self, clock: Clock) -> None:
@@ -401,6 +451,7 @@ class Scheduler:
         self._heap: List[_ScheduledItem] = []
         self._seq = 0
         self._cancelled: set[str] = set()
+        self._executing: set[str] = set()
         self._stopping = False
         self._thread = threading.Thread(target=self._run, name="sentinel43-scheduler", daemon=True)
         self._thread.start()
@@ -446,21 +497,31 @@ class Scheduler:
                     self._cancelled.discard(item.action_id)
                     continue
 
-            # Execute outside lock
+                # Mark executing while still holding lock
+                self._executing.add(item.action_id)
+
+            # Late-cancel check right before execution
+            with self._cv:
+                if item.action_id in self._cancelled:
+                    self._cancelled.discard(item.action_id)
+                    self._executing.discard(item.action_id)
+                    continue
+
             logging.warning(f"[SCHEDULER] Executing: {item.description}")
             try:
                 item.payload()
             except Exception as exc:
                 logging.error(f"[SCHEDULER] Execution failed for {item.action_id}: {exc}")
+            finally:
+                with self._cv:
+                    self._executing.discard(item.action_id)
 
 
 # ----------------------------- Policy Engine --------------------------------
 
 @dataclass(frozen=True)
 class PolicyConfig:
-    # high-level posture
     default_delay_seconds: int = 5
-    # cooldowns
     cooldown_low_seconds: int = 30
     cooldown_medium_seconds: int = 60
     cooldown_high_seconds: int = 180
@@ -468,18 +529,12 @@ class PolicyConfig:
 
 
 class PolicyEngine:
-    """
-    Converts ThreatEvent -> Decision.
-    Keep this pure and testable.
-    """
-
     def __init__(self, cfg: PolicyConfig) -> None:
         self._cfg = cfg
 
     def evaluate(self, threat: ThreatEvent) -> Decision:
         sev = threat.severity
 
-        # Basic ladder. Tune as needed.
         if sev in (Severity.LOW,):
             return Decision(
                 decision_type=DecisionType.SHADOW_LOG,
@@ -516,7 +571,6 @@ class PolicyEngine:
                 evidence=threat.evidence,
             )
 
-        # CRITICAL
         return Decision(
             decision_type=DecisionType.DELAYED_EXECUTE,
             target=threat.target,
@@ -533,35 +587,28 @@ class PolicyEngine:
 
 @dataclass(frozen=True)
 class OversightConfig:
-    # replay defense
     dedupe_ttl_seconds: int = 120
-
-    # backlog limits
     max_pending_or_gated: int = 500
 
-    # budget
     budget_window_seconds: int = 300
     budget_max_actions_per_target: int = 5
 
-    # corroboration
     require_two_signals_for_high: bool = True
     corroboration_ttl_seconds: int = 600
 
-    # cleanup cadence
+    # Cleanup
     cleanup_every_n_actions: int = 25
+    cleanup_interval_seconds: int = 60
+
+    # Execution hardening
+    action_timeout_seconds: int = 30
+    max_action_workers: int = 4
+
+    # Shutdown behavior
+    shutdown_wait_seconds: int = 10
 
 
 class OversightEngine:
-    """
-    Hardened boundary:
-    - Restart-resistant dedupe via fingerprint
-    - Per-target budget via SQLite
-    - Two-signal corroboration for HIGH+ (optional)
-    - Gated approvals in HUMAN_GATED
-    - Scheduler-based delayed execution in ACTIVE
-    - Tamper-evident audit events
-    """
-
     def __init__(
         self,
         *,
@@ -582,9 +629,74 @@ class OversightEngine:
         self._pending: Dict[str, ActionRequest] = {}
         self._action_counter = 0
 
+        self._executing: set[str] = set()
+
+        # Run payloads off the scheduler thread to avoid hangs.
+        self._exec_pool = ThreadPoolExecutor(
+            max_workers=max(1, int(self._cfg.max_action_workers)),
+            thread_name_prefix="sentinel43-action",
+        )
+
+        # Background cleanup
+        self._cleanup_stop = threading.Event()
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_loop,
+            name="sentinel43-cleanup",
+            daemon=True,
+        )
+        self._cleanup_thread.start()
+
+    def shutdown(self) -> None:
+        # Stop cleanup loop
+        self._cleanup_stop.set()
+        self._cleanup_thread.join(timeout=3)
+
+        # Wait briefly for in-flight actions
+        deadline = self._clock.now() + max(0, int(self._cfg.shutdown_wait_seconds))
+        while True:
+            with self._lock:
+                if not self._executing:
+                    break
+            if self._clock.now() >= deadline:
+                logging.warning(f"[OVERSIGHT] Shutdown timeout. In-flight actions: {len(self._executing)}")
+                break
+            time.sleep(0.05)
+
+        self._exec_pool.shutdown(wait=False, cancel_futures=False)
+
+    def _cleanup_loop(self) -> None:
+        while not self._cleanup_stop.wait(timeout=max(5, int(self._cfg.cleanup_interval_seconds))):
+            try:
+                now_ts = self._clock.now_int()
+                self._store.dedupe_cleanup(now_ts=now_ts, ttl_seconds=self._cfg.dedupe_ttl_seconds)
+                self._store.corroboration_cleanup(now_ts=now_ts, ttl_seconds=self._cfg.corroboration_ttl_seconds)
+            except Exception as exc:
+                logging.error(f"[OVERSIGHT] Cleanup failed: {exc}")
+
     def _audit(self, event_type: str, payload: Dict[str, Any]) -> None:
         ts = self._clock.now_int()
         self._store.append_audit_event(ts=ts, event_type=event_type, payload=payload)
+
+    def _run_payload_with_timeout(self, req: ActionRequest) -> None:
+        # Executes the real_payload with timeout, applies cooldown ONLY if successful.
+        self._audit("action_execute", {"action_id": req.action_id, "target": req.target})
+
+        fut = self._exec_pool.submit(req.real_payload)
+        try:
+            fut.result(timeout=max(1, int(self._cfg.action_timeout_seconds)))
+        except FuturesTimeoutError:
+            logging.error(f"[OVERSIGHT] Action timed out: {req.action_id} target={req.target}")
+            self._audit("action_timeout", {"action_id": req.action_id, "target": req.target})
+            return
+        except Exception as exc:
+            logging.error(f"[OVERSIGHT] Action failed: {req.action_id} error={exc}")
+            self._audit("action_failed", {"action_id": req.action_id, "target": req.target, "error": str(exc)})
+            return
+
+        # Success -> apply cooldown
+        now_ts = self._clock.now_int()
+        self._store.set_cooldown(req.target, until_ts=now_ts + max(0, int(req.cooldown_seconds)))
+        self._audit("cooldown_set", {"action_id": req.action_id, "target": req.target, "until_ts": now_ts + int(req.cooldown_seconds)})
 
     def schedule_action(self, req: ActionRequest) -> None:
         mode = self._mode_resolver()
@@ -592,9 +704,6 @@ class OversightEngine:
 
         with self._lock:
             self._action_counter += 1
-            if self._action_counter % max(1, self._cfg.cleanup_every_n_actions) == 0:
-                self._store.dedupe_cleanup(now_ts=now_ts, ttl_seconds=self._cfg.dedupe_ttl_seconds)
-                self._store.corroboration_cleanup(now_ts=now_ts, ttl_seconds=self._cfg.corroboration_ttl_seconds)
 
             # backlog protection
             if (len(self._pending) + len(self._gated)) >= self._cfg.max_pending_or_gated:
@@ -632,22 +741,15 @@ class OversightEngine:
                     now_ts=now_ts,
                     ttl_seconds=self._cfg.corroboration_ttl_seconds,
                 )
-                logging.info(f"[OVERSIGHT] Corroboration fp={req.fingerprint[:12]}... -> {count}")
                 self._audit("corroboration", {"fingerprint": req.fingerprint, "count": count})
 
                 if count < 2:
-                    # advisory-only on first signal
                     logging.info(f"[OVERSIGHT] Waiting for second signal before acting on HIGH+: {req.action_id}")
                     if mode is OpMode.SHADOW:
                         req.shadow_payload()
-                    # HUMAN_GATED/ACTIVE: do not stage/arm yet
                     return
 
             logging.info(f"[OVERSIGHT] Mode={mode.value} | {req.description}")
-
-            # Apply cooldown immediately once we accept the action into the pipeline
-            cooldown_until = now_ts + max(0, int(30))  # baseline, can be tuned at policy layer too
-            self._store.set_cooldown(req.target, until_ts=cooldown_until)
 
             self._audit("action_received", {
                 "mode": mode.value,
@@ -658,6 +760,7 @@ class OversightEngine:
                 "reason_code": req.reason_code.value,
                 "reason": req.reason,
                 "evidence": asdict(req.evidence),
+                "cooldown_seconds": int(req.cooldown_seconds),
             })
 
             # Mode behaviors
@@ -680,14 +783,18 @@ class OversightEngine:
             self._audit("action_pending", {"action_id": req.action_id, "delay_seconds": req.delay_seconds})
 
             def _payload_wrapper() -> None:
-                # Remove from pending only when we execute
                 with self._lock:
                     popped = self._pending.pop(req.action_id, None)
-                if not popped:
-                    return
-                logging.warning(f"[OVERSIGHT] AUTO-EXECUTING: {req.description}")
-                self._audit("action_execute", {"action_id": req.action_id, "target": req.target})
-                req.real_payload()
+                    if not popped:
+                        return
+                    self._executing.add(req.action_id)
+
+                try:
+                    logging.warning(f"[OVERSIGHT] AUTO-EXECUTING: {req.description}")
+                    self._run_payload_with_timeout(req)
+                finally:
+                    with self._lock:
+                        self._executing.discard(req.action_id)
 
             self._scheduler.schedule(
                 action_id=req.action_id,
@@ -719,6 +826,8 @@ class OversightEngine:
     def approve_gated_action(self, action_id: str) -> bool:
         with self._lock:
             req = self._gated.pop(action_id, None)
+            if req:
+                self._executing.add(req.action_id)
 
         if not req:
             logging.warning(f"[OVERSIGHT] APPROVAL FAILED: {action_id} not staged.")
@@ -727,14 +836,14 @@ class OversightEngine:
 
         logging.warning(f"[OVERSIGHT] APPROVED: {action_id}. Executing now.")
         self._audit("gated_approved", {"action_id": action_id, "target": req.target})
+
         try:
-            req.real_payload()
+            self._run_payload_with_timeout(req)
             self._audit("gated_execute", {"action_id": action_id})
             return True
-        except Exception as exc:
-            logging.error(f"[OVERSIGHT] Approved execution failed for {action_id}: {exc}")
-            self._audit("gated_execute_failed", {"action_id": action_id, "error": str(exc)})
-            return False
+        finally:
+            with self._lock:
+                self._executing.discard(action_id)
 
     def list_gated_actions(self) -> Dict[str, Dict[str, Any]]:
         with self._lock:
@@ -757,11 +866,9 @@ class OversightEngine:
 class SentinelConfig:
     db_path: str = "./sentinel43_state/sentinel43.sqlite3"
 
-    # Evidence defaults (override per detector)
     default_sensor: str = "manual"
     default_confidence: float = 0.65
 
-    # Oversight / policy
     policy: PolicyConfig = PolicyConfig()
     oversight: OversightConfig = OversightConfig()
 
@@ -769,15 +876,13 @@ class SentinelConfig:
 # ------------------------------ Sentinel Nexus ------------------------------
 
 class SentinelNexus:
-    """
-    Top-level controller:
-    - Accept ThreatEvent (or raw inputs to construct it)
-    - Evaluate policy
-    - Build ActionRequest (fingerprint + stable IDs)
-    - Hand off to OversightEngine
-    """
-
-    def __init__(self, *, cfg: SentinelConfig = SentinelConfig(), initial_mode: OpMode = OpMode.SHADOW, clock: Optional[Clock] = None) -> None:
+    def __init__(
+        self,
+        *,
+        cfg: SentinelConfig = SentinelConfig(),
+        initial_mode: OpMode = OpMode.SHADOW,
+        clock: Optional[Clock] = None
+    ) -> None:
         self._cfg = cfg
         self._mode = initial_mode
         self._clock = clock or Clock()
@@ -795,7 +900,6 @@ class SentinelNexus:
 
         logging.info(f"[{SYSTEM_ID}] Nexus Online. Operational Mode={self._mode.value}")
 
-        # Audit boot event
         self._store.append_audit_event(
             ts=self._clock.now_int(),
             event_type="boot",
@@ -803,13 +907,17 @@ class SentinelNexus:
         )
 
     def shutdown(self) -> None:
-        """Graceful stop."""
         self._store.append_audit_event(
             ts=self._clock.now_int(),
             event_type="shutdown",
             payload={"system": SYSTEM_ID, "mode": self._mode.value},
         )
+        try:
+            self.oversight.shutdown()
+        except Exception:
+            pass
         self._scheduler.shutdown()
+        self._store.close()
 
     def set_mode(self, mode: OpMode) -> None:
         self._mode = mode
@@ -842,12 +950,16 @@ class SentinelNexus:
 
         tt = (threat_type or "UNKNOWN").strip()
 
+        conf = float(confidence if confidence is not None else self._cfg.default_confidence)
+        if not (0.0 <= conf <= 1.0):
+            raise ValueError("confidence must be between 0.0 and 1.0")
+
         ev = Evidence(
             system=SYSTEM_ID,
             sensor=(sensor or self._cfg.default_sensor),
             observed_at=self._clock.now_int(),
-            confidence=float(confidence if confidence is not None else self._cfg.default_confidence),
-            details=dict(details or {}),
+            confidence=conf,
+            _details=dict(details or {}),
         )
         return ThreatEvent(
             target=tgt,
@@ -858,14 +970,8 @@ class SentinelNexus:
         )
 
     def handle_threat(self, threat: ThreatEvent) -> Optional[str]:
-        """
-        Full pipeline:
-        ThreatEvent -> Decision -> ActionRequest -> Oversight
-        Returns action_id if an action was created, else None.
-        """
         decision = self._policy.evaluate(threat)
 
-        # None means ignore
         if decision.decision_type is DecisionType.NONE:
             self._store.append_audit_event(
                 ts=self._clock.now_int(),
@@ -874,11 +980,11 @@ class SentinelNexus:
             )
             return None
 
-        # Build stable fingerprint
         fp = stable_fingerprint(
             target=threat.target,
             threat_type=threat.threat_type,
             reason_code=threat.reason_code,
+            severity=decision.severity,
             reason=decision.reason,
             extra={
                 "system": SYSTEM_ID,
@@ -887,11 +993,9 @@ class SentinelNexus:
             },
         )
 
-        # Action ID uses fingerprint prefix + time bucket, for readability + grouping
-        bucket = int(self._clock.now() // 30)  # coarse bucket for log grouping
+        bucket = int(self._clock.now() // 30)
         action_id = f"BLOCK-{threat.target}-{fp[:12]}-T{bucket}"
 
-        # Action type mapping to mode intent happens inside Oversight (mode controls behavior)
         req = ActionRequest(
             action_id=action_id,
             fingerprint=fp,
@@ -902,6 +1006,7 @@ class SentinelNexus:
             reason=decision.reason,
             reason_code=decision.reason_code,
             evidence=decision.evidence,
+            cooldown_seconds=decision.cooldown_seconds,
             real_payload=lambda: IntegrationHub.execute_firewall_block(
                 threat.target, reason=decision.reason, evidence=decision.evidence
             ),
@@ -916,14 +1021,5 @@ class SentinelNexus:
             f"sensor={threat.evidence.sensor} confidence={threat.evidence.confidence:.2f}"
         )
 
-        # If policy says "shadow only", we can force the system into shadow behavior regardless of opmode,
-        # but in a public release it's usually better to keep opmode authoritative.
-        # We'll keep opmode authoritative and use req.shadow_payload in SHADOW mode.
-
         self.oversight.schedule_action(req)
-
-        # Apply cooldown tuned by policy decision
-        now_ts = self._clock.now_int()
-        self._store.set_cooldown(threat.target, until_ts=now_ts + max(0, decision.cooldown_seconds))
-
         return action_id
