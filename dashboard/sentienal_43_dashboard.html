@@ -36,12 +36,9 @@
       top:0;
       z-index:10;
     }
-    .brand{
-      display:flex; gap:12px; align-items:center;
-    }
-    .brand h1{
-      margin:0; font-size:16px; letter-spacing:0.5px;
-    }
+    .brand{ display:flex; gap:12px; align-items:center; }
+    .brand h1{ margin:0; font-size:16px; letter-spacing:0.5px; }
+
     .pill{
       display:inline-flex;
       align-items:center;
@@ -58,6 +55,7 @@
     .dot.good{background:var(--good)}
     .dot.bad{background:var(--bad)}
     .dot.warn{background:var(--warn)}
+
     main{
       display:grid;
       grid-template-columns: 1.2fr 0.8fr;
@@ -105,9 +103,11 @@
       font-weight:800;
       font-size:12px;
       cursor:pointer;
+      transition: border-color 120ms ease, background 120ms ease, transform 120ms ease;
     }
     .btn:hover{ border-color:#3b4a6b; }
-    .btn:disabled{ opacity:0.5; cursor:not-allowed; }
+    .btn:active{ transform: translateY(1px); }
+    .btn:disabled{ opacity:0.55; cursor:not-allowed; transform:none; }
 
     .btn-approve{
       border-color: rgba(34,197,94,0.35);
@@ -117,13 +117,17 @@
       border-color: rgba(239,68,68,0.35);
       background: rgba(239,68,68,0.10);
     }
+    .btn.active{
+      border-color: rgba(56,189,248,0.55);
+      background: rgba(56,189,248,0.12);
+      color:#bae6fd;
+    }
 
     .grid2{
       display:grid;
       grid-template-columns: 1fr 1fr;
       gap:10px;
     }
-
     .kv{
       display:flex;
       align-items:center;
@@ -145,6 +149,7 @@
       font-weight:900;
       border:1px solid var(--line);
       margin-left:8px;
+      user-select:none;
     }
     .tag.active{ border-color: rgba(239,68,68,0.45); background: rgba(239,68,68,0.10); color:#fecaca;}
     .tag.gated{ border-color: rgba(56,189,248,0.45); background: rgba(56,189,248,0.10); color:#bae6fd;}
@@ -162,10 +167,7 @@
       background: rgba(15,23,42,0.55);
       margin-bottom:10px;
     }
-    .incident-details h4{
-      margin:0 0 6px 0;
-      font-size:13px;
-    }
+    .incident-details h4{ margin:0 0 6px 0; font-size:13px; }
     .incident-details p{
       margin:0;
       font-size:12px;
@@ -177,7 +179,7 @@
       flex-direction:column;
       gap:8px;
       align-items:flex-end;
-      min-width:120px;
+      min-width:140px;
     }
     .smallnote{
       font-size:12px;
@@ -202,6 +204,53 @@
     .log-line.crit{ color:#fecaca; }
     .log-line.sim{ color:#fde68a; }
 
+    /* Modal */
+    .modal[hidden]{ display:none; }
+    .modal{
+      position:fixed; inset:0; z-index:999;
+      display:grid; place-items:center;
+    }
+    .modal-backdrop{
+      position:absolute; inset:0; background: rgba(0,0,0,.65);
+    }
+    .modal-card{
+      position:relative;
+      width: min(560px, calc(100vw - 28px));
+      border-radius:16px;
+      padding:18px;
+      background: rgba(18, 22, 35, .92);
+      border:1px solid rgba(255,255,255,.10);
+      box-shadow: 0 20px 60px rgba(0,0,0,.45);
+    }
+    .modal-card h3{ margin:0 0 6px 0; font-size:14px; letter-spacing:.2px; }
+    .modal-card .muted{ margin:0 0 10px 0; color: var(--muted); font-size:12px; }
+    .modal-card textarea{
+      width:100%;
+      padding:10px;
+      border-radius:12px;
+      background: rgba(255,255,255,.06);
+      border:1px solid rgba(255,255,255,.10);
+      color: inherit;
+      resize: vertical;
+      outline:none;
+      font-family: inherit;
+      font-size: 13px;
+      line-height: 1.35;
+    }
+    .modal-card textarea:focus{ border-color: rgba(56,189,248,.45); box-shadow: 0 0 0 3px rgba(56,189,248,.10); }
+    .modal-error{
+      min-height:18px;
+      margin-top:8px;
+      color:#ff6b6b;
+      font-size:12px;
+    }
+    .modal-actions{
+      display:flex;
+      justify-content:flex-end;
+      gap:10px;
+      margin-top:12px;
+    }
+
     @media (max-width: 980px){
       main{ grid-template-columns: 1fr; }
     }
@@ -220,7 +269,7 @@
     <span class="pill"><span id="status-dot" class="dot warn"></span><span id="status-pill">Booting</span></span>
     <span class="pill">Queue: <span id="queue-count">0</span></span>
 
-    <button id="refresh-now" class="btn">Refresh</button>
+    <button id="refresh-now" class="btn" aria-label="Refresh pending actions">Refresh</button>
     <button id="inject-test" class="btn">Inject Test Action</button>
     <button id="set-token" class="btn">Set JWT</button>
   </div>
@@ -257,21 +306,52 @@
         <div class="kv"><div class="k">Auth</div><div class="v" id="auth-state">Missing</div></div>
       </div>
 
-      <div id="log-console"></div>
+      <div id="log-console" role="log" aria-live="polite" aria-atomic="false"></div>
     </div>
   </aside>
 </main>
 
+<!-- Decision Modal -->
+<div id="decision-modal" class="modal" hidden aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+  <div class="modal-backdrop" data-close></div>
+  <div class="modal-card" role="document">
+    <h3 id="modal-title">Provide reason</h3>
+    <p id="modal-subtitle" class="muted">Reason is required (10–500 chars). Ctrl+Enter confirms.</p>
+
+    <textarea id="modal-input" rows="4" maxlength="500" placeholder="Type reason…"></textarea>
+    <div id="modal-error" class="modal-error" aria-live="polite"></div>
+
+    <div class="modal-actions">
+      <button id="modal-cancel" class="btn">Cancel</button>
+      <button id="modal-confirm" class="btn btn-approve">Confirm</button>
+    </div>
+  </div>
+</div>
+
 <script>
   // ============================================================
   // LIVE ONLY: Sentinel Pending Actions UI
-  // No demo provider. Backend is the authority.
+  // Backend is authority. UI is just a nervous messenger.
   // ============================================================
 
   const MODES = {
     SHADOW: "SHADOW",
     ACTIVE: "ACTIVE",
     HUMAN_GATED: "HUMAN_GATED"
+  };
+
+  // Backend-supported statuses. If you add STAGED server-side, great.
+  const VALID_STATUSES = new Set(["PENDING","STAGED","APPROVED","VETOED","EXPIRED","EXECUTED"]);
+
+  const CONFIG = {
+    API_BASE: "/api/v1",
+    POLL_BASE_MS: 1500,
+    MAX_FAILS: 5,
+    LIST_LIMIT: 250,
+    REASON_MIN: 10,
+    REASON_MAX: 500,
+    ENABLE_COOKIE_AUTH: true, // credentials:"include" on fetch (ready for httpOnly cookie)
+    ALLOW_SHADOWED_FILTER: false // set true ONLY if backend actually supports SHADOWED
   };
 
   const feed = document.getElementById("incident-feed");
@@ -293,76 +373,83 @@
   const filterAllBtn     = document.getElementById("filter-all");
 
   let FILTER = "ALL"; // ALL | PENDING | STAGED
-  const incidents = new Map(); // action_id -> last snapshot
+  let refreshInFlight = false;
+  let failCount = 0;
+  let lastCount = -1;
+
+  // Diff-render map: action_id -> { el, status }
+  const rowMap = new Map();
 
   // ------------------------------------------------------------
   // API seam (real endpoints)
   // ------------------------------------------------------------
   const api = {
     token: () => sessionStorage.getItem("SENTINEL_JWT") || null,
+
     headers: () => {
       const h = { "Content-Type": "application/json" };
       const t = api.token();
+      // Demo/prototype auth (XSS risk). Cookie auth is the real fix.
       if (t) h["Authorization"] = `Bearer ${t}`;
       return h;
     },
 
-    health: async () => {
-      const r = await fetch("/api/v1/health", { headers: api.headers() });
-      if (!r.ok) throw new Error(`Health check failed (${r.status})`);
-      return r.json();
-    },
-
-    listActionsByStatus: async (statusFilter) => {
-      const r = await fetch(`/api/v1/actions?status_filter=${encodeURIComponent(statusFilter)}&limit=250`, { headers: api.headers() });
-      if (!r.ok) throw new Error(`Fetch actions failed (${r.status})`);
-      return r.json(); // List[PendingActionOut]
-    },
-
-    approve: async (actionId, reason) => {
-      const r = await fetch(`/api/v1/actions/${encodeURIComponent(actionId)}/approve`, {
-        method: "POST",
-        headers: api.headers(),
-        body: JSON.stringify({ reason }),
+    async request(path, options = {}) {
+      const r = await fetch(`${CONFIG.API_BASE}${path}`, {
+        ...options,
+        headers: { ...api.headers(), ...(options.headers || {}) },
+        credentials: CONFIG.ENABLE_COOKIE_AUTH ? "include" : "same-origin"
       });
-      return r.ok;
+      if (!r.ok) {
+        const txt = await safeText(r);
+        throw new Error(`${path} failed (${r.status})${txt ? `: ${txt}` : ""}`);
+      }
+      const ct = r.headers.get("content-type") || "";
+      if (ct.includes("application/json")) return r.json();
+      return r.text();
     },
 
-    veto: async (actionId, reason) => {
-      const r = await fetch(`/api/v1/actions/${encodeURIComponent(actionId)}/veto`, {
+    health: () => api.request("/health"),
+
+    listActionsByStatus: (statusFilter) =>
+      api.request(`/actions?status_filter=${encodeURIComponent(statusFilter)}&limit=${CONFIG.LIST_LIMIT}`),
+
+    approve: (actionId, reason) =>
+      api.request(`/actions/${encodeURIComponent(actionId)}/approve`, {
         method: "POST",
-        headers: api.headers(),
-        body: JSON.stringify({ reason }),
-      });
-      return r.ok;
-    },
+        body: JSON.stringify({ reason })
+      }),
 
-    inject: async () => {
-      // Optional: only works if your backend supports POST /api/v1/actions
-      const payload = {
+    veto: (actionId, reason) =>
+      api.request(`/actions/${encodeURIComponent(actionId)}/veto`, {
+        method: "POST",
+        body: JSON.stringify({ reason })
+      }),
+
+    inject: () => api.request("/actions", {
+      method: "POST",
+      body: JSON.stringify({
         action_type: "TEST_INCIDENT",
-        payload: {
-          ip: "203.0.113.88",
-          threat: "Injected test action",
-          source_ip: "203.0.113.88"
-        }
-      };
-      const r = await fetch("/api/v1/actions", {
-        method: "POST",
-        headers: api.headers(),
-        body: JSON.stringify(payload),
-      });
-      return r.ok;
-    }
+        payload: { ip: "203.0.113.88", threat: "Injected test action", source_ip: "203.0.113.88" }
+      })
+    })
   };
+
+  async function safeText(r) {
+    try { return (await r.text()).slice(0, 200); } catch { return ""; }
+  }
 
   // ------------------------------------------------------------
   // UI helpers
   // ------------------------------------------------------------
+  function nowTs() {
+    return new Date().toLocaleTimeString("en-US", { hour12:false });
+  }
+
   function addLog(msg, type = "") {
     const div = document.createElement("div");
     div.className = `log-line ${type}`;
-    div.textContent = msg.startsWith("[") ? msg : `> ${msg}`;
+    div.textContent = `[${nowTs()}] ${msg.startsWith("[") ? msg : `> ${msg}`}`;
     consoleLog.appendChild(div);
     consoleLog.scrollTop = consoleLog.scrollHeight;
   }
@@ -376,8 +463,12 @@
       .replaceAll("'", "&#039;");
   }
 
+  function setActiveFilter(btn) {
+    [filterPendingBtn, filterStagedBtn, filterAllBtn].forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+  }
+
   function setModeBadge(mode) {
-    // If you don’t have server mode yet, we display HUMAN_GATED by default.
     if (mode === MODES.SHADOW) {
       modeBadge.textContent = "MODE: SHADOW ADVISORY";
       modeBadge.style.background = "rgba(245,158,11,0.12)";
@@ -400,7 +491,7 @@
     statusPill.textContent = state;
     statusDot.classList.remove("good","bad","warn");
     if (state === "Online") statusDot.classList.add("good");
-    else if (state === "Degraded") statusDot.classList.add("warn");
+    else if (state === "Degraded" || state === "Syncing") statusDot.classList.add("warn");
     else statusDot.classList.add("bad");
   }
 
@@ -416,27 +507,31 @@
   }
 
   function rowTag(status) {
+    // Keep it honest: don’t invent statuses your backend doesn’t have.
     if (status === "PENDING") return { cls:"active", label:"PENDING" };
     if (status === "STAGED") return { cls:"gated", label:"STAGED" };
-    if (status === "SHADOWED") return { cls:"shadow", label:"SHADOWED" };
     if (status === "APPROVED" || status === "EXECUTED") return { cls:"done", label:status };
     if (status === "VETOED") return { cls:"shadow", label:"VETOED" };
-    return { cls:"shadow", label:status };
+    if (status === "EXPIRED") return { cls:"shadow", label:"EXPIRED" };
+    return { cls:"shadow", label:status || "UNKNOWN" };
   }
 
   function normalizeAction(a) {
-    // Backend schema -> UI schema
     const createdMs = Date.parse(a.created_at);
     const payload = a.payload || {};
     const ip = payload.source_ip || payload.ip || "n/a";
     const threat = payload.threat || a.action_type || "ACTION";
 
+    const status = (a.status || "UNKNOWN").toUpperCase();
+    const safeStatus = VALID_STATUSES.has(status) ? status : "UNKNOWN";
+
     return {
-      action_id: a.id,
+      action_id: String(a.id || ""),
       ip,
       threat,
       created_at_ms: Number.isFinite(createdMs) ? createdMs : Date.now(),
-      status: a.status,
+      created_at_text: a.created_at || "",
+      status: safeStatus,
       decision_reason: a.decision_reason || "",
       raw: a
     };
@@ -446,6 +541,7 @@
     const row = document.createElement("div");
     row.className = "incident-row";
     row.dataset.actionId = inc.action_id;
+    row.dataset.status = inc.status;
 
     const tag = rowTag(inc.status);
     const created = new Date(inc.created_at_ms).toLocaleString();
@@ -491,14 +587,133 @@
     return row;
   }
 
-  function rerender(items) {
-    feed.innerHTML = "";
+  function diffRender(items) {
     emptyState.style.display = items.length ? "none" : "block";
+    updateQueueCount(items);
+
+    const newIds = new Set(items.map(i => i.action_id));
+
+    // Remove stale
+    for (const [id, rec] of rowMap.entries()) {
+      if (!newIds.has(id)) {
+        rec.el.remove();
+        rowMap.delete(id);
+      }
+    }
+
+    // Insert/update in sorted order
+    const frag = document.createDocumentFragment();
 
     for (const inc of items) {
-      feed.appendChild(renderIncidentRow(inc));
+      const existing = rowMap.get(inc.action_id);
+      if (!existing) {
+        const el = renderIncidentRow(inc);
+        rowMap.set(inc.action_id, { el, status: inc.status });
+        frag.appendChild(el);
+      } else {
+        // Update only when status or decision_reason changes
+        const oldStatus = existing.el.dataset.status;
+        const oldReason = existing.el.querySelector(".incident-details p strong") ? (existing.el.dataset.reason || "") : (existing.el.dataset.reason || "");
+        const newReason = inc.decision_reason || "";
+
+        if (oldStatus !== inc.status || oldReason !== newReason) {
+          const el = renderIncidentRow(inc);
+          rowMap.set(inc.action_id, { el, status: inc.status });
+          existing.el.replaceWith(el);
+        }
+      }
     }
-    updateQueueCount(items);
+
+    // Rebuild order by re-attaching in the correct sequence (cheap + stable)
+    feed.innerHTML = "";
+    feed.appendChild(frag);
+  }
+
+  // ------------------------------------------------------------
+  // Modal (no prompt garbage)
+  // ------------------------------------------------------------
+  function validateReason(reason) {
+    const r = (reason || "").trim();
+    if (!r) return "Reason is required.";
+    if (r.length < CONFIG.REASON_MIN) return `Reason must be at least ${CONFIG.REASON_MIN} characters.`;
+    if (r.length > CONFIG.REASON_MAX) return `Reason must be ${CONFIG.REASON_MAX} characters or less.`;
+    if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(r)) return "Reason contains invalid control characters.";
+    return null;
+  }
+
+  function showDecisionModal({ title, subtitle, defaultText, confirmText, confirmClass }) {
+    return new Promise((resolve) => {
+      const modal = document.getElementById("decision-modal");
+      const titleEl = document.getElementById("modal-title");
+      const subEl = document.getElementById("modal-subtitle");
+      const input = document.getElementById("modal-input");
+      const errEl = document.getElementById("modal-error");
+      const okBtn = document.getElementById("modal-confirm");
+      const cancelBtn = document.getElementById("modal-cancel");
+      const backdrop = modal.querySelector("[data-close]");
+
+      let done = false;
+
+      const cleanup = () => {
+        okBtn.onclick = null;
+        cancelBtn.onclick = null;
+        backdrop.onclick = null;
+        document.removeEventListener("keydown", onKey);
+      };
+
+      const close = (val) => {
+        if (done) return;
+        done = true;
+        cleanup();
+        modal.hidden = true;
+        modal.setAttribute("aria-hidden", "true");
+        errEl.textContent = "";
+        resolve(val);
+      };
+
+      const onKey = (e) => {
+        if (e.key === "Escape") close(null);
+        if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) okBtn.click();
+      };
+
+      titleEl.textContent = title || "Provide reason";
+      subEl.textContent = subtitle || `Reason is required (${CONFIG.REASON_MIN}–${CONFIG.REASON_MAX} chars). Ctrl+Enter confirms.`;
+      input.value = defaultText || "";
+      okBtn.textContent = confirmText || "Confirm";
+      okBtn.className = `btn ${confirmClass || "btn-approve"}`;
+
+      modal.hidden = false;
+      modal.setAttribute("aria-hidden", "false");
+      errEl.textContent = "";
+      setTimeout(() => input.focus(), 0);
+
+      backdrop.onclick = () => close(null);
+      cancelBtn.onclick = () => close(null);
+
+      okBtn.onclick = () => {
+        const val = input.value;
+        const error = validateReason(val);
+        if (error) {
+          errEl.textContent = error;
+          return;
+        }
+        close(val.trim());
+      };
+
+      document.addEventListener("keydown", onKey);
+    });
+  }
+
+  async function runButtonAction(btn, busyText, fn) {
+    const oldText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = busyText;
+    try {
+      await fn();
+    } finally {
+      btn.disabled = false;
+      btn.textContent = oldText;
+    }
   }
 
   // ------------------------------------------------------------
@@ -510,23 +725,51 @@
 
     if (vetoBtn) {
       const id = vetoBtn.dataset.veto;
-      const reason = (prompt("Veto reason (required):", "Authorized traffic / false positive") || "").trim();
+
+      const reason = await showDecisionModal({
+        title: `Veto ${id}`,
+        subtitle: "Required. Explain why this action is being blocked.",
+        defaultText: "Authorized traffic / false positive",
+        confirmText: "Veto",
+        confirmClass: "btn-veto"
+      });
+
       if (!reason) {
-        addLog(`[OVERSIGHT] VETO aborted: reason required for ${id}.`, "sim");
+        addLog(`[OVERSIGHT] VETO cancelled for ${id}.`, "sim");
         return;
       }
-      const ok = await api.veto(id, reason);
-      addLog(ok ? `[OVERSIGHT] VETOED ${id} | Reason: ${reason}` : `[OVERSIGHT] VETO FAILED ${id}`, ok ? "ok" : "crit");
-      await refresh();
+
+      await runButtonAction(vetoBtn, "PROCESSING…", async () => {
+        await api.veto(id, reason);
+        addLog(`[OVERSIGHT] VETOED ${id} | Reason: ${reason}`, "ok");
+      });
+
+      await refreshOnce(true);
       return;
     }
 
     if (approveBtn) {
       const id = approveBtn.dataset.approve;
-      const reason = (prompt("Approve reason:", "Approved by operator") || "Approved by operator").trim();
-      const ok = await api.approve(id, reason);
-      addLog(ok ? `[OVERSIGHT] APPROVED ${id}` : `[OVERSIGHT] APPROVE FAILED ${id}`, ok ? "ok" : "crit");
-      await refresh();
+
+      const reason = await showDecisionModal({
+        title: `Approve ${id}`,
+        subtitle: "Required. This may execute an irreversible action.",
+        defaultText: "Approved by operator",
+        confirmText: "Approve",
+        confirmClass: "btn-approve"
+      });
+
+      if (!reason) {
+        addLog(`[OVERSIGHT] APPROVE cancelled for ${id}.`, "sim");
+        return;
+      }
+
+      await runButtonAction(approveBtn, "PROCESSING…", async () => {
+        await api.approve(id, reason);
+        addLog(`[OVERSIGHT] APPROVED ${id}`, "ok");
+      });
+
+      await refreshOnce(true);
       return;
     }
   });
@@ -538,66 +781,135 @@
 
   setTokenBtn.addEventListener("click", () => {
     const cur = api.token() || "";
-    const t = (prompt("Paste SENTINEL JWT (stored in sessionStorage):", cur) || "").trim();
+    const t = (prompt("Paste SENTINEL JWT (stored in sessionStorage). Leave blank to clear:", cur) || "").trim();
     if (!t) {
       sessionStorage.removeItem("SENTINEL_JWT");
       addLog("[CFG] JWT cleared.", "sim");
     } else {
       sessionStorage.setItem("SENTINEL_JWT", t);
-      addLog("[CFG] JWT set.", "ok");
+      addLog("[CFG] JWT set. (Reminder: sessionStorage is not safe from XSS.)", "sim");
     }
     updateAuthState();
+    refreshOnce(true);
   });
 
   injectBtn.addEventListener("click", async () => {
     try {
-      const ok = await api.inject();
-      addLog(ok ? "[TEST] Injected test action." : "[TEST] Inject failed (endpoint missing or auth).", ok ? "ok" : "crit");
-      await refresh();
+      injectBtn.disabled = true;
+      injectBtn.textContent = "INJECTING…";
+      await api.inject();
+      addLog("[TEST] Injected test action.", "ok");
+      await refreshOnce(true);
     } catch (err) {
-      addLog(`[TEST] Inject error: ${String(err)}`, "crit");
+      addLog(`[TEST] Inject failed: ${String(err)}`, "crit");
+    } finally {
+      injectBtn.disabled = false;
+      injectBtn.textContent = "Inject Test Action";
     }
   });
 
-  refreshBtn.addEventListener("click", async () => { await refresh(); });
+  refreshBtn.addEventListener("click", async () => { await refreshOnce(true); });
 
-  filterPendingBtn.addEventListener("click", async () => { FILTER = "PENDING"; addLog("[CFG] Filter: PENDING", "sim"); await refresh(); });
-  filterStagedBtn.addEventListener("click", async () => { FILTER = "STAGED"; addLog("[CFG] Filter: STAGED", "sim"); await refresh(); });
-  filterAllBtn.addEventListener("click", async () => { FILTER = "ALL"; addLog("[CFG] Filter: ALL", "sim"); await refresh(); });
+  filterPendingBtn.addEventListener("click", async () => {
+    FILTER = "PENDING";
+    setActiveFilter(filterPendingBtn);
+    addLog("[CFG] Filter: PENDING", "sim");
+    await refreshOnce(true);
+  });
+
+  filterStagedBtn.addEventListener("click", async () => {
+    FILTER = "STAGED";
+    setActiveFilter(filterStagedBtn);
+    addLog("[CFG] Filter: STAGED", "sim");
+    await refreshOnce(true);
+  });
+
+  filterAllBtn.addEventListener("click", async () => {
+    FILTER = "ALL";
+    setActiveFilter(filterAllBtn);
+    addLog("[CFG] Filter: ALL", "sim");
+    await refreshOnce(true);
+  });
+
+  // Keyboard shortcut: "r" to refresh (unless typing in textarea/input)
+  document.addEventListener("keydown", (e) => {
+    const tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : "";
+    if (tag === "input" || tag === "textarea") return;
+    if (e.key === "r" && !e.ctrlKey && !e.metaKey) refreshBtn.click();
+  });
 
   // ------------------------------------------------------------
-  // Poll loop
+  // Poll loop (safe + backoff)
   // ------------------------------------------------------------
-  async function refresh() {
-    updateAuthState();
+  async function refreshOnce(logSyncing = false) {
+    if (refreshInFlight) return;
+
+    refreshInFlight = true;
     try {
+      updateAuthState();
+      setStatus(logSyncing ? "Syncing" : statusPill.textContent);
+
       // If your server later exposes /api/v1/mode, wire it here.
       setModeBadge(MODES.HUMAN_GATED);
 
-      // Pull statuses
-      const wanted = (FILTER === "ALL") ? ["PENDING", "STAGED", "SHADOWED"] : [FILTER];
-      const lists = await Promise.all(wanted.map(s => api.listActionsByStatus(s)));
+      // Only request statuses your backend supports
+      const wanted = (FILTER === "ALL")
+        ? ["PENDING", "STAGED"]
+        : [FILTER];
 
+      // If you actually add SHADOWED server-side, flip the config.
+      if (CONFIG.ALLOW_SHADOWED_FILTER && FILTER === "ALL") wanted.push("SHADOWED");
+
+      const lists = await Promise.all(wanted.map(s => api.listActionsByStatus(s)));
       const raw = lists.flat();
-      const normalized = raw.map(normalizeAction)
+
+      const normalized = raw
+        .map(normalizeAction)
         .sort((a,b) => b.created_at_ms - a.created_at_ms);
 
+      failCount = 0;
       setStatus("Online");
-      rerender(normalized);
 
-      addLog(`[UI] Loaded ${normalized.length} action(s).`, "ok");
+      diffRender(normalized);
+
+      if (normalized.length !== lastCount) {
+        addLog(`[UI] Loaded ${normalized.length} action(s).`, "ok");
+        lastCount = normalized.length;
+      }
     } catch (err) {
+      failCount++;
       setStatus("Degraded");
-      addLog(`[UI] Refresh failed: ${String(err)}`, "crit");
+      addLog(`[UI] Refresh failed (${failCount}/${CONFIG.MAX_FAILS}): ${String(err)}`, "crit");
+      if (failCount >= CONFIG.MAX_FAILS) {
+        setStatus("Offline");
+        addLog("[UI] Auto-refresh stopped after repeated failures. Click Refresh to retry.", "crit");
+        refreshInFlight = false;
+        return;
+      }
+    } finally {
+      refreshInFlight = false;
     }
+  }
+
+  async function refreshLoop() {
+    // Do not overlap requests
+    if (!refreshInFlight) await refreshOnce(false);
+
+    // backoff schedule
+    const delay = CONFIG.POLL_BASE_MS * Math.pow(2, Math.min(failCount, 4));
+
+    if (failCount >= CONFIG.MAX_FAILS) return; // stopped
+    setTimeout(refreshLoop, delay);
   }
 
   // Boot
   addLog("[SYS] Analyst Workstation Loaded (LIVE).", "ok");
   addLog("[CFG] No demo provider. API is required.", "sim");
+
   updateAuthState();
-  refresh();
-  setInterval(refresh, 1500);
+  setActiveFilter(filterAllBtn);
+  refreshOnce(true);
+  refreshLoop();
 </script>
 </body>
 </html>
