@@ -1,4 +1,15 @@
-Sentinel-43
+Quick Summary (Public Version)
+Sentinel-43 is a risk assessment + response recommendation engine.
+It helps humans make consistent decisions by turning events into:
+a risk score
+a policy-based recommendation
+a written explanation
+an audit record
+It does not execute enforcement.
+It doesn’t block users, shut down systems, or take action unless you wire that in separately. 
+
+
+##Sentinel-43##
 Sentinel-43 is a modular detection and response-planning engine designed to analyze structured events, assess risk, and produce explainable, policy-bound recommendations under human oversight.
 It is not an autonomous enforcement system.
 It does not execute actions by default.
