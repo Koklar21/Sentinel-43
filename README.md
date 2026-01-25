@@ -1,5 +1,6 @@
 Quick Summary (Public Version)
 Sentinel-43 is a risk assessment + response recommendation engine.
+
 It helps humans make consistent decisions by turning events into:
 a risk score
 a policy-based recommendation
