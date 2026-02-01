@@ -1,11 +1,21 @@
 """
-Core package for Sentinel-43.
+Sentinel-43 Core Package
 
-Contains the backbone modules:
-- config
-- detection
-- memory
-- audit (if/when added)
+This package contains the foundational runtime components:
+- configuration
+- governance
+- policy enforcement
+- auditing
+- guards
 """
 
-__all__ = [] 
+__all__ = [
+    "config",
+    "governance",
+    "policy_gate",
+    "audit",
+    "guards",
+    "logging",
+    "detection",
+    "memory",
+]
