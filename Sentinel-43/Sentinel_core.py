@@ -33,16 +33,11 @@ from pathlib import Path
 from queue import Empty, Full, Queue
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-
 # ---------------------------------------------------------------------------
-# Logging
+# Logging (NO basicConfig here. Orchestration owns global logging.)
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(module)-18s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+logger = logging.getLogger(__name__)
 
 SYSTEM_ID = "SENTINEL-43-NODE-01"
 
@@ -226,8 +221,6 @@ class AuditLogger:
         self._pool_size = max(1, int(pool_size))
 
         # Serialize audit chain updates for ordering stability (chain correctness).
-        # Other state ops also use BEGIN IMMEDIATE so correctness doesn't rely on this lock,
-        # but chaining benefits from deterministic sequencing.
         self._chain_lock = threading.RLock()
 
         for _ in range(self._pool_size):
@@ -236,7 +229,12 @@ class AuditLogger:
         self._init_db()
 
     def _create_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30, isolation_level=None)
+        conn = sqlite3.connect(
+            str(self.db_path),
+            check_same_thread=False,
+            timeout=30,
+            isolation_level=None,
+        )
         conn.execute(f"PRAGMA journal_mode={self.journal_mode};")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
@@ -265,7 +263,6 @@ class AuditLogger:
                 try:
                     self._pool.put(conn, timeout=5.0)
                 except Full:
-                    # Shouldn't happen; if it does, close to avoid leak.
                     try:
                         conn.close()
                     except Exception:
@@ -398,8 +395,6 @@ class AuditLogger:
         ts = _iso_utc(_utcnow())
         context_json = _canonical_json(context, max_len=max_context_json) if context is not None else None
 
-        # Retry loop for optimistic chain update, though BEGIN IMMEDIATE + chain lock
-        # already makes contention rare. Still: correctness > vibes.
         max_retries = 5
         backoff = 0.01
 
@@ -429,7 +424,6 @@ class AuditLogger:
                         (ts, SYSTEM_ID, event_type.value, module, message, context_json, prev_hash, event_hash),
                     )
 
-                    # Optimistic lock: update only if last_hash hasn't changed
                     rc = conn.execute(
                         "UPDATE audit_chain_state SET last_hash=? WHERE id=1 AND last_hash=?;",
                         (event_hash, prev_hash),
@@ -552,7 +546,6 @@ class AuditLogger:
             if used >= int(max_actions):
                 return False
 
-            # Atomic increment
             conn.execute(
                 "UPDATE action_budget SET used_count = used_count + 1 WHERE principal_id=?;",
                 (principal_id,),
@@ -562,10 +555,6 @@ class AuditLogger:
     # ---- Corroboration ----
 
     def corroboration_bump(self, key: str, *, ttl_seconds: int) -> int:
-        """
-        Bumps corroboration count inside a TTL window.
-        If last_seen is older than ttl_seconds, resets to 1.
-        """
         now = _utcnow()
         now_s = _iso_utc(now, seconds=True)
 
@@ -666,7 +655,7 @@ class Scheduler:
                 if not self._executing:
                     break
             if (time.time() - start) >= timeout:
-                logging.warning(f"[SCHEDULER] Shutdown timeout: {len(self._executing)} actions still executing.")
+                logger.warning("[SCHEDULER] Shutdown timeout: %s actions still executing.", len(self._executing))
                 break
             time.sleep(0.1)
 
@@ -691,7 +680,6 @@ class Scheduler:
 
                 heapq.heappop(self._heap)
 
-                # Cancel check while holding lock (prevents the specific race you had before).
                 if item.action_id in self._cancelled:
                     self._cancelled.discard(item.action_id)
                     continue
@@ -738,7 +726,7 @@ class OversightEngine:
     def schedule_vetoable_action(self, action: PendingAction) -> None:
         with self._lock:
             if action.action_id in self._pending:
-                logging.warning(f"[OVERSIGHT] Duplicate pending action ignored: {action.action_id}")
+                logger.warning("[OVERSIGHT] Duplicate pending action ignored: %s", action.action_id)
                 return
             self._pending[action.action_id] = action
 
@@ -787,7 +775,7 @@ class OversightEngine:
             act = self._pending.pop(action_id, None)
 
         if not act:
-            logging.warning(f"[OVERSIGHT] Veto failed (not pending): {action_id}")
+            logger.warning("[OVERSIGHT] Veto failed (not pending): %s", action_id)
             return False
 
         self._scheduler.cancel(action_id)
@@ -848,7 +836,6 @@ class WatchtowerManager:
         )
 
     def perform_scan(self) -> List[AnomalyRecord]:
-        # Synthetic scan for demo. Replace with your real telemetry.
         import random
 
         anomalies: List[AnomalyRecord] = []
@@ -1010,8 +997,8 @@ class SentinelNode:
         try:
             self.audit.append(event_type, module, message, context)
         except Exception as exc:
-            logging.error(f"[AUDIT_FAIL] {event_type.value} {module}: {message} | {exc}")
-        logging.info(f"[{module}] {message}")
+            logger.error("[AUDIT_FAIL] %s %s: %s | %s", event_type.value, module, message, exc)
+        logger.info("[%s] %s", module, message)
 
     def _notify_operator(self, message: str) -> None:
         self._log(EventType.SYSTEM, "NOTIFY", message)
@@ -1021,7 +1008,6 @@ class SentinelNode:
     def shutdown(self, *, drain_timeout: float = 10.0) -> None:
         self._log(EventType.SYSTEM, "SYSTEM", "Shutdown requested.")
 
-        # stop worker intake loop
         self._worker_stop.set()
 
         start = time.time()
@@ -1029,15 +1015,19 @@ class SentinelNode:
             time.sleep(0.1)
 
         if not self._queue.empty():
-            logging.warning(f"[SHUTDOWN] Queue drain timeout: {self._queue.qsize()} items remain.")
+            logger.warning("[SHUTDOWN] Queue drain timeout: %s items remain.", self._queue.qsize())
 
-        # stop cleanup + scheduler
+        # wait for worker thread to exit cleanly
+        self._worker.join(timeout=5)
+
         self.cleanup_manager.shutdown()
         self.scheduler.shutdown()
 
+        # LOG BEFORE closing the audit DB
+        self._log(EventType.SYSTEM, "SYSTEM", "Shutdown complete.")
+
         # close DB connections last
         self.audit.close()
-        self._log(EventType.SYSTEM, "SYSTEM", "Shutdown complete.")
 
     # ---- Worker Loop ----
 
@@ -1247,7 +1237,6 @@ class SentinelNode:
         alert_ctx = {"event_id": anomaly.event_id, "severity": anomaly.severity.value, **(anomaly.metadata or {})}
         self._log(EventType.ALERT, "ALERT", f"[{anomaly.module_id}] {anomaly.description}", context=alert_ctx)
 
-        # Example: IAM anomalies trigger response workflow
         if anomaly.module_id == "WT_03_IAM_AUD":
             principal = _safe_str(anomaly.metadata.get("principal_id", "Unknown.Principal"), max_len=80)
             self.trigger_response(principal, "Suspicious IAM access pattern", anomaly.severity, anomaly_event_id=anomaly.event_id)
@@ -1260,18 +1249,3 @@ class SentinelNode:
         if severity is RiskLevel.MEDIUM:
             return self.delay_medium_seconds
         return self.delay_low_seconds
-
-
-# ---------------------------------------------------------------------------
-# Quick demo (optional)
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    node = SentinelNode(mode=DeploymentMode.SHADOW)
-    try:
-        for _ in range(5):
-            node.run_watchtower_cycle()
-            time.sleep(1.0)
-        logging.info(f"Metrics: {node.get_metrics()}")
-    finally:
-        node.shutdown()
