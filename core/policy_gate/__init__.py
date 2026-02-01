@@ -2,19 +2,32 @@
 Sentinel-43 Policy Gate Package
 
 Purpose:
-- Holds enforcement modules that sit *outside* Core and *before* IntegrationHub.
-- Provides governance + risk gating + audit-chain logging.
+- Governance-backed policy enforcement
+- Risk gating across SHADOW / HUMAN_GATED / AUTONOMOUS_VETO
+- Deterministic, auditable decision output
 
-Keep this package free of "business core" logic.
+This package contains NO business logic and NO I/O.
 """
 
-from .ghost_governance import engine, SystemOrchestrator, Decision, TransactionContext, ReasonCodes, CONFIG
+from .policy_gate import (
+    PolicyGate,
+    PolicyContext,
+    PolicyDecision,
+    evaluate,
+)
+
+from .governance import (
+    MODE_SHADOW,
+    MODE_HUMAN_GATED,
+    MODE_AUTONOMOUS_VETO,
+)
 
 __all__ = [
-    "engine",
-    "SystemOrchestrator",
-    "Decision",
-    "TransactionContext",
-    "ReasonCodes",
-    "CONFIG",
+    "PolicyGate",
+    "PolicyContext",
+    "PolicyDecision",
+    "evaluate",
+    "MODE_SHADOW",
+    "MODE_HUMAN_GATED",
+    "MODE_AUTONOMOUS_VETO",
 ]
