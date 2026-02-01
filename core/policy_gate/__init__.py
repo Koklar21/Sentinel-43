@@ -1,12 +1,8 @@
 """
-Sentinel-43 Policy Gate Package
+Sentinel-43 Policy Gate
 
-Purpose:
-- Governance-backed policy enforcement
-- Risk gating across SHADOW / HUMAN_GATED / AUTONOMOUS_VETO
-- Deterministic, auditable decision output
-
-This package contains NO business logic and NO I/O.
+Deterministic policy evaluation layer.
+No I/O, no side effects, no orchestration.
 """
 
 from .policy_gate import (
