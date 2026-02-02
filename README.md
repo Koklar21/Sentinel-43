@@ -1097,3 +1097,5 @@ if __name__ == "__main__":
         print("Approved:", ok)
 
     print("Export approved:", nexus.export_approved(limit=10))
+
+    Sentinel is dual-licensed under AGPLv3 or a commercial license.
