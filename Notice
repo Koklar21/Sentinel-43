@@ -1,6 +1,12 @@
-Sentinel-43
-Copyright (c) 2025 Justin
+# NOTICE
 
-This product includes software developed by Justin.
+Sentinel is dual-licensed:
 
-Licensed under the Apache License, Version 2.0.
+- AGPL-3.0-or-later (see LICENSE.md), or
+- Commercial License (see COMMERCIAL_LICENSE.md)
+
+If you do not have a commercial license, any network deployment of a modified
+version must provide the corresponding source code to users interacting with it,
+as required by the AGPL.
+
+SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
