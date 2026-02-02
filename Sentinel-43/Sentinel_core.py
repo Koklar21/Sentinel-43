@@ -242,8 +242,22 @@ class AuditLogger:
         return conn
 
     @contextmanager
-    def _conn_txn(self) -> sqlite3.Connection:
-        conn: Optional[sqlite3.Connection] = None
+def _conn_txn(self) -> Iterator[sqlite3.Connection]:
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = self._pool.get(timeout=5.0)
+        conn.execute("BEGIN IMMEDIATE;")
+        yield conn
+        conn.commit()
+    except Exception:
+        if conn is not None:
+            conn.rollback()
+        raise
+    finally:
+        if conn is not None:
+            self._pool.put(conn)
+
+            conn: Optional[sqlite3.Connection] = None
         try:
             conn = self._pool.get(timeout=5.0)
             conn.execute("BEGIN IMMEDIATE;")
