@@ -1,17 +1,30 @@
+# sentinel43_nexus_onefile.py
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 Justin
+
 from __future__ import annotations
 
 import enum
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
+
+
+# ============================================================
+# Logging (NO basicConfig here. Caller owns global logging.)
+# ============================================================
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -37,18 +50,19 @@ def _env(name: str, default: str) -> str:
     return os.getenv(legacy, default)
 
 
-DB_PATH = Path(_env("SENTINEL_DB_PATH", str(BASE_DIR / "sentinel_secure.db")))
+DB_PATH = Path(_env("SENTINEL_DB_PATH", str(BASE_DIR / "sentinel43_state" / "sentinel43.sqlite3")))
 SYSTEM_ID = _env("SENTINEL_SYSTEM_ID", "SENTINEL-43-NEXUS-01")
 
-# Dedupe TTL: prevents queue spam for identical directives
 DEFAULT_DEDUPE_TTL_SECONDS = int(_env("SENTINEL_ACTION_DEDUPE_TTL", "60"))
-
-# Log + action retention (prevents SQLite growth DoS)
 DEFAULT_LOG_RETENTION_DAYS = int(_env("SENTINEL_LOG_RETENTION_DAYS", "90"))
 DEFAULT_ACTION_RETENTION_DAYS = int(_env("SENTINEL_ACTION_RETENTION_DAYS", "30"))
 
 # Hash salt for privacy-safe logs (do not leave default in anything you ship)
 LOG_SALT = _env("SENTINEL_LOG_SALT", "CHANGE_ME_IN_PROD")
+
+# ACTIVE executor behavior
+EXECUTOR_POLL_MS = int(_env("SENTINEL_EXECUTOR_POLL_MS", "500"))
+EXECUTOR_MAX_BATCH = int(_env("SENTINEL_EXECUTOR_MAX_BATCH", "25"))
 
 
 # ============================================================
@@ -122,24 +136,19 @@ class ResponseAction(enum.Enum):
 
 @dataclass(frozen=True)
 class ResponsePolicy:
-    # Score thresholds
     medium_threshold: float = 40.0
     high_threshold: float = 65.0
     critical_threshold: float = 85.0
 
-    # Automation escalation bump
     automation_medium_bonus: float = 5.0
     automation_high_bonus: float = 10.0
 
-    # Durations
     temp_block_seconds: int = 900        # 15 minutes
     hard_block_seconds: int = 3600 * 6   # 6 hours
 
-    # Auto-escalation toggles
     auto_open_incident_on_critical: bool = True
     auto_require_human_review_on_high: bool = True
 
-    # ACTIVE mode veto window default (UI countdown)
     veto_window_seconds: int = 30
 
 
@@ -165,12 +174,13 @@ class ResponseDirective:
 # ============================================================
 
 class ActionStatus(str, enum.Enum):
-    SHADOWED = "SHADOWED"     # recorded only
-    STAGED = "STAGED"         # waiting for approval (HUMAN_GATED)
-    PENDING = "PENDING"       # veto window open (ACTIVE)
+    SHADOWED = "SHADOWED"
+    STAGED = "STAGED"
+    PENDING = "PENDING"
     VETOED = "VETOED"
     APPROVED = "APPROVED"
     EXECUTED = "EXECUTED"
+    FAILED = "FAILED"
     EXPIRED = "EXPIRED"
 
 
@@ -178,10 +188,10 @@ class ActionStatus(str, enum.Enum):
 class PendingAction:
     action_id: str
     created_at_ms: int
-    execute_at_ms: Optional[int]  # only used in ACTIVE (veto window)
+    execute_at_ms: Optional[int]
     status: ActionStatus
 
-    target_type: str     # "ip" | "identity" | "session"
+    target_type: str     # "ip" | "identity"
     target_value: str
 
     primary_action: str
@@ -205,6 +215,7 @@ class PendingAction:
 
 _SAFE_COMPONENT_RE = re.compile(r"[^a-zA-Z0-9.:_\-@]")
 
+
 def sanitize_key_component(value: str, *, max_len: int = 200) -> str:
     s = "" if value is None else str(value)
     s = s.strip()
@@ -224,11 +235,6 @@ def pseudonymize(value: str) -> str:
 
 
 def normalize_ip(ip: str) -> str:
-    """
-    Canonicalize IP formatting if valid, else return stripped original.
-    We do NOT hard-fail because you may feed internal identifiers sometimes,
-    but we normalize when we can.
-    """
     s = "" if ip is None else str(ip).strip()
     try:
         return str(ipaddress.ip_address(s))
@@ -236,8 +242,39 @@ def normalize_ip(ip: str) -> str:
         return s
 
 
-def utc_iso() -> str:
-    return __import__("datetime").datetime.utcnow().isoformat(timespec="microseconds") + "Z"
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _json_dumps(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+# ============================================================
+# INTEGRATION HUB (REAL-WORLD EFFECTS LIVE HERE)
+# ============================================================
+
+class IntegrationHub:
+    """
+    Replace these with actual integrations:
+    - firewall / WAF / IAM / SIEM / ticketing / paging
+    Keep this as the terminal boundary for effects.
+    """
+
+    @staticmethod
+    def execute(directive: PendingAction) -> bool:
+        # Stub: do NOT do real blocking here unless you wire it intentionally.
+        # This function is the only place you're allowed to touch the outside world.
+        logger.warning(
+            "[INTEGRATION] EXECUTE %s target_type=%s target=%s primary=%s severity=%s reason=%s",
+            directive.action_id,
+            directive.target_type,
+            pseudonymize(directive.target_value),
+            directive.primary_action,
+            directive.severity,
+            directive.reason,
+        )
+        return True
 
 
 # ============================================================
@@ -251,165 +288,240 @@ class ActionStore(Protocol):
     def insert_pending_action(self, pa: PendingAction) -> None: ...
     def update_action_status(self, action_id: str, new_status: ActionStatus, *, operator_id: Optional[str], operator_reason: Optional[str], expected_status: ActionStatus) -> bool: ...
     def get_action_status(self, action_id: str) -> Optional[str]: ...
+    def fetch_due_pending(self, *, now_ms: int, limit: int) -> List[PendingAction]: ...
+    def mark_pending_executing(self, action_id: str) -> bool: ...
+    def finalize_execution(self, action_id: str, *, ok: bool, operator_reason: str = "") -> None: ...
+    def expire_overdue(self, *, now_ms: int) -> int: ...
     def cleanup_old_logs(self, retention_days: int) -> int: ...
     def cleanup_old_actions(self, retention_days: int) -> int: ...
 
 
 def _db_conn() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
 
 class SqliteActionStore:
+    """
+    Critical fixes:
+    - event_logs uses ts_ms INTEGER (no ISO comparison bugs)
+    - update_action_status uses cursor.rowcount (not conn.total_changes)
+    - all write paths use BEGIN IMMEDIATE to avoid lost-update races
+    """
+
+    _schema_lock = threading.RLock()
+
     def ensure_schema(self) -> None:
-        with _db_conn() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS event_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT NOT NULL,
-                    level TEXT NOT NULL,
-                    module TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    context_json TEXT
+        with self._schema_lock, _db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS event_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts_ms INTEGER NOT NULL,
+                        level TEXT NOT NULL,
+                        module TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        context_json TEXT
+                    )
+                    """
                 )
-                """
-            )
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_event_logs_ts ON event_logs(ts_ms)")
 
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS pending_actions (
-                    action_id TEXT PRIMARY KEY,
-                    created_at_ms INTEGER NOT NULL,
-                    execute_at_ms INTEGER,
-                    status TEXT NOT NULL,
-                    target_type TEXT NOT NULL,
-                    target_value TEXT NOT NULL,
-                    primary_action TEXT NOT NULL,
-                    actions_json TEXT NOT NULL,
-                    severity TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    source_kind TEXT NOT NULL,
-                    score REAL NOT NULL,
-                    reason TEXT NOT NULL,
-                    system_id TEXT NOT NULL,
-                    operator_id TEXT,
-                    operator_reason TEXT
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS pending_actions (
+                        action_id TEXT PRIMARY KEY,
+                        created_at_ms INTEGER NOT NULL,
+                        execute_at_ms INTEGER,
+                        status TEXT NOT NULL,
+                        target_type TEXT NOT NULL,
+                        target_value TEXT NOT NULL,
+                        primary_action TEXT NOT NULL,
+                        actions_json TEXT NOT NULL,
+                        severity TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        source_kind TEXT NOT NULL,
+                        score REAL NOT NULL,
+                        reason TEXT NOT NULL,
+                        system_id TEXT NOT NULL,
+                        operator_id TEXT,
+                        operator_reason TEXT
+                    )
+                    """
                 )
-                """
-            )
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_actions_status_exec ON pending_actions(status, execute_at_ms)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_actions_created ON pending_actions(created_at_ms)")
 
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS action_dedupe (
-                    dedupe_key TEXT PRIMARY KEY,
-                    expires_at_ms INTEGER NOT NULL
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS action_dedupe (
+                        dedupe_key TEXT PRIMARY KEY,
+                        expires_at_ms INTEGER NOT NULL
+                    )
+                    """
                 )
-                """
-            )
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_dedupe_exp ON action_dedupe(expires_at_ms)")
 
-            # hygiene: remove expired dedupe entries
-            now_ms = int(time.time() * 1000)
-            conn.execute("DELETE FROM action_dedupe WHERE expires_at_ms <= ?", (now_ms,))
+                # Optional: tamper-evident audit chain (lightweight)
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS audit_chain (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        prev_hash TEXT NOT NULL
+                    )
+                    """
+                )
+                row = conn.execute("SELECT prev_hash FROM audit_chain WHERE id=1").fetchone()
+                if not row:
+                    conn.execute("INSERT INTO audit_chain (id, prev_hash) VALUES (1, ?)", ("0" * 64,))
 
-        # cleanup on startup (best-effort)
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS audit_events (
+                        ts_ms INTEGER NOT NULL,
+                        event_type TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        prev_hash TEXT NOT NULL,
+                        hash TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_events_ts ON audit_events(ts_ms)")
+
+                conn.execute("COMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+
+        # best-effort cleanup (never block boot)
         try:
             self.cleanup_old_logs(DEFAULT_LOG_RETENTION_DAYS)
             self.cleanup_old_actions(DEFAULT_ACTION_RETENTION_DAYS)
         except Exception:
-            # don't block boot on housekeeping failures
             pass
 
+    # --------------------
+    # Audit chain (optional)
+    # --------------------
+    def _append_audit(self, *, event_type: str, payload: Dict[str, Any]) -> None:
+        ts_ms = _now_ms()
+        payload_json = _json_dumps(payload)
+        with _db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                prev_hash = conn.execute("SELECT prev_hash FROM audit_chain WHERE id=1").fetchone()[0]
+                raw = (prev_hash + "|" + str(ts_ms) + "|" + event_type + "|" + payload_json).encode("utf-8")
+                h = hashlib.sha256(raw).hexdigest()
+                conn.execute(
+                    "INSERT INTO audit_events (ts_ms, event_type, payload_json, prev_hash, hash) VALUES (?, ?, ?, ?, ?)",
+                    (ts_ms, event_type, payload_json, prev_hash, h),
+                )
+                conn.execute("UPDATE audit_chain SET prev_hash=? WHERE id=1", (h,))
+                conn.execute("COMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+
+    # --------------------
+    # Event logs
+    # --------------------
     def log_event(self, level: str, module: str, message: str, context: Optional[Dict[str, Any]] = None) -> None:
-        ts = utc_iso()
-        ctx = json.dumps(context, default=str) if context else None
+        ts_ms = _now_ms()
+        ctx = _json_dumps(context) if context else None
         with _db_conn() as conn:
             conn.execute(
-                """
-                INSERT INTO event_logs (timestamp, level, module, message, context_json)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (ts, level, module, message, ctx),
+                "INSERT INTO event_logs (ts_ms, level, module, message, context_json) VALUES (?, ?, ?, ?, ?)",
+                (ts_ms, level, module, message, ctx),
             )
+        # also chain it (best-effort)
+        try:
+            self._append_audit(event_type=f"log.{level}", payload={"module": module, "message": message, "context": context or {}})
+        except Exception:
+            pass
 
+    # --------------------
+    # Dedupe
+    # --------------------
     def dedupe_check_and_set(self, key: str, ttl_seconds: int) -> bool:
-        """
-        Returns True if allowed (not a duplicate in TTL window).
-        Atomic under concurrency (no SELECT-then-act race).
-        """
-        now_ms = int(time.time() * 1000)
+        now_ms = _now_ms()
         exp_ms = now_ms + int(ttl_seconds * 1000)
 
-        # Hard cap to prevent key-bloat attacks
         key = ("" if key is None else str(key)).strip()
         if len(key) > 512:
             key = key[:512]
 
         with _db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
             try:
-                conn.execute("BEGIN IMMEDIATE")
                 conn.execute("DELETE FROM action_dedupe WHERE expires_at_ms <= ?", (now_ms,))
                 conn.execute(
                     "INSERT INTO action_dedupe (dedupe_key, expires_at_ms) VALUES (?, ?)",
                     (key, exp_ms),
                 )
-                conn.commit()
+                conn.execute("COMMIT;")
                 return True
             except sqlite3.IntegrityError:
-                conn.rollback()
+                conn.execute("ROLLBACK;")
                 return False
             except Exception:
-                conn.rollback()
+                conn.execute("ROLLBACK;")
                 raise
 
+    # --------------------
+    # Actions
+    # --------------------
     def insert_pending_action(self, pa: PendingAction) -> None:
         with _db_conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO pending_actions (
-                    action_id, created_at_ms, execute_at_ms, status,
-                    target_type, target_value,
-                    primary_action, actions_json,
-                    severity, kind, source_kind, score,
-                    reason, system_id,
-                    operator_id, operator_reason
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO pending_actions (
+                        action_id, created_at_ms, execute_at_ms, status,
+                        target_type, target_value,
+                        primary_action, actions_json,
+                        severity, kind, source_kind, score,
+                        reason, system_id,
+                        operator_id, operator_reason
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        pa.action_id,
+                        pa.created_at_ms,
+                        pa.execute_at_ms,
+                        pa.status.value,
+                        pa.target_type,
+                        pa.target_value,
+                        pa.primary_action,
+                        pa.actions_json,
+                        pa.severity,
+                        pa.kind,
+                        pa.source_kind,
+                        float(pa.score),
+                        pa.reason,
+                        pa.system_id,
+                        pa.operator_id,
+                        pa.operator_reason,
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    pa.action_id,
-                    pa.created_at_ms,
-                    pa.execute_at_ms,
-                    pa.status.value,
-                    pa.target_type,
-                    pa.target_value,
-                    pa.primary_action,
-                    pa.actions_json,
-                    pa.severity,
-                    pa.kind,
-                    pa.source_kind,
-                    float(pa.score),
-                    pa.reason,
-                    pa.system_id,
-                    pa.operator_id,
-                    pa.operator_reason,
-                ),
-            )
+                conn.execute("COMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
 
     def get_action_status(self, action_id: str) -> Optional[str]:
         with _db_conn() as conn:
-            row = conn.execute(
-                "SELECT status FROM pending_actions WHERE action_id = ?",
-                (action_id,),
-            ).fetchone()
-            if not row:
-                return None
-            return str(row["status"])
+            row = conn.execute("SELECT status FROM pending_actions WHERE action_id=?", (action_id,)).fetchone()
+            return str(row["status"]) if row else None
 
     def update_action_status(
         self,
@@ -424,39 +536,130 @@ class SqliteActionStore:
         rsn = operator_reason[:300] if operator_reason else None
 
         with _db_conn() as conn:
-            conn.execute(
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                cur = conn.execute(
+                    """
+                    UPDATE pending_actions
+                       SET status=?, operator_id=?, operator_reason=?
+                     WHERE action_id=?
+                       AND status=?
+                    """,
+                    (new_status.value, op, rsn, action_id, expected_status.value),
+                )
+                conn.execute("COMMIT;")
+                return int(cur.rowcount or 0) > 0
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+
+    def fetch_due_pending(self, *, now_ms: int, limit: int) -> List[PendingAction]:
+        with _db_conn() as conn:
+            rows = conn.execute(
                 """
-                UPDATE pending_actions
-                   SET status = ?, operator_id = ?, operator_reason = ?
-                 WHERE action_id = ?
-                   AND status = ?
+                SELECT * FROM pending_actions
+                 WHERE status = ?
+                   AND execute_at_ms IS NOT NULL
+                   AND execute_at_ms <= ?
+                 ORDER BY execute_at_ms ASC
+                 LIMIT ?
                 """,
-                (new_status.value, op, rsn, action_id, expected_status.value),
+                (ActionStatus.PENDING.value, int(now_ms), int(limit)),
+            ).fetchall()
+
+        out: List[PendingAction] = []
+        for r in rows:
+            out.append(
+                PendingAction(
+                    action_id=str(r["action_id"]),
+                    created_at_ms=int(r["created_at_ms"]),
+                    execute_at_ms=int(r["execute_at_ms"]) if r["execute_at_ms"] is not None else None,
+                    status=ActionStatus(str(r["status"])),
+                    target_type=str(r["target_type"]),
+                    target_value=str(r["target_value"]),
+                    primary_action=str(r["primary_action"]),
+                    actions_json=str(r["actions_json"]),
+                    severity=str(r["severity"]),
+                    kind=str(r["kind"]),
+                    source_kind=str(r["source_kind"]),
+                    score=float(r["score"]),
+                    reason=str(r["reason"]),
+                    system_id=str(r["system_id"]),
+                    operator_id=str(r["operator_id"]) if r["operator_id"] is not None else None,
+                    operator_reason=str(r["operator_reason"]) if r["operator_reason"] is not None else None,
+                )
             )
-            return conn.total_changes > 0
+        return out
+
+    def mark_pending_executing(self, action_id: str) -> bool:
+        """
+        Claim the action atomically so only one executor runs it.
+        Uses expected_status=PENDING -> APPROVED as "claimed for execution".
+        """
+        return self.update_action_status(
+            action_id,
+            ActionStatus.APPROVED,
+            operator_id="executor",
+            operator_reason="claimed_for_execution",
+            expected_status=ActionStatus.PENDING,
+        )
+
+    def finalize_execution(self, action_id: str, *, ok: bool, operator_reason: str = "") -> None:
+        new_status = ActionStatus.EXECUTED if ok else ActionStatus.FAILED
+        # Expected_status is APPROVED because executor claimed it.
+        self.update_action_status(
+            action_id,
+            new_status,
+            operator_id="executor",
+            operator_reason=(operator_reason or "")[:300],
+            expected_status=ActionStatus.APPROVED,
+        )
+
+    def expire_overdue(self, *, now_ms: int) -> int:
+        """
+        Safety valve: expire ancient PENDING actions that never got executed.
+        (You can tune this if you want longer windows.)
+        """
+        stale_before = int(now_ms) - (24 * 3600 * 1000)  # 24h
+        with _db_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                cur = conn.execute(
+                    """
+                    UPDATE pending_actions
+                       SET status=?
+                     WHERE status=?
+                       AND created_at_ms < ?
+                    """,
+                    (ActionStatus.EXPIRED.value, ActionStatus.PENDING.value, stale_before),
+                )
+                conn.execute("COMMIT;")
+                return int(cur.rowcount or 0)
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
 
     def cleanup_old_logs(self, retention_days: int) -> int:
-        from datetime import datetime, timedelta, timezone
-        cutoff = datetime.now(timezone.utc) - timedelta(days=int(retention_days))
-        cutoff_iso = cutoff.isoformat(timespec="seconds")
+        cutoff_ms = _now_ms() - int(retention_days) * 86400 * 1000
         with _db_conn() as conn:
-            cur = conn.execute("DELETE FROM event_logs WHERE timestamp < ?", (cutoff_iso,))
+            cur = conn.execute("DELETE FROM event_logs WHERE ts_ms < ?", (cutoff_ms,))
             return int(cur.rowcount or 0)
 
     def cleanup_old_actions(self, retention_days: int) -> int:
-        cutoff_ms = int((time.time() - (int(retention_days) * 86400)) * 1000)
+        cutoff_ms = _now_ms() - int(retention_days) * 86400 * 1000
         with _db_conn() as conn:
             cur = conn.execute(
                 """
                 DELETE FROM pending_actions
                  WHERE created_at_ms < ?
-                   AND status IN (?, ?, ?, ?)
+                   AND status IN (?, ?, ?, ?, ?)
                 """,
                 (
                     cutoff_ms,
                     ActionStatus.VETOED.value,
-                    ActionStatus.APPROVED.value,
                     ActionStatus.EXECUTED.value,
+                    ActionStatus.APPROVED.value,
+                    ActionStatus.FAILED.value,
                     ActionStatus.EXPIRED.value,
                 ),
             )
@@ -469,13 +672,12 @@ class SqliteActionStore:
 
 class Sentinel43ResponseEngine:
     """
-    Sentinel-43 response engine:
-      - consumes ThreatAssessment (from detector layer)
+    Single-file Nexus:
+      - consumes ThreatAssessment
       - produces ResponseDirective
-      - stages/persists PendingAction according to mode
-      - logs (PII-safe via hashing in event logs)
-      - dedupes action spam (atomic DB dedupe)
-      - provides authenticated approval/veto APIs
+      - stages actions in SQLite
+      - ACTIVE mode auto-executes due actions via an executor thread
+      - approvals/veto are authenticated via provided authenticator callback
     """
 
     def __init__(
@@ -485,16 +687,34 @@ class Sentinel43ResponseEngine:
         dedupe_ttl_seconds: int = DEFAULT_DEDUPE_TTL_SECONDS,
         *,
         operator_authenticator: Optional[Callable[[str], bool]] = None,
+        integration: Optional[type] = None,
     ) -> None:
         self.store = store or SqliteActionStore()
         self.policy = policy or ResponsePolicy()
         self.dedupe_ttl_seconds = int(dedupe_ttl_seconds)
 
-        # Fail-closed by default: if you want approvals, you must provide auth.
+        # Fail-closed: if you want approvals, you must provide auth.
         self._operator_authenticator = operator_authenticator or (lambda _op: False)
 
+        self._integration = integration or IntegrationHub
+
+        self._stop = threading.Event()
+        self._executor_thread = threading.Thread(target=self._executor_loop, name="sentinel43-executor", daemon=True)
+
         self.store.ensure_schema()
-        self.store.log_event("INFO", "BOOT", "Sentinel-43 Response Engine initialized.", {"system_id": SYSTEM_ID})
+        self.store.log_event("INFO", "BOOT", "Sentinel-43 Nexus initialized.", {"system_id": SYSTEM_ID})
+
+        # Start executor
+        self._executor_thread.start()
+
+    # ------------------------------
+    # Shutdown
+    # ------------------------------
+    def shutdown(self) -> None:
+        self.store.log_event("INFO", "SYSTEM", "Shutdown requested.", {"system_id": SYSTEM_ID})
+        self._stop.set()
+        self._executor_thread.join(timeout=5)
+        self.store.log_event("INFO", "SYSTEM", "Shutdown complete.", {"system_id": SYSTEM_ID})
 
     # ------------------------------
     # PUBLIC ENTRY
@@ -502,7 +722,7 @@ class Sentinel43ResponseEngine:
     def handle_assessment(self, mode: SentinelMode, assessment: ThreatAssessment) -> Optional[PendingAction]:
         directive = self.plan_response(assessment)
 
-        # PII-safe: hash identity + ip in logs
+        # PII-safe logs
         self.store.log_event(
             "INFO",
             "RESPONSE",
@@ -549,6 +769,11 @@ class Sentinel43ResponseEngine:
             "Action approved" if ok else "Approval failed",
             {"action_id": action_id, "operator_id": op},
         )
+
+        # In HUMAN_GATED, approval means execute NOW.
+        if ok:
+            self._execute_approved_now(action_id)
+
         return ok
 
     def veto_action(self, action_id: str, operator_id: str, reason: str) -> bool:
@@ -568,6 +793,16 @@ class Sentinel43ResponseEngine:
             expected_status=ActionStatus.PENDING,
         )
 
+        # also allow veto of STAGED (human gated)
+        if not ok:
+            ok = self.store.update_action_status(
+                action_id,
+                ActionStatus.VETOED,
+                operator_id=op,
+                operator_reason=rsn,
+                expected_status=ActionStatus.STAGED,
+            )
+
         self.store.log_event(
             "WARN" if ok else "ERROR",
             "OVERSIGHT",
@@ -580,10 +815,8 @@ class Sentinel43ResponseEngine:
     # PLANNING
     # ------------------------------
     def plan_response(self, assessment: ThreatAssessment) -> ResponseDirective:
-        # normalize IP for consistency
         assessment_ip = normalize_ip(assessment.source_ip)
 
-        # Keep identity as provided; sanitize later for dedupe keys.
         a = ThreatAssessment(
             identity=assessment.identity,
             source_ip=assessment_ip,
@@ -709,7 +942,6 @@ class Sentinel43ResponseEngine:
 
         target_type, raw_target_value = self._pick_primary_target(d)
 
-        # Sanitize dedupe inputs (prevents keyspace abuse and keeps DB tidy)
         target_value = sanitize_key_component(raw_target_value, max_len=200)
         if not target_value:
             self.store.log_event(
@@ -737,7 +969,7 @@ class Sentinel43ResponseEngine:
             return None
 
         action_id = self._new_action_id()
-        now_ms = int(time.time() * 1000)
+        now_ms = _now_ms()
 
         if mode == SentinelMode.SHADOW:
             status = ActionStatus.SHADOWED
@@ -749,23 +981,21 @@ class Sentinel43ResponseEngine:
             status = ActionStatus.PENDING
             execute_at_ms = now_ms + int(self.policy.veto_window_seconds * 1000)
 
-        actions_json = json.dumps(
+        actions_json = _json_dumps(
             {
                 "primary": d.primary_action.name,
                 "additional": [a.name for a in d.additional_actions],
                 "expires_at": d.expires_at,
-            },
-            default=str,
+            }
         )
 
-        # Store raw target_value in pending_actions (needed for real execution downstream).
         pa = PendingAction(
             action_id=action_id,
             created_at_ms=now_ms,
             execute_at_ms=execute_at_ms,
             status=status,
             target_type=target_type,
-            target_value=raw_target_value,
+            target_value=raw_target_value,  # raw is kept in DB for downstream execution
             primary_action=d.primary_action.name,
             actions_json=actions_json,
             severity=d.threat_severity.name,
@@ -778,7 +1008,6 @@ class Sentinel43ResponseEngine:
 
         self.store.insert_pending_action(pa)
 
-        # PII-safe staging log: hash target, do not dump raw target into event_logs
         self.store.log_event(
             "INFO",
             "OVERSIGHT",
@@ -806,8 +1035,113 @@ class Sentinel43ResponseEngine:
         return ("identity", d.identity)
 
     def _new_action_id(self) -> str:
-        # Non-guessable and collision-resistant
         return f"ACT-{uuid.uuid4().hex}".upper()
+
+    # ------------------------------
+    # ACTIVE EXECUTOR (the missing part)
+    # ------------------------------
+    def _executor_loop(self) -> None:
+        self.store.log_event("INFO", "EXECUTOR", "Executor thread online.", {"poll_ms": EXECUTOR_POLL_MS})
+        while not self._stop.is_set():
+            now_ms = _now_ms()
+
+            # best-effort expirations + hygiene
+            try:
+                expired = self.store.expire_overdue(now_ms=now_ms)
+                if expired:
+                    self.store.log_event("WARN", "EXECUTOR", "Expired stale pending actions", {"count": expired})
+            except Exception as exc:
+                self.store.log_event("ERROR", "EXECUTOR", "Expire pass failed", {"error": str(exc)})
+
+            try:
+                due = self.store.fetch_due_pending(now_ms=now_ms, limit=EXECUTOR_MAX_BATCH)
+                for pa in due:
+                    # Claim it atomically
+                    if not self.store.mark_pending_executing(pa.action_id):
+                        continue  # someone else claimed/vetoed it
+
+                    # Execute
+                    ok = False
+                    err = ""
+                    try:
+                        ok = bool(self._integration.execute(pa))
+                    except Exception as exc:
+                        err = str(exc)
+
+                    # Finalize
+                    try:
+                        self.store.finalize_execution(pa.action_id, ok=ok, operator_reason=(err or "ok"))
+                        self.store.log_event(
+                            "WARN" if ok else "ERROR",
+                            "EXECUTOR",
+                            "Executed action" if ok else "Execution failed",
+                            {"action_id": pa.action_id, "ok": ok, "error": err[:300]},
+                        )
+                    except Exception as exc:
+                        self.store.log_event("ERROR", "EXECUTOR", "Finalize failed", {"action_id": pa.action_id, "error": str(exc)})
+            except Exception as exc:
+                self.store.log_event("ERROR", "EXECUTOR", "Executor loop error", {"error": str(exc)})
+
+            self._stop.wait(timeout=max(0.05, EXECUTOR_POLL_MS / 1000.0))
+
+        self.store.log_event("INFO", "EXECUTOR", "Executor thread stopping.", {})
+
+    def _execute_approved_now(self, action_id: str) -> None:
+        """
+        HUMAN_GATED approval executes immediately.
+        We reuse the claim/execution pipeline by:
+          APPROVED (operator) -> EXECUTED/FAILED here directly.
+        """
+        # Minimal: just mark as EXECUTED if integration succeeds.
+        # If you want stronger semantics, add a fetch-by-id + execute.
+        try:
+            # Can't rely on in-memory; load it
+            with _db_conn() as conn:
+                row = conn.execute("SELECT * FROM pending_actions WHERE action_id=?", (action_id,)).fetchone()
+                if not row:
+                    return
+                pa = PendingAction(
+                    action_id=str(row["action_id"]),
+                    created_at_ms=int(row["created_at_ms"]),
+                    execute_at_ms=int(row["execute_at_ms"]) if row["execute_at_ms"] is not None else None,
+                    status=ActionStatus(str(row["status"])),
+                    target_type=str(row["target_type"]),
+                    target_value=str(row["target_value"]),
+                    primary_action=str(row["primary_action"]),
+                    actions_json=str(row["actions_json"]),
+                    severity=str(row["severity"]),
+                    kind=str(row["kind"]),
+                    source_kind=str(row["source_kind"]),
+                    score=float(row["score"]),
+                    reason=str(row["reason"]),
+                    system_id=str(row["system_id"]),
+                    operator_id=str(row["operator_id"]) if row["operator_id"] is not None else None,
+                    operator_reason=str(row["operator_reason"]) if row["operator_reason"] is not None else None,
+                )
+
+            ok = False
+            err = ""
+            try:
+                ok = bool(self._integration.execute(pa))
+            except Exception as exc:
+                err = str(exc)
+
+            # IMPORTANT: expected_status is APPROVED (operator set it)
+            self.store.update_action_status(
+                action_id,
+                ActionStatus.EXECUTED if ok else ActionStatus.FAILED,
+                operator_id="executor",
+                operator_reason=(err or "ok"),
+                expected_status=ActionStatus.APPROVED,
+            )
+            self.store.log_event(
+                "WARN" if ok else "ERROR",
+                "EXECUTOR",
+                "Executed approved action" if ok else "Approved action failed",
+                {"action_id": action_id, "ok": ok, "error": err[:300]},
+            )
+        except Exception as exc:
+            self.store.log_event("ERROR", "EXECUTOR", "Approved-now execution path failed", {"action_id": action_id, "error": str(exc)})
 
 
 # ============================================================
@@ -834,11 +1168,15 @@ if __name__ == "__main__":
     )
 
     pa = engine.handle_assessment(SentinelMode.ACTIVE, a)
-    print("Staged:", pa)
+    print("Staged (active):", pa)
 
-    # Demonstrate approval flow (would only make sense for HUMAN_GATED)
+    # Demonstrate approval flow (HUMAN_GATED)
     pa2 = engine.handle_assessment(SentinelMode.HUMAN_GATED, a)
     if pa2:
         print("Staged (gated):", pa2.action_id)
         ok = engine.approve_action(pa2.action_id, operator_id="admin", reason="reviewed")
         print("Approved:", ok)
+
+    # give executor a moment to run due actions
+    time.sleep(2)
+    engine.shutdown()
