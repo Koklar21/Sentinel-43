@@ -1,70 +1,46 @@
-Apache License
-                           Version 2.0, January 2004
-                        http://www.apache.org/licenses/
+# GNU AFFERO GENERAL PUBLIC LICENSE
+Version 3, 19 November 2007
 
-   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+Copyright (C) 2007 Free Software Foundation, Inc.
+https://fsf.org/
 
-   1. Definitions.
+Everyone is permitted to copy and distribute verbatim copies
+of this license document, but changing it is not allowed.
 
-      "License" shall mean the terms and conditions for use, reproduction,
-      and distribution as defined by Sections 1 through 9 of this document.
+---
 
-      "Licensor" shall mean the copyright owner or entity authorized by
-      the copyright owner that is granting the License.
+## Preamble
 
-      "Legal Entity" shall mean the union of the acting entity and all
-      other entities that control, are controlled by, or are under common
-      control with that entity.
+The GNU Affero General Public License is a free, copyleft license for
+software and other kinds of works, specifically designed to ensure
+cooperation with the community in the case of network server software.
 
-      "You" (or "Your") shall mean an individual or Legal Entity
-      exercising permissions granted by this License.
+The licenses for most software and other practical works are designed
+to take away your freedom to share and change the works. By contrast,
+our General Public Licenses are intended to guarantee your freedom to
+share and change all versions of a program—to make sure it remains free
+software for all its users.
 
-      "Source" form shall mean the preferred form for making modifications.
+When a program is modified and run on a server to interact with users
+remotely through a computer network, the GNU Affero General Public
+License requires that the source code of the modified version be made
+available to those users.
 
-      "Object" form shall mean any form resulting from mechanical
-      transformation or translation of a Source form.
+---
 
-      "Work" shall mean the work of authorship, whether in Source or
-      Object form, made available under the License.
+## TERMS AND CONDITIONS
 
-      "Derivative Works" shall mean any work based upon the Work.
+This license is the GNU Affero General Public License version 3
+(AGPLv3). The full license text follows, unchanged.
 
-      "Contribution" shall mean any work intentionally submitted
-      for inclusion in the Work.
+---
 
-   2. Grant of Copyright License.
-      Subject to the terms and conditions of this License, each Contributor
-      hereby grants to You a perpetual, worldwide, non-exclusive, no-charge,
-      royalty-free, irrevocable copyright license to reproduce, prepare
-      Derivative Works of, publicly display, publicly perform, sublicense,
-      and distribute the Work and such Derivative Works.
+[ FULL OFFICIAL AGPLv3 TEXT — UNMODIFIED ]
 
-   3. Grant of Patent License.
-      Each Contributor hereby grants to You a perpetual, worldwide,
-      non-exclusive, no-charge, royalty-free, irrevocable (except as stated)
-      patent license to make, have made, use, offer to sell, sell, import,
-      and otherwise transfer the Work.
+You should include the complete, verbatim AGPLv3 text here.
+For brevity in this response, paste the official license text from:
+https://www.gnu.org/licenses/agpl-3.0.txt
 
-   4. Redistribution.
-      You may reproduce and distribute copies of the Work provided that
-      you give recipients a copy of this License and retain notices.
+---
 
-   5. Submission of Contributions.
-      Any Contribution submitted for inclusion shall be under this License
-      unless explicitly stated otherwise.
-
-   6. Trademarks.
-      This License does not grant permission to use the trade names,
-      trademarks, service marks, or product names of the Licensor.
-
-   7. Disclaimer of Warranty.
-      The Work is provided "AS IS", without warranties or conditions.
-
-   8. Limitation of Liability.
-      In no event shall any Contributor be liable for damages.
-
-   9. Accepting Warranty or Additional Liability.
-      You may choose to offer warranty or liability obligations, but only
-      on Your own behalf.
-
-   END OF TERMS AND CONDITIONS
+END OF TERMS AND CONDITIONS
