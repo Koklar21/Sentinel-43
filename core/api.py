@@ -1,3 +1,15 @@
+<!--
+Copyright (c) 2026 Justin [LastName or Entity]
+
+Sentinel is dual-licensed:
+  (1) AGPL-3.0-or-later, or
+  (2) a commercial license (see COMMERCIAL_LICENSE.md).
+
+SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
+
+See LICENSE.md and COMMERCIAL_LICENSE.md at the repository root.
+-->
+
 from __future__ import annotations
 
 from dataclasses import asdict
