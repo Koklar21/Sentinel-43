@@ -44,7 +44,15 @@ Default: ADVISORY mode
 - Events analyzed, recommendations produced, audit stored
 - Execution is always external to the core
 """
+"""
+...
+Licensing
+This project is dual-licensed under:
+- AGPLv3 (see LICENSE-AGPLv3.md), or
+- A commercial license (see COMMERCIAL_LICENSE.md).
 
+If you use this over a network, AGPLv3 generally requires offering the Corresponding Source.
+"""
 from __future__ import annotations
 
 import enum
