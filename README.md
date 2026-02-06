@@ -1,7 +1,18 @@
-# sentinel43_nexus_onefile_advisory.py
-# Licensed under the Apache License, Version 2.0 (the "License");
-# http://www.apache.org/licenses/LICENSE-2.0
-
+# # sentinel43_nexus_onefile_advisory.py
+#
+# Sentinel-43 is dual-licensed:
+#   1) GNU Affero General Public License v3.0 (AGPLv3), or
+#   2) A commercial license (separate terms).
+#
+# You may use, modify, and distribute this software under the terms of the AGPLv3
+# unless you have purchased/received a commercial license from the copyright holder.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# NOTE: If you deploy this software to users over a network, the AGPL generally
+# requires you to provide the Corresponding Source to those users.
+#
+# Commercial licensing inquiries: see COMMERCIAL_LICENSE.md
 """
 SENTINEL-43: Advisory Risk + Response Recommendation Engine (Hardened, Public Version)
 
@@ -1098,4 +1109,4 @@ if __name__ == "__main__":
 
     print("Export approved:", nexus.export_approved(limit=10))
 
-    Sentinel is dual-licensed under AGPLv3 or a commercial license.
+    
