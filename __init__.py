@@ -1,409 +1,346 @@
 """
-SENTINEL-43 Package Initialization
+s34_auth.py — Sentinel-43 Authorization & Key Control
+=====================================================
 
-SPDX-License-Identifier: Apache-2.0
-Copyright (c) 2025 Justin
+SECURITY-CRITICAL FILE — REPO APPROVAL RULES
+--------------------------------------------
+This file is part of Sentinel-43’s trust perimeter. Any modification
+to this file or its execution path is SECURITY-SENSITIVE and subject
+to strict review.
 
-Purpose:
-- Safe, side-effect-free package bootstrap helpers
-- Config + logging bootstrap
-- Factories for runtime nexus + gateway app
+REQUIRED CONDITIONS FOR APPROVAL
+--------------------------------
+• No behavioral changes without explicit maintainer approval.
+• 24-hour activation delay is mandatory (NOT-BEFORE gate).
+• No plaintext secret persistence (no storing/logging/caching tokens).
+• Crypto guarantees are non-negotiable (salt + pepper + PBKDF2, constant-time compare).
+• No bypass paths (no debug flags, no env overrides that skip enforcement).
+• Scope enforcement must remain explicit (least-privilege; no implicit grants).
+• Auditability must be preserved (time gates, revocation, scope decisions).
+• No dependency inflation without justification and approval.
+• No architectural bleed: keep auth isolated from transport/business logic.
+• No license contamination: added code must comply with project licensing model.
+• Performance discipline: no expensive behavior without a scaling plan.
+
+AUTO-REJECT CONDITIONS
+----------------------
+• Hardcoded secrets/keys/credentials
+• Obfuscated logic or hidden behavior
+• Weakening cryptographic or timing guarantees
+• Altering activation timing without approval
+• Large refactors without a reviewed plan
+
+This file is an enforcement boundary. Treat it accordingly.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
 import logging
 import os
-import threading
+import secrets
+import sqlite3
+import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional, Sequence, Tuple, Any
-
-__all__ = [
-    "__version__",
-    "SentinelConfig",
-    "resolve_base_dir",
-    "load_config",
-    "configure_logging",
-    "create_nexus",
-    "create_gateway_app",
-]
-
-__version__ = "0.1.2"
-
-SYSTEM_ID_DEFAULT = "SENTINEL-43-NEXUS-01"
-DB_FILENAME_DEFAULT = "sentinel_secure.db"
-LOG_FILENAME_DEFAULT = "sentinel_system.log"
-
-_ALLOWED_MODES = {"SHADOW", "HUMAN_GATED", "AUTONOMOUS_VETO"}
+from typing import Optional, Sequence
 
 
-# ----------------------------
-# Back-compat env read
-# ----------------------------
-
-def _env_get(*keys: str, default: Optional[str] = None) -> Optional[str]:
-    for k in keys:
-        v = os.getenv(k)
-        if v is not None:
-            return v
-    return default
-
-
-# ----------------------------
-# Legacy Config (fallback only)
-# ----------------------------
+# ---------------------------
+# Config
+# ---------------------------
 
 @dataclass(frozen=True)
-class SentinelConfig:
-    system_id: str
-    base_dir: Path
-    db_path: Path
-    log_path: Path
+class AuthKeyConfig:
+    # Hard requirement: 24-hour activation delay
+    activation_delay_seconds: int = 24 * 60 * 60
 
-    gateway_host: str
-    gateway_port: int
+    # Default expiry if not specified (7 days)
+    default_expires_in_seconds: int = 7 * 24 * 60 * 60
 
-    jwt_secret: str
-    jwt_issuer: str
-    jwt_audience: str
+    # Pepper env var (REQUIRED in production)
+    pepper_env_var: str = "S43_AUTH_PEPPER"
 
-    default_mode: str
+    # PBKDF2 settings
+    hash_alg: str = "sha256"
+    hash_iters: int = 210_000
+    salt_bytes: int = 16
 
-
-def resolve_base_dir() -> Path:
-    env = _env_get("SENTINEL_BASE_DIR", "AEGIS_BASE_DIR")
-    if env:
-        return Path(env).expanduser().resolve()
-
-    # default to package directory
-    try:
-        return Path(__file__).resolve().parent
-    except Exception:
-        return Path.cwd().resolve()
+    # Token format
+    token_prefix: str = "S43K"
+    token_bytes: int = 32
 
 
-def _is_safe_path(path: Path, allowed_bases: Optional[Sequence[Path]] = None) -> bool:
-    try:
-        resolved = path.expanduser().resolve()
+# ---------------------------
+# Store
+# ---------------------------
 
-        forbidden = [
-            Path("/etc"),
-            Path("/sys"),
-            Path("/proc"),
-            Path("/dev"),
-            Path("/boot"),
-            Path("/root"),
-        ]
-        for base in forbidden:
-            try:
-                resolved.relative_to(base)
-                return False
-            except ValueError:
-                pass
+class AuthKeyStore:
+    """
+    SQLite-backed authorization key store with delayed activation.
 
-        if allowed_bases:
-            for base in allowed_bases:
-                try:
-                    resolved.relative_to(base.expanduser().resolve())
-                    return True
-                except ValueError:
-                    pass
+    Design:
+    - stores only salted+peppered PBKDF2 hash
+    - one-time plaintext token return on issuance
+    - constant-time compare for verification
+    - supports scopes, expiry, and revocation
+
+    NOTE (scaling):
+    verify_key() scans rows because we do not store plaintext or a lookup fingerprint.
+    Fine for early use. For large deployments, add a token fingerprint column.
+    """
+
+    def __init__(self, db_path: str, config: Optional[AuthKeyConfig] = None) -> None:
+        self.db_path = db_path
+        self.cfg = config or AuthKeyConfig()
+        self._ensure_schema()
+
+    # ---------- Public API ----------
+
+    def issue_key(
+        self,
+        subject: str,
+        scopes: Sequence[str],
+        issued_by: str,
+        *,
+        expires_in_seconds: Optional[int] = None,
+        metadata: Optional[dict] = None,
+    ) -> str:
+        """
+        Creates a new key and returns plaintext token ONE TIME.
+        """
+        now = int(time.time())
+        not_before = now + int(self.cfg.activation_delay_seconds)
+
+        exp_in = int(expires_in_seconds or self.cfg.default_expires_in_seconds)
+        expires_at = (now + exp_in) if exp_in > 0 else None
+
+        token = self._generate_token()
+        salt = secrets.token_bytes(self.cfg.salt_bytes)
+        key_hash = self._hash_token(token=token, salt=salt)
+
+        record = (
+            subject,
+            json.dumps(sorted(set(scopes))),
+            issued_by,
+            now,
+            not_before,
+            expires_at,
+            None,          # revoked_at
+            None,          # revoked_by
+            json.dumps(metadata or {}),
+            base64.b64encode(salt).decode("ascii"),
+            base64.b64encode(key_hash).decode("ascii"),
+        )
+
+        with self._conn() as cx:
+            cx.execute(
+                """
+                INSERT INTO auth_keys (
+                    subject, scopes_json, issued_by,
+                    issued_at, not_before, expires_at,
+                    revoked_at, revoked_by,
+                    metadata_json, salt_b64, hash_b64
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                record,
+            )
+
+        return token
+
+    def verify_key(
+        self,
+        token: str,
+        *,
+        required_scopes: Optional[Sequence[str]] = None,
+        now: Optional[int] = None,
+    ) -> bool:
+        """
+        Verifies:
+        - token matches stored hash (constant-time compare)
+        - not_before gate (24h delay)
+        - expires_at gate
+        - not revoked
+        - scope subset match (if required_scopes set)
+        """
+        now_ts = int(now or time.time())
+        required = set(required_scopes or [])
+
+        if not isinstance(token, str) or len(token) < 20:
             return False
 
-        return True
-    except Exception:
+        with self._conn() as cx:
+            rows = cx.execute(
+                """
+                SELECT
+                    scopes_json, not_before, expires_at, revoked_at,
+                    salt_b64, hash_b64
+                FROM auth_keys
+                """
+            ).fetchall()
+
+        for scopes_json, not_before, expires_at, revoked_at, salt_b64, hash_b64 in rows:
+            # Cheap gates first
+            if revoked_at is not None:
+                continue
+            if not_before is not None and now_ts < int(not_before):
+                continue
+            if expires_at is not None and now_ts > int(expires_at):
+                continue
+
+            try:
+                salt = base64.b64decode(salt_b64.encode("ascii"))
+                expected = base64.b64decode(hash_b64.encode("ascii"))
+            except Exception:
+                continue
+
+            actual = self._hash_token(token=token, salt=salt)
+            if hmac.compare_digest(expected, actual):
+                try:
+                    scopes = set(json.loads(scopes_json or "[]"))
+                except Exception:
+                    scopes = set()
+
+                if required and not required.issubset(scopes):
+                    return False
+                return True
+
         return False
 
+    def revoke_key(self, token: str, revoked_by: str, *, now: Optional[int] = None) -> bool:
+        """
+        Revokes a key by matching its token.
+        Returns True if revoked, False if not found.
+        """
+        now_ts = int(now or time.time())
 
-def _resolve_path(
-    env_key: str,
-    default_path: Path,
-    *,
-    legacy_env_key: Optional[str] = None,
-    allowed_bases: Optional[Sequence[Path]] = None,
-) -> Path:
-    raw = _env_get(env_key, legacy_env_key) if legacy_env_key else os.getenv(env_key)
-    if raw:
-        candidate = Path(raw).expanduser().resolve()
-        if not _is_safe_path(candidate, allowed_bases):
-            raise ValueError(f"Unsafe path in {env_key}: {raw}")
-        return candidate
-    return default_path.expanduser().resolve()
+        with self._conn() as cx:
+            rows = cx.execute(
+                """
+                SELECT id, salt_b64, hash_b64
+                FROM auth_keys
+                WHERE revoked_at IS NULL
+                """
+            ).fetchall()
 
+            for key_id, salt_b64, hash_b64 in rows:
+                try:
+                    salt = base64.b64decode(salt_b64.encode("ascii"))
+                    expected = base64.b64decode(hash_b64.encode("ascii"))
+                except Exception:
+                    continue
 
-def _require_secret(name: str, value: str, *, min_length: int = 32) -> None:
-    env = (_env_get("SENTINEL_ENV", "AEGIS_ENV", default="prod") or "prod").lower()
-    stripped = value.strip() if value else ""
+                actual = self._hash_token(token=token, salt=salt)
+                if hmac.compare_digest(expected, actual):
+                    cx.execute(
+                        """
+                        UPDATE auth_keys
+                        SET revoked_at = ?, revoked_by = ?
+                        WHERE id = ?
+                        """,
+                        (now_ts, revoked_by, key_id),
+                    )
+                    return True
 
-    weak = {
-        "dev-only-change-me",
-        "change-me",
-        "changeme",
-        "password",
-        "secret",
-        "default",
-        "test",
-        "admin",
-        "sentinel",
-        "aegis",
-    }
+        return False
 
-    is_weak = (not stripped) or (len(stripped) < min_length) or (stripped.lower() in weak)
+    def list_keys(self) -> list[dict]:
+        """
+        Lists keys WITHOUT revealing token.
+        """
+        with self._conn() as cx:
+            rows = cx.execute(
+                """
+                SELECT
+                    id, subject, scopes_json, issued_by,
+                    issued_at, not_before, expires_at,
+                    revoked_at, revoked_by, metadata_json
+                FROM auth_keys
+                ORDER BY id DESC
+                """
+            ).fetchall()
 
-    if is_weak:
-        msg = (
-            f"{name} is weak/missing (len={len(stripped)}, min={min_length}). "
-            "Generate: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
-        )
-        if env != "dev":
-            raise RuntimeError(msg)
-        logging.warning(f"[SECURITY] {msg}")
-
-
-def _load_config_legacy() -> SentinelConfig:
-    base_dir = resolve_base_dir()
-
-    allowed_bases = [
-        base_dir,
-        Path.cwd().resolve(),
-        (Path.home() / ".sentinel").expanduser().resolve(),
-        Path("/var/lib/sentinel"),
-    ]
-
-    system_id = _env_get("SENTINEL_SYSTEM_ID", "AEGIS_SYSTEM_ID", default=SYSTEM_ID_DEFAULT) or SYSTEM_ID_DEFAULT
-
-    db_path = _resolve_path(
-        "SENTINEL_DB_PATH",
-        base_dir / DB_FILENAME_DEFAULT,
-        legacy_env_key="AEGIS_DB_PATH",
-        allowed_bases=allowed_bases,
-    )
-    log_path = _resolve_path(
-        "SENTINEL_LOG_PATH",
-        base_dir / LOG_FILENAME_DEFAULT,
-        legacy_env_key="AEGIS_LOG_PATH",
-        allowed_bases=allowed_bases,
-    )
-
-    env = (_env_get("SENTINEL_ENV", "AEGIS_ENV", default="prod") or "prod").lower()
-    gateway_host = _env_get("SENTINEL_GATEWAY_HOST", "AEGIS_GATEWAY_HOST", default="127.0.0.1") or "127.0.0.1"
-    gateway_port = int(_env_get("SENTINEL_GATEWAY_PORT", "AEGIS_GATEWAY_PORT", default="8080") or "8080")
-
-    if gateway_host in ("0.0.0.0", "::", "*"):
-        if env != "dev":
-            if not (_env_get("SENTINEL_ALLOW_REMOTE_ACCESS", default="") or "").strip():
-                raise RuntimeError(
-                    "Remote bind requires explicit opt-in: set SENTINEL_ALLOW_REMOTE_ACCESS=1 "
-                    "(and put it behind TLS + firewall)."
-                )
-            logging.critical(
-                f"[SECURITY] Gateway binding to all interfaces: {gateway_host}:{gateway_port}. "
-                "Ensure TLS + firewall."
+        out: list[dict] = []
+        for r in rows:
+            out.append(
+                {
+                    "id": r[0],
+                    "subject": r[1],
+                    "scopes": json.loads(r[2] or "[]"),
+                    "issued_by": r[3],
+                    "issued_at": r[4],
+                    "not_before": r[5],
+                    "expires_at": r[6],
+                    "revoked_at": r[7],
+                    "revoked_by": r[8],
+                    "metadata": json.loads(r[9] or "{}"),
+                }
             )
-        else:
-            logging.warning(
-                f"[SECURITY] Dev binding to all interfaces: {gateway_host}:{gateway_port}. "
-                "Do not do this on a real network."
+        return out
+
+    # ---------- Internals ----------
+
+    def _generate_token(self) -> str:
+        raw = secrets.token_bytes(self.cfg.token_bytes)
+        b64 = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+        return f"{self.cfg.token_prefix}_{b64}"
+
+    def _pepper(self) -> bytes:
+        pep = os.environ.get(self.cfg.pepper_env_var, "")
+        if not pep:
+            # Still functions, but you should NOT ship this into real prod.
+            logging.getLogger(__name__).warning(
+                "[SECURITY] S43_AUTH_PEPPER not set. Using DEV fallback pepper. "
+                "Set S43_AUTH_PEPPER in env/secrets manager for production."
             )
+            pep = "DEV_ONLY__SET_S43_AUTH_PEPPER"
+        return pep.encode("utf-8")
 
-    jwt_secret = _env_get("SENTINEL_JWT_SECRET", "AEGIS_JWT_SECRET", default="") or ""
-    jwt_issuer = _env_get("SENTINEL_JWT_ISSUER", "AEGIS_JWT_ISSUER", default="sentinel") or "sentinel"
-    jwt_audience = _env_get("SENTINEL_JWT_AUDIENCE", "AEGIS_JWT_AUDIENCE", default="sentinel-remote") or "sentinel-remote"
-
-    default_mode = (_env_get("SENTINEL_DEFAULT_MODE", "AEGIS_DEFAULT_MODE", default="SHADOW") or "SHADOW").upper()
-    if default_mode not in _ALLOWED_MODES:
-        raise ValueError(f"SENTINEL_DEFAULT_MODE invalid: {default_mode}. Allowed: {sorted(_ALLOWED_MODES)}")
-
-    _require_secret("SENTINEL_JWT_SECRET", jwt_secret, min_length=32)
-
-    return SentinelConfig(
-        system_id=system_id,
-        base_dir=base_dir,
-        db_path=db_path,
-        log_path=log_path,
-        gateway_host=gateway_host,
-        gateway_port=gateway_port,
-        jwt_secret=jwt_secret,
-        jwt_issuer=jwt_issuer,
-        jwt_audience=jwt_audience,
-        default_mode=default_mode,
-    )
-
-
-def load_config() -> Any:
-    """
-    Prefer new settings system (core.config.get_settings).
-    Fall back to legacy env-based SentinelConfig for back-compat.
-    """
-    # Try the new settings (pydantic) first
-    try:
-        from .core.config import get_settings  # type: ignore
-        return get_settings()
-    except Exception:
-        return _load_config_legacy()
-
-
-# ----------------------------
-# Logging Bootstrap (thread-safe)
-# ----------------------------
-
-_LOGGING_LOCK = threading.Lock()
-_LOGGING_CONFIGURED = False
-
-
-def configure_logging(config: Optional[Any] = None) -> None:
-    """
-    Idempotent logging setup. Safe to call multiple times.
-    If new settings exists, honors it. Otherwise uses legacy paths.
-    """
-    global _LOGGING_CONFIGURED
-    if _LOGGING_CONFIGURED:
-        return
-
-    with _LOGGING_LOCK:
-        if _LOGGING_CONFIGURED:
-            return
-
-        cfg = config or load_config()
-
-        handlers = [logging.StreamHandler()]
-
-        # Determine log path if available
-        log_path: Optional[Path] = None
-        try:
-            # new Settings has log_dir; legacy has log_path
-            if hasattr(cfg, "log_dir"):
-                log_path = Path(getattr(cfg, "log_dir")) / "sentinel43.log"
-            elif hasattr(cfg, "log_path"):
-                log_path = Path(getattr(cfg, "log_path"))
-        except Exception:
-            log_path = None
-
-        if log_path:
-            try:
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                handlers.insert(0, logging.FileHandler(log_path, encoding="utf-8"))
-            except Exception as e:
-                import sys
-                print(f"Warning: file logging unavailable: {e}", file=sys.stderr)
-
-        level = (_env_get("SENTINEL_LOG_LEVEL", "AEGIS_LOG_LEVEL", default="INFO") or "INFO").upper()
-
-        logging.basicConfig(
-            level=level,
-            format="%(asctime)s | %(levelname)-8s | %(name)-18s | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-            handlers=handlers,
+    def _hash_token(self, token: str, salt: bytes) -> bytes:
+        material = token.encode("utf-8") + b"|" + self._pepper()
+        return hashlib.pbkdf2_hmac(
+            self.cfg.hash_alg,
+            material,
+            salt,
+            self.cfg.hash_iters,
+            dklen=32,
         )
 
-        # Keep uvicorn logs reasonable if used
-        logging.getLogger("uvicorn").setLevel(logging.INFO)
-        logging.getLogger("uvicorn.error").setLevel(logging.INFO)
-        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    def _conn(self) -> sqlite3.Connection:
+        cx = sqlite3.connect(self.db_path)
+        cx.execute("PRAGMA foreign_keys = ON;")
+        cx.execute("PRAGMA journal_mode = WAL;")
+        cx.execute("PRAGMA synchronous = NORMAL;")
+        return cx
 
-        _LOGGING_CONFIGURED = True
-        logging.getLogger(__name__).info("[BOOT] Logging configured.")
+    def _ensure_schema(self) -> None:
+        with self._conn() as cx:
+            cx.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auth_keys (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subject TEXT NOT NULL,
+                    scopes_json TEXT NOT NULL,
+                    issued_by TEXT NOT NULL,
 
+                    issued_at INTEGER NOT NULL,
+                    not_before INTEGER NOT NULL,
+                    expires_at INTEGER NULL,
 
-# ----------------------------
-# Import helpers + Factories
-# ----------------------------
+                    revoked_at INTEGER NULL,
+                    revoked_by TEXT NULL,
 
-def _try_import_candidates(
-    base_pkg: str,
-    candidates: Sequence[Tuple[str, str]],
-) -> object:
-    """
-    candidates: [(module_path, symbol_name), ...]
-    module_path is absolute-from-base, e.g. ".sentinel_node"
-    """
-    import_errors = []
-    for module_path, symbol in candidates:
-        try:
-            module = __import__(base_pkg + module_path, fromlist=[symbol])
-            return getattr(module, symbol)
-        except Exception as exc:
-            import_errors.append(f"{module_path}.{symbol}: {exc}")
+                    metadata_json TEXT NOT NULL,
 
-    raise ImportError("Could not import runtime object. Tried:\n- " + "\n- ".join(import_errors))
-
-
-def create_nexus(config: Optional[Any] = None):
-    """
-    Creates your Sentinel runtime object.
-    Tries multiple known names for back-compat.
-    """
-    cfg = config or load_config()
-    configure_logging(cfg)
-
-    base_pkg = __package__ or __name__  # safer than __name__ alone
-
-    RuntimeClass = _try_import_candidates(
-        base_pkg,
-        candidates=(
-            (".sentinel43_orchestrator", "SentinelNode"),
-            (".sentinel43_nexus", "SecurityNexus"),
-            (".sentinel_nexus_node", "SecurityNexus"),
-            (".sentinel_node", "SentinelNode"),
-            (".sentinel_nexus", "SecurityNexus"),
-            (".sentinel43", "SentinelNode"),
-            (".sentinel43", "SecurityNexus"),
-            (".aegis_remote_legacy", "SecurityNode"),
-        ),
-    )
-
-    # Prefer explicit db path if supported
-    db_path = None
-    if hasattr(cfg, "db_path"):
-        db_path = getattr(cfg, "db_path")
-    elif hasattr(cfg, "db_url"):
-        db_path = getattr(cfg, "db_url")
-
-    try:
-        node = RuntimeClass(audit_db_path=db_path) if db_path else RuntimeClass()
-    except Exception:
-        node = RuntimeClass()
-
-    logging.getLogger(__name__).info("[BOOT] Nexus created.")
-    return node
-
-
-def create_gateway_app(config: Optional[Any] = None):
-    """
-    Returns the FastAPI app for remote access.
-    Supports either:
-    - factory: create_app(config)
-    - module-level: app
-    """
-    cfg = config or load_config()
-    configure_logging(cfg)
-
-    # NON-SECRETS env bridging only
-    def _set(k: str, v: str) -> None:
-        if v:
-            os.environ.setdefault(k, v)
-
-    # Legacy config fields
-    if hasattr(cfg, "system_id"):
-        _set("SENTINEL_SYSTEM_ID", str(getattr(cfg, "system_id")))
-        _set("AEGIS_SYSTEM_ID", str(getattr(cfg, "system_id")))
-
-    if hasattr(cfg, "db_path"):
-        _set("SENTINEL_DB_PATH", str(getattr(cfg, "db_path")))
-        _set("AEGIS_DB_PATH", str(getattr(cfg, "db_path")))
-
-    # New settings fields
-    if hasattr(cfg, "db_url"):
-        _set("SENTINEL_DB_URL", str(getattr(cfg, "db_url")))
-
-    base_pkg = __package__ or __name__
-
-    try:
-        from .sentinel_remote_gateway import create_app  # type: ignore
-        logging.getLogger(__name__).info("[BOOT] Remote Gateway app created (factory).")
-        return create_app(cfg)
-    except Exception:
-        from .sentinel_remote_gateway import app  # type: ignore
-        logging.getLogger(__name__).info("[BOOT] Remote Gateway app loaded (module-level app).")
-        return app
+                    salt_b64 TEXT NOT NULL,
+                    hash_b64 TEXT NOT NULL
+                );
+                """
+            )
+            cx.execute("CREATE INDEX IF NOT EXISTS idx_auth_keys_subject ON auth_keys(subject);")
+            cx.execute("CREATE INDEX IF NOT EXISTS idx_auth_keys_revoked ON auth_keys(revoked_at);")
+            cx.execute("CREATE INDEX IF NOT EXISTS idx_auth_keys_not_before ON auth_keys(not_before);")
+            cx.execute("CREATE INDEX IF NOT EXISTS idx_auth_keys_expires ON auth_keys(expires_at);")
