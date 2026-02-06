@@ -1,4 +1,82 @@
 """
+s34_auth.py — Sentinel-43 Authorization & Key Control
+=====================================================
+
+SECURITY-CRITICAL FILE — REPO APPROVAL RULES
+--------------------------------------------
+This file is part of Sentinel-43’s trust perimeter. Any modification
+to this file or its execution path is SECURITY-SENSITIVE and subject
+to strict review.
+
+REQUIRED CONDITIONS FOR APPROVAL
+--------------------------------
+• No behavioral changes without explicit maintainer approval.
+  - This file governs authorization, activation timing, and trust gates.
+  - Unauthorized edits are treated as security regressions.
+
+• 24-hour activation delay is mandatory.
+  - The NOT-BEFORE enforcement window must remain intact.
+  - No overrides, environment shortcuts, debug flags, or test bypasses.
+
+• No plaintext secret persistence.
+  - Authorization tokens must NEVER be stored, logged, cached,
+    or reconstructed.
+  - One-time token visibility is mandatory.
+
+• Cryptographic guarantees are non-negotiable.
+  - Salting, pepper usage, PBKDF2/HMAC, and constant-time comparisons
+    must remain enforced.
+  - Weakening or replacing crypto primitives is grounds for rejection.
+
+• No bypass paths.
+  - All verification must converge on the same enforcement logic.
+  - No alternate validation flows, “temporary” skips, or shortcuts.
+
+• Scope enforcement must remain explicit.
+  - Least-privilege only.
+  - No wildcard scopes, implicit grants, or silent expansions.
+
+• Auditability must be preserved.
+  - Issuance time, activation delay, expiration, revocation,
+    and scope decisions must remain inspectable.
+  - Removal of audit-relevant fields is forbidden.
+
+• No dependency inflation.
+  - New dependencies require justification, security review,
+    and explicit approval.
+
+• No architectural bleed.
+  - Authorization logic stays isolated.
+  - Do not mix auth with transport, business logic, or unrelated concerns.
+
+• No license contamination.
+  - Added code must comply with the project’s licensing model
+    (including commercial protections).
+
+• Performance discipline required.
+  - No unbounded scans or expensive operations without
+    documented scaling plans that preserve security invariants.
+
+• Maintainer authority is final.
+  - If changes do not align with Sentinel-43 methodology,
+    structure, or security posture, they will not be merged.
+
+AUTO-REJECT CONDITIONS
+----------------------
+• Hardcoded secrets, keys, or credentials
+• Obfuscated or intentionally unclear logic
+• Altering activation timing without approval
+• Weakening cryptographic or timing guarantees
+• Large refactors without scoped, reviewed plans
+• Mixing authorization with unrelated systems
+
+This file is not “just code.”
+It is an enforcement boundary.
+Treat it accordingly.
+"""
+
+
+"""
 Sentinel-43 Authorization Keys (Delayed Activation)
 ---------------------------------------------------
 
