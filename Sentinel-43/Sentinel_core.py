@@ -242,7 +242,7 @@ class AuditLogger:
         return conn
 
        @contextmanager
-    def _conn_txn(self) -> Iterator[sqlite3.Connection]:
+    def _conn_txn(self): -> Iterator[sqlite3.Connection]:
         """
         Lease a pooled connection, open a BEGIN IMMEDIATE transaction, and
         guarantee commit/rollback + return-to-pool.
