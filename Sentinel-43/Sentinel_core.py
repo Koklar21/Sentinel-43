@@ -2,19 +2,6 @@
 # Copyright (c) 2025 Justin
 #
 # SENTINEL-43: Intelligent Log Triage & Response Orchestrator (Hardened Foundation)
-#
-# Hardened features implemented (actually, not just claimed):
-# - SQLite connection pool with proper cleanup
-# - BEGIN IMMEDIATE transactions for all state operations (no lost updates)
-# - Tamper-evident audit chain with optimistic locking + retry
-# - heapq scheduler (O(log n)) + cancel race mitigation
-# - Background cleanup thread (no cleanup on hot path)
-# - Indexes for cleanup queries
-# - Action execution timeout wrapper that does NOT deadlock scheduler threads
-# - Graceful shutdown with queue drain
-# - Immutable metadata copy
-# - Input validation
-# - Configurable delays + metrics
 
 from __future__ import annotations
 
@@ -31,16 +18,14 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from queue import Empty, Full, Queue
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Logging (NO basicConfig here. Orchestration owns global logging.)
 # ---------------------------------------------------------------------------
 
 logger = logging.getLogger(__name__)
-
 SYSTEM_ID = "SENTINEL-43-NODE-01"
-
 
 # ---------------------------------------------------------------------------
 # Enums & Models
@@ -83,7 +68,6 @@ class AnomalyRecord:
     event_id: str
 
     def __post_init__(self) -> None:
-        # Copy to prevent external mutation. "Frozen" doesn't freeze nested dicts.
         object.__setattr__(self, "metadata", dict(self.metadata or {}))
 
 
@@ -131,7 +115,6 @@ class Metrics:
 # ---------------------------------------------------------------------------
 
 def _utcnow() -> _dt.datetime:
-    # Naive UTC for stable ISO handling in SQLite text fields.
     return _dt.datetime.utcnow().replace(tzinfo=None)
 
 
@@ -170,12 +153,6 @@ def _default_event_id(module_id: str, detected_at: _dt.datetime, description: st
 
 
 def execute_with_timeout(fn: Callable[[], None], *, timeout_seconds: int) -> Tuple[bool, Optional[str]]:
-    """
-    Thread-based timeout wrapper:
-    - Prevents scheduler thread from blocking forever.
-    - IMPORTANT LIMITATION: Python can't kill a stuck thread. If fn hangs, it may continue running.
-      That's a reality problem, not a "you problem". Use subprocesses for hard-kill.
-    """
     done = threading.Event()
     err: List[str] = []
 
@@ -220,7 +197,6 @@ class AuditLogger:
         self._pool: "Queue[sqlite3.Connection]" = Queue(maxsize=max(1, int(pool_size)))
         self._pool_size = max(1, int(pool_size))
 
-        # Serialize audit chain updates for ordering stability (chain correctness).
         self._chain_lock = threading.RLock()
 
         for _ in range(self._pool_size):
@@ -241,15 +217,11 @@ class AuditLogger:
         conn.execute("PRAGMA busy_timeout=5000;")
         return conn
 
-       @contextmanager
-    def _conn_txn(self): -> Iterator[sqlite3.Connection]:
+    @contextmanager
+    def _conn_txn(self) -> Iterator[sqlite3.Connection]:
         """
         Lease a pooled connection, open a BEGIN IMMEDIATE transaction, and
         guarantee commit/rollback + return-to-pool.
-
-        Notes:
-        - BEGIN IMMEDIATE prevents lost updates under concurrency.
-        - Even with isolation_level=None, explicit BEGIN/COMMIT/ROLLBACK works.
         """
         conn: Optional[sqlite3.Connection] = None
 
@@ -267,32 +239,6 @@ class AuditLogger:
                 conn.rollback()
             except Exception:
                 pass
-            raise
-        finally:
-            # Return to pool; if pool is full (shouldn't happen), close to avoid leaking.
-            try:
-                self._pool.put(conn, timeout=5.0)
-            except Full:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-
-
-            conn: Optional[sqlite3.Connection] = None
-        try:
-            conn = self._pool.get(timeout=5.0)
-            conn.execute("BEGIN IMMEDIATE;")
-            yield conn
-            conn.execute("COMMIT;")
-        except Empty as exc:
-            raise RuntimeError("Connection pool exhausted") from exc
-        except Exception:
-            if conn is not None:
-                try:
-                    conn.execute("ROLLBACK;")
-                except Exception:
-                    pass
             raise
         finally:
             if conn is not None:
@@ -1053,16 +999,12 @@ class SentinelNode:
         if not self._queue.empty():
             logger.warning("[SHUTDOWN] Queue drain timeout: %s items remain.", self._queue.qsize())
 
-        # wait for worker thread to exit cleanly
         self._worker.join(timeout=5)
 
         self.cleanup_manager.shutdown()
         self.scheduler.shutdown()
 
-        # LOG BEFORE closing the audit DB
         self._log(EventType.SYSTEM, "SYSTEM", "Shutdown complete.")
-
-        # close DB connections last
         self.audit.close()
 
     # ---- Worker Loop ----
