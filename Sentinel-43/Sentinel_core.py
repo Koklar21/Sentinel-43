@@ -241,21 +241,43 @@ class AuditLogger:
         conn.execute("PRAGMA busy_timeout=5000;")
         return conn
 
-    @contextmanager
-def _conn_txn(self) -> Iterator[sqlite3.Connection]:
-    conn: Optional[sqlite3.Connection] = None
-    try:
-        conn = self._pool.get(timeout=5.0)
-        conn.execute("BEGIN IMMEDIATE;")
-        yield conn
-        conn.commit()
-    except Exception:
-        if conn is not None:
-            conn.rollback()
-        raise
-    finally:
-        if conn is not None:
-            self._pool.put(conn)
+       @contextmanager
+    def _conn_txn(self) -> Iterator[sqlite3.Connection]:
+        """
+        Lease a pooled connection, open a BEGIN IMMEDIATE transaction, and
+        guarantee commit/rollback + return-to-pool.
+
+        Notes:
+        - BEGIN IMMEDIATE prevents lost updates under concurrency.
+        - Even with isolation_level=None, explicit BEGIN/COMMIT/ROLLBACK works.
+        """
+        conn: Optional[sqlite3.Connection] = None
+
+        try:
+            conn = self._pool.get(timeout=5.0)
+        except Empty as exc:
+            raise RuntimeError("Connection pool exhausted") from exc
+
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            yield conn
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            # Return to pool; if pool is full (shouldn't happen), close to avoid leaking.
+            try:
+                self._pool.put(conn, timeout=5.0)
+            except Full:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
 
             conn: Optional[sqlite3.Connection] = None
         try:
