@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from threading import RLock
 from typing import Deque, Dict, List, Optional, Tuple
 
-from .sentinel_threat_detector import EventContext, SequenceWindow
+from sentinel_43_ai.detection.sentinel_threat_detector import EventContext, SequenceWindow
+
 
 
 @dataclass(frozen=True)
