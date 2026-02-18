@@ -1,3 +1,67 @@
+# =============================================================================
+# Sentinel-43 Security Platform
+# =============================================================================
+#
+# Copyright (c) 2026 Justin. All rights reserved.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later OR Commercial
+#
+# Classification: INTERNAL
+#
+# This file is part of the Sentinel-43 security, audit, and orchestration system.
+#
+# =============================================================================
+# LICENSE (DUAL LICENSE MODEL)
+# =============================================================================
+#
+# OPEN SOURCE LICENSE OPTION (AGPLv3):
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#
+# See the GNU Affero General Public License for more details:
+#
+# https://www.gnu.org/licenses/agpl-3.0.html
+#
+#
+# COMMERCIAL LICENSE OPTION:
+#
+# This file may alternatively be used under the terms of a commercial license
+# issued by the copyright holder.
+#
+# Commercial licenses allow private use, modification, and distribution
+# without the copyleft requirements of the AGPL.
+#
+# For commercial licensing inquiries, contact:
+#
+# licensing@sentinel43.io
+#
+#
+# =============================================================================
+# FILE INFORMATION
+# =============================================================================
+#
+# Project: Sentinel-43
+# Component: Identity Core
+# File: models.py
+#
+# Description:
+# Immutable authentication identity models and cryptographic key usage audit records.
+#
+# Author: Justin
+# Created: 2026
+# Last Modified: 2026-02-18
+#
+# WARNING:
+# Unauthorized modification of this file may compromise system integrity.
+# All changes must be reviewed under Sentinel-43 governance controls.
+#
+# =============================================================================
 """
 s34_auth.py — Sentinel-43 Authorization & Key Control
 =====================================================
