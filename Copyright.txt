@@ -1,0 +1,7 @@
+Sentinel-43 Security Platform
+Copyright (c) 2026 Justin
+All rights reserved.
+
+This software is licensed under a dual-license model:
+- GNU Affero General Public License v3 (AGPLv3)
+- Commercial license available upon request
