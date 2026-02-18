@@ -1,3 +1,62 @@
+# =============================================================================
+# Sentinel-43 Watchtower Node
+# =============================================================================
+#
+# Copyright (c) 2026 Justin [Last Name Optional] / Sentinel-43 Project
+# All rights reserved.
+#
+# This file is part of the Sentinel-43 security and orchestration platform.
+#
+# =============================================================================
+# LICENSE TERMS (DUAL LICENSE MODEL)
+# =============================================================================
+#
+# OPEN SOURCE LICENSE OPTION:
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, version 3 of the License.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#
+# See the GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see:
+#
+#     https://www.gnu.org/licenses/agpl-3.0.html
+#
+#
+# COMMERCIAL LICENSE OPTION:
+#
+# This file may alternatively be used under the terms of a commercial license
+# issued by the copyright holder. Commercial licenses allow the use,
+# modification, and distribution of this software without the copyleft
+# requirements of the AGPL.
+#
+# To obtain a commercial license, contact:
+#
+#     licensing@sentinel43.io   (or your future business email)
+#
+#
+# =============================================================================
+# PROJECT INFORMATION
+# =============================================================================
+#
+# Project Name: Sentinel-43
+# Component: Watchtower Threat Detection Node
+# File: s43_watchtower_node.py
+#
+# Purpose:
+# Provides modular intrusion detection, event analysis, and alert generation
+# for Sentinel-43 distributed security infrastructure.
+#
+# Author: Justin
+# Initial Creation: 2026
+#
+# =============================================================================
 from __future__ import annotations
 
 import enum
