@@ -1,0 +1,4 @@
+AUTH_HEADER = "Authorization"
+BEARER_PREFIX = "Bearer "
+
+DEFAULT_ALGORITHM = "HS256"
