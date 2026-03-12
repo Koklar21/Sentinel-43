@@ -1,15 +1,3 @@
-"""
-Sentinel-43 Monitoring Package
-
-Central import surface for Watchtower monitoring behavior.
-
-This package exposes:
-- Watchtower node and config types
-- tower state/type enums
-- event normalization helpers
-- rule registry access
-"""
-
 from .watchtower import (
     WatchtowerState,
     TowerSlot,
@@ -41,8 +29,17 @@ from .rules import (
     registry,
 )
 
+from .manager import MonitoringManager
+
+from .exceptions import (
+    MonitoringError,
+    MonitoringConfigError,
+    EventNormalizationError,
+    RuleRegistrationError,
+    WatchtowerStateError,
+)
+
 __all__ = [
-    # watchtower core
     "WatchtowerState",
     "TowerSlot",
     "TowerType",
@@ -51,8 +48,6 @@ __all__ = [
     "WatchtowerSegment",
     "WatchtowerNode",
     "create_api_app",
-
-    # event layer
     "BaseEvent",
     "RequestEvent",
     "ExpectationEvent",
@@ -63,10 +58,14 @@ __all__ = [
     "ResourceEvent",
     "SecurityEvent",
     "normalize_event",
-
-    # rules layer
     "ThresholdProfile",
     "thresholds_for",
     "RuleRegistry",
     "registry",
+    "MonitoringManager",
+    "MonitoringError",
+    "MonitoringConfigError",
+    "EventNormalizationError",
+    "RuleRegistrationError",
+    "WatchtowerStateError",
 ]
