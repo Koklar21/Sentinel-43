@@ -35,7 +35,9 @@ class SentinelError(Exception):
         return f"{self.code}: {self.message}"
 
 
-# ---- Expectations (invariants / requirements) ----
+# ============================================================
+# Expectations (invariants / requirements)
+# ============================================================
 
 class ExpectationFailed(SentinelError):
     """Raised when a required invariant or expectation is not met."""
@@ -55,3 +57,27 @@ class PolicyExpectationFailed(ExpectationFailed):
 
 class DetectionExpectationFailed(ExpectationFailed):
     """Raised when detection pipeline expectations fail."""
+
+
+class MonitoringExpectationFailed(ExpectationFailed):
+    """Raised when monitoring subsystem expectations fail."""
+
+
+class WatchtowerExpectationFailed(MonitoringExpectationFailed):
+    """Raised when Watchtower runtime expectations fail."""
+
+
+class WatchtowerConfigExpectationFailed(MonitoringExpectationFailed):
+    """Raised when Watchtower configuration expectations fail."""
+
+
+class WatchtowerStateExpectationFailed(MonitoringExpectationFailed):
+    """Raised when Watchtower state transition expectations fail."""
+
+
+class WatchtowerInputExpectationFailed(MonitoringExpectationFailed):
+    """Raised when Watchtower event input expectations fail."""
+
+
+class WatchtowerRuleExpectationFailed(MonitoringExpectationFailed):
+    """Raised when Watchtower rule or threshold expectations fail."""
