@@ -1,3 +1,43 @@
+"""
+Sentinel-43 Monitoring Subsystem
+Watchtower Node Implementation
+
+Copyright (c) 2026 Justin [Last Name]
+
+This file is part of the Sentinel-43 project.
+
+LICENSE STRUCTURE
+-----------------
+Sentinel-43 is distributed under a dual-purpose license:
+
+1. Non-Commercial Research License
+   This software may be used, studied, modified, and shared for
+   personal, academic, and non-commercial research purposes.
+
+2. Commercial License
+   Any commercial, enterprise, governmental, or production use
+   requires a separate commercial license issued by the author.
+
+Restrictions
+------------
+You may NOT:
+
+- Sell this software or derivatives
+- Use this software in a commercial product
+- Deploy this software in a paid service
+- Repackage or redistribute this software for profit
+
+without explicit written permission.
+
+DISCLAIMER
+----------
+This software is provided "AS IS", without warranty of any kind.
+The author shall not be liable for damages arising from its use.
+
+Commercial licensing inquiries:
+contact: licensing@sentinel43.ai
+"""
+
 from __future__ import annotations
 
 import enum
