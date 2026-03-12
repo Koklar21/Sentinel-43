@@ -8,6 +8,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from .rules import ThresholdProfile, thresholds_for
+
 
 # ============================================================
 # Logging
@@ -33,6 +35,13 @@ def _clamp_int(name: str, value: Any, lo: int, hi: int) -> int:
     return iv
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _ensure_event_id(event: Dict[str, Any]) -> str:
     event_id = event.get("id")
     if isinstance(event_id, str) and event_id.strip():
@@ -40,36 +49,6 @@ def _ensure_event_id(event: Dict[str, Any]) -> str:
     new_id = str(uuid.uuid4())
     event["id"] = new_id
     return new_id
-
-
-# ============================================================
-# Threshold Profiles
-# ============================================================
-@dataclass(frozen=True)
-class ThresholdProfile:
-    error_rate_percent: int
-    expectation_fail_count: int
-    stale_config_seconds: int
-
-
-def thresholds_for(sensitivity: Any) -> ThresholdProfile:
-    """
-    Sensitivity 1..10
-      1  = quieter, fewer alerts
-      10 = aggressive, more alerts
-    """
-    s = _clamp_int("sensitivity", sensitivity, 1, 10)
-
-    # Higher sensitivity = lower thresholds
-    error_rate_percent = int(round(15 - (s - 1) * (10 / 9)))        # 15 -> 5
-    expectation_fail_count = int(round(10 - (s - 1) * (7 / 9)))     # 10 -> 3
-    stale_config_seconds = int(round(3600 - (s - 1) * (3000 / 9)))  # 3600 -> 600
-
-    return ThresholdProfile(
-        error_rate_percent=error_rate_percent,
-        expectation_fail_count=expectation_fail_count,
-        stale_config_seconds=stale_config_seconds,
-    )
 
 
 # ============================================================
@@ -136,8 +115,19 @@ class WatchtowerConfig:
     port: int = 9200
     towers: List[TowerConfig] = field(default_factory=list)
 
+    # Per-scan failure doctrine:
+    # if N or more tower scan failures happen during one scan_event() call,
+    # the node moves to DEGRADED.
+    scan_failure_degrade_threshold: int = 2
+
     def __post_init__(self) -> None:
         self.port = _clamp_int("port", self.port, 1024, 65535)
+        self.scan_failure_degrade_threshold = _clamp_int(
+            "scan_failure_degrade_threshold",
+            self.scan_failure_degrade_threshold,
+            1,
+            100,
+        )
 
     @property
     def api_url(self) -> str:
@@ -166,6 +156,7 @@ class WatchtowerConfig:
             "host": self.host,
             "port": self.port,
             "api_url": self.api_url,
+            "scan_failure_degrade_threshold": self.scan_failure_degrade_threshold,
             "towers": [tower.to_dict() for tower in self.towers],
         }
 
@@ -178,11 +169,37 @@ class WatchtowerSegment:
         self.cfg = cfg
         self.last_scan_ts: Optional[float] = None
         self.alert_count: int = 0
-        self._thresholds = thresholds_for(cfg.sensitivity)
+        self.malformed_input_count: int = 0
+        self._thresholds: ThresholdProfile = thresholds_for(cfg.sensitivity)
+        self._lock = threading.Lock()
 
     @property
     def id(self) -> str:
         return f"{self.cfg.slot.value}:{self.cfg.tower_type.value}"
+
+    def _event_int(
+        self,
+        event: Dict[str, Any],
+        field_name: str,
+        default: int = 0,
+    ) -> int:
+        raw = event.get(field_name, default)
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            with self._lock:
+                self.malformed_input_count += 1
+
+            logger.warning(
+                "[%s] malformed numeric field '%s' on tower=%s raw=%r defaulting=%d event_id=%s",
+                self.cfg.name,
+                field_name,
+                self.id,
+                raw,
+                default,
+                event.get("id"),
+            )
+            return default
 
     def scan(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not self.cfg.enabled:
@@ -198,8 +215,9 @@ class WatchtowerSegment:
         # ------------------------------------------------------------
         if tower_type == TowerType.API_HEALTH:
             if event.get("kind") == "request":
-                status_code = int(event.get("status_code", 200))
-                latency_ms = int(event.get("latency_ms", 0))
+                status_code = self._event_int(event, "status_code", 200)
+                latency_ms = self._event_int(event, "latency_ms", 0)
+
                 if status_code >= 500:
                     suspicious = True
                     reason = f"API returned server error ({status_code})"
@@ -209,10 +227,14 @@ class WatchtowerSegment:
 
         elif tower_type == TowerType.EXPECTATION_GUARD:
             if event.get("kind") == "expectation":
-                fail_count = int(event.get("failed_checks", 0))
+                fail_count = self._event_int(event, "failed_checks", 0)
+
                 if fail_count >= self._thresholds.expectation_fail_count:
                     suspicious = True
-                    reason = f"Expectation failures exceeded threshold (>= {self._thresholds.expectation_fail_count})"
+                    reason = (
+                        f"Expectation failures exceeded threshold "
+                        f"(>= {self._thresholds.expectation_fail_count})"
+                    )
                 elif event.get("expectation_status") == "failed":
                     suspicious = True
                     reason = "Expectation contract failed"
@@ -223,10 +245,13 @@ class WatchtowerSegment:
                     suspicious = True
                     reason = "Configuration drift detected"
                 else:
-                    age_seconds = int(event.get("config_age_seconds", 0))
+                    age_seconds = self._event_int(event, "config_age_seconds", 0)
                     if age_seconds >= self._thresholds.stale_config_seconds:
                         suspicious = True
-                        reason = f"Configuration is stale (>= {self._thresholds.stale_config_seconds}s)"
+                        reason = (
+                            f"Configuration is stale "
+                            f"(>= {self._thresholds.stale_config_seconds}s)"
+                        )
 
         elif tower_type == TowerType.LOGGING_AUDIT:
             if event.get("kind") == "log":
@@ -239,10 +264,14 @@ class WatchtowerSegment:
 
         elif tower_type == TowerType.ERROR_RATE:
             if event.get("kind") == "runtime":
-                error_rate = int(event.get("error_rate_percent", 0))
+                error_rate = self._event_int(event, "error_rate_percent", 0)
+
                 if error_rate >= self._thresholds.error_rate_percent:
                     suspicious = True
-                    reason = f"Error rate exceeded threshold (>= {self._thresholds.error_rate_percent}%)"
+                    reason = (
+                        f"Error rate exceeded threshold "
+                        f"(>= {self._thresholds.error_rate_percent}%)"
+                    )
                 elif event.get("crash_loop", False):
                     suspicious = True
                     reason = "Crash loop detected"
@@ -258,9 +287,10 @@ class WatchtowerSegment:
 
         elif tower_type == TowerType.RESOURCE_PRESSURE:
             if event.get("kind") == "resource":
-                cpu = int(event.get("cpu_percent", 0))
-                mem = int(event.get("memory_percent", 0))
-                disk = int(event.get("disk_percent", 0))
+                cpu = self._event_int(event, "cpu_percent", 0)
+                mem = self._event_int(event, "memory_percent", 0)
+                disk = self._event_int(event, "disk_percent", 0)
+
                 if cpu >= 90 or mem >= 90 or disk >= 95:
                     suspicious = True
                     reason = f"Resource pressure detected (cpu={cpu} mem={mem} disk={disk})"
@@ -280,7 +310,9 @@ class WatchtowerSegment:
         if not suspicious:
             return None
 
-        self.alert_count += 1
+        with self._lock:
+            self.alert_count += 1
+
         event_id = _ensure_event_id(event)
 
         return {
@@ -295,6 +327,10 @@ class WatchtowerSegment:
         }
 
     def status(self) -> Dict[str, Any]:
+        with self._lock:
+            alert_count = self.alert_count
+            malformed_input_count = self.malformed_input_count
+
         return {
             "id": self.id,
             "name": self.cfg.name,
@@ -308,7 +344,8 @@ class WatchtowerSegment:
                 "stale_config_seconds": self._thresholds.stale_config_seconds,
             },
             "last_scan_ts": self.last_scan_ts,
-            "alert_count": self.alert_count,
+            "alert_count": alert_count,
+            "malformed_input_count": malformed_input_count,
         }
 
 
@@ -317,7 +354,11 @@ class WatchtowerSegment:
 # ============================================================
 class WatchtowerNode:
     _ALLOWED_TRANSITIONS = {
-        WatchtowerState.INITIALIZING: {WatchtowerState.ACTIVE, WatchtowerState.DEGRADED, WatchtowerState.FAILED},
+        WatchtowerState.INITIALIZING: {
+            WatchtowerState.ACTIVE,
+            WatchtowerState.DEGRADED,
+            WatchtowerState.FAILED,
+        },
         WatchtowerState.ACTIVE: {WatchtowerState.DEGRADED, WatchtowerState.FAILED},
         WatchtowerState.DEGRADED: {WatchtowerState.ACTIVE, WatchtowerState.FAILED},
         WatchtowerState.FAILED: set(),
@@ -398,13 +439,16 @@ class WatchtowerNode:
             except Exception as exc:
                 failures += 1
                 logger.exception(
-                    "[%s] Segment scan failure tower=%s error=%s",
+                    "[%s] Segment scan failure tower=%s error=%s event_id=%s",
                     self.config.node_id,
                     segment.id,
                     type(exc).__name__,
+                    event.get("id"),
                 )
 
-        if failures >= 2:
+        # Intentional doctrine:
+        # degrade only when enough segment failures occur in a single scan pass.
+        if failures >= self.config.scan_failure_degrade_threshold:
             self.set_state(WatchtowerState.DEGRADED)
 
         return alerts
@@ -419,6 +463,7 @@ class WatchtowerNode:
             "state": state.value,
             "environment": self.config.environment,
             "api_url": self.config.api_url,
+            "scan_failure_degrade_threshold": self.config.scan_failure_degrade_threshold,
             "towers": [tower.status() for tower in tower_snapshot],
         }
 
