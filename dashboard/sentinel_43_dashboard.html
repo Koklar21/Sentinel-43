@@ -1,0 +1,1201 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Sentinel-43 Dashboard</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --bg2: #11182d;
+      --panel: #121a30;
+      --panel2: #0f172a;
+      --line: #24324d;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --blue: #38bdf8;
+      --green: #22c55e;
+      --yellow: #f59e0b;
+      --red: #ef4444;
+      --purple: #8b5cf6;
+      --shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+      --radius: 16px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      background:
+        radial-gradient(circle at top left, rgba(56,189,248,0.10), transparent 25%),
+        radial-gradient(circle at top right, rgba(139,92,246,0.10), transparent 20%),
+        linear-gradient(180deg, #0a0f1f 0%, #0b1020 100%);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      min-height: 100%;
+    }
+
+    body {
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 16px 20px;
+      background: rgba(11, 16, 32, 0.88);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .brand-mark {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--blue);
+      box-shadow: 0 0 18px rgba(56,189,248,0.7);
+      flex: 0 0 14px;
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1;
+      letter-spacing: 0.4px;
+    }
+
+    .brand p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .header-actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: flex-end;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.7);
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--yellow);
+      box-shadow: 0 0 10px rgba(245,158,11,0.6);
+    }
+
+    .dot.online {
+      background: var(--green);
+      box-shadow: 0 0 10px rgba(34,197,94,0.6);
+    }
+
+    .dot.offline {
+      background: var(--red);
+      box-shadow: 0 0 10px rgba(239,68,68,0.6);
+    }
+
+    .btn {
+      appearance: none;
+      border: 1px solid var(--line);
+      background: rgba(15, 23, 42, 0.85);
+      color: var(--text);
+      padding: 10px 14px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 800;
+      cursor: pointer;
+      transition: 160ms ease;
+    }
+
+    .btn:hover {
+      border-color: #35507a;
+      transform: translateY(-1px);
+    }
+
+    .btn:active {
+      transform: translateY(0);
+    }
+
+    .btn.primary {
+      border-color: rgba(56,189,248,0.35);
+      background: rgba(56,189,248,0.12);
+      color: #bae6fd;
+    }
+
+    .btn.good {
+      border-color: rgba(34,197,94,0.35);
+      background: rgba(34,197,94,0.12);
+      color: #bbf7d0;
+    }
+
+    .btn.warn {
+      border-color: rgba(245,158,11,0.35);
+      background: rgba(245,158,11,0.12);
+      color: #fde68a;
+    }
+
+    .btn.bad {
+      border-color: rgba(239,68,68,0.35);
+      background: rgba(239,68,68,0.12);
+      color: #fecaca;
+    }
+
+    .btn.active {
+      border-color: rgba(56,189,248,0.50);
+      background: rgba(56,189,248,0.16);
+      color: #d7f3ff;
+    }
+
+    .btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    main {
+      width: 100%;
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 18px;
+      display: grid;
+      grid-template-columns: 1.4fr 0.9fr;
+      gap: 18px;
+    }
+
+    .left-col,
+    .right-col {
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .panel {
+      background: linear-gradient(180deg, rgba(18,26,48,0.90), rgba(15,23,42,0.92));
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel-header {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .panel-header h2 {
+      margin: 0;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: #d1d5db;
+    }
+
+    .panel-body {
+      padding: 16px;
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+    }
+
+    .stat-card {
+      background: rgba(15,23,42,0.72);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+    }
+
+    .stat-label {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      font-weight: 800;
+      margin-bottom: 10px;
+    }
+
+    .stat-value {
+      font-size: 28px;
+      font-weight: 900;
+      line-height: 1;
+      margin-bottom: 6px;
+    }
+
+    .stat-sub {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .actions-table-wrap {
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 760px;
+    }
+
+    thead th {
+      text-align: left;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: var(--muted);
+      padding: 12px 10px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    tbody td {
+      padding: 12px 10px;
+      border-bottom: 1px solid rgba(36, 50, 77, 0.7);
+      vertical-align: top;
+      font-size: 13px;
+    }
+
+    tbody tr:hover {
+      background: rgba(56,189,248,0.04);
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      padding: 4px 9px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 900;
+      border: 1px solid var(--line);
+      white-space: nowrap;
+    }
+
+    .tag.pending {
+      color: #fde68a;
+      border-color: rgba(245,158,11,0.35);
+      background: rgba(245,158,11,0.10);
+    }
+
+    .tag.staged {
+      color: #bae6fd;
+      border-color: rgba(56,189,248,0.35);
+      background: rgba(56,189,248,0.10);
+    }
+
+    .tag.approved,
+    .tag.executed {
+      color: #bbf7d0;
+      border-color: rgba(34,197,94,0.35);
+      background: rgba(34,197,94,0.10);
+    }
+
+    .tag.vetoed,
+    .tag.expired {
+      color: #fecaca;
+      border-color: rgba(239,68,68,0.35);
+      background: rgba(239,68,68,0.10);
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+
+    .actions-cell {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .log-console {
+      height: 420px;
+      overflow: auto;
+      background: rgba(15,23,42,0.7);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+
+    .log-line {
+      padding: 8px;
+      border-bottom: 1px dashed rgba(36,50,77,0.7);
+      color: #d1d5db;
+      word-break: break-word;
+    }
+
+    .log-line.ok { color: #bbf7d0; }
+    .log-line.warn { color: #fde68a; }
+    .log-line.err { color: #fecaca; }
+    .log-line.info { color: #bae6fd; }
+
+    .config-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .config-box {
+      background: rgba(15,23,42,0.72);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px;
+    }
+
+    .config-box .k {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: var(--muted);
+      font-weight: 800;
+      margin-bottom: 6px;
+    }
+
+    .config-box .v {
+      font-size: 13px;
+      font-weight: 800;
+      word-break: break-word;
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    .empty-state {
+      padding: 18px;
+      text-align: center;
+      border: 1px dashed var(--line);
+      border-radius: 14px;
+      color: var(--muted);
+      background: rgba(15,23,42,0.35);
+    }
+
+    .modal[hidden] {
+      display: none;
+    }
+
+    .modal {
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      display: grid;
+      place-items: center;
+    }
+
+    .modal-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.70);
+    }
+
+    .modal-card {
+      position: relative;
+      width: min(560px, calc(100vw - 28px));
+      background: rgba(17, 24, 39, 0.96);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 18px;
+      box-shadow: 0 24px 60px rgba(0,0,0,0.5);
+      padding: 18px;
+    }
+
+    .modal-card h3 {
+      margin: 0 0 8px;
+      font-size: 16px;
+    }
+
+    .modal-card p {
+      margin: 0 0 12px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .modal-card textarea {
+      width: 100%;
+      min-height: 110px;
+      resize: vertical;
+      padding: 12px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: rgba(15, 23, 42, 0.95);
+      color: var(--text);
+      font: inherit;
+      outline: none;
+    }
+
+    .modal-card textarea:focus {
+      border-color: rgba(56,189,248,0.45);
+      box-shadow: 0 0 0 3px rgba(56,189,248,0.10);
+    }
+
+    .modal-error {
+      min-height: 18px;
+      margin-top: 8px;
+      color: #ff8f8f;
+      font-size: 12px;
+    }
+
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 12px;
+      flex-wrap: wrap;
+    }
+
+    @media (max-width: 1100px) {
+      main {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 800px) {
+      .stats-grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .config-grid {
+        grid-template-columns: 1fr;
+      }
+
+      header {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .header-actions {
+        width: 100%;
+        justify-content: flex-start;
+      }
+    }
+
+    @media (max-width: 520px) {
+      .stats-grid {
+        grid-template-columns: 1fr;
+      }
+
+      main {
+        padding: 12px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="brand-mark"></div>
+      <div>
+        <h1>Sentinel-43 Dashboard</h1>
+        <p>Human-gated oversight console</p>
+      </div>
+    </div>
+
+    <div class="header-actions">
+      <span class="pill">
+        <span id="statusDot" class="dot"></span>
+        <span id="statusText">Booting</span>
+      </span>
+      <span class="pill">Mode: <span id="modeText">HUMAN_GATED</span></span>
+      <span class="pill">Queue: <span id="queueCount">0</span></span>
+      <button id="refreshBtn" class="btn primary">Refresh</button>
+      <button id="injectBtn" class="btn warn">Inject Test</button>
+      <button id="authBtn" class="btn">Set JWT</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="left-col">
+      <section class="panel">
+        <div class="panel-header">
+          <h2>System Overview</h2>
+        </div>
+        <div class="panel-body">
+          <div class="stats-grid">
+            <div class="stat-card">
+              <div class="stat-label">Pending</div>
+              <div id="pendingCount" class="stat-value">0</div>
+              <div class="stat-sub">Awaiting operator decision</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Staged</div>
+              <div id="stagedCount" class="stat-value">0</div>
+              <div class="stat-sub">Ready for gated approval</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Approved</div>
+              <div id="approvedCount" class="stat-value">0</div>
+              <div class="stat-sub">Approved or executed</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label">Vault Records</div>
+              <div id="vaultCount" class="stat-value">--</div>
+              <div class="stat-sub">Reported by backend</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Pending Actions</h2>
+          <div class="toolbar">
+            <button class="btn active" data-filter="ALL">All</button>
+            <button class="btn" data-filter="PENDING">Pending</button>
+            <button class="btn" data-filter="STAGED">Staged</button>
+            <button class="btn" data-filter="APPROVED">Approved</button>
+            <button class="btn" data-filter="VETOED">Vetoed</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div class="actions-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Action ID</th>
+                  <th>Threat</th>
+                  <th>Source</th>
+                  <th>Status</th>
+                  <th>Created</th>
+                  <th>Decision</th>
+                  <th>Operator</th>
+                </tr>
+              </thead>
+              <tbody id="actionsBody"></tbody>
+            </table>
+          </div>
+          <div id="emptyState" class="empty-state" hidden>
+            No actions to display. Either everything is quiet, or the backend is sulking.
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="right-col">
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Runtime Config</h2>
+        </div>
+        <div class="panel-body">
+          <div class="config-grid">
+            <div class="config-box">
+              <div class="k">API Base</div>
+              <div id="apiBaseText" class="v">/api/v1</div>
+            </div>
+            <div class="config-box">
+              <div class="k">Auth State</div>
+              <div id="authStateText" class="v">Missing</div>
+            </div>
+            <div class="config-box">
+              <div class="k">Polling</div>
+              <div id="pollText" class="v">1500 ms</div>
+            </div>
+            <div class="config-box">
+              <div class="k">Demo Mode</div>
+              <div id="demoText" class="v">Enabled</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Console Log</h2>
+          <div class="toolbar">
+            <button id="clearLogBtn" class="btn">Clear</button>
+          </div>
+        </div>
+        <div class="panel-body">
+          <div id="logConsole" class="log-console" role="log" aria-live="polite"></div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <div id="reasonModal" class="modal" hidden aria-hidden="true" role="dialog" aria-modal="true">
+    <div class="modal-backdrop" data-close></div>
+    <div class="modal-card">
+      <h3 id="modalTitle">Provide reason</h3>
+      <p id="modalSubtitle">Reason is required. Ctrl+Enter confirms.</p>
+      <textarea id="modalInput" maxlength="500" placeholder="Enter reason..."></textarea>
+      <div id="modalError" class="modal-error"></div>
+      <div class="modal-actions">
+        <button id="modalCancel" class="btn">Cancel</button>
+        <button id="modalConfirm" class="btn good">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    "use strict";
+
+    const CONFIG = {
+      API_BASE: "/api/v1",
+      POLL_MS: 1500,
+      REASON_MIN: 5,
+      REASON_MAX: 500,
+      DEMO_MODE: true
+    };
+
+    const STATUS_CLASSES = {
+      PENDING: "pending",
+      STAGED: "staged",
+      APPROVED: "approved",
+      EXECUTED: "executed",
+      VETOED: "vetoed",
+      EXPIRED: "expired"
+    };
+
+    const el = {
+      statusDot: document.getElementById("statusDot"),
+      statusText: document.getElementById("statusText"),
+      modeText: document.getElementById("modeText"),
+      queueCount: document.getElementById("queueCount"),
+
+      pendingCount: document.getElementById("pendingCount"),
+      stagedCount: document.getElementById("stagedCount"),
+      approvedCount: document.getElementById("approvedCount"),
+      vaultCount: document.getElementById("vaultCount"),
+
+      apiBaseText: document.getElementById("apiBaseText"),
+      authStateText: document.getElementById("authStateText"),
+      pollText: document.getElementById("pollText"),
+      demoText: document.getElementById("demoText"),
+
+      refreshBtn: document.getElementById("refreshBtn"),
+      injectBtn: document.getElementById("injectBtn"),
+      authBtn: document.getElementById("authBtn"),
+      clearLogBtn: document.getElementById("clearLogBtn"),
+
+      actionsBody: document.getElementById("actionsBody"),
+      emptyState: document.getElementById("emptyState"),
+      logConsole: document.getElementById("logConsole"),
+
+      reasonModal: document.getElementById("reasonModal"),
+      modalTitle: document.getElementById("modalTitle"),
+      modalSubtitle: document.getElementById("modalSubtitle"),
+      modalInput: document.getElementById("modalInput"),
+      modalError: document.getElementById("modalError"),
+      modalCancel: document.getElementById("modalCancel"),
+      modalConfirm: document.getElementById("modalConfirm")
+    };
+
+    let currentFilter = "ALL";
+    let refreshInFlight = false;
+    let pollTimer = null;
+
+    function nowStamp() {
+      return new Date().toLocaleString();
+    }
+
+    function log(message, type = "info") {
+      const line = document.createElement("div");
+      line.className = `log-line ${type}`;
+      line.textContent = `[${nowStamp()}] ${message}`;
+      el.logConsole.appendChild(line);
+      el.logConsole.scrollTop = el.logConsole.scrollHeight;
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function setStatus(state) {
+      el.statusText.textContent = state;
+      el.statusDot.classList.remove("online", "offline");
+
+      if (state === "Online") {
+        el.statusDot.classList.add("online");
+      } else if (state === "Offline") {
+        el.statusDot.classList.add("offline");
+      }
+    }
+
+    function updateStaticConfig() {
+      el.apiBaseText.textContent = CONFIG.API_BASE;
+      el.pollText.textContent = `${CONFIG.POLL_MS} ms`;
+      el.demoText.textContent = CONFIG.DEMO_MODE ? "Enabled" : "Disabled";
+
+      const token = sessionStorage.getItem("SENTINEL_JWT");
+      el.authStateText.textContent = token ? "Present" : "Missing";
+      el.authStateText.style.color = token ? "#bbf7d0" : "#fde68a";
+    }
+
+    function getAuthHeaders() {
+      const headers = {
+        "Content-Type": "application/json"
+      };
+      const token = sessionStorage.getItem("SENTINEL_JWT");
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
+      return headers;
+    }
+
+    async function fetchJson(path, options = {}) {
+      const response = await fetch(`${CONFIG.API_BASE}${path}`, {
+        ...options,
+        headers: {
+          ...getAuthHeaders(),
+          ...(options.headers || {})
+        },
+        credentials: "include"
+      });
+
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        throw new Error(`${response.status} ${response.statusText}${text ? `: ${text}` : ""}`);
+      }
+
+      const type = response.headers.get("content-type") || "";
+      if (type.includes("application/json")) {
+        return response.json();
+      }
+      return null;
+    }
+
+    const demoBackend = (() => {
+      const actions = new Map();
+
+      function id() {
+        return `ACT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`.toUpperCase();
+      }
+
+      function createAction(overrides = {}) {
+        const item = {
+          id: id(),
+          action_type: overrides.action_type || "THREAT_ACTION",
+          status: overrides.status || (Math.random() > 0.5 ? "PENDING" : "STAGED"),
+          created_at: overrides.created_at || new Date().toISOString(),
+          decision_reason: overrides.decision_reason || "",
+          payload: {
+            ip: overrides.ip || overrides.source_ip || "203.0.113.10",
+            source_ip: overrides.source_ip || overrides.ip || "203.0.113.10",
+            threat: overrides.threat || "Suspicious activity detected"
+          }
+        };
+        actions.set(item.id, item);
+      }
+
+      createAction({ threat: "SQL injection pattern", ip: "198.51.100.22", status: "PENDING" });
+      createAction({ threat: "Credential abuse indicator", ip: "203.0.113.77", status: "STAGED" });
+      createAction({ threat: "High-rate probe", ip: "192.0.2.41", status: "APPROVED", decision_reason: "Approved by operator" });
+
+      return {
+        async listActions() {
+          return Array.from(actions.values()).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+        },
+        async approve(actionId, reason) {
+          const item = actions.get(actionId);
+          if (!item) throw new Error("Action not found");
+          item.status = "APPROVED";
+          item.decision_reason = reason;
+          return { ok: true };
+        },
+        async veto(actionId, reason) {
+          const item = actions.get(actionId);
+          if (!item) throw new Error("Action not found");
+          item.status = "VETOED";
+          item.decision_reason = reason;
+          return { ok: true };
+        },
+        async inject() {
+          createAction({
+            threat: "Injected test incident",
+            ip: "203.0.113.88",
+            status: Math.random() > 0.5 ? "PENDING" : "STAGED"
+          });
+          return { ok: true };
+        },
+        async vaultStats() {
+          return { records: 12487 };
+        }
+      };
+    })();
+
+    const api = {
+      async listActions() {
+        if (CONFIG.DEMO_MODE) return demoBackend.listActions();
+        return fetchJson("/actions?limit=250");
+      },
+      async approve(actionId, reason) {
+        if (CONFIG.DEMO_MODE) return demoBackend.approve(actionId, reason);
+        return fetchJson(`/actions/${encodeURIComponent(actionId)}/approve`, {
+          method: "POST",
+          body: JSON.stringify({ reason })
+        });
+      },
+      async veto(actionId, reason) {
+        if (CONFIG.DEMO_MODE) return demoBackend.veto(actionId, reason);
+        return fetchJson(`/actions/${encodeURIComponent(actionId)}/veto`, {
+          method: "POST",
+          body: JSON.stringify({ reason })
+        });
+      },
+      async inject() {
+        if (CONFIG.DEMO_MODE) return demoBackend.inject();
+        return fetchJson("/actions", {
+          method: "POST",
+          body: JSON.stringify({
+            action_type: "TEST_INCIDENT",
+            payload: {
+              ip: "203.0.113.88",
+              source_ip: "203.0.113.88",
+              threat: "Injected test incident"
+            }
+          })
+        });
+      },
+      async vaultStats() {
+        if (CONFIG.DEMO_MODE) return demoBackend.vaultStats();
+        return fetchJson("/vault/stats");
+      }
+    };
+
+    function normalizeAction(raw) {
+      const payload = raw.payload || {};
+      return {
+        id: String(raw.id || ""),
+        threat: payload.threat || raw.action_type || "UNKNOWN",
+        source: payload.source_ip || payload.ip || "n/a",
+        status: String(raw.status || "UNKNOWN").toUpperCase(),
+        createdAt: raw.created_at || new Date().toISOString(),
+        decisionReason: raw.decision_reason || ""
+      };
+    }
+
+    function applyFilter(actions) {
+      if (currentFilter === "ALL") return actions;
+      return actions.filter(action => action.status === currentFilter);
+    }
+
+    function updateStats(actions) {
+      const pending = actions.filter(a => a.status === "PENDING").length;
+      const staged = actions.filter(a => a.status === "STAGED").length;
+      const approved = actions.filter(a => a.status === "APPROVED" || a.status === "EXECUTED").length;
+      const queue = actions.filter(a => a.status === "PENDING" || a.status === "STAGED").length;
+
+      el.pendingCount.textContent = pending;
+      el.stagedCount.textContent = staged;
+      el.approvedCount.textContent = approved;
+      el.queueCount.textContent = queue;
+    }
+
+    function renderActions(actions) {
+      el.actionsBody.innerHTML = "";
+
+      if (!actions.length) {
+        el.emptyState.hidden = false;
+        return;
+      }
+
+      el.emptyState.hidden = true;
+
+      for (const action of actions) {
+        const tr = document.createElement("tr");
+        const statusClass = STATUS_CLASSES[action.status] || "pending";
+        const created = new Date(action.createdAt).toLocaleString();
+
+        let operatorCell = `<span class="muted">N/A</span>`;
+        if (action.status === "PENDING" || action.status === "STAGED") {
+          operatorCell = `
+            <div class="actions-cell">
+              ${action.status === "STAGED" ? `<button class="btn good" data-approve="${escapeHtml(action.id)}">Approve</button>` : ""}
+              <button class="btn bad" data-veto="${escapeHtml(action.id)}">Veto</button>
+            </div>
+          `;
+        }
+
+        tr.innerHTML = `
+          <td class="mono">${escapeHtml(action.id)}</td>
+          <td>${escapeHtml(action.threat)}</td>
+          <td class="mono">${escapeHtml(action.source)}</td>
+          <td><span class="tag ${statusClass}">${escapeHtml(action.status)}</span></td>
+          <td>${escapeHtml(created)}</td>
+          <td>${action.decisionReason ? escapeHtml(action.decisionReason) : `<span class="muted">None</span>`}</td>
+          <td>${operatorCell}</td>
+        `;
+
+        el.actionsBody.appendChild(tr);
+      }
+    }
+
+    function validateReason(reason) {
+      const value = (reason || "").trim();
+      if (!value) return "Reason is required.";
+      if (value.length < CONFIG.REASON_MIN) return `Reason must be at least ${CONFIG.REASON_MIN} characters.`;
+      if (value.length > CONFIG.REASON_MAX) return `Reason must be ${CONFIG.REASON_MAX} characters or less.`;
+      return null;
+    }
+
+    function openReasonModal({ title, subtitle, confirmText, confirmClass = "good", defaultText = "" }) {
+      return new Promise(resolve => {
+        const close = result => {
+          el.reasonModal.hidden = true;
+          el.reasonModal.setAttribute("aria-hidden", "true");
+          el.modalError.textContent = "";
+          resolve(result);
+        };
+
+        el.modalTitle.textContent = title;
+        el.modalSubtitle.textContent = subtitle;
+        el.modalInput.value = defaultText;
+        el.modalConfirm.textContent = confirmText;
+        el.modalConfirm.className = `btn ${confirmClass}`;
+
+        el.reasonModal.hidden = false;
+        el.reasonModal.setAttribute("aria-hidden", "false");
+
+        setTimeout(() => el.modalInput.focus(), 0);
+
+        const onCancel = () => {
+          cleanup();
+          close(null);
+        };
+
+        const onConfirm = () => {
+          const error = validateReason(el.modalInput.value);
+          if (error) {
+            el.modalError.textContent = error;
+            return;
+          }
+          cleanup();
+          close(el.modalInput.value.trim());
+        };
+
+        const onBackdrop = event => {
+          if (event.target.hasAttribute("data-close")) {
+            onCancel();
+          }
+        };
+
+        const onKey = event => {
+          if (event.key === "Escape") onCancel();
+          if ((event.ctrlKey || event.metaKey) && event.key === "Enter") onConfirm();
+        };
+
+        function cleanup() {
+          el.modalCancel.removeEventListener("click", onCancel);
+          el.modalConfirm.removeEventListener("click", onConfirm);
+          el.reasonModal.removeEventListener("click", onBackdrop);
+          document.removeEventListener("keydown", onKey);
+        }
+
+        el.modalCancel.addEventListener("click", onCancel);
+        el.modalConfirm.addEventListener("click", onConfirm);
+        el.reasonModal.addEventListener("click", onBackdrop);
+        document.addEventListener("keydown", onKey);
+      });
+    }
+
+    async function refreshDashboard(manual = false) {
+      if (refreshInFlight) return;
+
+      refreshInFlight = true;
+      if (manual) setStatus("Syncing");
+
+      try {
+        updateStaticConfig();
+
+        const [rawActions, vault] = await Promise.all([
+          api.listActions(),
+          api.vaultStats().catch(() => ({ records: null }))
+        ]);
+
+        const actions = rawActions.map(normalizeAction).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+        const filtered = applyFilter(actions);
+
+        updateStats(actions);
+        renderActions(filtered);
+
+        if (typeof vault?.records === "number") {
+          el.vaultCount.textContent = vault.records.toLocaleString();
+        } else {
+          el.vaultCount.textContent = "--";
+        }
+
+        setStatus("Online");
+        if (manual) log(`Manual refresh complete. Loaded ${filtered.length} visible action(s).`, "ok");
+      } catch (error) {
+        setStatus("Offline");
+        log(`Refresh failed: ${error.message || String(error)}`, "err");
+      } finally {
+        refreshInFlight = false;
+      }
+    }
+
+    function startPolling() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(() => {
+        refreshDashboard(false);
+      }, CONFIG.POLL_MS);
+    }
+
+    document.addEventListener("click", async event => {
+      const filterBtn = event.target.closest("[data-filter]");
+      if (filterBtn) {
+        currentFilter = filterBtn.dataset.filter;
+        document.querySelectorAll("[data-filter]").forEach(btn => btn.classList.remove("active"));
+        filterBtn.classList.add("active");
+        log(`Filter changed to ${currentFilter}.`, "info");
+        await refreshDashboard(true);
+        return;
+      }
+
+      const approveBtn = event.target.closest("[data-approve]");
+      if (approveBtn) {
+        const actionId = approveBtn.dataset.approve;
+        const reason = await openReasonModal({
+          title: `Approve ${actionId}`,
+          subtitle: "Required. This action will be marked approved.",
+          confirmText: "Approve",
+          confirmClass: "good",
+          defaultText: "Approved by operator"
+        });
+
+        if (!reason) {
+          log(`Approve cancelled for ${actionId}.`, "warn");
+          return;
+        }
+
+        try {
+          approveBtn.disabled = true;
+          await api.approve(actionId, reason);
+          log(`Approved ${actionId}.`, "ok");
+          await refreshDashboard(true);
+        } catch (error) {
+          log(`Approve failed for ${actionId}: ${error.message || String(error)}`, "err");
+        } finally {
+          approveBtn.disabled = false;
+        }
+        return;
+      }
+
+      const vetoBtn = event.target.closest("[data-veto]");
+      if (vetoBtn) {
+        const actionId = vetoBtn.dataset.veto;
+        const reason = await openReasonModal({
+          title: `Veto ${actionId}`,
+          subtitle: "Required. Explain why this action is being blocked.",
+          confirmText: "Veto",
+          confirmClass: "bad",
+          defaultText: "False positive or authorized traffic"
+        });
+
+        if (!reason) {
+          log(`Veto cancelled for ${actionId}.`, "warn");
+          return;
+        }
+
+        try {
+          vetoBtn.disabled = true;
+          await api.veto(actionId, reason);
+          log(`Vetoed ${actionId}.`, "warn");
+          await refreshDashboard(true);
+        } catch (error) {
+          log(`Veto failed for ${actionId}: ${error.message || String(error)}`, "err");
+        } finally {
+          vetoBtn.disabled = false;
+        }
+      }
+    });
+
+    el.refreshBtn.addEventListener("click", async () => {
+      await refreshDashboard(true);
+    });
+
+    el.injectBtn.addEventListener("click", async () => {
+      try {
+        el.injectBtn.disabled = true;
+        await api.inject();
+        log("Injected test action.", "info");
+        await refreshDashboard(true);
+      } catch (error) {
+        log(`Inject failed: ${error.message || String(error)}`, "err");
+      } finally {
+        el.injectBtn.disabled = false;
+      }
+    });
+
+    el.authBtn.addEventListener("click", async () => {
+      const current = sessionStorage.getItem("SENTINEL_JWT") || "";
+      const value = prompt("Paste SENTINEL JWT. Leave blank to clear.", current);
+      if (value === null) return;
+
+      const trimmed = value.trim();
+      if (!trimmed) {
+        sessionStorage.removeItem("SENTINEL_JWT");
+        log("JWT cleared.", "warn");
+      } else {
+        sessionStorage.setItem("SENTINEL_JWT", trimmed);
+        log("JWT set in sessionStorage.", "info");
+      }
+
+      updateStaticConfig();
+      await refreshDashboard(true);
+    });
+
+    el.clearLogBtn.addEventListener("click", () => {
+      el.logConsole.innerHTML = "";
+      log("Console cleared.", "info");
+    });
+
+    window.addEventListener("beforeunload", () => {
+      if (pollTimer) clearInterval(pollTimer);
+    });
+
+    log("Dashboard booting.", "info");
+    updateStaticConfig();
+    refreshDashboard(true);
+    startPolling();
+  </script>
+</body>
+</html>
