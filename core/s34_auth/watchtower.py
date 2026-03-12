@@ -2,7 +2,7 @@
 # Sentinel-43 Watchtower Node
 # =============================================================================
 #
-# Copyright (c) 2026 Justin [Last Name Optional] / Sentinel-43 Project
+# Copyright (c) 2026 Justin / Sentinel-43 Project
 # All rights reserved.
 #
 # This file is part of the Sentinel-43 security and orchestration platform.
@@ -38,7 +38,7 @@
 #
 # To obtain a commercial license, contact:
 #
-#     licensing@sentinel43.io   (or your future business email)
+#     licensing@sentinel43.io
 #
 #
 # =============================================================================
@@ -57,20 +57,20 @@
 # Initial Creation: 2026
 #
 # =============================================================================
+
 from __future__ import annotations
 
 import enum
 import logging
 import os
+import threading
 import time
 import uuid
-import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-
 # ============================================================
-# Logging (Sentinel-43 style)
+# Logging
 # ============================================================
 logger = logging.getLogger("sentinel43.watchtower")
 if not logger.handlers:
@@ -79,16 +79,30 @@ if not logger.handlers:
         format="%(asctime)s - Sentinel-43 - Watchtower - %(levelname)s - %(message)s",
     )
 
-
 # ============================================================
 # Pydantic / fallback
 # ============================================================
-try:
-    from pydantic import BaseModel, Field, conint, computed_field
-    HAS_PYDANTIC = True
-except Exception:
-    HAS_PYDANTIC = False
+HAS_PYDANTIC = False
+HAS_PYDANTIC_V2 = False
 
+try:
+    from pydantic import BaseModel, Field, conint
+
+    HAS_PYDANTIC = True
+
+    try:
+        from pydantic import ConfigDict, computed_field
+
+        HAS_PYDANTIC_V2 = True
+    except Exception:
+        ConfigDict = None  # type: ignore
+
+        def computed_field(*args, **kwargs):  # type: ignore
+            def decorator(fn):
+                return property(fn)
+            return decorator
+
+except Exception:
     class BaseModel:  # type: ignore
         def __init__(self, **data: Any):
             for k, v in data.items():
@@ -104,7 +118,6 @@ except Exception:
         def decorator(fn):
             return property(fn)
         return decorator
-
 
 # ============================================================
 # Utilities
@@ -139,40 +152,33 @@ class ThresholdProfile:
 
 
 def thresholds_for(sensitivity: Any) -> ThresholdProfile:
-    """
-    Sensitivity 1..10 -> threshold profile.
-      1 = less sensitive (higher thresholds)
-      10 = more sensitive (lower thresholds)
-    """
     s = _clamp_int("sensitivity", sensitivity, 1, 10)
     failed_logins = int(round(10 - (s - 1) * (6 / 9)))   # 10 -> 4
     phishing_score = int(round(85 - (s - 1) * (25 / 9))) # 85 -> 60
-    return ThresholdProfile(failed_logins=failed_logins, phishing_score=phishing_score)
-
+    return ThresholdProfile(
+        failed_logins=failed_logins,
+        phishing_score=phishing_score,
+    )
 
 # ============================================================
 # Sentinel-43 Event + Alert Schema
 # ============================================================
 class SentinelEvent(BaseModel):
-    """
-    Lightweight schema wrapper (dict-compatible via .to_dict()).
-    Use this as your "contract" between intake -> watchtower -> governance.
-    """
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     correlation_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     created_ts: float = Field(default_factory=_utc_ts)
 
-    # Source metadata
-    source: str = Field("unknown", description="Producer module/node name (e.g., s34_auth, api_gateway).")
-    kind: str = Field("generic", description="Event category (auth/network/file/process/email/url/etc).")
+    source: str = Field("unknown", description="Producer module/node name.")
+    kind: str = Field("generic", description="Event category.")
     environment: str = Field("production")
 
-    # Freeform payload
     payload: Dict[str, Any] = Field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         if HAS_PYDANTIC and hasattr(self, "model_dump"):
             return self.model_dump()
+        if HAS_PYDANTIC and hasattr(self, "dict"):
+            return self.dict()  # type: ignore[attr-defined]
         return {
             "event_id": self.event_id,
             "correlation_id": self.correlation_id,
@@ -194,11 +200,9 @@ class SentinelAlert(BaseModel):
     alert_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     created_ts: float = Field(default_factory=_utc_ts)
 
-    # Linkage
     event_id: str = Field(...)
     correlation_id: str = Field(...)
 
-    # Tower info
     tower_id: str = Field(...)
     tower_name: str = Field(...)
     tower_type: str = Field(...)
@@ -208,14 +212,16 @@ class SentinelAlert(BaseModel):
     reason: str = Field(...)
     sensitivity: int = Field(5)
 
-    # Optional enrichment
     tags: List[str] = Field(default_factory=list)
     details: Dict[str, Any] = Field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         if HAS_PYDANTIC and hasattr(self, "model_dump"):
             d = self.model_dump()
-            # pydantic might serialize enums differently depending on version
+            d["severity"] = getattr(self.severity, "value", str(self.severity))
+            return d
+        if HAS_PYDANTIC and hasattr(self, "dict"):
+            d = self.dict()  # type: ignore[attr-defined]
             d["severity"] = getattr(self.severity, "value", str(self.severity))
             return d
         return {
@@ -233,7 +239,6 @@ class SentinelAlert(BaseModel):
             "tags": list(self.tags),
             "details": dict(self.details),
         }
-
 
 # ============================================================
 # Enums
@@ -266,7 +271,6 @@ class TowerPosition(enum.Enum):
     W = "W"
     NW = "NW"
 
-
 # ============================================================
 # Config Models
 # ============================================================
@@ -277,7 +281,13 @@ class TowerConfig(BaseModel):
     enabled: bool = Field(True)
     sensitivity: conint(ge=1, le=10) = Field(5, description="1=low noise, 10=hyper sensitive.")
     severity: AlertSeverity = Field(AlertSeverity.WARNING, description="Default alert severity for this tower.")
-    tags: List[str] = Field(default_factory=list, description="Static tags emitted on alerts (e.g., ['auth','edge']).")
+    tags: List[str] = Field(default_factory=list, description="Static tags emitted on alerts.")
+
+    if HAS_PYDANTIC_V2:
+        model_config = ConfigDict(extra="ignore")  # type: ignore[misc]
+    elif HAS_PYDANTIC:
+        class Config:
+            extra = "ignore"
 
     def validated_sensitivity(self) -> int:
         return _clamp_int("sensitivity", getattr(self, "sensitivity", 5), 1, 10)
@@ -300,33 +310,81 @@ class WatchtowerConfig(BaseModel):
     host: str = Field("0.0.0.0", description="Bind host.")
     port: conint(ge=1024, le=65535) = Field(9100, description="Bind port.")
     towers: List[TowerConfig] = Field(default_factory=list, description="Tower segment configs.")
-    model_name: str = Field("none", description="Optional upstream AI model label (metadata only).")
+    model_name: str = Field("none", description="Optional upstream AI model label.")
+    max_tower_errors_before_degrade: conint(ge=1, le=1000) = Field(
+        25,
+        description="Segment errors before node degrades.",
+    )
 
-    # reliability knobs
-    max_tower_errors_before_degrade: conint(ge=1, le=1000) = Field(25, description="Segment errors before node degrades.")
+    if HAS_PYDANTIC_V2:
+        model_config = ConfigDict(extra="ignore")  # type: ignore[misc]
+    elif HAS_PYDANTIC:
+        class Config:
+            extra = "ignore"
 
     @computed_field
     def api_url(self) -> str:
         return f"http://{self.host}:{int(self.port)}"
-
-    if HAS_PYDANTIC:
-        class Config:
-            env_prefix = "S43_WATCHTOWER_"
-            extra = "ignore"
 
     @classmethod
     def default_octagon(cls, node_id: str) -> "WatchtowerConfig":
         return cls(
             node_id=node_id,
             towers=[
-                TowerConfig(name="Inbound Traffic Sentinel", position=TowerPosition.N,  tower_type=TowerType.TRAFFIC_INBOUND, tags=["traffic", "inbound"]),
-                TowerConfig(name="Outbound Traffic Sentinel", position=TowerPosition.S, tower_type=TowerType.TRAFFIC_OUTBOUND, tags=["traffic", "outbound"]),
-                TowerConfig(name="Network Intrusion Guard", position=TowerPosition.E,  tower_type=TowerType.INTRUSION_NETWORK, tags=["intrusion", "network"], severity=AlertSeverity.CRITICAL),
-                TowerConfig(name="Auth Intrusion Guard", position=TowerPosition.W,     tower_type=TowerType.INTRUSION_AUTH, tags=["intrusion", "auth"], severity=AlertSeverity.CRITICAL),
-                TowerConfig(name="Malware Signature Scanner", position=TowerPosition.NE, tower_type=TowerType.MALWARE_SIGNATURE, tags=["malware"], severity=AlertSeverity.CRITICAL),
-                TowerConfig(name="Malware Behavior Analyzer", position=TowerPosition.SE, tower_type=TowerType.MALWARE_BEHAVIOR, tags=["malware"], severity=AlertSeverity.CRITICAL),
-                TowerConfig(name="Phishing Content Filter", position=TowerPosition.SW, tower_type=TowerType.PHISHING_CONTENT, tags=["phishing"], severity=AlertSeverity.WARNING),
-                TowerConfig(name="Phishing Domain Sentinel", position=TowerPosition.NW, tower_type=TowerType.PHISHING_DOMAIN, tags=["phishing"], severity=AlertSeverity.WARNING),
+                TowerConfig(
+                    name="Inbound Traffic Sentinel",
+                    position=TowerPosition.N,
+                    tower_type=TowerType.TRAFFIC_INBOUND,
+                    tags=["traffic", "inbound"],
+                ),
+                TowerConfig(
+                    name="Outbound Traffic Sentinel",
+                    position=TowerPosition.S,
+                    tower_type=TowerType.TRAFFIC_OUTBOUND,
+                    tags=["traffic", "outbound"],
+                ),
+                TowerConfig(
+                    name="Network Intrusion Guard",
+                    position=TowerPosition.E,
+                    tower_type=TowerType.INTRUSION_NETWORK,
+                    tags=["intrusion", "network"],
+                    severity=AlertSeverity.CRITICAL,
+                ),
+                TowerConfig(
+                    name="Auth Intrusion Guard",
+                    position=TowerPosition.W,
+                    tower_type=TowerType.INTRUSION_AUTH,
+                    tags=["intrusion", "auth"],
+                    severity=AlertSeverity.CRITICAL,
+                ),
+                TowerConfig(
+                    name="Malware Signature Scanner",
+                    position=TowerPosition.NE,
+                    tower_type=TowerType.MALWARE_SIGNATURE,
+                    tags=["malware"],
+                    severity=AlertSeverity.CRITICAL,
+                ),
+                TowerConfig(
+                    name="Malware Behavior Analyzer",
+                    position=TowerPosition.SE,
+                    tower_type=TowerType.MALWARE_BEHAVIOR,
+                    tags=["malware"],
+                    severity=AlertSeverity.CRITICAL,
+                ),
+                TowerConfig(
+                    name="Phishing Content Filter",
+                    position=TowerPosition.SW,
+                    tower_type=TowerType.PHISHING_CONTENT,
+                    tags=["phishing"],
+                    severity=AlertSeverity.WARNING,
+                ),
+                TowerConfig(
+                    name="Phishing Domain Sentinel",
+                    position=TowerPosition.NW,
+                    tower_type=TowerType.PHISHING_DOMAIN,
+                    tags=["phishing"],
+                    severity=AlertSeverity.WARNING,
+                ),
             ],
         )
 
@@ -343,6 +401,8 @@ class WatchtowerConfig(BaseModel):
 
         host = _get("HOST", "0.0.0.0") or "0.0.0.0"
         port_raw = _get("PORT", "9100") or "9100"
+        environment = _get("ENVIRONMENT", "production") or "production"
+        model_name = _get("MODEL_NAME", "none") or "none"
 
         try:
             port = int(port_raw)
@@ -352,21 +412,36 @@ class WatchtowerConfig(BaseModel):
         if not (1024 <= port <= 65535):
             raise ValueError(f"{prefix}PORT must be between 1024 and 65535, got {port}")
 
-        cfg = cls.default_octagon(node_id=node_id)
-        cfg.host = host
-        cfg.port = port
-        cfg.environment = _get("ENVIRONMENT", "production") or "production"
-        cfg.model_name = _get("MODEL_NAME", "none") or "none"
+        max_errors_raw = _get("MAX_TOWER_ERRORS_BEFORE_DEGRADE", None)
+        if max_errors_raw is None:
+            max_errors_before_degrade = 25
+        else:
+            max_errors_before_degrade = _clamp_int(
+                "max_tower_errors_before_degrade",
+                max_errors_raw,
+                1,
+                1000,
+            )
 
-        mte = _get("MAX_TOWER_ERRORS_BEFORE_DEGRADE", None)
-        if mte is not None:
-            cfg.max_tower_errors_before_degrade = _clamp_int("max_tower_errors_before_degrade", mte, 1, 1000)
+        base = cls.default_octagon(node_id=node_id)
 
-        return cfg
+        return cls(
+            node_id=base.node_id,
+            environment=environment,
+            host=host,
+            port=port,
+            towers=list(base.towers),
+            model_name=model_name,
+            max_tower_errors_before_degrade=max_errors_before_degrade,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         if HAS_PYDANTIC and hasattr(self, "model_dump"):
             d = self.model_dump()
+            d["api_url"] = self.api_url
+            return d
+        if HAS_PYDANTIC and hasattr(self, "dict"):
+            d = self.dict()  # type: ignore[attr-defined]
             d["api_url"] = self.api_url
             return d
         return {
@@ -380,28 +455,39 @@ class WatchtowerConfig(BaseModel):
             "towers": [t.to_dict() for t in self.towers],
         }
 
-
 # ============================================================
-# Tower rule registry (pluggable)
+# Tower rule registry
 # ============================================================
 RuleResult = Optional[Tuple[str, AlertSeverity, List[str], Dict[str, Any]]]
 RuleFn = Callable[[SentinelEvent, ThresholdProfile], RuleResult]
 
 _RULES: Dict[TowerType, RuleFn] = {}
+_RULES_LOCK = threading.RLock()
 
 
 def register_rule(ttype: TowerType) -> Callable[[RuleFn], RuleFn]:
     def deco(fn: RuleFn) -> RuleFn:
-        _RULES[ttype] = fn
+        with _RULES_LOCK:
+            _RULES[ttype] = fn
         return fn
     return deco
+
+
+def _get_registered_rule(ttype: TowerType) -> Optional[RuleFn]:
+    with _RULES_LOCK:
+        return _RULES.get(ttype)
 
 
 @register_rule(TowerType.TRAFFIC_INBOUND)
 def _rule_inbound(event: SentinelEvent, thr: ThresholdProfile) -> RuleResult:
     p = event.payload
     if p.get("direction") == "inbound" and int(p.get("bytes", 0) or 0) > 0 and bool(p.get("blocked", False)):
-        return ("Blocked inbound traffic", AlertSeverity.WARNING, ["traffic", "inbound"], {"bytes": p.get("bytes")})
+        return (
+            "Blocked inbound traffic",
+            AlertSeverity.WARNING,
+            ["traffic", "inbound"],
+            {"bytes": p.get("bytes")},
+        )
     return None
 
 
@@ -409,7 +495,12 @@ def _rule_inbound(event: SentinelEvent, thr: ThresholdProfile) -> RuleResult:
 def _rule_outbound(event: SentinelEvent, thr: ThresholdProfile) -> RuleResult:
     p = event.payload
     if p.get("direction") == "outbound" and p.get("dest_reputation", "good") in {"bad", "unknown"}:
-        return ("Outbound to bad/unknown reputation host", AlertSeverity.WARNING, ["traffic", "outbound"], {"dest": p.get("dest")})
+        return (
+            "Outbound to bad/unknown reputation host",
+            AlertSeverity.WARNING,
+            ["traffic", "outbound"],
+            {"dest": p.get("dest")},
+        )
     return None
 
 
@@ -417,7 +508,12 @@ def _rule_outbound(event: SentinelEvent, thr: ThresholdProfile) -> RuleResult:
 def _rule_intrusion_network(event: SentinelEvent, thr: ThresholdProfile) -> RuleResult:
     p = event.payload
     if event.kind == "network" and bool(p.get("scan_detected", False)):
-        return ("Port scan / probe detected", AlertSeverity.CRITICAL, ["intrusion", "network"], {"src_ip": p.get("src_ip")})
+        return (
+            "Port scan / probe detected",
+            AlertSeverity.CRITICAL,
+            ["intrusion", "network"],
+            {"src_ip": p.get("src_ip")},
+        )
     return None
 
 
@@ -425,7 +521,12 @@ def _rule_intrusion_network(event: SentinelEvent, thr: ThresholdProfile) -> Rule
 def _rule_intrusion_auth(event: SentinelEvent, thr: ThresholdProfile) -> RuleResult:
     p = event.payload
     if event.kind == "auth" and int(p.get("failed_logins", 0) or 0) >= thr.failed_logins:
-        return (f"Multiple failed login attempts (>= {thr.failed_logins})", AlertSeverity.CRITICAL, ["intrusion", "auth"], {"failed_logins": p.get("failed_logins")})
+        return (
+            f"Multiple failed login attempts (>= {thr.failed_logins})",
+            AlertSeverity.CRITICAL,
+            ["intrusion", "auth"],
+            {"failed_logins": p.get("failed_logins")},
+        )
     return None
 
 
@@ -433,7 +534,12 @@ def _rule_intrusion_auth(event: SentinelEvent, thr: ThresholdProfile) -> RuleRes
 def _rule_malware_sig(event: SentinelEvent, thr: ThresholdProfile) -> RuleResult:
     p = event.payload
     if event.kind == "file" and bool(p.get("signature_match", False)):
-        return ("Known malware signature match", AlertSeverity.CRITICAL, ["malware", "signature"], {"signature": p.get("signature")})
+        return (
+            "Known malware signature match",
+            AlertSeverity.CRITICAL,
+            ["malware", "signature"],
+            {"signature": p.get("signature")},
+        )
     return None
 
 
@@ -441,7 +547,12 @@ def _rule_malware_sig(event: SentinelEvent, thr: ThresholdProfile) -> RuleResult
 def _rule_malware_behavior(event: SentinelEvent, thr: ThresholdProfile) -> RuleResult:
     p = event.payload
     if event.kind == "process" and bool(p.get("suspicious_behavior", False)):
-        return ("Behavioral malware indicator", AlertSeverity.CRITICAL, ["malware", "behavior"], {"proc": p.get("process_name")})
+        return (
+            "Behavioral malware indicator",
+            AlertSeverity.CRITICAL,
+            ["malware", "behavior"],
+            {"proc": p.get("process_name")},
+        )
     return None
 
 
@@ -449,7 +560,12 @@ def _rule_malware_behavior(event: SentinelEvent, thr: ThresholdProfile) -> RuleR
 def _rule_phishing_content(event: SentinelEvent, thr: ThresholdProfile) -> RuleResult:
     p = event.payload
     if event.kind == "email" and int(p.get("phishing_score", 0) or 0) >= thr.phishing_score:
-        return (f"Phishing-like email content (>= {thr.phishing_score})", AlertSeverity.WARNING, ["phishing", "content"], {"phishing_score": p.get("phishing_score")})
+        return (
+            f"Phishing-like email content (>= {thr.phishing_score})",
+            AlertSeverity.WARNING,
+            ["phishing", "content"],
+            {"phishing_score": p.get("phishing_score")},
+        )
     return None
 
 
@@ -457,47 +573,65 @@ def _rule_phishing_content(event: SentinelEvent, thr: ThresholdProfile) -> RuleR
 def _rule_phishing_domain(event: SentinelEvent, thr: ThresholdProfile) -> RuleResult:
     p = event.payload
     if event.kind == "url" and p.get("domain_reputation", "good") in {"phishing", "unknown"}:
-        return ("Suspicious/phishing domain reputation", AlertSeverity.WARNING, ["phishing", "domain"], {"domain": p.get("domain")})
+        return (
+            "Suspicious/phishing domain reputation",
+            AlertSeverity.WARNING,
+            ["phishing", "domain"],
+            {"domain": p.get("domain")},
+        )
     return None
-
 
 # ============================================================
 # Tower Runtime Object
 # ============================================================
+def _max_severity(a: AlertSeverity, b: AlertSeverity) -> AlertSeverity:
+    order = {
+        AlertSeverity.INFO: 1,
+        AlertSeverity.WARNING: 2,
+        AlertSeverity.CRITICAL: 3,
+    }
+    return a if order[a] >= order[b] else b
+
+
 class WatchtowerSegment:
     def __init__(self, cfg: TowerConfig):
         self.cfg = cfg
         self.last_scan_ts: Optional[float] = None
         self.alert_count: int = 0
         self.error_count: int = 0
-
         self._thr = thresholds_for(self.cfg.validated_sensitivity())
+        self._lock = threading.RLock()
 
     @property
     def id(self) -> str:
         return f"{self.cfg.position.value}:{self.cfg.tower_type.value}"
 
+    def increment_error(self) -> None:
+        with self._lock:
+            self.error_count += 1
+
     def scan(self, event: SentinelEvent) -> Optional[SentinelAlert]:
         if not self.cfg.enabled:
             return None
 
-        self.last_scan_ts = _utc_ts()
-
-        rule = _RULES.get(self.cfg.tower_type)
+        rule = _get_registered_rule(self.cfg.tower_type)
         if not rule:
+            with self._lock:
+                self.last_scan_ts = _utc_ts()
             return None
 
         result = rule(event, self._thr)
-        if not result:
-            return None
 
-        reason, rule_sev, rule_tags, details = result
-        self.alert_count += 1
+        with self._lock:
+            self.last_scan_ts = _utc_ts()
 
-        # Tower config sets a default severity, but rule can override upward.
-        # We take the more severe between cfg.severity and rule_sev.
+            if not result:
+                return None
+
+            reason, rule_sev, rule_tags, details = result
+            self.alert_count += 1
+
         sev = _max_severity(self.cfg.severity, rule_sev)
-
         merged_tags = list(dict.fromkeys([*self.cfg.tags, *rule_tags]))
 
         return SentinelAlert(
@@ -515,41 +649,42 @@ class WatchtowerSegment:
         )
 
     def status(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "name": self.cfg.name,
-            "position": self.cfg.position.value,
-            "tower_type": self.cfg.tower_type.value,
-            "enabled": bool(self.cfg.enabled),
-            "sensitivity": self.cfg.validated_sensitivity(),
-            "severity": getattr(self.cfg.severity, "value", str(self.cfg.severity)),
-            "thresholds": {
-                "failed_logins": self._thr.failed_logins,
-                "phishing_score": self._thr.phishing_score,
-            },
-            "last_scan_ts": self.last_scan_ts,
-            "alert_count": self.alert_count,
-            "error_count": self.error_count,
-        }
-
-
-def _max_severity(a: AlertSeverity, b: AlertSeverity) -> AlertSeverity:
-    order = {
-        AlertSeverity.INFO: 1,
-        AlertSeverity.WARNING: 2,
-        AlertSeverity.CRITICAL: 3,
-    }
-    return a if order[a] >= order[b] else b
-
+        with self._lock:
+            return {
+                "id": self.id,
+                "name": self.cfg.name,
+                "position": self.cfg.position.value,
+                "tower_type": self.cfg.tower_type.value,
+                "enabled": bool(self.cfg.enabled),
+                "sensitivity": self.cfg.validated_sensitivity(),
+                "severity": getattr(self.cfg.severity, "value", str(self.cfg.severity)),
+                "thresholds": {
+                    "failed_logins": self._thr.failed_logins,
+                    "phishing_score": self._thr.phishing_score,
+                },
+                "last_scan_ts": self.last_scan_ts,
+                "alert_count": self.alert_count,
+                "error_count": self.error_count,
+            }
 
 # ============================================================
 # Watchtower Node
 # ============================================================
 class WatchtowerNode:
     _ALLOWED_TRANSITIONS = {
-        WatchtowerState.INITIALIZING: {WatchtowerState.ACTIVE, WatchtowerState.DEGRADED, WatchtowerState.FAILED},
-        WatchtowerState.ACTIVE: {WatchtowerState.DEGRADED, WatchtowerState.FAILED},
-        WatchtowerState.DEGRADED: {WatchtowerState.ACTIVE, WatchtowerState.FAILED},
+        WatchtowerState.INITIALIZING: {
+            WatchtowerState.ACTIVE,
+            WatchtowerState.DEGRADED,
+            WatchtowerState.FAILED,
+        },
+        WatchtowerState.ACTIVE: {
+            WatchtowerState.DEGRADED,
+            WatchtowerState.FAILED,
+        },
+        WatchtowerState.DEGRADED: {
+            WatchtowerState.ACTIVE,
+            WatchtowerState.FAILED,
+        },
         WatchtowerState.FAILED: set(),
     }
 
@@ -557,15 +692,14 @@ class WatchtowerNode:
         self.config = config
         self._lock = threading.RLock()
         self._state: WatchtowerState = WatchtowerState.INITIALIZING
-
         self.towers: Dict[str, WatchtowerSegment] = {}
+        self._tower_errors_total = 0
+
         for tcfg in self.config.towers:
             seg = WatchtowerSegment(tcfg)
             if seg.id in self.towers:
-                raise ValueError(f"Duplicate tower id '{seg.id}' in config (would overwrite).")
+                raise ValueError(f"Duplicate tower id '{seg.id}' in config.")
             self.towers[seg.id] = seg
-
-        self._tower_errors_total = 0
 
         logger.info(
             "[%s] Watchtower initialized with %d segments on %s",
@@ -609,29 +743,46 @@ class WatchtowerNode:
             with self._lock:
                 self._state = WatchtowerState.FAILED
 
+    def _record_tower_error_and_maybe_degrade(self, seg: WatchtowerSegment) -> None:
+        degrade_now = False
+
+        seg.increment_error()
+
+        with self._lock:
+            self._tower_errors_total += 1
+            if (
+                self._state == WatchtowerState.ACTIVE
+                and self._tower_errors_total >= int(self.config.max_tower_errors_before_degrade)
+            ):
+                degrade_now = True
+
+        if degrade_now:
+            self.set_state(WatchtowerState.DEGRADED)
+
     def scan_event(self, event_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """
-        Input: raw dict (intake-friendly)
-        Output: list of alert dicts (API-friendly)
-        """
         with self._lock:
             if self._state != WatchtowerState.ACTIVE:
                 logger.debug("[%s] Ignoring event; state=%s", self.config.node_id, self._state.value)
                 return []
             towers_snapshot = list(self.towers.items())
 
-        # Normalize/ensure IDs at the edge
         _ensure_id(event_dict, "event_id")
         _ensure_id(event_dict, "correlation_id")
         if "created_ts" not in event_dict:
             event_dict["created_ts"] = _utc_ts()
 
-        # Convert into SentinelEvent
-        # Expect: payload is nested, but tolerate old flat events by folding into payload.
         payload = event_dict.get("payload")
         if not isinstance(payload, dict):
             payload = dict(event_dict)
-            for k in ("event_id", "correlation_id", "created_ts", "source", "kind", "environment", "payload"):
+            for k in (
+                "event_id",
+                "correlation_id",
+                "created_ts",
+                "source",
+                "kind",
+                "environment",
+                "payload",
+            ):
                 payload.pop(k, None)
 
         event = SentinelEvent(
@@ -651,13 +802,13 @@ class WatchtowerNode:
                 if alert:
                     alerts.append(alert.to_dict())
             except Exception as e:
-                seg.error_count += 1
-                self._tower_errors_total += 1
-                logger.exception("[%s] tower scan failed id=%s err=%s", self.config.node_id, seg_id, type(e).__name__)
-
-                # If towers are melting down, degrade the node to stop pretending everything is fine.
-                if self._tower_errors_total >= int(self.config.max_tower_errors_before_degrade):
-                    self.set_state(WatchtowerState.DEGRADED)
+                self._record_tower_error_and_maybe_degrade(seg)
+                logger.exception(
+                    "[%s] tower scan failed id=%s err=%s",
+                    self.config.node_id,
+                    seg_id,
+                    type(e).__name__,
+                )
 
         return alerts
 
@@ -665,6 +816,7 @@ class WatchtowerNode:
         with self._lock:
             st = self._state
             towers_snapshot = list(self.towers.values())
+            tower_errors_total = self._tower_errors_total
 
         return {
             "node_id": self.config.node_id,
@@ -672,20 +824,14 @@ class WatchtowerNode:
             "environment": self.config.environment,
             "api_url": self.config.api_url,
             "model_name": self.config.model_name,
-            "tower_errors_total": self._tower_errors_total,
+            "tower_errors_total": tower_errors_total,
             "towers": [seg.status() for seg in towers_snapshot],
         }
 
-
 # ============================================================
-# API factory (framework-agnostic)
+# API factory
 # ============================================================
 def create_api_app(node: WatchtowerNode) -> Dict[str, Any]:
-    """
-    Framework-agnostic API descriptor.
-
-    Returns handlers you can bind to routes in FastAPI/Starlette/etc.
-    """
     logger.info("Creating API for Sentinel-43 Watchtower node %s", node.config.node_id)
 
     def health_check() -> Dict[str, Any]:
@@ -711,6 +857,7 @@ def create_api_app(node: WatchtowerNode) -> Dict[str, Any]:
 
 __all__ = [
     "HAS_PYDANTIC",
+    "HAS_PYDANTIC_V2",
     "SentinelEvent",
     "SentinelAlert",
     "AlertSeverity",
@@ -724,3 +871,87 @@ __all__ = [
     "register_rule",
     "create_api_app",
 ]
+
+from __future__ import annotations
+
+from sentinel.expectations.contracts import (
+    ExpectationCategory,
+    ExpectationContract,
+    ExpectationContext,
+    ExpectationResult,
+    ExpectationSeverity,
+    ExpectationViolation,
+)
+
+from sentinel.expectations.expectations import BaseExpectation
+
+
+class WatchtowerAuthorizationExpectation(BaseExpectation):
+    """
+    Ensures S34 authorization events sent to Watchtower contain
+    the minimum required identity and decision data.
+    """
+
+    name = "watchtower.authorization.event.contract"
+    category = ExpectationCategory.AUTH
+    severity = ExpectationSeverity.CRITICAL
+
+    REQUIRED_FIELDS = {
+        "event_id",
+        "correlation_id",
+        "source",
+        "kind",
+        "payload",
+    }
+
+    REQUIRED_PAYLOAD_FIELDS = {
+        "subject",
+        "action",
+        "decision",
+    }
+
+    def evaluate(self, ctx: ExpectationContext) -> ExpectationResult:
+
+        event = ctx.data or {}
+
+        violations = []
+
+        # -------------------------------------------------
+        # Top level fields
+        # -------------------------------------------------
+        for field in self.REQUIRED_FIELDS:
+            if field not in event:
+                violations.append(
+                    ExpectationViolation(
+                        message=f"Missing required event field: {field}"
+                    )
+                )
+
+        payload = event.get("payload", {})
+
+        if not isinstance(payload, dict):
+            violations.append(
+                ExpectationViolation(
+                    message="Event payload must be a dictionary"
+                )
+            )
+        else:
+
+            for field in self.REQUIRED_PAYLOAD_FIELDS:
+                if field not in payload:
+                    violations.append(
+                        ExpectationViolation(
+                            message=f"Missing required auth payload field: {field}"
+                        )
+                    )
+
+        # -------------------------------------------------
+        # Result
+        # -------------------------------------------------
+        if violations:
+            return ExpectationResult(
+                passed=False,
+                violations=violations,
+            )
+
+        return ExpectationResult(passed=True)
