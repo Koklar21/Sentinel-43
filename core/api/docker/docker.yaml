@@ -1,0 +1,119 @@
+# =============================
+# Sentinel-43 Docker Setup
+# Production-ready baseline
+# =============================
+
+# ---------- Dockerfile ----------
+FROM python:3.12-slim
+
+# System setup
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# Install system deps
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python deps
+COPY requirements.txt ./
+RUN pip install --upgrade pip && pip install -r requirements.txt
+
+# Copy app
+COPY . .
+
+# Expose watchtower port
+EXPOSE 9100
+
+# Default run (watchtower node)
+CMD ["python", "-m", "core.watchtower"]
+
+
+# ---------- docker-compose.yml ----------
+version: "3.9"
+
+services:
+  s43-watchtower:
+    build: .
+    container_name: s43_watchtower
+    restart: unless-stopped
+    ports:
+      - "9100:9100"
+    environment:
+      - S43_WATCHTOWER_HOST=0.0.0.0
+      - S43_WATCHTOWER_PORT=9100
+      - S43_ENV=production
+      - S43_LOG_LEVEL=INFO
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      - s43-db
+
+  s43-db:
+    image: postgres:16
+    container_name: s43_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: s43
+      POSTGRES_USER: s43
+      POSTGRES_PASSWORD: s43_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - s43_pgdata:/var/lib/postgresql/data
+
+  s43-redis:
+    image: redis:7
+    container_name: s43_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+volumes:
+  s43_pgdata:
+
+
+# ---------- .dockerignore ----------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+.env
+.git
+.gitignore
+node_modules/
+dist/
+build/
+logs/
+
+
+# ---------- requirements.txt (baseline) ----------
+fastapi
+uvicorn[standard]
+pydantic>=2
+pydantic-settings
+sqlalchemy
+psycopg2-binary
+redis
+python-dotenv
+
+
+# ---------- Optional: entrypoint.sh ----------
+#!/bin/sh
+
+# Wait for DB
+until nc -z s43-db 5432; do
+  echo "Waiting for Postgres..."
+  sleep 1
+done
+
+# Run migrations if you add Alembic later
+# alembic upgrade head
+
+# Start app
+exec python -m core.watchtower
