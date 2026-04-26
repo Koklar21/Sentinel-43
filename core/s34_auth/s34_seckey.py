@@ -8,165 +8,13 @@
 #
 # Classification: INTERNAL
 #
-# This file is part of the Sentinel-43 security, audit, and orchestration system.
-#
-# =============================================================================
-# LICENSE (DUAL LICENSE MODEL)
-# =============================================================================
-#
-# OPEN SOURCE LICENSE OPTION (AGPLv3):
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, version 3 of the License.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-#
-# See the GNU Affero General Public License for more details:
-#
-# https://www.gnu.org/licenses/agpl-3.0.html
-#
-#
-# COMMERCIAL LICENSE OPTION:
-#
-# This file may alternatively be used under the terms of a commercial license
-# issued by the copyright holder.
-#
-# Commercial licenses allow private use, modification, and distribution
-# without the copyleft requirements of the AGPL.
-#
-# For commercial licensing inquiries, contact:
-#
-# licensing@sentinel43.io
-#
-#
-# =============================================================================
-# FILE INFORMATION
-# =============================================================================
-#
-# Project: Sentinel-43
 # Component: Identity Core
-# File: models.py
+# File: s34_auth.py
 #
 # Description:
-# Immutable authentication identity models and cryptographic key usage audit records.
-#
-# Author: Justin
-# Created: 2026
-# Last Modified: 2026-02-18
-#
-# WARNING:
-# Unauthorized modification of this file may compromise system integrity.
-# All changes must be reviewed under Sentinel-43 governance controls.
+# Sentinel-43 Authorization & Key Control
 #
 # =============================================================================
-"""
-s34_auth.py — Sentinel-43 Authorization & Key Control
-=====================================================
-
-SECURITY-CRITICAL FILE — REPO APPROVAL RULES
---------------------------------------------
-This file is part of Sentinel-43’s trust perimeter. Any modification
-to this file or its execution path is SECURITY-SENSITIVE and subject
-to strict review.
-
-REQUIRED CONDITIONS FOR APPROVAL
---------------------------------
-• No behavioral changes without explicit maintainer approval.
-  - This file governs authorization, activation timing, and trust gates.
-  - Unauthorized edits are treated as security regressions.
-
-• 24-hour activation delay is mandatory.
-  - The NOT-BEFORE enforcement window must remain intact.
-  - No overrides, environment shortcuts, debug flags, or test bypasses.
-
-• No plaintext secret persistence.
-  - Authorization tokens must NEVER be stored, logged, cached,
-    or reconstructed.
-  - One-time token visibility is mandatory.
-
-• Cryptographic guarantees are non-negotiable.
-  - Salting, pepper usage, PBKDF2/HMAC, and constant-time comparisons
-    must remain enforced.
-  - Weakening or replacing crypto primitives is grounds for rejection.
-
-• No bypass paths.
-  - All verification must converge on the same enforcement logic.
-  - No alternate validation flows, “temporary” skips, or shortcuts.
-
-• Scope enforcement must remain explicit.
-  - Least-privilege only.
-  - No wildcard scopes, implicit grants, or silent expansions.
-
-• Auditability must be preserved.
-  - Issuance time, activation delay, expiration, revocation,
-    and scope decisions must remain inspectable.
-  - Removal of audit-relevant fields is forbidden.
-
-• No dependency inflation.
-  - New dependencies require justification, security review,
-    and explicit approval.
-
-• No architectural bleed.
-  - Authorization logic stays isolated.
-  - Do not mix auth with transport, business logic, or unrelated concerns.
-
-• No license contamination.
-  - Added code must comply with the project’s licensing model
-    (including commercial protections).
-
-• Performance discipline required.
-  - No unbounded scans or expensive operations without
-    documented scaling plans that preserve security invariants.
-
-• Maintainer authority is final.
-  - If changes do not align with Sentinel-43 methodology,
-    structure, or security posture, they will not be merged.
-
-AUTO-REJECT CONDITIONS
-----------------------
-• Hardcoded secrets, keys, or credentials
-• Obfuscated or intentionally unclear logic
-• Altering activation timing without approval
-• Weakening cryptographic or timing guarantees
-• Large refactors without scoped, reviewed plans
-• Mixing authorization with unrelated systems
-
-This file is not “just code.”
-It is an enforcement boundary.
-Treat it accordingly.
-"""
-
-
-"""
-Sentinel-43 Authorization Keys (Delayed Activation)
----------------------------------------------------
-
-Design goals:
-- Store only hashed keys (never store plaintext keys).
-- One-time display of plaintext key at creation.
-- Constant-time verification (hmac.compare_digest).
-- Built-in 24-hour activation delay (NOT BEFORE).
-- Optional expiry + revocation.
-- SQLite-first, production-ready enough to not embarrass you later.
-
-Drop-in usage:
-    from authorization_keys import AuthKeyStore, AuthKeyConfig
-
-    store = AuthKeyStore(db_path="sentinel43.db")
-    token = store.issue_key(
-        subject="service:api",
-        scopes=["read:events", "write:events"],
-        issued_by="admin",
-        expires_in_seconds=7 * 24 * 3600,  # optional, default 7 days
-    )
-    print("SAVE THIS TOKEN NOW:", token)
-
-    # ... 24 hours later ...
-    ok = store.verify_key(token, required_scopes=["read:events"])
-"""
 
 from __future__ import annotations
 
@@ -178,47 +26,36 @@ import os
 import secrets
 import sqlite3
 import time
+import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Iterator, Optional, Sequence
 
-
-# ---------------------------
-# Config
-# ---------------------------
 
 @dataclass(frozen=True)
 class AuthKeyConfig:
-    # The thing you asked for: hard 24-hour activation delay.
     activation_delay_seconds: int = 24 * 60 * 60
-
-    # Default expiry if not specified at issuance (7 days).
     default_expires_in_seconds: int = 7 * 24 * 60 * 60
 
-    # HMAC "pepper" to prevent rainbow-table attacks against DB leaks.
-    # REQUIRED in production: set S43_AUTH_PEPPER in env/secrets manager.
     pepper_env_var: str = "S43_AUTH_PEPPER"
 
-    # Hash settings
     hash_alg: str = "sha256"
-    hash_iters: int = 210_000  # PBKDF2 iterations (tune if needed)
+    hash_iters: int = 210_000
     salt_bytes: int = 16
 
-    # Token format settings
     token_prefix: str = "S43K"
-    token_bytes: int = 32  # raw secret bytes before base64
+    token_bytes: int = 32
 
+    sqlite_timeout_seconds: float = 15.0
+    max_verify_candidates: int = 500
+    schema_version: int = 1
 
-# ---------------------------
-# Store (SQLite)
-# ---------------------------
 
 class AuthKeyStore:
     def __init__(self, db_path: str, config: Optional[AuthKeyConfig] = None) -> None:
         self.db_path = db_path
         self.cfg = config or AuthKeyConfig()
         self._ensure_schema()
-
-    # ---------- Public API ----------
 
     def issue_key(
         self,
@@ -229,53 +66,50 @@ class AuthKeyStore:
         expires_in_seconds: Optional[int] = None,
         metadata: Optional[dict] = None,
     ) -> str:
-        """
-        Create a new authorization key.
-
-        Returns:
-            plaintext token (ONE TIME). Store it securely.
-        """
         now = int(time.time())
         not_before = now + int(self.cfg.activation_delay_seconds)
 
-        exp_in = int(expires_in_seconds or self.cfg.default_expires_in_seconds)
+        if expires_in_seconds is None:
+            exp_in = int(self.cfg.default_expires_in_seconds)
+        else:
+            exp_in = int(expires_in_seconds)
+
         expires_at = now + exp_in if exp_in > 0 else None
 
         token = self._generate_token()
         salt = secrets.token_bytes(self.cfg.salt_bytes)
-
         key_hash = self._hash_token(token=token, salt=salt)
-
-        rec = {
-            "subject": subject,
-            "scopes_json": json.dumps(sorted(set(scopes))),
-            "issued_by": issued_by,
-            "issued_at": now,
-            "not_before": not_before,
-            "expires_at": expires_at,
-            "revoked_at": None,
-            "revoked_by": None,
-            "metadata_json": json.dumps(metadata or {}),
-            "salt_b64": base64.b64encode(salt).decode("ascii"),
-            "hash_b64": base64.b64encode(key_hash).decode("ascii"),
-        }
 
         with self._conn() as cx:
             cx.execute(
                 """
                 INSERT INTO auth_keys (
-                    subject, scopes_json, issued_by,
-                    issued_at, not_before, expires_at,
-                    revoked_at, revoked_by,
-                    metadata_json, salt_b64, hash_b64
+                    subject,
+                    scopes_json,
+                    issued_by,
+                    issued_at,
+                    not_before,
+                    expires_at,
+                    revoked_at,
+                    revoked_by,
+                    metadata_json,
+                    salt_b64,
+                    hash_b64
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    rec["subject"], rec["scopes_json"], rec["issued_by"],
-                    rec["issued_at"], rec["not_before"], rec["expires_at"],
-                    rec["revoked_at"], rec["revoked_by"],
-                    rec["metadata_json"], rec["salt_b64"], rec["hash_b64"],
+                    subject,
+                    json.dumps(sorted(set(scopes))),
+                    issued_by,
+                    now,
+                    not_before,
+                    expires_at,
+                    None,
+                    None,
+                    json.dumps(metadata or {}),
+                    base64.b64encode(salt).decode("ascii"),
+                    base64.b64encode(key_hash).decode("ascii"),
                 ),
             )
 
@@ -288,81 +122,94 @@ class AuthKeyStore:
         required_scopes: Optional[Sequence[str]] = None,
         now: Optional[int] = None,
     ) -> bool:
-        """
-        Verify token validity + delayed activation + expiry + revocation + scopes.
-        """
-        now_ts = int(now or time.time())
+        now_ts = int(now if now is not None else time.time())
         required = set(required_scopes or [])
 
-        # Fast fail for obviously wrong tokens, but don't leak too much.
-        if not isinstance(token, str) or len(token) < 20:
+        if not isinstance(token, str):
+            return False
+
+        if not token.startswith(f"{self.cfg.token_prefix}_"):
+            return False
+
+        if len(token) < 20:
             return False
 
         with self._conn() as cx:
-            # We can't lookup by token (we don't store plaintext). So we scan.
-            # This is OK for small-ish installations; for large scale, add a key_id
-            # prefix encoding or a token fingerprint column.
             rows = cx.execute(
                 """
                 SELECT
                     id,
                     scopes_json,
-                    not_before,
-                    expires_at,
-                    revoked_at,
                     salt_b64,
                     hash_b64
                 FROM auth_keys
-                """
+                WHERE revoked_at IS NULL
+                  AND not_before <= ?
+                  AND (expires_at IS NULL OR expires_at > ?)
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (now_ts, now_ts, int(self.cfg.max_verify_candidates)),
             ).fetchall()
 
-        token_bytes = token.encode("utf-8", errors="ignore")
-
-        for (key_id, scopes_json, not_before, expires_at, revoked_at, salt_b64, hash_b64) in rows:
-            # Time gates first (cheap)
-            if revoked_at is not None:
-                continue
-            if not_before is not None and now_ts < int(not_before):
-                continue
-            if expires_at is not None and now_ts > int(expires_at):
+        for _key_id, scopes_json, salt_b64, hash_b64 in rows:
+            try:
+                salt = base64.b64decode(salt_b64.encode("ascii"))
+                expected_hash = base64.b64decode(hash_b64.encode("ascii"))
+            except Exception:
                 continue
 
-            salt = base64.b64decode(salt_b64.encode("ascii"))
-            expected_hash = base64.b64decode(hash_b64.encode("ascii"))
             actual_hash = self._hash_token(token=token, salt=salt)
 
-            if hmac.compare_digest(expected_hash, actual_hash):
-                # Matched token: now check scopes
-                try:
-                    scopes = set(json.loads(scopes_json or "[]"))
-                except Exception:
-                    scopes = set()
+            if not hmac.compare_digest(expected_hash, actual_hash):
+                continue
 
-                if required and not required.issubset(scopes):
-                    return False
-                return True
+            try:
+                scopes = set(json.loads(scopes_json or "[]"))
+            except Exception:
+                return False
+
+            if required and not required.issubset(scopes):
+                return False
+
+            return True
 
         return False
 
-    def revoke_key(self, token: str, revoked_by: str, *, now: Optional[int] = None) -> bool:
-        """
-        Revoke a token (requires matching it).
-        Returns True if revoked, False if not found.
-        """
-        now_ts = int(now or time.time())
+    def revoke_key(
+        self,
+        token: str,
+        revoked_by: str,
+        *,
+        now: Optional[int] = None,
+    ) -> bool:
+        now_ts = int(now if now is not None else time.time())
+
+        if not isinstance(token, str):
+            return False
 
         with self._conn() as cx:
             rows = cx.execute(
                 """
-                SELECT id, salt_b64, hash_b64
+                SELECT
+                    id,
+                    salt_b64,
+                    hash_b64
                 FROM auth_keys
                 WHERE revoked_at IS NULL
-                """
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (int(self.cfg.max_verify_candidates),),
             ).fetchall()
 
-            for (key_id, salt_b64, hash_b64) in rows:
-                salt = base64.b64decode(salt_b64.encode("ascii"))
-                expected_hash = base64.b64decode(hash_b64.encode("ascii"))
+            for key_id, salt_b64, hash_b64 in rows:
+                try:
+                    salt = base64.b64decode(salt_b64.encode("ascii"))
+                    expected_hash = base64.b64decode(hash_b64.encode("ascii"))
+                except Exception:
+                    continue
+
                 actual_hash = self._hash_token(token=token, salt=salt)
 
                 if hmac.compare_digest(expected_hash, actual_hash):
@@ -378,41 +225,55 @@ class AuthKeyStore:
 
         return False
 
-    def list_keys(self) -> list[dict]:
-        """
-        Admin utility: lists keys WITHOUT revealing token.
-        """
+    def list_keys(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        safe_limit = max(1, min(int(limit), 500))
+        safe_offset = max(0, int(offset))
+
         with self._conn() as cx:
             rows = cx.execute(
                 """
                 SELECT
-                    id, subject, scopes_json, issued_by,
-                    issued_at, not_before, expires_at,
-                    revoked_at, revoked_by, metadata_json
+                    id,
+                    subject,
+                    scopes_json,
+                    issued_by,
+                    issued_at,
+                    not_before,
+                    expires_at,
+                    revoked_at,
+                    revoked_by,
+                    metadata_json
                 FROM auth_keys
                 ORDER BY id DESC
-                """
+                LIMIT ? OFFSET ?
+                """,
+                (safe_limit, safe_offset),
             ).fetchall()
 
         out: list[dict] = []
-        for r in rows:
+
+        for row in rows:
             out.append(
                 {
-                    "id": r[0],
-                    "subject": r[1],
-                    "scopes": json.loads(r[2] or "[]"),
-                    "issued_by": r[3],
-                    "issued_at": r[4],
-                    "not_before": r[5],
-                    "expires_at": r[6],
-                    "revoked_at": r[7],
-                    "revoked_by": r[8],
-                    "metadata": json.loads(r[9] or "{}"),
+                    "id": row[0],
+                    "subject": row[1],
+                    "scopes": self._safe_json_list(row[2]),
+                    "issued_by": row[3],
+                    "issued_at": row[4],
+                    "not_before": row[5],
+                    "expires_at": row[6],
+                    "revoked_at": row[7],
+                    "revoked_by": row[8],
+                    "metadata": self._safe_json_dict(row[9]),
                 }
             )
-        return out
 
-    # ---------- Internals ----------
+        return out
 
     def _generate_token(self) -> str:
         raw = secrets.token_bytes(self.cfg.token_bytes)
@@ -420,18 +281,29 @@ class AuthKeyStore:
         return f"{self.cfg.token_prefix}_{b64}"
 
     def _pepper(self) -> bytes:
-        pep = os.environ.get(self.cfg.pepper_env_var, "")
-        if not pep:
-            # In production this should be set. Here we still run, but loudly.
-            # If you ship this without pepper, you're basically handing attackers a coupon.
-            pep = "DEV_ONLY__SET_S43_AUTH_PEPPER"
-        return pep.encode("utf-8")
+        pepper = os.environ.get(self.cfg.pepper_env_var, "")
+
+        if pepper:
+            return pepper.encode("utf-8")
+
+        env = os.environ.get("S43_ENV", "").lower().strip()
+
+        if env in {"production", "prod"}:
+            raise RuntimeError(
+                f"Missing required production secret: {self.cfg.pepper_env_var}"
+            )
+
+        warnings.warn(
+            f"{self.cfg.pepper_env_var} is not set. Using development-only pepper.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+        return b"DEV_ONLY__SET_S43_AUTH_PEPPER"
 
     def _hash_token(self, token: str, salt: bytes) -> bytes:
-        """
-        PBKDF2-HMAC(token + pepper, salt, iters)
-        """
         material = token.encode("utf-8") + b"|" + self._pepper()
+
         return hashlib.pbkdf2_hmac(
             self.cfg.hash_alg,
             material,
@@ -440,19 +312,41 @@ class AuthKeyStore:
             dklen=32,
         )
 
-    def _conn(self) -> sqlite3.Connection:
-        cx = sqlite3.connect(self.db_path)
-        cx.execute("PRAGMA foreign_keys = ON;")
-        cx.execute("PRAGMA journal_mode = WAL;")
-        cx.execute("PRAGMA synchronous = NORMAL;")
-        return cx
+    @contextmanager
+    def _conn(self) -> Iterator[sqlite3.Connection]:
+        cx = sqlite3.connect(
+            self.db_path,
+            timeout=float(self.cfg.sqlite_timeout_seconds),
+        )
+
+        try:
+            cx.execute("PRAGMA foreign_keys = ON;")
+            cx.execute("PRAGMA journal_mode = WAL;")
+            cx.execute("PRAGMA synchronous = NORMAL;")
+            yield cx
+            cx.commit()
+        except Exception:
+            cx.rollback()
+            raise
+        finally:
+            cx.close()
 
     def _ensure_schema(self) -> None:
         with self._conn() as cx:
             cx.execute(
                 """
+                CREATE TABLE IF NOT EXISTS schema_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                """
+            )
+
+            cx.execute(
+                """
                 CREATE TABLE IF NOT EXISTS auth_keys (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+
                     subject TEXT NOT NULL,
                     scopes_json TEXT NOT NULL,
                     issued_by TEXT NOT NULL,
@@ -471,7 +365,49 @@ class AuthKeyStore:
                 );
                 """
             )
-            cx.execute("CREATE INDEX IF NOT EXISTS idx_auth_keys_subject ON auth_keys(subject);")
-            cx.execute("CREATE INDEX IF NOT EXISTS idx_auth_keys_revoked ON auth_keys(revoked_at);")
-            cx.execute("CREATE INDEX IF NOT EXISTS idx_auth_keys_not_before ON auth_keys(not_before);")
-            cx.execute("CREATE INDEX IF NOT EXISTS idx_auth_keys_expires ON auth_keys(expires_at);")
+
+            cx.execute(
+                """
+                INSERT INTO schema_meta (key, value)
+                VALUES ('auth_schema_version', ?)
+                ON CONFLICT(key) DO NOTHING
+                """,
+                (str(self.cfg.schema_version),),
+            )
+
+            cx.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_auth_keys_subject
+                ON auth_keys(subject);
+                """
+            )
+
+            cx.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_auth_keys_active_window
+                ON auth_keys(revoked_at, not_before, expires_at);
+                """
+            )
+
+            cx.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_auth_keys_issued_at
+                ON auth_keys(issued_at);
+                """
+            )
+
+    @staticmethod
+    def _safe_json_list(value: str) -> list:
+        try:
+            parsed = json.loads(value or "[]")
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+
+    @staticmethod
+    def _safe_json_dict(value: str) -> dict:
+        try:
+            parsed = json.loads(value or "{}")
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
