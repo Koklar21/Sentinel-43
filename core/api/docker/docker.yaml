@@ -1,46 +1,11 @@
-# =============================
-# Sentinel-43 Docker Setup
-# Production-ready baseline
-# =============================
-
-# ---------- Dockerfile ----------
-FROM python:3.12-slim
-
-# System setup
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
-
-WORKDIR /app
-
-# Install system deps
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Python deps
-COPY requirements.txt ./
-RUN pip install --upgrade pip && pip install -r requirements.txt
-
-# Copy app
-COPY . .
-
-# Expose watchtower port
-EXPOSE 9100
-
-# Default run (watchtower node)
-CMD ["python", "-m", "core.watchtower"]
-
-
-# ---------- docker-compose.yml ----------
 version: "3.9"
 
 services:
-  s43-watchtower:
+  s43-core:
     build: .
-    container_name: s43_watchtower
+    container_name: s43_core
     restart: unless-stopped
+    command: python -m core.watchtower
     ports:
       - "9100:9100"
     environment:
@@ -48,10 +13,43 @@ services:
       - S43_WATCHTOWER_PORT=9100
       - S43_ENV=production
       - S43_LOG_LEVEL=INFO
+      - DATABASE_URL=postgresql://s43:s43_password@s43-db:5432/s43
+      - REDIS_URL=redis://s43-redis:6379/0
     volumes:
       - ./logs:/app/logs
     depends_on:
       - s43-db
+      - s43-redis
+
+  s43-api:
+    build: .
+    container_name: s43_api
+    restart: unless-stopped
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      - S43_ENV=production
+      - S43_LOG_LEVEL=INFO
+      - CORE_URL=http://s43-core:9100
+      - DATABASE_URL=postgresql://s43:s43_password@s43-db:5432/s43
+      - REDIS_URL=redis://s43-redis:6379/0
+      - CORS_ORIGINS=http://localhost:3000
+    depends_on:
+      - s43-core
+      - s43-db
+      - s43-redis
+
+  s43-ui:
+    build: ./ui
+    container_name: s43_ui
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - s43-api
 
   s43-db:
     image: postgres:16
@@ -75,45 +73,3 @@ services:
 
 volumes:
   s43_pgdata:
-
-
-# ---------- .dockerignore ----------
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.sqlite3
-.env
-.git
-.gitignore
-node_modules/
-dist/
-build/
-logs/
-
-
-# ---------- requirements.txt (baseline) ----------
-fastapi
-uvicorn[standard]
-pydantic>=2
-pydantic-settings
-sqlalchemy
-psycopg2-binary
-redis
-python-dotenv
-
-
-# ---------- Optional: entrypoint.sh ----------
-#!/bin/sh
-
-# Wait for DB
-until nc -z s43-db 5432; do
-  echo "Waiting for Postgres..."
-  sleep 1
-done
-
-# Run migrations if you add Alembic later
-# alembic upgrade head
-
-# Start app
-exec python -m core.watchtower
