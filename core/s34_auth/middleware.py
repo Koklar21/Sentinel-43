@@ -1,17 +1,40 @@
-from typing import Optional
+from typing import Mapping, Optional
 
 from .constants import AUTH_HEADER, BEARER_PREFIX
-from .manager import AuthManager
 
 
-def extract_token(headers: dict) -> Optional[str]:
+def extract_token(headers: Optional[Mapping[str, str]]) -> Optional[str]:
+    """
+    Extract a Bearer token from request headers.
+
+    Returns None when:
+    - headers is None or empty
+    - Authorization header is missing
+    - Authorization header is not a string
+    - scheme is not Bearer
+    - token is missing or malformed
+    """
+    if not headers:
+        return None
 
     auth_header = headers.get(AUTH_HEADER)
-
-    if not auth_header:
+    if not isinstance(auth_header, str):
         return None
 
-    if not auth_header.startswith(BEARER_PREFIX):
+    parts = auth_header.strip().split()
+
+    expected_scheme = BEARER_PREFIX.strip().lower()
+
+    if len(parts) != 2:
         return None
 
-    return auth_header[len(BEARER_PREFIX):]
+    scheme, token = parts
+
+    if scheme.lower() != expected_scheme:
+        return None
+
+    token = token.strip()
+    if not token:
+        return None
+
+    return token
