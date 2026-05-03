@@ -1,736 +1,1158 @@
-"""sentinel43.core.governance.governance
+"""
+sentinel43.core.governance.governance
 
-Unified Governance Module for Sentinel-43
+Unified Governance Module for Sentinel-43.
+"""
 
-This file merges:
+from __future__ import annotations
 
-1. DATA-FIRST governance definitions (modes, actions, allow/deny rules)
-
-
-2. Governance orchestrator utilities (authz gate, velocity guard, tamper-evident audit)
-
-
-
-Design notes:
-
-The policy definitions section is pure data + helpers (no I/O).
-
-The orchestrator section intentionally performs I/O (SQLite/JSONL audit) and logging.
-
-
-If you later want strict separation, split this file into:
-
-governance_rules.py (data-first)
-
-governance_orchestrator.py (runtime)
-
-
-For now: one file, one source of truth. """
-
-from future import annotations
-
-import hashlib import hmac import json import logging import os import sqlite3 import threading from dataclasses import dataclass, field from datetime import datetime, timedelta, timezone from decimal import Decimal, InvalidOperation from pathlib import Path from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
-
-============================================================================
-
-LOG
-
-============================================================================
+import hashlib
+import hmac
+import json
+import logging
+import os
+import sqlite3
+import threading
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Callable, Deque, Mapping
 
 _logger = logging.getLogger("sentinel43.governance")
 
-============================================================================
 
-SECTION 1: DATA-FIRST GOVERNANCE DEFINITIONS
+# ============================================================================
+# CONFIG HELPERS
+# ============================================================================
 
-(No runtime side effects. No I/O.)
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.getenv(name)
 
-============================================================================
+    if raw is None or raw == "":
+        return default
 
-----------------------------
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}") from exc
 
-Policy Modes
+    if value < minimum:
+        raise RuntimeError(f"{name} must be >= {minimum}, got {value}")
 
-----------------------------
+    return value
 
-MODE_SHADOW = "SHADOW"  # observe-only; never execute high-impact actions MODE_HUMAN_GATED = "HUMAN_GATED"  # high-impact requires explicit human approval MODE_AUTONOMOUS_VETO = "AUTONOMOUS_VETO"  # conservative autonomous allow-list
 
-ALLOWED_MODES: Set[str] = {MODE_SHADOW, MODE_HUMAN_GATED, MODE_AUTONOMOUS_VETO}
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
 
-----------------------------
+    if raw is None or raw == "":
+        return default
 
-Action Taxonomy
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
-----------------------------
 
-ACTION_READ = "read" ACTION_WRITE = "write" ACTION_DELETE = "delete" ACTION_EXECUTE = "execute" ACTION_QUARANTINE = "quarantine" ACTION_ISOLATE = "isolate" ACTION_SHUTDOWN = "shutdown" ACTION_NETWORK_BLOCK = "network_block" ACTION_PRIV_ESC = "privilege_escalation"
-
-@dataclass(frozen=True) class GovernanceRules: """Canonical policy ruleset.
-
-- always_deny: actions never allowed under any mode
-- human_required: actions requiring explicit human approval in HUMAN_GATED
-- allowed_by_mode: explicit allow-lists per mode
-
-Shadow mode is *observe-only*.
-"""
-
-always_deny: Set[str]
-human_required: Set[str]
-allowed_by_mode: Dict[str, Set[str]]
-
-DEFAULT_GOVERNANCE = GovernanceRules( always_deny={ ACTION_PRIV_ESC, }, human_required={ ACTION_DELETE, ACTION_QUARANTINE, ACTION_ISOLATE, ACTION_SHUTDOWN, ACTION_NETWORK_BLOCK, }, allowed_by_mode={ # Shadow mode: you can evaluate anything you know about, but execution is not allowed. # Keep this as the broadest allow-list for observation, not enforcement. MODE_SHADOW: { ACTION_READ, ACTION_WRITE, ACTION_DELETE, ACTION_EXECUTE, ACTION_QUARANTINE, ACTION_ISOLATE, ACTION_SHUTDOWN, ACTION_NETWORK_BLOCK, }, MODE_HUMAN_GATED: { ACTION_READ, ACTION_WRITE, ACTION_EXECUTE, }, MODE_AUTONOMOUS_VETO: { ACTION_READ, ACTION_WRITE, }, }, )
-
-----------------------------
-
-Governance Decisions
-
-----------------------------
-
-GOV_DECISION_ALLOW = "ALLOW" GOV_DECISION_REQUIRE_HUMAN = "REQUIRE_HUMAN" GOV_DECISION_DENY = "DENY" GOV_DECISION_OBSERVE = "OBSERVE"  # shadow mode: do not execute, but record what would've happened
-
-@dataclass(frozen=True) class GovernanceDecision: decision: str reason: str
-
-def is_action_known(action: str) -> bool: """Return True if the action exists anywhere in governance.""" if action in DEFAULT_GOVERNANCE.always_deny: return True if action in DEFAULT_GOVERNANCE.human_required: return True for s in DEFAULT_GOVERNANCE.allowed_by_mode.values(): if action in s: return True return False
-
-def is_always_denied(action: str) -> bool: return action in DEFAULT_GOVERNANCE.always_deny
-
-def requires_human_approval(action: str) -> bool: return action in DEFAULT_GOVERNANCE.human_required
-
-def is_allowed_in_mode(action: str, mode: str) -> bool: """Return True if action is explicitly allowed in the given mode.
-
-Safety invariants:
-- always_deny always wins
-- unknown mode -> False
-"""
-if mode not in ALLOWED_MODES:
-    return False
-if is_always_denied(action):
-    return False
-return action in DEFAULT_GOVERNANCE.allowed_by_mode.get(mode, set())
-
-def list_allowed_actions(mode: str) -> List[str]: return sorted(DEFAULT_GOVERNANCE.allowed_by_mode.get(mode, set()))
-
-def evaluate_action(*, action: str, mode: str, human_approved: bool = False) -> GovernanceDecision: """Single source of truth for governance evaluation.
-
-- In SHADOW: never allow execution; return OBSERVE if action is eligible for evaluation.
-- always_deny: always DENY.
-- HUMAN_GATED: if human_required and not approved -> REQUIRE_HUMAN.
-- AUTONOMOUS_VETO: only allow what's on the allow-list.
-"""
-
-if mode not in ALLOWED_MODES:
-    return GovernanceDecision(GOV_DECISION_DENY, "UNKNOWN_MODE")
-
-if not is_action_known(action):
-    return GovernanceDecision(GOV_DECISION_DENY, "UNKNOWN_ACTION")
-
-if is_always_denied(action):
-    return GovernanceDecision(GOV_DECISION_DENY, "ALWAYS_DENIED")
-
-if not is_allowed_in_mode(action, mode):
-    return GovernanceDecision(GOV_DECISION_DENY, "NOT_ALLOWED_IN_MODE")
-
-# Shadow mode: observe-only.
-if mode == MODE_SHADOW:
-    return GovernanceDecision(GOV_DECISION_OBSERVE, "SHADOW_OBSERVE_ONLY")
-
-if mode == MODE_HUMAN_GATED and requires_human_approval(action) and not human_approved:
-    return GovernanceDecision(GOV_DECISION_REQUIRE_HUMAN, "HUMAN_APPROVAL_REQUIRED")
-
-return GovernanceDecision(GOV_DECISION_ALLOW, "ALLOWED")
-
-============================================================================
-
-SECTION 2: ORCHESTRATOR + AUDIT (Runtime, I/O, Logging)
-
-============================================================================
-
-------------------------------------------------------------
-
-CONFIG
-
-------------------------------------------------------------
-
-CONFIG: Dict[str, Any] = { "AUDIT_SQLITE_PATH": str(Path(os.getenv("SENTINEL_AUDIT_DB", "audit.db")).expanduser().resolve()), "AUDIT_JSONL_FILE": os.getenv("SENTINEL_AUDIT_JSONL", ""),  # optional
-
-"VELOCITY_WINDOW_SECONDS": int(os.getenv("SENTINEL_VELOCITY_WINDOW_SECONDS", "60")),
-"VELOCITY_LIMIT": int(os.getenv("SENTINEL_VELOCITY_LIMIT", "10")),
-"VELOCITY_GC_INTERVAL_SECONDS": int(os.getenv("SENTINEL_VELOCITY_GC_INTERVAL_SECONDS", "300")),
-"VELOCITY_MAX_ENTRIES_PER_USER": int(os.getenv("SENTINEL_VELOCITY_MAX_ENTRIES_PER_USER", "1000")),
-"VELOCITY_MAX_DISTINCT_USERS": int(os.getenv("SENTINEL_VELOCITY_MAX_DISTINCT_USERS", "50000")),
-
-# Auth replay/staleness guard
-"AUTH_MAX_AGE_SECONDS": int(os.getenv("SENTINEL_AUTH_MAX_AGE_SECONDS", "900")),
-
-# Audit behavior
-"SENTINEL_ENV": (os.getenv("SENTINEL_ENV") or "prod").lower(),
-"DEV_ALLOW_AUDIT_FAIL_OPEN": os.getenv("SENTINEL_DEV_ALLOW_AUDIT_FAIL_OPEN", "0") in {"1", "true", "TRUE"},
-
-# Audit retry to reduce fork drops under concurrency
-"AUDIT_MAX_RETRIES": int(os.getenv("SENTINEL_AUDIT_MAX_RETRIES", "3")),
-
+CONFIG: dict[str, Any] = {
+    "AUDIT_SQLITE_PATH": str(
+        Path(os.getenv("SENTINEL_AUDIT_DB", "audit.db")).expanduser().resolve()
+    ),
+    "AUDIT_JSONL_FILE": os.getenv("SENTINEL_AUDIT_JSONL", ""),
+    "VELOCITY_WINDOW_SECONDS": _env_int(
+        "SENTINEL_VELOCITY_WINDOW_SECONDS", 60
+    ),
+    "VELOCITY_LIMIT": _env_int("SENTINEL_VELOCITY_LIMIT", 10),
+    "VELOCITY_GC_INTERVAL_SECONDS": _env_int(
+        "SENTINEL_VELOCITY_GC_INTERVAL_SECONDS", 300
+    ),
+    "VELOCITY_MAX_ENTRIES_PER_USER": _env_int(
+        "SENTINEL_VELOCITY_MAX_ENTRIES_PER_USER", 1000
+    ),
+    "VELOCITY_MAX_DISTINCT_USERS": _env_int(
+        "SENTINEL_VELOCITY_MAX_DISTINCT_USERS", 50000
+    ),
+    "AUTH_MAX_AGE_SECONDS": _env_int("SENTINEL_AUTH_MAX_AGE_SECONDS", 900),
+    "SENTINEL_ENV": (os.getenv("SENTINEL_ENV") or "prod").strip().lower(),
+    "DEV_ALLOW_AUDIT_FAIL_OPEN": _env_bool(
+        "SENTINEL_DEV_ALLOW_AUDIT_FAIL_OPEN", False
+    ),
+    "AUDIT_MAX_RETRIES": _env_int("SENTINEL_AUDIT_MAX_RETRIES", 3),
 }
 
-class ReasonCodes: CLEARED = "CLEARED" AUTHORIZATION_FAILED = "AUTHORIZATION_FAILED" AUTH_STALE = "AUTH_STALE"
 
-AUDIT_CHAIN_FORK = "AUDIT_CHAIN_FORK"
-AUDIT_CRYPTO_CONFIG_MISSING = "AUDIT_CRYPTO_CONFIG_MISSING"
-AUDIT_APPEND_FAILED = "AUDIT_APPEND_FAILED"
+# ============================================================================
+# GOVERNANCE DEFINITIONS
+# ============================================================================
 
-VELOCITY_LIMIT = "VELOCITY_LIMIT"
-VELOCITY_CAP_EXCEEDED = "VELOCITY_CAP_EXCEEDED"
-VELOCITY_GLOBAL_CAP = "VELOCITY_GLOBAL_CAP"
+MODE_SHADOW = "SHADOW"
+MODE_HUMAN_GATED = "HUMAN_GATED"
+MODE_AUTONOMOUS_VETO = "AUTONOMOUS_VETO"
 
-INVALID_INPUT = "INVALID_INPUT"
-INVALID_AMOUNT = "INVALID_AMOUNT"
+ALLOWED_MODES: frozenset[str] = frozenset(
+    {
+        MODE_SHADOW,
+        MODE_HUMAN_GATED,
+        MODE_AUTONOMOUS_VETO,
+    }
+)
 
-class AuditEncoder(json.JSONEncoder): """Safe JSON encoder for Decimal/datetime."""
+ACTION_READ = "read"
+ACTION_WRITE = "write"
+ACTION_DELETE = "delete"
+ACTION_EXECUTE = "execute"
+ACTION_QUARANTINE = "quarantine"
+ACTION_ISOLATE = "isolate"
+ACTION_SHUTDOWN = "shutdown"
+ACTION_NETWORK_BLOCK = "network_block"
+ACTION_PRIV_ESC = "privilege_escalation"
 
-def default(self, obj: Any) -> Any:
-    if isinstance(obj, Decimal):
-        return str(obj)
-    if isinstance(obj, datetime):
-        return obj.isoformat()
-    return super().default(obj)
 
-def _get_hmac_secret() -> bytes: """Return HMAC secret bytes. FAILS CLOSED if missing."""
+@dataclass(frozen=True)
+class GovernanceRules:
+    """
+    Canonical policy ruleset.
 
-raw = os.getenv("GHOST_DEVICE_HASH_SECRET", "").strip()
-if not raw:
-    raise RuntimeError(
-        "GHOST_DEVICE_HASH_SECRET is required. "
-        "Generate with: python -c \"import secrets; print(secrets.token_hex(32))\""
+    MappingProxyType is used because frozen dataclasses do not freeze nested
+    mutable objects.
+    """
+
+    always_deny: frozenset[str]
+    human_required: frozenset[str]
+    allowed_by_mode: Mapping[str, frozenset[str]]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "allowed_by_mode",
+            MappingProxyType(dict(self.allowed_by_mode)),
+        )
+
+
+DEFAULT_GOVERNANCE = GovernanceRules(
+    always_deny=frozenset(
+        {
+            ACTION_PRIV_ESC,
+        }
+    ),
+    human_required=frozenset(
+        {
+            ACTION_DELETE,
+            ACTION_QUARANTINE,
+            ACTION_ISOLATE,
+            ACTION_SHUTDOWN,
+            ACTION_NETWORK_BLOCK,
+        }
+    ),
+    allowed_by_mode={
+        MODE_SHADOW: frozenset(
+            {
+                ACTION_READ,
+                ACTION_WRITE,
+                ACTION_DELETE,
+                ACTION_EXECUTE,
+                ACTION_QUARANTINE,
+                ACTION_ISOLATE,
+                ACTION_SHUTDOWN,
+                ACTION_NETWORK_BLOCK,
+            }
+        ),
+        MODE_HUMAN_GATED: frozenset(
+            {
+                ACTION_READ,
+                ACTION_WRITE,
+                ACTION_EXECUTE,
+                ACTION_DELETE,
+                ACTION_QUARANTINE,
+                ACTION_ISOLATE,
+                ACTION_SHUTDOWN,
+                ACTION_NETWORK_BLOCK,
+            }
+        ),
+        MODE_AUTONOMOUS_VETO: frozenset(
+            {
+                ACTION_READ,
+                ACTION_WRITE,
+            }
+        ),
+    },
+)
+
+GOV_DECISION_ALLOW = "ALLOW"
+GOV_DECISION_REQUIRE_HUMAN = "REQUIRE_HUMAN"
+GOV_DECISION_DENY = "DENY"
+GOV_DECISION_OBSERVE = "OBSERVE"
+
+
+@dataclass(frozen=True)
+class GovernanceDecision:
+    decision: str
+    reason: str
+
+
+def _normalize_action(action: str) -> str:
+    return (action or "").strip().lower()
+
+
+def _normalize_mode(mode: str) -> str:
+    return (mode or "").strip().upper()
+
+
+def is_action_known(action: str) -> bool:
+    normalized = _normalize_action(action)
+
+    if normalized in DEFAULT_GOVERNANCE.always_deny:
+        return True
+
+    if normalized in DEFAULT_GOVERNANCE.human_required:
+        return True
+
+    return any(
+        normalized in actions
+        for actions in DEFAULT_GOVERNANCE.allowed_by_mode.values()
     )
 
-# Accept hex or raw text. If hex-like, decode.
-try:
-    if all(c in "0123456789abcdefABCDEF" for c in raw) and len(raw) >= 64 and len(raw) % 2 == 0:
-        return bytes.fromhex(raw)
-except Exception:
-    pass
 
-return raw.encode("utf-8")
+def is_always_denied(action: str) -> bool:
+    return _normalize_action(action) in DEFAULT_GOVERNANCE.always_deny
 
-def constant_time_compare(a: str, b: str) -> bool: return hmac.compare_digest(a, b)
 
-class AuditStore: """Tamper-evident append-only audit chain (SQLite + optional JSONL sink).
+def requires_human_approval(action: str) -> bool:
+    return _normalize_action(action) in DEFAULT_GOVERNANCE.human_required
 
-NOTE: append() is transactionally atomic and fork-protected.
-"""
 
-def __init__(self, sqlite_path: str, jsonl_path: Optional[str] = None) -> None:
-    self.sqlite_path = sqlite_path
-    self.jsonl_path = jsonl_path or None
-    self._lock = threading.Lock()
-    self._ensure_schema()
+def is_allowed_in_mode(action: str, mode: str) -> bool:
+    normalized_action = _normalize_action(action)
+    normalized_mode = _normalize_mode(mode)
 
-def _connect(self) -> sqlite3.Connection:
-    con = sqlite3.connect(self.sqlite_path, timeout=5.0)
-    con.execute("PRAGMA journal_mode=WAL;")
-    con.execute("PRAGMA synchronous=FULL;")
-    return con
+    if normalized_mode not in ALLOWED_MODES:
+        return False
 
-def _ensure_schema(self) -> None:
-    Path(self.sqlite_path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
-    con = self._connect()
-    try:
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                decision_time TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                payload_hash TEXT NOT NULL,
-                prev_hash TEXT NOT NULL
-            )
-            """
+    if is_always_denied(normalized_action):
+        return False
+
+    return normalized_action in DEFAULT_GOVERNANCE.allowed_by_mode.get(
+        normalized_mode,
+        frozenset(),
+    )
+
+
+def list_allowed_actions(mode: str) -> list[str]:
+    return sorted(DEFAULT_GOVERNANCE.allowed_by_mode.get(_normalize_mode(mode), frozenset()))
+
+
+def evaluate_action(
+    *,
+    action: str,
+    mode: str,
+    human_approved: bool = False,
+) -> GovernanceDecision:
+    normalized_action = _normalize_action(action)
+    normalized_mode = _normalize_mode(mode)
+
+    if normalized_mode not in ALLOWED_MODES:
+        return GovernanceDecision(GOV_DECISION_DENY, "UNKNOWN_MODE")
+
+    if not is_action_known(normalized_action):
+        return GovernanceDecision(GOV_DECISION_DENY, "UNKNOWN_ACTION")
+
+    if is_always_denied(normalized_action):
+        return GovernanceDecision(GOV_DECISION_DENY, "ALWAYS_DENIED")
+
+    if not is_allowed_in_mode(normalized_action, normalized_mode):
+        return GovernanceDecision(GOV_DECISION_DENY, "NOT_ALLOWED_IN_MODE")
+
+    if normalized_mode == MODE_SHADOW:
+        return GovernanceDecision(GOV_DECISION_OBSERVE, "SHADOW_OBSERVE_ONLY")
+
+    if (
+        normalized_mode == MODE_HUMAN_GATED
+        and requires_human_approval(normalized_action)
+        and not human_approved
+    ):
+        return GovernanceDecision(
+            GOV_DECISION_REQUIRE_HUMAN,
+            "HUMAN_APPROVAL_REQUIRED",
         )
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS audit_anchor (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                prev_hash TEXT NOT NULL
-            )
-            """
+
+    return GovernanceDecision(GOV_DECISION_ALLOW, "ALLOWED")
+
+
+# ============================================================================
+# REASON CODES
+# ============================================================================
+
+class ReasonCodes:
+    CLEARED = "CLEARED"
+    REVIEW = "REVIEW"
+    AUTHORIZATION_FAILED = "AUTHORIZATION_FAILED"
+    AUTH_STALE = "AUTH_STALE"
+    AUDIT_CHAIN_FORK = "AUDIT_CHAIN_FORK"
+    AUDIT_CRYPTO_CONFIG_MISSING = "AUDIT_CRYPTO_CONFIG_MISSING"
+    AUDIT_APPEND_FAILED = "AUDIT_APPEND_FAILED"
+    VELOCITY_LIMIT = "VELOCITY_LIMIT"
+    VELOCITY_CAP_EXCEEDED = "VELOCITY_CAP_EXCEEDED"
+    VELOCITY_GLOBAL_CAP = "VELOCITY_GLOBAL_CAP"
+    INVALID_INPUT = "INVALID_INPUT"
+    INVALID_AMOUNT = "INVALID_AMOUNT"
+
+
+# ============================================================================
+# AUDIT SUPPORT
+# ============================================================================
+
+class AuditEncoder(json.JSONEncoder):
+    def default(self, obj: Any) -> Any:
+        if isinstance(obj, Decimal):
+            return str(obj)
+
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+
+        return super().default(obj)
+
+
+def _get_hmac_secret() -> bytes:
+    raw = os.getenv("GHOST_DEVICE_HASH_SECRET", "").strip()
+
+    if not raw:
+        raise RuntimeError(
+            "GHOST_DEVICE_HASH_SECRET is required. "
+            "Generate with: python -c \"import secrets; print(secrets.token_hex(32))\""
         )
-        row = con.execute("SELECT prev_hash FROM audit_anchor WHERE id=1").fetchone()
-        if row is None:
-            con.execute("INSERT INTO audit_anchor (id, prev_hash) VALUES (1, ?)", ("GENESIS",))
-        con.commit()
-    finally:
-        con.close()
 
-def get_prev_hash(self) -> str:
-    con = self._connect()
     try:
-        (prev_hash,) = con.execute("SELECT prev_hash FROM audit_anchor WHERE id=1").fetchone()
-        return str(prev_hash)
-    finally:
-        con.close()
+        if (
+            all(c in "0123456789abcdefABCDEF" for c in raw)
+            and len(raw) >= 64
+            and len(raw) % 2 == 0
+        ):
+            return bytes.fromhex(raw)
+    except Exception:
+        pass
 
-def append(self, payload: Dict[str, Any], payload_hash: str, prev_hash: str) -> None:
-    """Atomic append with fork detection."""
+    return raw.encode("utf-8")
 
-    with self._lock:
+
+def constant_time_compare(a: str | bytes, b: str | bytes) -> bool:
+    if type(a) is not type(b):
+        return False
+
+    return hmac.compare_digest(a, b)
+
+
+class AuditStore:
+    """
+    Tamper-evident append-only audit chain.
+
+    SQLite is the authoritative sink.
+    JSONL is optional secondary output.
+    """
+
+    def __init__(self, sqlite_path: str, jsonl_path: str | None = None) -> None:
+        self.sqlite_path = sqlite_path
+        self.jsonl_path = jsonl_path or None
+        self._lock = threading.Lock()
+        self._ensure_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        con = sqlite3.connect(self.sqlite_path, timeout=5.0)
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA synchronous=FULL;")
+        return con
+
+    def _ensure_schema(self) -> None:
+        Path(self.sqlite_path).expanduser().resolve().parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
         con = self._connect()
         try:
-            con.execute("BEGIN IMMEDIATE")
-            (current_head,) = con.execute("SELECT prev_hash FROM audit_anchor WHERE id=1").fetchone()
-            current_head = str(current_head)
-
-            if current_head != prev_hash:
-                con.rollback()
-                raise RuntimeError(f"Audit chain fork detected. expected={prev_hash} current_head={current_head}")
-
-            decision_time = payload.get("decision_time") or datetime.now(timezone.utc).isoformat()
-            payload_json = json.dumps(payload, cls=AuditEncoder, sort_keys=True, separators=(",", ":"))
-
             con.execute(
-                "INSERT INTO audit_log (decision_time, payload_json, payload_hash, prev_hash) VALUES (?, ?, ?, ?)",
-                (decision_time, payload_json, payload_hash, prev_hash),
+                """
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    decision_time TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    prev_hash TEXT NOT NULL
+                )
+                """
             )
-            con.execute("UPDATE audit_anchor SET prev_hash=? WHERE id=1", (payload_hash,))
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_anchor (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    prev_hash TEXT NOT NULL
+                )
+                """
+            )
+            row = con.execute(
+                "SELECT prev_hash FROM audit_anchor WHERE id = 1"
+            ).fetchone()
+
+            if row is None:
+                con.execute(
+                    "INSERT INTO audit_anchor (id, prev_hash) VALUES (1, ?)",
+                    ("GENESIS",),
+                )
+
             con.commit()
-        except Exception:
-            con.rollback()
-            raise
         finally:
             con.close()
 
-    # Best-effort JSONL sink outside DB transaction
-    if self.jsonl_path:
+    def get_prev_hash(self) -> str:
+        with self._lock:
+            con = self._connect()
+            try:
+                row = con.execute(
+                    "SELECT prev_hash FROM audit_anchor WHERE id = 1"
+                ).fetchone()
+
+                if row is None:
+                    raise RuntimeError("Audit anchor missing")
+
+                return str(row[0])
+            finally:
+                con.close()
+
+    def append(
+        self,
+        payload: dict[str, Any],
+        payload_hash: str,
+        prev_hash: str,
+    ) -> None:
+        """
+        Append payload to the audit chain.
+
+        The SQLite append and optional JSONL write are kept under the same
+        process lock to preserve local ordering.
+        """
+
+        with self._lock:
+            con = self._connect()
+            try:
+                con.execute("BEGIN IMMEDIATE")
+
+                row = con.execute(
+                    "SELECT prev_hash FROM audit_anchor WHERE id = 1"
+                ).fetchone()
+
+                if row is None:
+                    con.rollback()
+                    raise RuntimeError("Audit anchor missing")
+
+                current_head = str(row[0])
+
+                if current_head != prev_hash:
+                    con.rollback()
+                    raise RuntimeError(
+                        "Audit chain fork detected. "
+                        f"expected={prev_hash} current_head={current_head}"
+                    )
+
+                decision_time = payload.get("decision_time") or datetime.now(
+                    timezone.utc
+                ).isoformat()
+
+                payload_json = json.dumps(
+                    payload,
+                    cls=AuditEncoder,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+
+                con.execute(
+                    """
+                    INSERT INTO audit_log
+                    (decision_time, payload_json, payload_hash, prev_hash)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (decision_time, payload_json, payload_hash, prev_hash),
+                )
+
+                con.execute(
+                    "UPDATE audit_anchor SET prev_hash = ? WHERE id = 1",
+                    (payload_hash,),
+                )
+
+                con.commit()
+
+                if self.jsonl_path:
+                    self._append_jsonl_locked(payload, payload_hash)
+
+            except Exception:
+                con.rollback()
+                raise
+            finally:
+                con.close()
+
+    def _append_jsonl_locked(
+        self,
+        payload: dict[str, Any],
+        payload_hash: str,
+    ) -> None:
+        """
+        Append to JSONL sink.
+
+        Caller must hold self._lock.
+        """
+
+        if not self.jsonl_path:
+            return
+
         try:
             p = Path(self.jsonl_path).expanduser().resolve()
             p.parent.mkdir(parents=True, exist_ok=True)
+
             with open(p, "a", encoding="utf-8") as f:
-                # IMPORTANT: newline must be a valid string literal.
-                f.write(json.dumps({"payload": payload, "hash": payload_hash}, cls=AuditEncoder) + "\n")
+                f.write(
+                    json.dumps(
+                        {
+                            "payload": payload,
+                            "hash": payload_hash,
+                        },
+                        cls=AuditEncoder,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
                 f.flush()
                 os.fsync(f.fileno())
-        except Exception as e:
-            _logger.error(f"JSONL sink failed (non-fatal): {e}")
 
-@dataclass(frozen=True) class TransactionContext: user_id: str amount: Decimal timestamp: datetime location: str device_id: str metadata: Dict[str, Any] = field(default_factory=dict)
+        except Exception as exc:
+            _logger.error("JSONL sink failed: %s", exc)
 
-class SecureAuditLog: def init(self, store: AuditStore) -> None: self.store = store
 
-def _hmac_device(self, device_id: str) -> str:
-    secret = _get_hmac_secret()
-    # hmac.new is valid; using explicit digestmod for clarity.
-    return hmac.new(secret, device_id.encode("utf-8"), digestmod=hashlib.sha256).hexdigest()
+@dataclass(frozen=True)
+class TransactionContext:
+    user_id: str
+    amount: Decimal
+    timestamp: datetime
+    location: str
+    device_id: str
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
-def _hash_metadata(self, meta: Dict[str, Any]) -> str:
-    raw = json.dumps(meta or {}, cls=AuditEncoder, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
+    def __post_init__(self) -> None:
+        if self.timestamp.tzinfo is None:
+            raise ValueError("timestamp must be timezone-aware")
 
-def verify_device_hash(self, device_id: str, claimed_hash: str) -> bool:
-    try:
-        actual = self._hmac_device(device_id)
-        return constant_time_compare(actual, claimed_hash)
-    except Exception as e:
-        _logger.error(f"Device hash verification failed: {e}")
-        return False
+        object.__setattr__(
+            self,
+            "metadata",
+            MappingProxyType(dict(self.metadata)),
+        )
 
-def log_decision(
-    self,
-    context: TransactionContext,
-    decision: str,
-    reason_code: str,
-    score: Decimal,
-    filtered_meta: Dict[str, Any],
-    extra: Dict[str, Any],
-) -> bool:
-    """Write audit record with retry on fork."""
 
-    try:
-        device_hash = self._hmac_device(context.device_id)
-        meta_hash = self._hash_metadata(filtered_meta)
+class SecureAuditLog:
+    def __init__(self, store: AuditStore) -> None:
+        self.store = store
 
-        payload: Dict[str, Any] = {
-            "decision_time": datetime.now(timezone.utc).isoformat(),
-            "user_id": context.user_id,
-            "amount": str(context.amount),
-            "location": context.location,
-            "device_hash": device_hash,
-            "metadata_hash": meta_hash,
-            "decision": decision,
-            "reason_code": reason_code,
-            "score": str(score),
-            "extra": extra or {},
-        }
+    def _hmac_device(self, device_id: str) -> str:
+        secret = _get_hmac_secret()
+        return hmac.new(
+            secret,
+            device_id.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
 
-        max_retries = max(1, int(CONFIG.get("AUDIT_MAX_RETRIES", 3)))
-        for attempt in range(1, max_retries + 1):
-            prev_hash = self.store.get_prev_hash()
-            payload_json = json.dumps(payload, cls=AuditEncoder, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            payload_hash = hashlib.sha256(payload_json + prev_hash.encode("utf-8")).hexdigest()
+    def _hash_metadata(self, meta: Mapping[str, Any]) -> str:
+        raw = json.dumps(
+            dict(meta or {}),
+            cls=AuditEncoder,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
 
-            try:
-                self.store.append(payload=payload, payload_hash=payload_hash, prev_hash=prev_hash)
-                return True
-            except RuntimeError as e:
-                msg = str(e)
-                if "fork" in msg.lower() and attempt < max_retries:
-                    continue
-                _logger.critical(f"Audit failed (hard): {e}")
-                return False
+        return hashlib.sha256(raw).hexdigest()
 
-        return False
+    def verify_device_hash(self, device_id: str, claimed_hash: str) -> bool:
+        try:
+            actual = self._hmac_device(device_id)
+            return constant_time_compare(actual, claimed_hash)
+        except Exception as exc:
+            _logger.error("Device hash verification failed: %s", exc)
+            return False
 
-    except RuntimeError as e:
-        _logger.critical(f"Audit failed (hard): {e}")
-        return False
-    except Exception as e:
-        _logger.error(f"Audit failed: {e}")
-        return False
+    def log_decision(
+        self,
+        context: TransactionContext,
+        decision: str,
+        reason_code: str,
+        score: Decimal,
+        filtered_meta: Mapping[str, Any],
+        extra: Mapping[str, Any],
+    ) -> bool:
+        try:
+            device_hash = self._hmac_device(context.device_id)
+            meta_hash = self._hash_metadata(filtered_meta)
 
-class VelocityGuard: """In-memory velocity limiter with GC + caps against memory abuse."""
+            payload: dict[str, Any] = {
+                "decision_time": datetime.now(timezone.utc).isoformat(),
+                "user_id": context.user_id,
+                "amount": str(context.amount),
+                "location": context.location,
+                "device_hash": device_hash,
+                "metadata_hash": meta_hash,
+                "decision": decision,
+                "reason_code": reason_code,
+                "score": str(score),
+                "extra": dict(extra or {}),
+            }
 
-def __init__(
-    self,
-    *,
-    window_seconds: int,
-    limit: int,
-    gc_interval_seconds: int,
-    max_entries_per_user: int,
-    max_distinct_users: int,
-) -> None:
-    self.window_seconds = int(window_seconds)
-    self.limit = int(limit)
-    self.gc_interval_seconds = int(gc_interval_seconds)
-    self.max_entries_per_user = int(max_entries_per_user)
-    self.max_distinct_users = int(max_distinct_users)
+            max_retries = max(1, int(CONFIG["AUDIT_MAX_RETRIES"]))
 
-    self.user_events: Dict[str, Deque[datetime]] = {}
-    self.lock = threading.Lock()
-    self.last_gc = datetime.now(timezone.utc)
+            for attempt in range(1, max_retries + 1):
+                prev_hash = self.store.get_prev_hash()
 
-    from collections import deque
+                payload_json = json.dumps(
+                    payload,
+                    cls=AuditEncoder,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
 
-    self._deque = deque
+                payload_hash = hashlib.sha256(
+                    payload_json + prev_hash.encode("utf-8")
+                ).hexdigest()
 
-def _garbage_collect(self, now: datetime) -> None:
-    if (now - self.last_gc).total_seconds() < self.gc_interval_seconds:
-        return
+                try:
+                    self.store.append(
+                        payload=payload,
+                        payload_hash=payload_hash,
+                        prev_hash=prev_hash,
+                    )
+                    return True
 
-    cutoff = now - timedelta(seconds=self.window_seconds)
-    dead_users: List[str] = []
-    for user_id, dq in self.user_events.items():
-        while dq and dq[0] < cutoff:
-            dq.popleft()
-        if not dq:
-            dead_users.append(user_id)
+                except RuntimeError as exc:
+                    if "fork" in str(exc).lower() and attempt < max_retries:
+                        continue
 
-    for user_id in dead_users:
-        self.user_events.pop(user_id, None)
+                    _logger.critical("Audit failed: %s", exc)
+                    return False
 
-    self.last_gc = now
-
-def allow(self, user_id: str, now: datetime) -> Tuple[bool, str]:
-    """Returns (allowed, reason_code)."""
-
-    with self.lock:
-        self._garbage_collect(now)
-
-        is_new_user = user_id not in self.user_events
-        if is_new_user and len(self.user_events) >= self.max_distinct_users:
-            _logger.warning(
-                f"Velocity global cap exceeded distinct_users={len(self.user_events)} cap={self.max_distinct_users}"
+            _logger.critical(
+                "Audit failed: retries exhausted after %s attempts",
+                max_retries,
             )
-            return (False, ReasonCodes.VELOCITY_GLOBAL_CAP)
+            return False
 
-        dq = self.user_events.setdefault(user_id, self._deque())
-        cutoff = now - timedelta(seconds=self.window_seconds)
-        while dq and dq[0] < cutoff:
-            dq.popleft()
+        except RuntimeError as exc:
+            _logger.critical("Audit failed: %s", exc)
+            return False
 
-        if len(dq) >= self.max_entries_per_user:
-            _logger.warning(
-                f"Velocity cap exceeded user={user_id} entries={len(dq)} cap={self.max_entries_per_user}"
-            )
-            return (False, ReasonCodes.VELOCITY_CAP_EXCEEDED)
+        except Exception as exc:
+            _logger.error("Audit failed: %s", exc)
+            return False
 
-        if len(dq) >= self.limit:
-            return (False, ReasonCodes.VELOCITY_LIMIT)
 
-        dq.append(now)
-        return (True, ReasonCodes.CLEARED)
+# ============================================================================
+# VELOCITY GUARD
+# ============================================================================
 
-@dataclass(frozen=True) class CallerContext: caller_id: str caller_roles: Set[str] authenticated_at: datetime
-
-@dataclass(frozen=True) class Decision: status: str score: Decimal reason: str
-
-class SystemOrchestrator: """Governance gate.
-
-NOTE: This is still a demo-oriented transaction example.
-You will likely adapt it to: process_action(action, mode, target, human_approved, metadata).
-"""
-
-def __init__(
-    self,
-    *,
-    authorizer: Optional[Callable[[CallerContext, str], bool]] = None,
-    audit_sqlite_path: Optional[str] = None,
-    audit_jsonl_path: Optional[str] = None,
-) -> None:
-    self.authorizer = authorizer or self._default_authorizer
-
-    store = AuditStore(
-        sqlite_path=audit_sqlite_path or CONFIG["AUDIT_SQLITE_PATH"],
-        jsonl_path=(audit_jsonl_path or CONFIG["AUDIT_JSONL_FILE"] or None),
-    )
-    self.auditor = SecureAuditLog(store)
-
-    self.velocity_guard = VelocityGuard(
-        window_seconds=CONFIG["VELOCITY_WINDOW_SECONDS"],
-        limit=CONFIG["VELOCITY_LIMIT"],
-        gc_interval_seconds=CONFIG["VELOCITY_GC_INTERVAL_SECONDS"],
-        max_entries_per_user=CONFIG["VELOCITY_MAX_ENTRIES_PER_USER"],
-        max_distinct_users=CONFIG["VELOCITY_MAX_DISTINCT_USERS"],
-    )
-
-@staticmethod
-def _default_authorizer(caller: CallerContext, target_user_id: str) -> bool:
-    if caller.caller_id == target_user_id:
-        return True
-    if "admin" in caller.caller_roles or "system" in caller.caller_roles:
-        return True
-    return False
-
-def process_transaction(
-    self,
-    *,
-    caller: CallerContext,
-    user_id: str,
-    amount_str: str,
-    metadata: Dict[str, Any],
-) -> Decision:
-    now = datetime.now(timezone.utc)
-
-    # --- AUTHZ FIRST ---
-    if not self.authorizer(caller, user_id):
-        _logger.warning(f"Unauthorized: caller={caller.caller_id} -> user={user_id}")
-        self._best_effort_audit_block(
-            user_id=user_id,
-            metadata=metadata,
-            reason=ReasonCodes.AUTHORIZATION_FAILED,
-            extra={"caller_id": caller.caller_id, "caller_roles": sorted(caller.caller_roles)},
-        )
-        return Decision(status="BLOCKED", score=Decimal("0"), reason=ReasonCodes.AUTHORIZATION_FAILED)
-
-    # --- AUTH FRESHNESS ---
-    try:
-        max_age = int(CONFIG.get("AUTH_MAX_AGE_SECONDS", 900))
-    except Exception:
-        max_age = 900
-
-    if (now - caller.authenticated_at).total_seconds() > max_age:
-        _logger.warning(
-            f"Stale auth context: caller={caller.caller_id} "
-            f"age_s={(now - caller.authenticated_at).total_seconds():.0f}"
-        )
-        self._best_effort_audit_block(
-            user_id=user_id,
-            metadata=metadata,
-            reason=ReasonCodes.AUTH_STALE,
-            extra={"caller_id": caller.caller_id, "caller_roles": sorted(caller.caller_roles)},
-        )
-        return Decision(status="BLOCKED", score=Decimal("0"), reason=ReasonCodes.AUTH_STALE)
-
-    # --- INPUT VALIDATION ---
-    try:
-        amount = Decimal(amount_str)
-    except (InvalidOperation, ValueError, TypeError):
-        self._best_effort_audit_block(
-            user_id=user_id,
-            metadata=metadata,
-            reason=ReasonCodes.INVALID_INPUT,
-            extra={"amount_str": amount_str},
-        )
-        return Decision(status="BLOCKED", score=Decimal("0"), reason=ReasonCodes.INVALID_INPUT)
-
-    if (not amount.is_finite()) or amount < Decimal("0"):
-        self._best_effort_audit_block(
-            user_id=user_id,
-            metadata=metadata,
-            reason=ReasonCodes.INVALID_AMOUNT,
-            extra={"amount_str": amount_str},
-        )
-        return Decision(status="BLOCKED", score=Decimal("0"), reason=ReasonCodes.INVALID_AMOUNT)
-
-    # --- VELOCITY ---
-    allowed, v_reason = self.velocity_guard.allow(user_id, now)
-    if not allowed:
-        self._best_effort_audit_block(
-            user_id=user_id,
-            metadata=metadata,
-            reason=v_reason,
-            extra={
-                "window_seconds": CONFIG["VELOCITY_WINDOW_SECONDS"],
-                "limit": CONFIG["VELOCITY_LIMIT"],
-            },
-        )
-        return Decision(status="BLOCKED", score=Decimal("0"), reason=v_reason)
-
-    # --- PLACEHOLDER DECISION LOGIC ---
-    score = Decimal("0.5")
-    decision = "APPROVED" if amount <= Decimal("1000") else "REVIEW"
-
-    ctx = TransactionContext(
-        user_id=user_id,
-        amount=amount,
-        timestamp=now,
-        location=str(metadata.get("location", "UNKNOWN")),
-        device_id=str(metadata.get("device_id", "UNKNOWN")),
-        metadata=metadata or {},
-    )
-
-    ok = self.auditor.log_decision(
-        ctx,
-        decision=decision,
-        reason_code=ReasonCodes.CLEARED if decision == "APPROVED" else "REVIEW",
-        score=score,
-        filtered_meta=self._filter_metadata(metadata),
-        extra={"caller_id": caller.caller_id, "caller_roles": sorted(caller.caller_roles)},
-    )
-
-    if not ok:
-        # Fail closed by default. Only allow dev fail-open if explicitly enabled.
-        if not (CONFIG["SENTINEL_ENV"] == "dev" and CONFIG.get("DEV_ALLOW_AUDIT_FAIL_OPEN", False)):
-            return Decision(status="BLOCKED", score=Decimal("0"), reason=ReasonCodes.AUDIT_APPEND_FAILED)
-
-    return Decision(status=decision, score=score, reason=ReasonCodes.CLEARED)
-
-def _filter_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
-    """Forensic-safe metadata filter.
-
-    Keep this tight for privacy, but not so tight you lose incident context.
+class VelocityGuard:
+    """
+    In-memory velocity limiter with garbage collection and memory caps.
     """
 
-    allowed: Dict[str, Any] = {}
-    for k in (
-        "location",
-        "device_id",
-        "txn_type",
-        "channel",
-        "risk_flags",
-        "ip",
-        "user_agent",
-        "request_id",
-        "trace_id",
-    ):
-        if k in metadata:
-            allowed[k] = metadata[k]
+    def __init__(
+        self,
+        *,
+        window_seconds: int,
+        limit: int,
+        gc_interval_seconds: int,
+        max_entries_per_user: int,
+        max_distinct_users: int,
+    ) -> None:
+        self.window_seconds = int(window_seconds)
+        self.limit = int(limit)
+        self.gc_interval_seconds = int(gc_interval_seconds)
+        self.max_entries_per_user = int(max_entries_per_user)
+        self.max_distinct_users = int(max_distinct_users)
 
-    forensic = metadata.get("forensic")
-    if isinstance(forensic, dict):
-        allowed["forensic"] = forensic
+        if self.window_seconds <= 0:
+            raise ValueError("window_seconds must be > 0")
+        if self.limit <= 0:
+            raise ValueError("limit must be > 0")
+        if self.gc_interval_seconds <= 0:
+            raise ValueError("gc_interval_seconds must be > 0")
+        if self.max_entries_per_user <= 0:
+            raise ValueError("max_entries_per_user must be > 0")
+        if self.max_distinct_users <= 0:
+            raise ValueError("max_distinct_users must be > 0")
 
-    return allowed
+        self.user_events: dict[str, Deque[datetime]] = {}
+        self.lock = threading.Lock()
+        self.last_gc = datetime.now(timezone.utc)
 
-def _best_effort_audit_block(
-    self,
-    *,
-    user_id: str,
-    metadata: Dict[str, Any],
-    reason: str,
-    extra: Dict[str, Any],
-) -> None:
-    try:
+    def _garbage_collect(self, now: datetime) -> None:
+        if (now - self.last_gc).total_seconds() < self.gc_interval_seconds:
+            return
+
+        cutoff = now - timedelta(seconds=self.window_seconds)
+        dead_users: list[str] = []
+
+        for user_id, dq in self.user_events.items():
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+
+            if not dq:
+                dead_users.append(user_id)
+
+        for user_id in dead_users:
+            self.user_events.pop(user_id, None)
+
+        self.last_gc = now
+
+    def allow(self, user_id: str, now: datetime) -> tuple[bool, str]:
+        if now.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+
+        if not user_id:
+            return False, ReasonCodes.INVALID_INPUT
+
+        with self.lock:
+            self._garbage_collect(now)
+
+            is_new_user = user_id not in self.user_events
+
+            if is_new_user and len(self.user_events) >= self.max_distinct_users:
+                _logger.warning(
+                    "Velocity global cap exceeded distinct_users=%s cap=%s",
+                    len(self.user_events),
+                    self.max_distinct_users,
+                )
+                return False, ReasonCodes.VELOCITY_GLOBAL_CAP
+
+            dq = self.user_events.setdefault(user_id, deque())
+
+            cutoff = now - timedelta(seconds=self.window_seconds)
+
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+
+            if len(dq) >= self.max_entries_per_user:
+                _logger.warning(
+                    "Velocity cap exceeded user=%s entries=%s cap=%s",
+                    user_id,
+                    len(dq),
+                    self.max_entries_per_user,
+                )
+                return False, ReasonCodes.VELOCITY_CAP_EXCEEDED
+
+            if len(dq) >= self.limit:
+                return False, ReasonCodes.VELOCITY_LIMIT
+
+            dq.append(now)
+            return True, ReasonCodes.CLEARED
+
+
+# ============================================================================
+# ORCHESTRATOR
+# ============================================================================
+
+@dataclass(frozen=True)
+class CallerContext:
+    caller_id: str
+    caller_roles: frozenset[str]
+    authenticated_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.authenticated_at.tzinfo is None:
+            raise ValueError("authenticated_at must be timezone-aware")
+
+        object.__setattr__(
+            self,
+            "caller_roles",
+            frozenset(self.caller_roles),
+        )
+
+
+@dataclass(frozen=True)
+class Decision:
+    status: str
+    score: Decimal
+    reason: str
+
+
+class SystemOrchestrator:
+    def __init__(
+        self,
+        *,
+        authorizer: Callable[[CallerContext, str], bool] | None = None,
+        audit_sqlite_path: str | None = None,
+        audit_jsonl_path: str | None = None,
+    ) -> None:
+        self.authorizer = authorizer or self._default_authorizer
+
+        store = AuditStore(
+            sqlite_path=audit_sqlite_path or CONFIG["AUDIT_SQLITE_PATH"],
+            jsonl_path=(audit_jsonl_path or CONFIG["AUDIT_JSONL_FILE"] or None),
+        )
+
+        self.auditor = SecureAuditLog(store)
+
+        self.velocity_guard = VelocityGuard(
+            window_seconds=CONFIG["VELOCITY_WINDOW_SECONDS"],
+            limit=CONFIG["VELOCITY_LIMIT"],
+            gc_interval_seconds=CONFIG["VELOCITY_GC_INTERVAL_SECONDS"],
+            max_entries_per_user=CONFIG["VELOCITY_MAX_ENTRIES_PER_USER"],
+            max_distinct_users=CONFIG["VELOCITY_MAX_DISTINCT_USERS"],
+        )
+
+    @staticmethod
+    def _default_authorizer(caller: CallerContext, target_user_id: str) -> bool:
+        if caller.caller_id == target_user_id:
+            return True
+
+        if "admin" in caller.caller_roles or "system" in caller.caller_roles:
+            return True
+
+        return False
+
+    def process_transaction(
+        self,
+        *,
+        caller: CallerContext,
+        user_id: str,
+        amount_str: str,
+        metadata: Mapping[str, Any],
+    ) -> Decision:
+        now = datetime.now(timezone.utc)
+        metadata = MappingProxyType(dict(metadata or {}))
+
+        if not isinstance(caller, CallerContext):
+            raise TypeError(f"caller must be CallerContext, got {type(caller).__name__}")
+
+        if not user_id:
+            return Decision(
+                status="BLOCKED",
+                score=Decimal("0"),
+                reason=ReasonCodes.INVALID_INPUT,
+            )
+
+        if not self.authorizer(caller, user_id):
+            _logger.warning(
+                "Unauthorized: caller=%s -> user=%s",
+                caller.caller_id,
+                user_id,
+            )
+
+            self._best_effort_audit_block(
+                user_id=user_id,
+                metadata=metadata,
+                reason=ReasonCodes.AUTHORIZATION_FAILED,
+                extra={
+                    "caller_id": caller.caller_id,
+                    "caller_roles": sorted(caller.caller_roles),
+                },
+            )
+
+            return Decision(
+                status="BLOCKED",
+                score=Decimal("0"),
+                reason=ReasonCodes.AUTHORIZATION_FAILED,
+            )
+
+        max_age = int(CONFIG["AUTH_MAX_AGE_SECONDS"])
+        auth_age = (now - caller.authenticated_at).total_seconds()
+
+        if auth_age > max_age:
+            _logger.warning(
+                "Stale auth context: caller=%s age_s=%.0f",
+                caller.caller_id,
+                auth_age,
+            )
+
+            self._best_effort_audit_block(
+                user_id=user_id,
+                metadata=metadata,
+                reason=ReasonCodes.AUTH_STALE,
+                extra={
+                    "caller_id": caller.caller_id,
+                    "caller_roles": sorted(caller.caller_roles),
+                },
+            )
+
+            return Decision(
+                status="BLOCKED",
+                score=Decimal("0"),
+                reason=ReasonCodes.AUTH_STALE,
+            )
+
+        try:
+            amount = Decimal(amount_str)
+        except (InvalidOperation, ValueError, TypeError):
+            self._best_effort_audit_block(
+                user_id=user_id,
+                metadata=metadata,
+                reason=ReasonCodes.INVALID_INPUT,
+                extra={"amount_str": amount_str},
+            )
+
+            return Decision(
+                status="BLOCKED",
+                score=Decimal("0"),
+                reason=ReasonCodes.INVALID_INPUT,
+            )
+
+        if not amount.is_finite() or amount < Decimal("0"):
+            self._best_effort_audit_block(
+                user_id=user_id,
+                metadata=metadata,
+                reason=ReasonCodes.INVALID_AMOUNT,
+                extra={"amount_str": amount_str},
+            )
+
+            return Decision(
+                status="BLOCKED",
+                score=Decimal("0"),
+                reason=ReasonCodes.INVALID_AMOUNT,
+            )
+
+        allowed, v_reason = self.velocity_guard.allow(user_id, now)
+
+        if not allowed:
+            self._best_effort_audit_block(
+                user_id=user_id,
+                metadata=metadata,
+                reason=v_reason,
+                extra={
+                    "window_seconds": CONFIG["VELOCITY_WINDOW_SECONDS"],
+                    "limit": CONFIG["VELOCITY_LIMIT"],
+                },
+            )
+
+            return Decision(
+                status="BLOCKED",
+                score=Decimal("0"),
+                reason=v_reason,
+            )
+
+        score = Decimal("0.5")
+        decision = "APPROVED" if amount <= Decimal("1000") else "REVIEW"
+
         ctx = TransactionContext(
             user_id=user_id,
-            amount=Decimal("0"),
-            timestamp=datetime.now(timezone.utc),
+            amount=amount,
+            timestamp=now,
             location=str(metadata.get("location", "UNKNOWN")),
             device_id=str(metadata.get("device_id", "UNKNOWN")),
-            metadata=metadata or {},
+            metadata=metadata,
         )
+
+        reason_code = (
+            ReasonCodes.CLEARED
+            if decision == "APPROVED"
+            else ReasonCodes.REVIEW
+        )
+
         ok = self.auditor.log_decision(
             ctx,
-            decision="BLOCKED",
-            reason_code=reason,
-            score=Decimal("0"),
+            decision=decision,
+            reason_code=reason_code,
+            score=score,
             filtered_meta=self._filter_metadata(metadata),
-            extra=extra or {},
+            extra={
+                "caller_id": caller.caller_id,
+                "caller_roles": sorted(caller.caller_roles),
+            },
         )
+
         if not ok:
-            _logger.critical(f"Best-effort audit failed for BLOCKED decision reason={reason}")
-    except Exception as e:
-        _logger.critical(f"Best-effort audit exception reason={reason}: {e}")
+            fail_open = (
+                CONFIG["SENTINEL_ENV"] == "dev"
+                and CONFIG["DEV_ALLOW_AUDIT_FAIL_OPEN"]
+            )
 
-============================================================================
+            if not fail_open:
+                return Decision(
+                    status="BLOCKED",
+                    score=Decimal("0"),
+                    reason=ReasonCodes.AUDIT_APPEND_FAILED,
+                )
 
-TESTS
+        return Decision(
+            status=decision,
+            score=score,
+            reason=reason_code,
+        )
 
-============================================================================
+    def _filter_metadata(self, metadata: Mapping[str, Any]) -> dict[str, Any]:
+        allowed: dict[str, Any] = {}
 
-You currently only have a demo main. That is not a test suite.
+        for key in (
+            "location",
+            "device_id",
+            "txn_type",
+            "channel",
+            "risk_flags",
+            "ip",
+            "user_agent",
+            "request_id",
+            "trace_id",
+        ):
+            if key in metadata:
+                allowed[key] = metadata[key]
 
-The tests below are lightweight, run-only-when-invoked, and use temp files.
+        forensic = metadata.get("forensic")
 
-def _run_self_tests() -> None: import tempfile
+        if isinstance(forensic, Mapping):
+            allowed["forensic"] = dict(forensic)
 
-# --- Governance tests ---
-assert evaluate_action(action=ACTION_PRIV_ESC, mode=MODE_HUMAN_GATED).decision == GOV_DECISION_DENY
-assert evaluate_action(action=ACTION_READ, mode=MODE_SHADOW).decision == GOV_DECISION_OBSERVE
-assert evaluate_action(action=ACTION_DELETE, mode=MODE_HUMAN_GATED, human_approved=False).decision == GOV_DECISION_REQUIRE_HUMAN
-assert evaluate_action(action=ACTION_DELETE, mode=MODE_HUMAN_GATED, human_approved=True).decision == GOV_DECISION_DENY  # not in allow-list
-assert evaluate_action(action=ACTION_EXECUTE, mode=MODE_HUMAN_GATED).decision == GOV_DECISION_ALLOW
+        return allowed
 
-# --- Audit/Orchestrator tests ---
-with tempfile.TemporaryDirectory() as td:
-    db_path = str(Path(td) / "audit_test.db")
-    jsonl_path = str(Path(td) / "audit_test.jsonl")
+    def _best_effort_audit_block(
+        self,
+        *,
+        user_id: str,
+        metadata: Mapping[str, Any],
+        reason: str,
+        extra: Mapping[str, Any],
+    ) -> None:
+        try:
+            ctx = TransactionContext(
+                user_id=user_id,
+                amount=Decimal("0"),
+                timestamp=datetime.now(timezone.utc),
+                location=str(metadata.get("location", "UNKNOWN")),
+                device_id=str(metadata.get("device_id", "UNKNOWN")),
+                metadata=metadata,
+            )
 
-    # Secret must exist for audit to work.
+            ok = self.auditor.log_decision(
+                ctx,
+                decision="BLOCKED",
+                reason_code=reason,
+                score=Decimal("0"),
+                filtered_meta=self._filter_metadata(metadata),
+                extra=extra or {},
+            )
+
+            if not ok:
+                _logger.critical(
+                    "Best-effort audit failed for BLOCKED decision reason=%s",
+                    reason,
+                )
+
+        except Exception as exc:
+            _logger.critical(
+                "Best-effort audit exception reason=%s: %s",
+                reason,
+                exc,
+            )
+
+
+# ============================================================================
+# SELF TESTS
+# ============================================================================
+
+def _run_self_tests() -> None:
+    import tempfile
+
+    assert (
+        evaluate_action(action=ACTION_PRIV_ESC, mode=MODE_HUMAN_GATED).decision
+        == GOV_DECISION_DENY
+    )
+    assert (
+        evaluate_action(action=ACTION_READ, mode=MODE_SHADOW).decision
+        == GOV_DECISION_OBSERVE
+    )
+    assert (
+        evaluate_action(
+            action=ACTION_DELETE,
+            mode=MODE_HUMAN_GATED,
+            human_approved=False,
+        ).decision
+        == GOV_DECISION_REQUIRE_HUMAN
+    )
+    assert (
+        evaluate_action(
+            action=ACTION_DELETE,
+            mode=MODE_HUMAN_GATED,
+            human_approved=True,
+        ).decision
+        == GOV_DECISION_ALLOW
+    )
+    assert (
+        evaluate_action(action=ACTION_EXECUTE, mode=MODE_HUMAN_GATED).decision
+        == GOV_DECISION_ALLOW
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        db_path = str(Path(td) / "audit_test.db")
+        jsonl_path = str(Path(td) / "audit_test.jsonl")
+
+        os.environ.setdefault("GHOST_DEVICE_HASH_SECRET", "a" * 64)
+
+        orch = SystemOrchestrator(
+            audit_sqlite_path=db_path,
+            audit_jsonl_path=jsonl_path,
+        )
+
+        caller = CallerContext(
+            caller_id="user123",
+            caller_roles=frozenset({"user"}),
+            authenticated_at=datetime.now(timezone.utc),
+        )
+
+        d = orch.process_transaction(
+            caller=caller,
+            user_id="user123",
+            amount_str="25.00",
+            metadata={
+                "location": "US",
+                "device_id": "device123",
+                "txn_type": "test",
+            },
+        )
+
+        assert d.status in {"APPROVED", "REVIEW"}
+
+        d2 = orch.process_transaction(
+            caller=caller,
+            user_id="user123",
+            amount_str="NaN",
+            metadata={
+                "location": "US",
+                "device_id": "device123",
+            },
+        )
+
+        assert d2.status == "BLOCKED"
+        assert d2.reason == ReasonCodes.INVALID_AMOUNT
+
+        if Path(jsonl_path).exists():
+            txt = Path(jsonl_path).read_text(encoding="utf-8").strip()
+            assert txt
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     os.environ.setdefault("GHOST_DEVICE_HASH_SECRET", "a" * 64)
 
-    orch = SystemOrchestrator(audit_sqlite_path=db_path, audit_jsonl_path=jsonl_path)
-    caller = CallerContext(
+    orchestrator = SystemOrchestrator()
+
+    caller_context = CallerContext(
         caller_id="user123",
-        caller_roles={"user"},
+        caller_roles=frozenset({"user"}),
         authenticated_at=datetime.now(timezone.utc),
     )
 
-    # Happy path
-    d = orch.process_transaction(
-        caller=caller,
+    result = orchestrator.process_transaction(
+        caller=caller_context,
         user_id="user123",
         amount_str="25.00",
-        metadata={"location": "US", "device_id": "device123", "txn_type": "test"},
+        metadata={
+            "location": "US",
+            "device_id": "device123",
+            "txn_type": "test",
+            "ip": "127.0.0.1",
+        },
     )
-    assert d.status in {"APPROVED", "REVIEW"}
 
-    # Reject NaN
-    d2 = orch.process_transaction(
-        caller=caller,
-        user_id="user123",
-        amount_str="NaN",
-        metadata={"location": "US", "device_id": "device123"},
-    )
-    assert d2.status == "BLOCKED" and d2.reason == ReasonCodes.INVALID_AMOUNT
+    print(result)
 
-    # JSONL should contain at least one line when enabled
-    if Path(jsonl_path).exists():
-        txt = Path(jsonl_path).read_text(encoding="utf-8").strip()
-        assert txt
-
-if name == "main": logging.basicConfig(level=logging.INFO)
-
-# Local test: set a secret or you will correctly fail closed.
-os.environ.setdefault("GHOST_DEVICE_HASH_SECRET", "a" * 64)
-
-# Demo run
-orch = SystemOrchestrator()
-caller = CallerContext(caller_id="user123", caller_roles={"user"}, authenticated_at=datetime.now(timezone.utc))
-
-d = orch.process_transaction(
-    caller=caller,
-    user_id="user123",
-    amount_str="25.00",
-    metadata={"location": "US", "device_id": "device123", "txn_type": "test", "ip": "127.0.0.1"},
-)
-print(d)
-
-# Self-tests (raise AssertionError if something is wrong)
-_run_self_tests()
+    _run_self_tests()
