@@ -1,5 +1,36 @@
 """
 s34_auth.py — Sentinel-43 Authorization & Key Control
+=====================================================
+
+SECURITY-CRITICAL FILE — REPO APPROVAL RULES
+--------------------------------------------
+This file is part of Sentinel-43's trust perimeter. Any modification
+to this file or its execution path is SECURITY-SENSITIVE and subject
+to strict review.
+
+REQUIRED CONDITIONS FOR APPROVAL
+--------------------------------
+- No behavioral changes without explicit maintainer approval.
+- 24-hour activation delay is mandatory (NOT-BEFORE gate).
+- No plaintext secret persistence (no storing/logging/caching tokens).
+- Crypto guarantees are non-negotiable (salt + pepper + PBKDF2, constant-time compare).
+- No bypass paths (no debug flags, no env overrides that skip enforcement).
+- Scope enforcement must remain explicit (least-privilege; no implicit grants).
+- Auditability must be preserved (time gates, revocation, scope decisions).
+- No dependency inflation without justification and approval.
+- No architectural bleed: keep auth isolated from transport/business logic.
+- No license contamination: added code must comply with project licensing model.
+- Performance discipline: no expensive behavior without a scaling plan.
+
+AUTO-REJECT CONDITIONS
+----------------------
+- Hardcoded secrets/keys/credentials
+- Obfuscated logic or hidden behavior
+- Weakening cryptographic or timing guarantees
+- Altering activation timing without approval
+- Large refactors without a reviewed plan
+
+This file is an enforcement boundary. Treat it accordingly.
 """
 
 from __future__ import annotations
@@ -8,6 +39,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -17,11 +49,21 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 
+logger = logging.getLogger("sentinel43.auth")
+
 _SCOPE_RE = re.compile(r"^[a-z0-9:_\-.]{1,96}$")
+_TOKEN_BODY_RE = re.compile(r"^[A-Za-z0-9\-_]{32,}$")
 
 
 @dataclass(frozen=True)
 class AuthKeyConfig:
+    """
+    Configuration for AuthKeyStore.
+
+    Defaults are intentionally conservative. The 24-hour activation delay is
+    part of the trust model and should not be reduced without explicit review.
+    """
+
     activation_delay_seconds: int = 24 * 60 * 60
     default_expires_in_seconds: int = 7 * 24 * 60 * 60
 
@@ -38,6 +80,30 @@ class AuthKeyConfig:
     sqlite_timeout_seconds: float = 5.0
     sqlite_busy_timeout_ms: int = 5000
 
+    min_purge_safety_seconds: int = 3600
+
+    def __post_init__(self) -> None:
+        if self.activation_delay_seconds < 24 * 60 * 60:
+            raise ValueError("activation_delay_seconds must be at least 24 hours")
+        if self.default_expires_in_seconds <= 0:
+            raise ValueError("default_expires_in_seconds must be > 0")
+        if self.hash_iters < 210_000:
+            raise ValueError("hash_iters must be >= 210000")
+        if self.salt_bytes < 16:
+            raise ValueError("salt_bytes must be >= 16")
+        if self.token_bytes < 32:
+            raise ValueError("token_bytes must be >= 32")
+        if self.max_metadata_bytes <= 0:
+            raise ValueError("max_metadata_bytes must be > 0")
+        if self.sqlite_timeout_seconds <= 0:
+            raise ValueError("sqlite_timeout_seconds must be > 0")
+        if self.sqlite_busy_timeout_ms <= 0:
+            raise ValueError("sqlite_busy_timeout_ms must be > 0")
+        if self.min_purge_safety_seconds < 3600:
+            raise ValueError("min_purge_safety_seconds must be >= 3600")
+        if not self.token_prefix or "_" in self.token_prefix:
+            raise ValueError("token_prefix must be non-empty and must not contain '_'")
+
 
 class AuthKeyStore:
     """
@@ -50,6 +116,12 @@ class AuthKeyStore:
     - verification still requires salted + peppered PBKDF2
     - comparison uses constant-time compare
     - keys support scopes, expiry, delayed activation, and revocation
+
+    Migration note:
+    Rows created before token_fingerprint existed cannot be verified by the
+    fingerprint lookup path because the plaintext token was never stored. Reissue
+    those keys instead of trying to backfill impossible data. Irritating, yes.
+    Correct, also yes.
     """
 
     def __init__(self, db_path: str, config: AuthKeyConfig | None = None) -> None:
@@ -58,6 +130,7 @@ class AuthKeyStore:
 
         self.db_path = db_path
         self.cfg = config or AuthKeyConfig()
+        self._pepper_bytes = self._load_pepper()
         self._ensure_schema()
 
     def issue_key(
@@ -69,9 +142,14 @@ class AuthKeyStore:
         expires_in_seconds: int | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> str:
+        """
+        Create a new key and return the plaintext token exactly once.
+
+        The token is never stored. Caller is responsible for secure delivery.
+        """
+
         subject = self._validate_label("subject", subject)
         issued_by = self._validate_label("issued_by", issued_by)
-
         normalized_scopes = self._normalize_scopes(scopes)
         metadata_json = self._safe_json_metadata(metadata or {})
 
@@ -92,7 +170,7 @@ class AuthKeyStore:
         key_hash = self._hash_token(token=token, salt=salt)
 
         with self._conn() as cx:
-            cx.execute(
+            cur = cx.execute(
                 """
                 INSERT INTO auth_keys (
                     subject,
@@ -125,6 +203,17 @@ class AuthKeyStore:
                     base64.b64encode(key_hash).decode("ascii"),
                 ),
             )
+            key_id = cur.lastrowid
+
+        logger.info(
+            "Issued auth key id=%s subject=%s issued_by=%s scopes=%s not_before=%s expires_at=%s",
+            key_id,
+            subject,
+            issued_by,
+            normalized_scopes,
+            not_before,
+            expires_at,
+        )
 
         return token
 
@@ -135,7 +224,12 @@ class AuthKeyStore:
         required_scopes: Sequence[str] | None = None,
         now: int | None = None,
     ) -> bool:
+        """
+        Verify token, activation gate, expiry, revocation, and scope subset.
+        """
+
         if not self._looks_like_token(token):
+            logger.warning("Rejected malformed auth token")
             return False
 
         now_ts = int(now if now is not None else time.time())
@@ -145,7 +239,7 @@ class AuthKeyStore:
         with self._conn() as cx:
             rows = cx.execute(
                 """
-                SELECT scopes_json, salt_b64, hash_b64
+                SELECT id, subject, scopes_json, salt_b64, hash_b64
                 FROM auth_keys
                 WHERE token_fingerprint = ?
                   AND revoked_at IS NULL
@@ -157,9 +251,10 @@ class AuthKeyStore:
 
         for row in rows:
             try:
-                salt = base64.b64decode(row["salt_b64"].encode("ascii"))
-                expected = base64.b64decode(row["hash_b64"].encode("ascii"))
+                salt = base64.b64decode(row["salt_b64"].encode("ascii"), validate=True)
+                expected = base64.b64decode(row["hash_b64"].encode("ascii"), validate=True)
             except Exception:
+                logger.warning("Skipped malformed auth key row id=%s during verification", row["id"])
                 continue
 
             actual = self._hash_token(token=token, salt=salt)
@@ -170,13 +265,21 @@ class AuthKeyStore:
             try:
                 scopes = set(json.loads(row["scopes_json"] or "[]"))
             except Exception:
+                logger.warning("Auth key matched but scopes_json was malformed id=%s", row["id"])
                 scopes = set()
 
             if required and not required.issubset(scopes):
+                logger.warning(
+                    "Auth key matched but lacked required scopes id=%s subject=%s required=%s",
+                    row["id"],
+                    row["subject"],
+                    sorted(required),
+                )
                 continue
 
             return True
 
+        logger.warning("Auth key verification failed")
         return False
 
     def revoke_key(
@@ -186,11 +289,17 @@ class AuthKeyStore:
         *,
         now: int | None = None,
     ) -> bool:
+        """
+        Revoke a key by token.
+
+        Returns True only if an unrevoked matching row was updated.
+        """
+
         if not self._looks_like_token(token):
+            logger.warning("Rejected malformed auth token during revoke")
             return False
 
         revoked_by = self._validate_label("revoked_by", revoked_by)
-
         now_ts = int(now if now is not None else time.time())
         fingerprint = self._fingerprint_token(token)
 
@@ -200,7 +309,7 @@ class AuthKeyStore:
 
             rows = cx.execute(
                 """
-                SELECT id, salt_b64, hash_b64
+                SELECT id, subject, salt_b64, hash_b64
                 FROM auth_keys
                 WHERE token_fingerprint = ?
                   AND revoked_at IS NULL
@@ -210,15 +319,16 @@ class AuthKeyStore:
 
             for row in rows:
                 try:
-                    salt = base64.b64decode(row["salt_b64"].encode("ascii"))
-                    expected = base64.b64decode(row["hash_b64"].encode("ascii"))
+                    salt = base64.b64decode(row["salt_b64"].encode("ascii"), validate=True)
+                    expected = base64.b64decode(row["hash_b64"].encode("ascii"), validate=True)
                 except Exception:
+                    logger.warning("Skipped malformed auth key row id=%s during revoke", row["id"])
                     continue
 
                 actual = self._hash_token(token=token, salt=salt)
 
                 if hmac.compare_digest(expected, actual):
-                    cx.execute(
+                    cur = cx.execute(
                         """
                         UPDATE auth_keys
                         SET revoked_at = ?, revoked_by = ?
@@ -226,10 +336,22 @@ class AuthKeyStore:
                         """,
                         (now_ts, revoked_by, row["id"]),
                     )
+
                     cx.execute("COMMIT")
-                    return cx.total_changes > 0
+                    revoked = int(cur.rowcount or 0) > 0
+
+                    if revoked:
+                        logger.info(
+                            "Revoked auth key id=%s subject=%s revoked_by=%s",
+                            row["id"],
+                            row["subject"],
+                            revoked_by,
+                        )
+
+                    return revoked
 
             cx.execute("ROLLBACK")
+            logger.warning("Auth key revoke failed: key not found")
             return False
 
         except Exception:
@@ -300,12 +422,13 @@ class AuthKeyStore:
     ) -> int:
         """
         Delete expired or revoked keys older than the retention window.
-
-        Returns deleted row count.
         """
 
-        if older_than_seconds <= 0:
-            raise ValueError("older_than_seconds must be > 0")
+        if older_than_seconds < self.cfg.min_purge_safety_seconds:
+            raise ValueError(
+                "older_than_seconds must be >= "
+                f"{self.cfg.min_purge_safety_seconds}"
+            )
 
         now_ts = int(now if now is not None else time.time())
         cutoff = now_ts - int(older_than_seconds)
@@ -321,7 +444,10 @@ class AuthKeyStore:
                 """,
                 (cutoff, cutoff),
             )
-            return int(cur.rowcount or 0)
+            deleted = int(cur.rowcount or 0)
+
+        logger.info("Purged inactive auth keys count=%s cutoff=%s", deleted, cutoff)
+        return deleted
 
     def _generate_token(self) -> str:
         raw = secrets.token_bytes(self.cfg.token_bytes)
@@ -337,25 +463,20 @@ class AuthKeyStore:
         if not token.startswith(prefix):
             return False
 
-        body = token[len(prefix):]
-
-        if len(body) < 32:
-            return False
-
-        allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-        return all(ch in allowed for ch in body)
+        body = token[len(prefix) :]
+        return bool(_TOKEN_BODY_RE.fullmatch(body))
 
     def _fingerprint_token(self, token: str) -> str:
         """
         Non-secret lookup fingerprint.
 
-        This is not used as proof of authenticity. It only narrows the DB scan.
+        This is not proof of authenticity. It only narrows the DB scan.
         PBKDF2 verification remains authoritative.
         """
 
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
-    def _pepper(self) -> bytes:
+    def _load_pepper(self) -> bytes:
         pepper = os.environ.get(self.cfg.pepper_env_var, "").strip()
 
         if not pepper:
@@ -367,7 +488,7 @@ class AuthKeyStore:
         return pepper.encode("utf-8")
 
     def _hash_token(self, token: str, salt: bytes) -> bytes:
-        material = token.encode("utf-8") + b"|" + self._pepper()
+        material = token.encode("utf-8") + b"|" + self._pepper_bytes
 
         return hashlib.pbkdf2_hmac(
             self.cfg.hash_alg,
@@ -509,3 +630,9 @@ class AuthKeyStore:
                 ON auth_keys(expires_at);
                 """
             )
+
+
+__all__ = [
+    "AuthKeyConfig",
+    "AuthKeyStore",
+]
