@@ -1,24 +1,25 @@
 """
-Policy Gate (Decision Engine) for Sentinel-43
+Policy Gate (Decision Engine) for Sentinel-43.
 
 Responsibilities:
-- Evaluate a requested action against governance rules
+- Evaluate requested actions against governance rules.
 - Apply operational mode semantics:
-    - SHADOW: never blocks, but records what *would* happen
-    - HUMAN_GATED: high-risk actions require approval
-    - AUTONOMOUS_VETO: high-risk actions are blocked automatically
-- Return a stable decision object with reasons + tags
+    - SHADOW: never blocks, but records what would happen.
+    - HUMAN_GATED: high-risk actions require approval.
+    - AUTONOMOUS_VETO: high-risk actions are blocked automatically.
+- Return stable policy decisions with reasons and tags.
 
-NO I/O.
-NO networking.
-Logging is optional and should be done by the caller using the returned decision.
+No I/O.
+No networking.
+No logging.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from types import MappingProxyType
+from typing import Any, Callable, Mapping
 
 from .governance import (
     ALLOWED_MODES,
@@ -31,17 +32,20 @@ from .governance import (
     requires_human_approval,
 )
 
-# ----------------------------
-# Data Models
-# ----------------------------
+
+STATUS_ALLOW = "ALLOW"
+STATUS_DENY = "DENY"
+STATUS_REQUIRES_HUMAN = "REQUIRES_HUMAN"
+STATUS_UNKNOWN_ACTION = "UNKNOWN_ACTION"
+
 
 @dataclass(frozen=True)
 class PolicyContext:
     """
     Context for a policy evaluation.
 
-    Keep this SMALL and STABLE.
-    Everything else belongs in metadata.
+    Keep this small and stable. Extra caller-provided information belongs
+    in metadata and should not be treated as authoritative.
     """
 
     action: str
@@ -50,12 +54,32 @@ class PolicyContext:
     resource: str = "unknown"
     mode: str = MODE_SHADOW
 
-    # Optional fields
-    request_id: Optional[str] = None
-    correlation_id: Optional[str] = None
+    request_id: str | None = None
+    correlation_id: str | None = None
 
-    # Catch-all (non-authoritative)
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.action, str):
+            raise TypeError("action must be a string")
+
+        if not isinstance(self.actor_id, str):
+            raise TypeError("actor_id must be a string")
+
+        if not isinstance(self.tenant_id, str):
+            raise TypeError("tenant_id must be a string")
+
+        if not isinstance(self.resource, str):
+            raise TypeError("resource must be a string")
+
+        if not isinstance(self.mode, str):
+            raise TypeError("mode must be a string")
+
+        object.__setattr__(
+            self,
+            "metadata",
+            MappingProxyType(dict(self.metadata)),
+        )
 
 
 @dataclass(frozen=True)
@@ -64,13 +88,14 @@ class PolicyDecision:
     Policy evaluation result.
 
     allowed:
-      - True: proceed automatically
-      - False: do not proceed automatically
+        True  -> caller may proceed automatically.
+        False -> caller must not proceed automatically.
+
     status:
-      - "ALLOW"
-      - "DENY"
-      - "REQUIRES_HUMAN"
-      - "UNKNOWN_ACTION"
+        ALLOW
+        DENY
+        REQUIRES_HUMAN
+        UNKNOWN_ACTION
     """
 
     allowed: bool
@@ -78,24 +103,34 @@ class PolicyDecision:
     mode: str
     action: str
 
-    reasons: List[str] = field(default_factory=list)
-    tags: List[str] = field(default_factory=list)
+    actor_id: str = "unknown"
+    tenant_id: str = "default"
+    resource: str = "unknown"
 
-    # For SHADOW mode (what would have happened in a stricter mode)
-    shadow_would_status: Optional[str] = None
+    request_id: str | None = None
+    correlation_id: str | None = None
 
-    # Always include time for audit correlation (caller can override)
-    evaluated_at: str = field(
-        default_factory=lambda: datetime.now(tz=timezone.utc).isoformat()
-    )
+    reasons: tuple[str, ...] = field(default_factory=tuple)
+    tags: tuple[str, ...] = field(default_factory=tuple)
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Stable, JSON-safe representation."""
+    shadow_would_status: str | None = None
+    evaluated_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """
+        Return a stable, JSON-safe representation.
+        """
+
         return {
             "allowed": self.allowed,
             "status": self.status,
             "mode": self.mode,
             "action": self.action,
+            "actor_id": self.actor_id,
+            "tenant_id": self.tenant_id,
+            "resource": self.resource,
+            "request_id": self.request_id,
+            "correlation_id": self.correlation_id,
             "reasons": list(self.reasons),
             "tags": list(self.tags),
             "shadow_would_status": self.shadow_would_status,
@@ -103,166 +138,266 @@ class PolicyDecision:
         }
 
 
-# ----------------------------
-# Core Evaluator
-# ----------------------------
+def _utc_now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _decision(
+    *,
+    context: PolicyContext,
+    allowed: bool,
+    status: str,
+    mode: str,
+    action: str,
+    reasons: list[str],
+    tags: list[str],
+    evaluated_at: str,
+    shadow_would_status: str | None = None,
+) -> PolicyDecision:
+    return PolicyDecision(
+        allowed=allowed,
+        status=status,
+        mode=mode,
+        action=action,
+        actor_id=context.actor_id,
+        tenant_id=context.tenant_id,
+        resource=context.resource,
+        request_id=context.request_id,
+        correlation_id=context.correlation_id,
+        reasons=tuple(reasons),
+        tags=tuple(tags),
+        shadow_would_status=shadow_would_status,
+        evaluated_at=evaluated_at,
+    )
+
 
 def evaluate(context: PolicyContext) -> PolicyDecision:
     """
     Evaluate a policy context against governance rules.
 
-    This function is deterministic and side-effect free.
+    This function is deterministic except for evaluated_at timestamp capture.
+    It performs no I/O and has no side effects.
     """
-    action = (context.action or "").strip().lower()
-    mode = (context.mode or MODE_SHADOW).strip().upper()
 
-    reasons: List[str] = []
-    tags: List[str] = []
+    if not isinstance(context, PolicyContext):
+        raise TypeError(
+            f"context must be PolicyContext, got {type(context).__name__}"
+        )
+
+    evaluated_at = _utc_now_iso()
+
+    action = context.action.strip().lower()
+    mode = context.mode.strip().upper() or MODE_SHADOW
+
+    reasons: list[str] = []
+    tags: list[str] = []
+
+    if not action:
+        tags.append("empty_action")
+        reasons.append("Action is empty.")
+
+        if mode == MODE_SHADOW:
+            return _decision(
+                context=context,
+                allowed=True,
+                status=STATUS_UNKNOWN_ACTION,
+                mode=mode,
+                action=action,
+                reasons=reasons,
+                tags=tags,
+                shadow_would_status=STATUS_DENY,
+                evaluated_at=evaluated_at,
+            )
+
+        return _decision(
+            context=context,
+            allowed=False,
+            status=STATUS_UNKNOWN_ACTION,
+            mode=mode,
+            action=action,
+            reasons=reasons + ["Deny-by-default for empty action."],
+            tags=tags + ["deny_by_default"],
+            evaluated_at=evaluated_at,
+        )
 
     if mode not in ALLOWED_MODES:
-        # Fail safe: treat invalid mode as AUTONOMOUS_VETO
         tags.append("invalid_mode")
-        reasons.append(f"Invalid mode '{context.mode}', defaulting to AUTONOMOUS_VETO behavior.")
+        reasons.append(
+            f"Invalid mode '{mode}', defaulting to AUTONOMOUS_VETO behavior."
+        )
         mode = MODE_AUTONOMOUS_VETO
 
-    # Unknown action handling
     if not is_action_known(action):
         tags.append("unknown_action")
         reasons.append(f"Unknown action '{action}'.")
-        # In SHADOW: allow but flag; otherwise deny by default.
+
         if mode == MODE_SHADOW:
-            return PolicyDecision(
+            return _decision(
+                context=context,
                 allowed=True,
-                status="UNKNOWN_ACTION",
+                status=STATUS_UNKNOWN_ACTION,
                 mode=mode,
                 action=action,
                 reasons=reasons,
                 tags=tags,
-                shadow_would_status="DENY",
+                shadow_would_status=STATUS_DENY,
+                evaluated_at=evaluated_at,
             )
-        return PolicyDecision(
+
+        return _decision(
+            context=context,
             allowed=False,
-            status="UNKNOWN_ACTION",
+            status=STATUS_UNKNOWN_ACTION,
             mode=mode,
             action=action,
-            reasons=reasons + ["Deny-by-default for unknown actions in non-shadow modes."],
+            reasons=reasons
+            + ["Deny-by-default for unknown actions in non-shadow modes."],
             tags=tags + ["deny_by_default"],
+            evaluated_at=evaluated_at,
         )
 
-    # Global deny rules
     if is_always_denied(action):
         tags.append("always_denied")
         reasons.append(f"Action '{action}' is globally forbidden.")
-        # Even SHADOW should not silently "allow" forbidden actions; but per spec SHADOW never blocks.
+
         if mode == MODE_SHADOW:
-            return PolicyDecision(
+            return _decision(
+                context=context,
                 allowed=True,
-                status="ALLOW",
+                status=STATUS_ALLOW,
                 mode=mode,
                 action=action,
                 reasons=reasons,
                 tags=tags,
-                shadow_would_status="DENY",
+                shadow_would_status=STATUS_DENY,
+                evaluated_at=evaluated_at,
             )
-        return PolicyDecision(
+
+        return _decision(
+            context=context,
             allowed=False,
-            status="DENY",
+            status=STATUS_DENY,
             mode=mode,
             action=action,
             reasons=reasons,
             tags=tags,
+            evaluated_at=evaluated_at,
         )
 
-    # Mode allow-list check
-    allowed_in_mode = is_allowed_in_mode(action, mode)
-    if not allowed_in_mode:
+    if not is_allowed_in_mode(action, mode):
         tags.append("not_allowed_in_mode")
         reasons.append(f"Action '{action}' is not allow-listed for mode {mode}.")
 
         if mode == MODE_SHADOW:
-            # SHADOW never blocks, but records what would happen
-            return PolicyDecision(
+            return _decision(
+                context=context,
                 allowed=True,
-                status="ALLOW",
+                status=STATUS_ALLOW,
                 mode=mode,
                 action=action,
                 reasons=reasons,
                 tags=tags,
-                shadow_would_status="DENY",
+                shadow_would_status=STATUS_DENY,
+                evaluated_at=evaluated_at,
             )
 
-        return PolicyDecision(
+        return _decision(
+            context=context,
             allowed=False,
-            status="DENY",
+            status=STATUS_DENY,
             mode=mode,
             action=action,
             reasons=reasons,
             tags=tags,
+            evaluated_at=evaluated_at,
         )
 
-    # Human approval rules
     if requires_human_approval(action):
         tags.append("human_required")
         reasons.append(f"Action '{action}' requires human approval.")
 
         if mode == MODE_SHADOW:
-            # Would require human if not in shadow
-            return PolicyDecision(
+            return _decision(
+                context=context,
                 allowed=True,
-                status="ALLOW",
+                status=STATUS_ALLOW,
                 mode=mode,
                 action=action,
                 reasons=reasons,
                 tags=tags,
-                shadow_would_status="REQUIRES_HUMAN",
+                shadow_would_status=STATUS_REQUIRES_HUMAN,
+                evaluated_at=evaluated_at,
             )
 
         if mode == MODE_HUMAN_GATED:
-            return PolicyDecision(
+            return _decision(
+                context=context,
                 allowed=False,
-                status="REQUIRES_HUMAN",
+                status=STATUS_REQUIRES_HUMAN,
                 mode=mode,
                 action=action,
                 reasons=reasons,
                 tags=tags,
+                evaluated_at=evaluated_at,
             )
 
         if mode == MODE_AUTONOMOUS_VETO:
-            # Autonomous veto blocks human-required actions
-            return PolicyDecision(
+            return _decision(
+                context=context,
                 allowed=False,
-                status="DENY",
+                status=STATUS_DENY,
                 mode=mode,
                 action=action,
-                reasons=reasons + ["AUTONOMOUS_VETO blocks human-required actions."],
+                reasons=reasons
+                + ["AUTONOMOUS_VETO blocks human-required actions."],
                 tags=tags + ["autonomous_veto"],
+                evaluated_at=evaluated_at,
             )
 
-    # If we reach here, it's allowed automatically in this mode
-    return PolicyDecision(
+    return _decision(
+        context=context,
         allowed=True,
-        status="ALLOW",
+        status=STATUS_ALLOW,
         mode=mode,
         action=action,
         reasons=reasons,
         tags=tags,
+        evaluated_at=evaluated_at,
     )
 
-
-# ----------------------------
-# Optional: OO wrapper
-# ----------------------------
 
 class PolicyGate:
     """
     Object wrapper for evaluate().
 
-    Useful if you later want:
-    - injected governance
-    - decision hooks
-    - metrics counters
-    without changing call sites too much.
+    Accepts an injected evaluator callable for testing and extensibility.
     """
 
+    def __init__(
+        self,
+        evaluator: Callable[[PolicyContext], PolicyDecision] = evaluate,
+    ) -> None:
+        if not callable(evaluator):
+            raise TypeError("evaluator must be callable")
+
+        self._evaluator = evaluator
+
     def evaluate(self, context: PolicyContext) -> PolicyDecision:
-        return evaluate(context)
+        if not isinstance(context, PolicyContext):
+            raise TypeError(
+                f"context must be PolicyContext, got {type(context).__name__}"
+            )
+
+        return self._evaluator(context)
+
+
+__all__ = [
+    "PolicyContext",
+    "PolicyDecision",
+    "PolicyGate",
+    "evaluate",
+    "STATUS_ALLOW",
+    "STATUS_DENY",
+    "STATUS_REQUIRES_HUMAN",
+    "STATUS_UNKNOWN_ACTION",
+]
