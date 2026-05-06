@@ -2,1200 +2,356 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Sentinel-43 Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <style>
     :root {
-      --bg: #0b1020;
-      --bg2: #11182d;
-      --panel: #121a30;
-      --panel2: #0f172a;
-      --line: #24324d;
-      --text: #e5e7eb;
-      --muted: #9ca3af;
-      --blue: #38bdf8;
-      --green: #22c55e;
-      --yellow: #f59e0b;
-      --red: #ef4444;
-      --purple: #8b5cf6;
-      --shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
-      --radius: 16px;
-    }
-
-    * {
-      box-sizing: border-box;
-    }
-
-    html, body {
-      margin: 0;
-      padding: 0;
-      background:
-        radial-gradient(circle at top left, rgba(56,189,248,0.10), transparent 25%),
-        radial-gradient(circle at top right, rgba(139,92,246,0.10), transparent 20%),
-        linear-gradient(180deg, #0a0f1f 0%, #0b1020 100%);
-      color: var(--text);
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-      min-height: 100%;
-    }
-
-    body {
-      display: flex;
-      flex-direction: column;
-    }
-
-    header {
-      position: sticky;
-      top: 0;
-      z-index: 20;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 16px 20px;
-      background: rgba(11, 16, 32, 0.88);
-      backdrop-filter: blur(10px);
-      border-bottom: 1px solid var(--line);
-    }
-
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-    }
-
-    .brand-mark {
-      width: 14px;
-      height: 14px;
-      border-radius: 50%;
-      background: var(--blue);
-      box-shadow: 0 0 18px rgba(56,189,248,0.7);
-      flex: 0 0 14px;
-    }
-
-    .brand h1 {
-      margin: 0;
-      font-size: 18px;
-      line-height: 1;
-      letter-spacing: 0.4px;
-    }
-
-    .brand p {
-      margin: 4px 0 0;
-      color: var(--muted);
-      font-size: 12px;
-    }
-
-    .header-actions {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-      align-items: center;
-      justify-content: flex-end;
-    }
-
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 8px 12px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      background: rgba(15, 23, 42, 0.7);
-      color: var(--text);
-      font-size: 12px;
-      font-weight: 700;
-      white-space: nowrap;
-    }
-
-    .dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: var(--yellow);
-      box-shadow: 0 0 10px rgba(245,158,11,0.6);
-    }
-
-    .dot.online {
-      background: var(--green);
-      box-shadow: 0 0 10px rgba(34,197,94,0.6);
-    }
-
-    .dot.offline {
-      background: var(--red);
-      box-shadow: 0 0 10px rgba(239,68,68,0.6);
-    }
-
-    .btn {
-      appearance: none;
-      border: 1px solid var(--line);
-      background: rgba(15, 23, 42, 0.85);
-      color: var(--text);
-      padding: 10px 14px;
-      border-radius: 12px;
-      font-size: 12px;
-      font-weight: 800;
-      cursor: pointer;
-      transition: 160ms ease;
-    }
-
-    .btn:hover {
-      border-color: #35507a;
-      transform: translateY(-1px);
-    }
-
-    .btn:active {
-      transform: translateY(0);
-    }
-
-    .btn.primary {
-      border-color: rgba(56,189,248,0.35);
-      background: rgba(56,189,248,0.12);
-      color: #bae6fd;
-    }
-
-    .btn.good {
-      border-color: rgba(34,197,94,0.35);
-      background: rgba(34,197,94,0.12);
-      color: #bbf7d0;
-    }
-
-    .btn.warn {
-      border-color: rgba(245,158,11,0.35);
-      background: rgba(245,158,11,0.12);
-      color: #fde68a;
-    }
-
-    .btn.bad {
-      border-color: rgba(239,68,68,0.35);
-      background: rgba(239,68,68,0.12);
-      color: #fecaca;
-    }
-
-    .btn.active {
-      border-color: rgba(56,189,248,0.50);
-      background: rgba(56,189,248,0.16);
-      color: #d7f3ff;
-    }
-
-    .btn:disabled {
-      opacity: 0.6;
-      cursor: not-allowed;
-      transform: none;
-    }
-
-    main {
-      width: 100%;
-      max-width: 1400px;
-      margin: 0 auto;
-      padding: 18px;
-      display: grid;
-      grid-template-columns: 1.4fr 0.9fr;
-      gap: 18px;
-    }
-
-    .left-col,
-    .right-col {
-      display: flex;
-      flex-direction: column;
-      gap: 18px;
-    }
-
-    .panel {
-      background: linear-gradient(180deg, rgba(18,26,48,0.90), rgba(15,23,42,0.92));
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      overflow: hidden;
-    }
-
-    .panel-header {
-      padding: 14px 16px;
-      border-bottom: 1px solid var(--line);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
-
-    .panel-header h2 {
-      margin: 0;
-      font-size: 13px;
-      text-transform: uppercase;
-      letter-spacing: 0.8px;
-      color: #d1d5db;
-    }
-
-    .panel-body {
-      padding: 16px;
-    }
-
-    .stats-grid {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 12px;
-    }
-
-    .stat-card {
-      background: rgba(15,23,42,0.72);
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 14px;
-    }
-
-    .stat-label {
-      font-size: 11px;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.6px;
-      font-weight: 800;
-      margin-bottom: 10px;
-    }
-
-    .stat-value {
-      font-size: 28px;
-      font-weight: 900;
-      line-height: 1;
-      margin-bottom: 6px;
-    }
-
-    .stat-sub {
-      font-size: 12px;
-      color: var(--muted);
-    }
-
-    .toolbar {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-      align-items: center;
-    }
-
-    .actions-table-wrap {
-      overflow-x: auto;
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      min-width: 760px;
-    }
-
-    thead th {
-      text-align: left;
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.6px;
-      color: var(--muted);
-      padding: 12px 10px;
-      border-bottom: 1px solid var(--line);
-    }
-
-    tbody td {
-      padding: 12px 10px;
-      border-bottom: 1px solid rgba(36, 50, 77, 0.7);
-      vertical-align: top;
-      font-size: 13px;
-    }
-
-    tbody tr:hover {
-      background: rgba(56,189,248,0.04);
-    }
-
-    .tag {
-      display: inline-flex;
-      align-items: center;
-      padding: 4px 9px;
-      border-radius: 999px;
-      font-size: 11px;
-      font-weight: 900;
-      border: 1px solid var(--line);
-      white-space: nowrap;
-    }
-
-    .tag.pending {
-      color: #fde68a;
-      border-color: rgba(245,158,11,0.35);
-      background: rgba(245,158,11,0.10);
-    }
-
-    .tag.staged {
-      color: #bae6fd;
-      border-color: rgba(56,189,248,0.35);
-      background: rgba(56,189,248,0.10);
-    }
-
-    .tag.approved,
-    .tag.executed {
-      color: #bbf7d0;
-      border-color: rgba(34,197,94,0.35);
-      background: rgba(34,197,94,0.10);
-    }
-
-    .tag.vetoed,
-    .tag.expired {
-      color: #fecaca;
-      border-color: rgba(239,68,68,0.35);
-      background: rgba(239,68,68,0.10);
-    }
-
-    .mono {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 12px;
-    }
-
-    .actions-cell {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-
-    .log-console {
-      height: 420px;
-      overflow: auto;
-      background: rgba(15,23,42,0.7);
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 10px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 12px;
-    }
-
-    .log-line {
-      padding: 8px;
-      border-bottom: 1px dashed rgba(36,50,77,0.7);
-      color: #d1d5db;
-      word-break: break-word;
-    }
-
-    .log-line.ok { color: #bbf7d0; }
-    .log-line.warn { color: #fde68a; }
-    .log-line.err { color: #fecaca; }
-    .log-line.info { color: #bae6fd; }
-
-    .config-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-      margin-bottom: 14px;
-    }
-
-    .config-box {
-      background: rgba(15,23,42,0.72);
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 12px;
-    }
-
-    .config-box .k {
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.6px;
-      color: var(--muted);
-      font-weight: 800;
-      margin-bottom: 6px;
-    }
-
-    .config-box .v {
-      font-size: 13px;
-      font-weight: 800;
-      word-break: break-word;
-    }
-
-    .muted {
-      color: var(--muted);
-    }
-
-    .empty-state {
-      padding: 18px;
-      text-align: center;
-      border: 1px dashed var(--line);
-      border-radius: 14px;
-      color: var(--muted);
-      background: rgba(15,23,42,0.35);
-    }
-
-    .modal[hidden] {
-      display: none;
-    }
-
-    .modal {
-      position: fixed;
-      inset: 0;
-      z-index: 1000;
-      display: grid;
-      place-items: center;
-    }
-
-    .modal-backdrop {
-      position: absolute;
-      inset: 0;
-      background: rgba(0, 0, 0, 0.70);
-    }
-
-    .modal-card {
-      position: relative;
-      width: min(560px, calc(100vw - 28px));
-      background: rgba(17, 24, 39, 0.96);
-      border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 18px;
-      box-shadow: 0 24px 60px rgba(0,0,0,0.5);
-      padding: 18px;
-    }
-
-    .modal-card h3 {
-      margin: 0 0 8px;
-      font-size: 16px;
-    }
-
-    .modal-card p {
-      margin: 0 0 12px;
-      color: var(--muted);
-      font-size: 13px;
-    }
-
-    .modal-card textarea {
-      width: 100%;
-      min-height: 110px;
-      resize: vertical;
-      padding: 12px;
-      border-radius: 12px;
-      border: 1px solid var(--line);
-      background: rgba(15, 23, 42, 0.95);
-      color: var(--text);
-      font: inherit;
-      outline: none;
-    }
-
-    .modal-card textarea:focus {
-      border-color: rgba(56,189,248,0.45);
-      box-shadow: 0 0 0 3px rgba(56,189,248,0.10);
-    }
-
-    .modal-error {
-      min-height: 18px;
-      margin-top: 8px;
-      color: #ff8f8f;
-      font-size: 12px;
-    }
-
-    .modal-actions {
-      display: flex;
-      justify-content: flex-end;
-      gap: 10px;
-      margin-top: 12px;
-      flex-wrap: wrap;
-    }
-
-    @media (max-width: 1100px) {
-      main {
-        grid-template-columns: 1fr;
-      }
-    }
-
-    @media (max-width: 800px) {
-      .stats-grid {
-        grid-template-columns: repeat(2, 1fr);
-      }
-
-      .config-grid {
-        grid-template-columns: 1fr;
-      }
-
-      header {
-        align-items: flex-start;
-        flex-direction: column;
-      }
-
-      .header-actions {
-        width: 100%;
-        justify-content: flex-start;
-      }
-    }
-
-    @media (max-width: 520px) {
-      .stats-grid {
-        grid-template-columns: 1fr;
-      }
-
-      main {
-        padding: 12px;
-      }
-    }
+      --bg:#060a10; --surface:#0c1219; --panel:#0f1824;
+      --border:rgba(255,255,255,.06); --border2:rgba(255,255,255,.11);
+      --text:#e2e8f0; --muted:#64748b;
+      --cyan:#06b6d4; --cyan-dim:rgba(6,182,212,.14); --cyan-glow:rgba(6,182,212,.35);
+      --amber:#f59e0b; --amber-dim:rgba(245,158,11,.14);
+      --green:#10b981; --green-dim:rgba(16,185,129,.14);
+      --red:#f43f5e; --red-dim:rgba(244,63,94,.14);
+      --purple:#8b5cf6; --purple-dim:rgba(139,92,246,.14);
+      --r:6px; --font-body:'Space Grotesk',system-ui,sans-serif; --font-mono:'IBM Plex Mono',monospace;
+      --hdr-bg:rgba(6,10,16,.93); --scanline:rgba(255,255,255,.012);
+    }
+    html.light {
+      --bg:#eef2f7; --surface:#fff; --panel:#fff;
+      --border:rgba(0,0,0,.08); --border2:rgba(0,0,0,.13);
+      --text:#0f172a; --muted:#64748b;
+      --cyan:#0284c7; --cyan-dim:rgba(2,132,199,.09); --cyan-glow:rgba(2,132,199,.28);
+      --amber:#b45309; --amber-dim:rgba(180,83,9,.09);
+      --green:#047857; --green-dim:rgba(4,120,87,.09);
+      --red:#be123c; --red-dim:rgba(190,18,60,.09);
+      --purple:#6d28d9; --purple-dim:rgba(109,40,217,.09);
+      --hdr-bg:rgba(238,242,247,.93); --scanline:transparent;
+    }
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--font-body);font-size:14px;line-height:1.5;overflow-x:hidden;transition:background 280ms,color 280ms}
+    body::before{content:"";position:fixed;inset:0;background:repeating-linear-gradient(to bottom,var(--scanline) 0,var(--scanline) 1px,transparent 1px,transparent 4px);pointer-events:none;z-index:9999}
+    header{position:sticky;top:0;z-index:200;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 18px;height:54px;background:var(--hdr-bg);backdrop-filter:blur(14px);border-bottom:1px solid var(--border);transition:background 280ms}
+    .brand{display:flex;align-items:center;gap:11px;flex-shrink:0}.brand-icon{width:30px;height:30px;flex-shrink:0}.brand-icon svg{width:100%;height:100%}.brand-name{font-size:14px;font-weight:700;letter-spacing:.05em;color:var(--text)}.brand-sub{font-size:10px;color:var(--muted);letter-spacing:.09em;text-transform:uppercase;font-family:var(--font-mono)}.hdr-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+    #pollFlash{width:6px;height:6px;border-radius:50%;background:var(--cyan);opacity:0;flex-shrink:0;transition:opacity 200ms}#pollFlash.flash{opacity:1}#lastSync{font-size:10px;font-family:var(--font-mono);color:var(--muted);white-space:nowrap}
+    .chip{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;border:1px solid var(--border2);background:var(--surface);font-size:10px;font-family:var(--font-mono);color:var(--muted);white-space:nowrap}.chip strong{color:var(--text)}.chip.demo{border-color:rgba(245,158,11,.38);background:var(--amber-dim);color:var(--amber)}.chip.warn{border-color:rgba(244,63,94,.38);background:var(--red-dim);color:var(--red)}
+    .dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;background:var(--amber);box-shadow:0 0 5px var(--amber)}.dot.online{background:var(--green);box-shadow:0 0 5px var(--green)}.dot.offline{background:var(--red);box-shadow:0 0 5px var(--red)}
+    .btn{appearance:none;display:inline-flex;align-items:center;gap:5px;padding:5px 11px;border-radius:var(--r);border:1px solid var(--border2);background:var(--surface);color:var(--text);font-family:var(--font-body);font-size:11px;font-weight:600;letter-spacing:.03em;cursor:pointer;white-space:nowrap;transition:background 120ms,border-color 120ms,color 120ms,transform 70ms}.btn:hover{background:rgba(255,255,255,.07);border-color:rgba(255,255,255,.16)}html.light .btn:hover{background:rgba(0,0,0,.05);border-color:rgba(0,0,0,.20)}.btn:active{transform:scale(.97)}.btn:disabled{opacity:.38;cursor:not-allowed;transform:none}.btn.cyan{border-color:var(--cyan-glow);background:var(--cyan-dim);color:var(--cyan)}.btn.amber{border-color:rgba(245,158,11,.38);background:var(--amber-dim);color:var(--amber)}.btn.green{border-color:rgba(16,185,129,.38);background:var(--green-dim);color:var(--green)}.btn.red{border-color:rgba(244,63,94,.38);background:var(--red-dim);color:var(--red)}.btn.active{border-color:var(--cyan-glow);background:var(--cyan-dim);color:var(--cyan)}.btn.ghost{border-color:transparent;background:transparent}
+    main{display:grid;grid-template-columns:1fr 330px;gap:14px;padding:14px;max-width:1500px;margin:0 auto;min-height:calc(100vh - 54px)}.col{display:flex;flex-direction:column;gap:14px}.stat-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat-card{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);padding:13px 15px;position:relative;overflow:hidden;transition:border-color 300ms}.stat-card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px}.s-amber::before{background:var(--amber)}.s-cyan::before{background:var(--cyan);box-shadow:0 0 8px var(--cyan-glow)}.s-green::before{background:var(--green)}.s-purple::before{background:var(--purple)}.stat-label{font-size:10px;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin-bottom:7px}.stat-value{font-size:30px;font-weight:700;line-height:1;color:var(--text);margin-bottom:3px;transition:transform 200ms}.stat-value.bump{transform:scale(1.08)}.stat-sub{font-size:11px;color:var(--muted)}
+    .panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);overflow:hidden}.panel-hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:9px 13px;border-bottom:1px solid var(--border)}.panel-title{font-size:10px;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:.11em;color:var(--muted)}.panel-title span{color:var(--cyan);margin-right:5px}.toolbar{display:flex;gap:5px;align-items:center;flex-wrap:wrap}.search-wrap{padding:7px 13px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:7px}.search-wrap input{flex:1;background:var(--surface);border:1px solid var(--border2);border-radius:var(--r);padding:5px 10px;color:var(--text);font-family:var(--font-mono);font-size:12px;outline:none;transition:border-color 120ms}.search-wrap input::placeholder{color:var(--muted)}.search-wrap input:focus{border-color:var(--cyan-glow)}
+    .table-scroll-wrap{overflow-x:auto;position:relative}.table-scroll-wrap::after{content:"";position:absolute;top:0;right:0;bottom:0;width:24px;background:linear-gradient(to right,transparent,var(--panel));pointer-events:none}table{width:100%;border-collapse:collapse;min-width:700px}thead th{text-align:left;font-size:10px;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:.1em;color:var(--muted);padding:9px 11px;border-bottom:1px solid var(--border);font-weight:400;white-space:nowrap}thead th.sel-col{width:36px}tbody td{padding:10px 11px;border-bottom:1px solid var(--border);font-size:12px;vertical-align:middle}tbody tr:last-child td{border-bottom:none}tbody tr:hover{background:rgba(255,255,255,.02)}html.light tbody tr:hover{background:rgba(0,0,0,.02)}tbody tr.selected{background:var(--cyan-dim)}tbody tr.focused{outline:1px solid var(--cyan-glow);outline-offset:-1px;background:var(--cyan-dim)}.mono{font-family:var(--font-mono);font-size:11px}
+    .expand-btn{background:none;border:none;cursor:pointer;color:var(--muted);font-size:12px;line-height:1;padding:2px 4px;border-radius:3px;transition:color 120ms}.expand-btn:hover{color:var(--text)}.expand-row td{padding:0;border-bottom:1px solid var(--border)}.expand-inner{padding:10px 13px;background:var(--surface);font-family:var(--font-mono);font-size:11px;color:var(--muted);display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px}.expand-kv .k{color:var(--muted);margin-bottom:2px;font-size:10px;text-transform:uppercase;letter-spacing:.08em}.expand-kv .v{color:var(--text);word-break:break-all}input[type=checkbox]{accent-color:var(--cyan);cursor:pointer}
+    .tag{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:4px;font-size:10px;font-family:var(--font-mono);font-weight:600;letter-spacing:.06em;text-transform:uppercase;white-space:nowrap}.tag::before{content:"";width:4px;height:4px;border-radius:50%;flex-shrink:0}.pending{background:var(--amber-dim);color:var(--amber);border:1px solid rgba(245,158,11,.22)}.pending::before{background:var(--amber);box-shadow:0 0 4px var(--amber)}.staged{background:var(--cyan-dim);color:var(--cyan);border:1px solid rgba(6,182,212,.22)}.staged::before{background:var(--cyan);box-shadow:0 0 4px var(--cyan)}.approved,.executed{background:var(--green-dim);color:var(--green);border:1px solid rgba(16,185,129,.22)}.approved::before,.executed::before{background:var(--green)}.vetoed,.expired{background:var(--red-dim);color:var(--red);border:1px solid rgba(244,63,94,.22)}.vetoed::before,.expired::before{background:var(--red)}.unknown{background:var(--surface);color:var(--muted);border:1px solid var(--border2)}.unknown::before{background:var(--muted)}.act-btns{display:flex;gap:5px}
+    #bulkBar{display:none;align-items:center;gap:8px;flex-wrap:wrap;padding:7px 13px;background:var(--cyan-dim);border-top:1px solid var(--border)}#bulkBar.visible{display:flex}#bulkBar .bulk-label{font-size:11px;font-family:var(--font-mono);color:var(--cyan);flex:1}
+    #kbToast{position:fixed;bottom:18px;right:18px;z-index:500;background:var(--panel);border:1px solid var(--border2);border-radius:var(--r);padding:10px 14px;opacity:0;transform:translateY(6px);pointer-events:none;transition:opacity 200ms,transform 200ms}#kbToast.show{opacity:1;transform:translateY(0);pointer-events:auto}#kbToast table{min-width:0}#kbToast td{padding:2px 8px 2px 0;border:none;font-size:11px;font-family:var(--font-mono);color:var(--muted)}#kbToast td:first-child{white-space:nowrap}kbd{background:var(--surface);border:1px solid var(--border2);border-radius:3px;padding:1px 5px;color:var(--text);font-family:var(--font-mono);font-size:10px}
+    .cfg-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.cfg-box{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:9px 11px}.cfg-key{font-size:10px;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:3px}.cfg-val{font-size:12px;font-weight:600;font-family:var(--font-mono);color:var(--text);word-break:break-all}
+    .modal-overlay{position:fixed;inset:0;z-index:400;display:grid;place-items:center}.modal-overlay[hidden]{display:none}.modal-bd{position:absolute;inset:0;background:rgba(0,0,0,.72);backdrop-filter:blur(4px)}.modal-card{position:relative;width:min(500px,calc(100vw - 28px));background:var(--panel);border:1px solid var(--border2);border-radius:10px;padding:18px}.modal-card h3{font-size:14px;font-weight:700;margin-bottom:4px}.modal-card p{font-size:12px;color:var(--muted);margin-bottom:10px}.modal-card input[type=text],.modal-card textarea{width:100%;padding:9px 11px;border-radius:var(--r);border:1px solid var(--border2);background:var(--surface);color:var(--text);font-family:var(--font-mono);font-size:12px;outline:none;transition:border-color 120ms}.modal-card textarea{min-height:90px;resize:vertical;font-family:var(--font-body);font-size:13px}.modal-card input[type=text]:focus,.modal-card textarea:focus{border-color:var(--cyan-glow)}.modal-err{min-height:15px;font-size:11px;color:var(--red);margin-top:5px;font-family:var(--font-mono)}.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:10px;flex-wrap:wrap}
+    .log-toolbar{display:flex;gap:5px;align-items:center}.log-console{height:300px;overflow-y:auto;padding:7px;font-family:var(--font-mono);font-size:11px;scrollbar-width:thin;scrollbar-color:var(--border2) transparent}.log-line{display:grid;grid-template-columns:auto auto 1fr;gap:7px;padding:4px 6px;border-radius:3px;line-height:1.4;word-break:break-word}.log-line+.log-line{margin-top:1px}.log-ts{color:var(--muted);white-space:nowrap}.log-lvl{font-size:9px;letter-spacing:.08em;padding:1px 5px;border-radius:3px;align-self:start;margin-top:1px;white-space:nowrap}.log-line.ok .log-lvl{background:var(--green-dim);color:var(--green)}.log-line.warn .log-lvl{background:var(--amber-dim);color:var(--amber)}.log-line.err .log-lvl{background:var(--red-dim);color:var(--red)}.log-line.info .log-lvl{background:var(--surface);color:var(--muted)}.log-line.ok .log-msg{color:#a3e6cc}.log-line.warn .log-msg{color:var(--amber)}.log-line.err .log-msg{color:var(--red)}.log-line.info .log-msg{color:#94a3b8}.log-line.err{background:rgba(244,63,94,.05)}.empty-state{padding:28px;text-align:center;color:var(--muted);font-family:var(--font-mono);font-size:11px}
+    ::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+    @media(max-width:1100px){main{grid-template-columns:1fr}}@media(max-width:700px){.stat-row{grid-template-columns:1fr 1fr}.cfg-grid{grid-template-columns:1fr}header{height:auto;padding:10px 14px;flex-wrap:wrap}}@media(max-width:440px){.stat-row{grid-template-columns:1fr}}
+    @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}.stat-value.bump{transform:none}}
   </style>
 </head>
 <body>
-  <header>
-    <div class="brand">
-      <div class="brand-mark"></div>
-      <div>
-        <h1>Sentinel-43 Dashboard</h1>
-        <p>Human-gated oversight console</p>
+<header>
+  <div class="brand">
+    <div class="brand-icon" aria-hidden="true">
+      <svg viewBox="0 0 30 30" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="15" cy="15" r="14" stroke="#06b6d4" stroke-width="1.1" stroke-dasharray="2.5 2"/>
+        <circle cx="15" cy="15" r="9" stroke="#06b6d4" stroke-width="0.7" opacity="0.45"/>
+        <circle cx="15" cy="15" r="3.5" fill="#06b6d4" opacity="0.9"/>
+        <line x1="15" y1="1" x2="15" y2="6.5" stroke="#06b6d4" stroke-width="1.1"/>
+        <line x1="15" y1="23.5" x2="15" y2="29" stroke="#06b6d4" stroke-width="1.1"/>
+        <line x1="1" y1="15" x2="6.5" y2="15" stroke="#06b6d4" stroke-width="1.1"/>
+        <line x1="23.5" y1="15" x2="29" y2="15" stroke="#06b6d4" stroke-width="1.1"/>
+      </svg>
+    </div>
+    <div><div class="brand-name">SENTINEL-43</div><div class="brand-sub">Human-gated oversight console</div></div>
+  </div>
+  <div class="hdr-right">
+    <div id="pollFlash" aria-hidden="true"></div>
+    <span id="lastSync">—</span>
+    <span id="demoBadge" class="chip demo" hidden>DEMO DATA</span>
+    <span id="jwtRiskBadge" class="chip warn" hidden>DEV JWT STORAGE</span>
+    <span class="chip"><span id="statusDot" class="dot"></span><span id="statusText">BOOTING</span></span>
+    <span class="chip">MODE&nbsp;<strong id="modeText">HUMAN_GATED</strong></span>
+    <span class="chip">QUEUE&nbsp;<strong id="queueCount">0</strong></span>
+    <button id="refreshBtn" class="btn cyan" type="button">↻ Refresh</button>
+    <button id="injectBtn" class="btn amber" type="button">⚡ Inject</button>
+    <button id="exportBtn" class="btn" type="button">⬇ Export</button>
+    <button id="themeBtn" class="btn" type="button">☀ Light</button>
+    <button id="authBtn" class="btn" type="button">🔑 JWT</button>
+    <button id="kbHelpBtn" class="btn ghost" type="button" title="Keyboard shortcuts" aria-label="Keyboard shortcuts">?</button>
+  </div>
+</header>
+<main>
+  <div class="col">
+    <div class="stat-row">
+      <div class="stat-card s-amber"><div class="stat-label">Pending</div><div id="pendingCount" class="stat-value">0</div><div class="stat-sub">Awaiting decision</div></div>
+      <div class="stat-card s-cyan"><div class="stat-label">Staged</div><div id="stagedCount" class="stat-value">0</div><div class="stat-sub">Ready for approval</div></div>
+      <div class="stat-card s-green"><div class="stat-label">Approved</div><div id="approvedCount" class="stat-value">0</div><div class="stat-sub">Approved / executed</div></div>
+      <div class="stat-card s-purple"><div class="stat-label">Vault Records</div><div id="vaultCount" class="stat-value">--</div><div class="stat-sub">Reported by backend</div></div>
+    </div>
+    <div class="panel" style="flex:1;">
+      <div class="panel-hdr">
+        <div class="panel-title"><span>//</span>PENDING ACTIONS</div>
+        <div class="toolbar">
+          <button class="btn active" type="button" data-filter="ALL">All <span id="fc-ALL"></span></button>
+          <button class="btn" type="button" data-filter="PENDING">Pending <span id="fc-PENDING"></span></button>
+          <button class="btn" type="button" data-filter="STAGED">Staged <span id="fc-STAGED"></span></button>
+          <button class="btn" type="button" data-filter="APPROVED">Approved <span id="fc-APPROVED"></span></button>
+          <button class="btn" type="button" data-filter="VETOED">Vetoed <span id="fc-VETOED"></span></button>
+        </div>
       </div>
-    </div>
-
-    <div class="header-actions">
-      <span class="pill">
-        <span id="statusDot" class="dot"></span>
-        <span id="statusText">Booting</span>
-      </span>
-      <span class="pill">Mode: <span id="modeText">HUMAN_GATED</span></span>
-      <span class="pill">Queue: <span id="queueCount">0</span></span>
-      <button id="refreshBtn" class="btn primary">Refresh</button>
-      <button id="injectBtn" class="btn warn">Inject Test</button>
-      <button id="authBtn" class="btn">Set JWT</button>
-    </div>
-  </header>
-
-  <main>
-    <div class="left-col">
-      <section class="panel">
-        <div class="panel-header">
-          <h2>System Overview</h2>
-        </div>
-        <div class="panel-body">
-          <div class="stats-grid">
-            <div class="stat-card">
-              <div class="stat-label">Pending</div>
-              <div id="pendingCount" class="stat-value">0</div>
-              <div class="stat-sub">Awaiting operator decision</div>
-            </div>
-            <div class="stat-card">
-              <div class="stat-label">Staged</div>
-              <div id="stagedCount" class="stat-value">0</div>
-              <div class="stat-sub">Ready for gated approval</div>
-            </div>
-            <div class="stat-card">
-              <div class="stat-label">Approved</div>
-              <div id="approvedCount" class="stat-value">0</div>
-              <div class="stat-sub">Approved or executed</div>
-            </div>
-            <div class="stat-card">
-              <div class="stat-label">Vault Records</div>
-              <div id="vaultCount" class="stat-value">--</div>
-              <div class="stat-sub">Reported by backend</div>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-header">
-          <h2>Pending Actions</h2>
-          <div class="toolbar">
-            <button class="btn active" data-filter="ALL">All</button>
-            <button class="btn" data-filter="PENDING">Pending</button>
-            <button class="btn" data-filter="STAGED">Staged</button>
-            <button class="btn" data-filter="APPROVED">Approved</button>
-            <button class="btn" data-filter="VETOED">Vetoed</button>
-          </div>
-        </div>
-        <div class="panel-body">
-          <div class="actions-table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Action ID</th>
-                  <th>Threat</th>
-                  <th>Source</th>
-                  <th>Status</th>
-                  <th>Created</th>
-                  <th>Decision</th>
-                  <th>Operator</th>
-                </tr>
-              </thead>
-              <tbody id="actionsBody"></tbody>
-            </table>
-          </div>
-          <div id="emptyState" class="empty-state" hidden>
-            No actions to display. Either everything is quiet, or the backend is sulking.
-          </div>
-        </div>
-      </section>
-    </div>
-
-    <div class="right-col">
-      <section class="panel">
-        <div class="panel-header">
-          <h2>Runtime Config</h2>
-        </div>
-        <div class="panel-body">
-          <div class="config-grid">
-            <div class="config-box">
-              <div class="k">API Base</div>
-              <div id="apiBaseText" class="v">/api/v1</div>
-            </div>
-            <div class="config-box">
-              <div class="k">Auth State</div>
-              <div id="authStateText" class="v">Missing</div>
-            </div>
-            <div class="config-box">
-              <div class="k">Polling</div>
-              <div id="pollText" class="v">1500 ms</div>
-            </div>
-            <div class="config-box">
-              <div class="k">Demo Mode</div>
-              <div id="demoText" class="v">Enabled</div>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-header">
-          <h2>Console Log</h2>
-          <div class="toolbar">
-            <button id="clearLogBtn" class="btn">Clear</button>
-          </div>
-        </div>
-        <div class="panel-body">
-          <div id="logConsole" class="log-console" role="log" aria-live="polite"></div>
-        </div>
-      </section>
-    </div>
-  </main>
-
-  <div id="reasonModal" class="modal" hidden aria-hidden="true" role="dialog" aria-modal="true">
-    <div class="modal-backdrop" data-close></div>
-    <div class="modal-card">
-      <h3 id="modalTitle">Provide reason</h3>
-      <p id="modalSubtitle">Reason is required. Ctrl+Enter confirms.</p>
-      <textarea id="modalInput" maxlength="500" placeholder="Enter reason..."></textarea>
-      <div id="modalError" class="modal-error"></div>
-      <div class="modal-actions">
-        <button id="modalCancel" class="btn">Cancel</button>
-        <button id="modalConfirm" class="btn good">Confirm</button>
+      <div class="search-wrap">
+        <span style="font-size:13px;color:var(--muted);" aria-hidden="true">🔍</span>
+        <input id="searchInput" type="text" placeholder="Search by threat, IP, or action ID…" autocomplete="off" spellcheck="false" />
+        <button id="clearSearchBtn" class="btn ghost" type="button" style="font-size:12px;padding:2px 6px;" title="Clear" aria-label="Clear search">✕</button>
       </div>
+      <div class="table-scroll-wrap">
+        <table>
+          <thead><tr><th class="sel-col"><input type="checkbox" id="selectAll" title="Select all visible" aria-label="Select all visible rows" /></th><th></th><th>Action ID</th><th>Threat</th><th>Source IP</th><th>Status</th><th>Created</th><th>Reason</th><th>Operator</th></tr></thead>
+          <tbody id="actionsBody"></tbody>
+        </table>
+        <div id="emptyState" class="empty-state" hidden>▸ No matching actions found.</div>
+      </div>
+      <div id="bulkBar"><span class="bulk-label" id="bulkLabel">0 selected</span><button id="bulkApproveBtn" class="btn green" type="button">✓ Bulk Approve</button><button id="bulkVetoBtn" class="btn red" type="button">✕ Bulk Veto</button><button id="bulkClearBtn" class="btn ghost" type="button">Clear</button></div>
     </div>
   </div>
-
-  <script>
-    "use strict";
-
-    const CONFIG = {
-      API_BASE: "/api/v1",
-      POLL_MS: 1500,
-      REASON_MIN: 5,
-      REASON_MAX: 500,
-      DEMO_MODE: true
-    };
-
-    const STATUS_CLASSES = {
-      PENDING: "pending",
-      STAGED: "staged",
-      APPROVED: "approved",
-      EXECUTED: "executed",
-      VETOED: "vetoed",
-      EXPIRED: "expired"
-    };
-
-    const el = {
-      statusDot: document.getElementById("statusDot"),
-      statusText: document.getElementById("statusText"),
-      modeText: document.getElementById("modeText"),
-      queueCount: document.getElementById("queueCount"),
-
-      pendingCount: document.getElementById("pendingCount"),
-      stagedCount: document.getElementById("stagedCount"),
-      approvedCount: document.getElementById("approvedCount"),
-      vaultCount: document.getElementById("vaultCount"),
-
-      apiBaseText: document.getElementById("apiBaseText"),
-      authStateText: document.getElementById("authStateText"),
-      pollText: document.getElementById("pollText"),
-      demoText: document.getElementById("demoText"),
-
-      refreshBtn: document.getElementById("refreshBtn"),
-      injectBtn: document.getElementById("injectBtn"),
-      authBtn: document.getElementById("authBtn"),
-      clearLogBtn: document.getElementById("clearLogBtn"),
-
-      actionsBody: document.getElementById("actionsBody"),
-      emptyState: document.getElementById("emptyState"),
-      logConsole: document.getElementById("logConsole"),
-
-      reasonModal: document.getElementById("reasonModal"),
-      modalTitle: document.getElementById("modalTitle"),
-      modalSubtitle: document.getElementById("modalSubtitle"),
-      modalInput: document.getElementById("modalInput"),
-      modalError: document.getElementById("modalError"),
-      modalCancel: document.getElementById("modalCancel"),
-      modalConfirm: document.getElementById("modalConfirm")
-    };
-
-    let currentFilter = "ALL";
-    let refreshInFlight = false;
-    let pollTimer = null;
-
-    function nowStamp() {
-      return new Date().toLocaleString();
-    }
-
-    function log(message, type = "info") {
-      const line = document.createElement("div");
-      line.className = `log-line ${type}`;
-      line.textContent = `[${nowStamp()}] ${message}`;
-      el.logConsole.appendChild(line);
-      el.logConsole.scrollTop = el.logConsole.scrollHeight;
-    }
-
-    function escapeHtml(value) {
-      return String(value)
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;")
-        .replaceAll("'", "&#039;");
-    }
-
-    function setStatus(state) {
-      el.statusText.textContent = state;
-      el.statusDot.classList.remove("online", "offline");
-
-      if (state === "Online") {
-        el.statusDot.classList.add("online");
-      } else if (state === "Offline") {
-        el.statusDot.classList.add("offline");
-      }
-    }
-
-    function updateStaticConfig() {
-      el.apiBaseText.textContent = CONFIG.API_BASE;
-      el.pollText.textContent = `${CONFIG.POLL_MS} ms`;
-      el.demoText.textContent = CONFIG.DEMO_MODE ? "Enabled" : "Disabled";
-
-      const token = sessionStorage.getItem("SENTINEL_JWT");
-      el.authStateText.textContent = token ? "Present" : "Missing";
-      el.authStateText.style.color = token ? "#bbf7d0" : "#fde68a";
-    }
-
-    function getAuthHeaders() {
-      const headers = {
-        "Content-Type": "application/json"
-      };
-      const token = sessionStorage.getItem("SENTINEL_JWT");
-      if (token) {
-        headers.Authorization = `Bearer ${token}`;
-      }
-      return headers;
-    }
-
-    async function fetchJson(path, options = {}) {
-      const response = await fetch(`${CONFIG.API_BASE}${path}`, {
-        ...options,
-        headers: {
-          ...getAuthHeaders(),
-          ...(options.headers || {})
-        },
-        credentials: "include"
-      });
-
-      if (!response.ok) {
-        const text = await response.text().catch(() => "");
-        throw new Error(`${response.status} ${response.statusText}${text ? `: ${text}` : ""}`);
-      }
-
-      const type = response.headers.get("content-type") || "";
-      if (type.includes("application/json")) {
-        return response.json();
-      }
-      return null;
-    }
-
-    const demoBackend = (() => {
-      const actions = new Map();
-
-      function id() {
-        return `ACT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`.toUpperCase();
-      }
-
-      function createAction(overrides = {}) {
-        const item = {
-          id: id(),
-          action_type: overrides.action_type || "THREAT_ACTION",
-          status: overrides.status || (Math.random() > 0.5 ? "PENDING" : "STAGED"),
-          created_at: overrides.created_at || new Date().toISOString(),
-          decision_reason: overrides.decision_reason || "",
-          payload: {
-            ip: overrides.ip || overrides.source_ip || "203.0.113.10",
-            source_ip: overrides.source_ip || overrides.ip || "203.0.113.10",
-            threat: overrides.threat || "Suspicious activity detected"
-          }
-        };
-        actions.set(item.id, item);
-      }
-
-      createAction({ threat: "SQL injection pattern", ip: "198.51.100.22", status: "PENDING" });
-      createAction({ threat: "Credential abuse indicator", ip: "203.0.113.77", status: "STAGED" });
-      createAction({ threat: "High-rate probe", ip: "192.0.2.41", status: "APPROVED", decision_reason: "Approved by operator" });
-
-      return {
-        async listActions() {
-          return Array.from(actions.values()).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-        },
-        async approve(actionId, reason) {
-          const item = actions.get(actionId);
-          if (!item) throw new Error("Action not found");
-          item.status = "APPROVED";
-          item.decision_reason = reason;
-          return { ok: true };
-        },
-        async veto(actionId, reason) {
-          const item = actions.get(actionId);
-          if (!item) throw new Error("Action not found");
-          item.status = "VETOED";
-          item.decision_reason = reason;
-          return { ok: true };
-        },
-        async inject() {
-          createAction({
-            threat: "Injected test incident",
-            ip: "203.0.113.88",
-            status: Math.random() > 0.5 ? "PENDING" : "STAGED"
-          });
-          return { ok: true };
-        },
-        async vaultStats() {
-          return { records: 12487 };
-        }
-      };
-    })();
-
-    const api = {
-      async listActions() {
-        if (CONFIG.DEMO_MODE) return demoBackend.listActions();
-        return fetchJson("/actions?limit=250");
-      },
-      async approve(actionId, reason) {
-        if (CONFIG.DEMO_MODE) return demoBackend.approve(actionId, reason);
-        return fetchJson(`/actions/${encodeURIComponent(actionId)}/approve`, {
-          method: "POST",
-          body: JSON.stringify({ reason })
-        });
-      },
-      async veto(actionId, reason) {
-        if (CONFIG.DEMO_MODE) return demoBackend.veto(actionId, reason);
-        return fetchJson(`/actions/${encodeURIComponent(actionId)}/veto`, {
-          method: "POST",
-          body: JSON.stringify({ reason })
-        });
-      },
-      async inject() {
-        if (CONFIG.DEMO_MODE) return demoBackend.inject();
-        return fetchJson("/actions", {
-          method: "POST",
-          body: JSON.stringify({
-            action_type: "TEST_INCIDENT",
-            payload: {
-              ip: "203.0.113.88",
-              source_ip: "203.0.113.88",
-              threat: "Injected test incident"
-            }
-          })
-        });
-      },
-      async vaultStats() {
-        if (CONFIG.DEMO_MODE) return demoBackend.vaultStats();
-        return fetchJson("/vault/stats");
-      }
-    };
-
-    function normalizeAction(raw) {
-      const payload = raw.payload || {};
-      return {
-        id: String(raw.id || ""),
-        threat: payload.threat || raw.action_type || "UNKNOWN",
-        source: payload.source_ip || payload.ip || "n/a",
-        status: String(raw.status || "UNKNOWN").toUpperCase(),
-        createdAt: raw.created_at || new Date().toISOString(),
-        decisionReason: raw.decision_reason || ""
-      };
-    }
-
-    function applyFilter(actions) {
-      if (currentFilter === "ALL") return actions;
-      return actions.filter(action => action.status === currentFilter);
-    }
-
-    function updateStats(actions) {
-      const pending = actions.filter(a => a.status === "PENDING").length;
-      const staged = actions.filter(a => a.status === "STAGED").length;
-      const approved = actions.filter(a => a.status === "APPROVED" || a.status === "EXECUTED").length;
-      const queue = actions.filter(a => a.status === "PENDING" || a.status === "STAGED").length;
-
-      el.pendingCount.textContent = pending;
-      el.stagedCount.textContent = staged;
-      el.approvedCount.textContent = approved;
-      el.queueCount.textContent = queue;
-    }
-
-    function renderActions(actions) {
-      el.actionsBody.innerHTML = "";
-
-      if (!actions.length) {
-        el.emptyState.hidden = false;
-        return;
-      }
-
-      el.emptyState.hidden = true;
-
-      for (const action of actions) {
-        const tr = document.createElement("tr");
-        const statusClass = STATUS_CLASSES[action.status] || "pending";
-        const created = new Date(action.createdAt).toLocaleString();
-
-        let operatorCell = `<span class="muted">N/A</span>`;
-        if (action.status === "PENDING" || action.status === "STAGED") {
-          operatorCell = `
-            <div class="actions-cell">
-              ${action.status === "STAGED" ? `<button class="btn good" data-approve="${escapeHtml(action.id)}">Approve</button>` : ""}
-              <button class="btn bad" data-veto="${escapeHtml(action.id)}">Veto</button>
-            </div>
-          `;
-        }
-
-        tr.innerHTML = `
-          <td class="mono">${escapeHtml(action.id)}</td>
-          <td>${escapeHtml(action.threat)}</td>
-          <td class="mono">${escapeHtml(action.source)}</td>
-          <td><span class="tag ${statusClass}">${escapeHtml(action.status)}</span></td>
-          <td>${escapeHtml(created)}</td>
-          <td>${action.decisionReason ? escapeHtml(action.decisionReason) : `<span class="muted">None</span>`}</td>
-          <td>${operatorCell}</td>
-        `;
-
-        el.actionsBody.appendChild(tr);
-      }
-    }
-
-    function validateReason(reason) {
-      const value = (reason || "").trim();
-      if (!value) return "Reason is required.";
-      if (value.length < CONFIG.REASON_MIN) return `Reason must be at least ${CONFIG.REASON_MIN} characters.`;
-      if (value.length > CONFIG.REASON_MAX) return `Reason must be ${CONFIG.REASON_MAX} characters or less.`;
-      return null;
-    }
-
-    function openReasonModal({ title, subtitle, confirmText, confirmClass = "good", defaultText = "" }) {
-      return new Promise(resolve => {
-        const close = result => {
-          el.reasonModal.hidden = true;
-          el.reasonModal.setAttribute("aria-hidden", "true");
-          el.modalError.textContent = "";
-          resolve(result);
-        };
-
-        el.modalTitle.textContent = title;
-        el.modalSubtitle.textContent = subtitle;
-        el.modalInput.value = defaultText;
-        el.modalConfirm.textContent = confirmText;
-        el.modalConfirm.className = `btn ${confirmClass}`;
-
-        el.reasonModal.hidden = false;
-        el.reasonModal.setAttribute("aria-hidden", "false");
-
-        setTimeout(() => el.modalInput.focus(), 0);
-
-        const onCancel = () => {
-          cleanup();
-          close(null);
-        };
-
-        const onConfirm = () => {
-          const error = validateReason(el.modalInput.value);
-          if (error) {
-            el.modalError.textContent = error;
-            return;
-          }
-          cleanup();
-          close(el.modalInput.value.trim());
-        };
-
-        const onBackdrop = event => {
-          if (event.target.hasAttribute("data-close")) {
-            onCancel();
-          }
-        };
-
-        const onKey = event => {
-          if (event.key === "Escape") onCancel();
-          if ((event.ctrlKey || event.metaKey) && event.key === "Enter") onConfirm();
-        };
-
-        function cleanup() {
-          el.modalCancel.removeEventListener("click", onCancel);
-          el.modalConfirm.removeEventListener("click", onConfirm);
-          el.reasonModal.removeEventListener("click", onBackdrop);
-          document.removeEventListener("keydown", onKey);
-        }
-
-        el.modalCancel.addEventListener("click", onCancel);
-        el.modalConfirm.addEventListener("click", onConfirm);
-        el.reasonModal.addEventListener("click", onBackdrop);
-        document.addEventListener("keydown", onKey);
-      });
-    }
-
-    async function refreshDashboard(manual = false) {
-      if (refreshInFlight) return;
-
-      refreshInFlight = true;
-      if (manual) setStatus("Syncing");
-
-      try {
-        updateStaticConfig();
-
-        const [rawActions, vault] = await Promise.all([
-          api.listActions(),
-          api.vaultStats().catch(() => ({ records: null }))
-        ]);
-
-        const actions = rawActions.map(normalizeAction).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-        const filtered = applyFilter(actions);
-
-        updateStats(actions);
-        renderActions(filtered);
-
-        if (typeof vault?.records === "number") {
-          el.vaultCount.textContent = vault.records.toLocaleString();
-        } else {
-          el.vaultCount.textContent = "--";
-        }
-
-        setStatus("Online");
-        if (manual) log(`Manual refresh complete. Loaded ${filtered.length} visible action(s).`, "ok");
-      } catch (error) {
-        setStatus("Offline");
-        log(`Refresh failed: ${error.message || String(error)}`, "err");
-      } finally {
-        refreshInFlight = false;
-      }
-    }
-
-    function startPolling() {
-      if (pollTimer) clearInterval(pollTimer);
-      pollTimer = setInterval(() => {
-        refreshDashboard(false);
-      }, CONFIG.POLL_MS);
-    }
-
-    document.addEventListener("click", async event => {
-      const filterBtn = event.target.closest("[data-filter]");
-      if (filterBtn) {
-        currentFilter = filterBtn.dataset.filter;
-        document.querySelectorAll("[data-filter]").forEach(btn => btn.classList.remove("active"));
-        filterBtn.classList.add("active");
-        log(`Filter changed to ${currentFilter}.`, "info");
-        await refreshDashboard(true);
-        return;
-      }
-
-      const approveBtn = event.target.closest("[data-approve]");
-      if (approveBtn) {
-        const actionId = approveBtn.dataset.approve;
-        const reason = await openReasonModal({
-          title: `Approve ${actionId}`,
-          subtitle: "Required. This action will be marked approved.",
-          confirmText: "Approve",
-          confirmClass: "good",
-          defaultText: "Approved by operator"
-        });
-
-        if (!reason) {
-          log(`Approve cancelled for ${actionId}.`, "warn");
-          return;
-        }
-
-        try {
-          approveBtn.disabled = true;
-          await api.approve(actionId, reason);
-          log(`Approved ${actionId}.`, "ok");
-          await refreshDashboard(true);
-        } catch (error) {
-          log(`Approve failed for ${actionId}: ${error.message || String(error)}`, "err");
-        } finally {
-          approveBtn.disabled = false;
-        }
-        return;
-      }
-
-      const vetoBtn = event.target.closest("[data-veto]");
-      if (vetoBtn) {
-        const actionId = vetoBtn.dataset.veto;
-        const reason = await openReasonModal({
-          title: `Veto ${actionId}`,
-          subtitle: "Required. Explain why this action is being blocked.",
-          confirmText: "Veto",
-          confirmClass: "bad",
-          defaultText: "False positive or authorized traffic"
-        });
-
-        if (!reason) {
-          log(`Veto cancelled for ${actionId}.`, "warn");
-          return;
-        }
-
-        try {
-          vetoBtn.disabled = true;
-          await api.veto(actionId, reason);
-          log(`Vetoed ${actionId}.`, "warn");
-          await refreshDashboard(true);
-        } catch (error) {
-          log(`Veto failed for ${actionId}: ${error.message || String(error)}`, "err");
-        } finally {
-          vetoBtn.disabled = false;
-        }
-      }
-    });
-
-    el.refreshBtn.addEventListener("click", async () => {
-      await refreshDashboard(true);
-    });
-
-    el.injectBtn.addEventListener("click", async () => {
-      try {
-        el.injectBtn.disabled = true;
-        await api.inject();
-        log("Injected test action.", "info");
-        await refreshDashboard(true);
-      } catch (error) {
-        log(`Inject failed: ${error.message || String(error)}`, "err");
-      } finally {
-        el.injectBtn.disabled = false;
-      }
-    });
-
-    el.authBtn.addEventListener("click", async () => {
-      const current = sessionStorage.getItem("SENTINEL_JWT") || "";
-      const value = prompt("Paste SENTINEL JWT. Leave blank to clear.", current);
-      if (value === null) return;
-
-      const trimmed = value.trim();
-      if (!trimmed) {
-        sessionStorage.removeItem("SENTINEL_JWT");
-        log("JWT cleared.", "warn");
-      } else {
-        sessionStorage.setItem("SENTINEL_JWT", trimmed);
-        log("JWT set in sessionStorage.", "info");
-      }
-
-      updateStaticConfig();
-      await refreshDashboard(true);
-    });
-
-    el.clearLogBtn.addEventListener("click", () => {
-      el.logConsole.innerHTML = "";
-      log("Console cleared.", "info");
-    });
-
-    window.addEventListener("beforeunload", () => {
-      if (pollTimer) clearInterval(pollTimer);
-    });
-
-    log("Dashboard booting.", "info");
-    updateStaticConfig();
-    refreshDashboard(true);
-    startPolling();
-  </script>
+  <div class="col">
+    <div class="panel"><div class="panel-hdr"><div class="panel-title"><span>//</span>RUNTIME CONFIG</div></div><div style="padding:10px;"><div class="cfg-grid"><div class="cfg-box"><div class="cfg-key">API Base</div><div id="apiBaseText" class="cfg-val">/api/v1</div></div><div class="cfg-box"><div class="cfg-key">Auth State</div><div id="authStateText" class="cfg-val" style="color:var(--amber)">MISSING</div></div><div class="cfg-box"><div class="cfg-key">Poll Interval</div><div id="pollText" class="cfg-val">1500 ms</div></div><div class="cfg-box"><div class="cfg-key">Demo Mode</div><div id="demoText" class="cfg-val" style="color:var(--red)">DISABLED</div></div></div></div></div>
+    <div class="panel" style="flex:1;"><div class="panel-hdr"><div class="panel-title"><span>//</span>CONSOLE LOG</div><div class="log-toolbar"><div class="toolbar"><button class="btn active" type="button" data-log-filter="ALL" style="padding:3px 8px;font-size:10px;">All</button><button class="btn" type="button" data-log-filter="err" style="padding:3px 8px;font-size:10px;">Err</button><button class="btn" type="button" data-log-filter="warn" style="padding:3px 8px;font-size:10px;">Warn</button><button class="btn" type="button" data-log-filter="ok" style="padding:3px 8px;font-size:10px;">OK</button></div><button id="clearLogBtn" class="btn" type="button">Clear</button></div></div><div id="logConsole" class="log-console" role="log" aria-live="polite"></div></div>
+  </div>
+</main>
+<div id="reasonModal" class="modal-overlay" hidden aria-hidden="true" role="dialog" aria-modal="true"><div class="modal-bd" data-close></div><div class="modal-card"><h3 id="modalTitle">Provide reason</h3><p id="modalSubtitle">Reason is required. Ctrl+Enter confirms.</p><textarea id="modalInput" maxlength="500" placeholder="Enter a substantive reason (min 10 characters)…"></textarea><div style="display:flex;justify-content:space-between;align-items:center;margin-top:5px;"><div id="modalError" class="modal-err"></div><div id="modalCharCount" style="font-size:10px;font-family:var(--font-mono);color:var(--muted);">0 / 500</div></div><div class="modal-actions"><button id="modalCancel" class="btn" type="button">Cancel</button><button id="modalConfirm" class="btn green" type="button">Confirm</button></div></div></div>
+<div id="jwtModal" class="modal-overlay" hidden aria-hidden="true" role="dialog" aria-modal="true"><div class="modal-bd" data-close-jwt></div><div class="modal-card"><h3>Set SENTINEL JWT</h3><p>Development mode only. Production should use secure HttpOnly cookies, because apparently browsers enjoy giving attackers tiny treasure chests.</p><input type="text" id="jwtInput" placeholder="eyJ…" autocomplete="off" spellcheck="false" /><div class="modal-actions"><button id="jwtCancel" class="btn" type="button">Cancel</button><button id="jwtClear" class="btn red" type="button">Clear JWT</button><button id="jwtConfirm" class="btn cyan" type="button">Set JWT</button></div></div></div>
+<div id="injectModal" class="modal-overlay" hidden aria-hidden="true" role="dialog" aria-modal="true"><div class="modal-bd" data-close-inject></div><div class="modal-card"><h3>Inject test action?</h3><p>Adds a synthetic incident to the queue. Only available when demo mode is enabled.</p><div class="modal-actions"><button id="injectCancel" class="btn" type="button">Cancel</button><button id="injectConfirm" class="btn amber" type="button">⚡ Confirm Inject</button></div></div></div>
+<div id="kbToast"><table><tr><td><kbd>/</kbd></td><td>Focus search</td></tr><tr><td><kbd>R</kbd></td><td>Refresh</td></tr><tr><td><kbd>↑↓</kbd></td><td>Navigate rows</td></tr><tr><td><kbd>A</kbd></td><td>Approve focused staged row</td></tr><tr><td><kbd>V</kbd></td><td>Veto focused actionable row</td></tr><tr><td><kbd>Esc</kbd></td><td>Clear selection / close</td></tr></table></div>
+<script>
+"use strict";
+
+const CONFIG = Object.freeze({
+  API_BASE:"/api/v1",
+  POLL_MS:1500,
+  REASON_MIN:10,
+  REASON_MAX:500,
+  DEMO_MODE:new URLSearchParams(location.search).get("demo") === "1",
+  MAX_LOG_LINES:500
+});
+
+const STATUS_CLASSES = Object.freeze({PENDING:"pending",STAGED:"staged",APPROVED:"approved",EXECUTED:"executed",VETOED:"vetoed",EXPIRED:"expired",UNKNOWN:"unknown"});
+const $ = id => document.getElementById(id);
+const el = {
+  statusDot:$("statusDot"),statusText:$("statusText"),modeText:$("modeText"),queueCount:$("queueCount"),lastSync:$("lastSync"),pollFlash:$("pollFlash"),demoBadge:$("demoBadge"),jwtRiskBadge:$("jwtRiskBadge"),
+  pendingCount:$("pendingCount"),stagedCount:$("stagedCount"),approvedCount:$("approvedCount"),vaultCount:$("vaultCount"),apiBaseText:$("apiBaseText"),authStateText:$("authStateText"),pollText:$("pollText"),demoText:$("demoText"),
+  refreshBtn:$("refreshBtn"),injectBtn:$("injectBtn"),exportBtn:$("exportBtn"),themeBtn:$("themeBtn"),authBtn:$("authBtn"),kbHelpBtn:$("kbHelpBtn"),actionsBody:$("actionsBody"),emptyState:$("emptyState"),logConsole:$("logConsole"),clearLogBtn:$("clearLogBtn"),
+  searchInput:$("searchInput"),clearSearchBtn:$("clearSearchBtn"),selectAll:$("selectAll"),bulkBar:$("bulkBar"),bulkLabel:$("bulkLabel"),bulkApproveBtn:$("bulkApproveBtn"),bulkVetoBtn:$("bulkVetoBtn"),bulkClearBtn:$("bulkClearBtn"),
+  reasonModal:$("reasonModal"),modalTitle:$("modalTitle"),modalSubtitle:$("modalSubtitle"),modalInput:$("modalInput"),modalError:$("modalError"),modalCharCount:$("modalCharCount"),modalCancel:$("modalCancel"),modalConfirm:$("modalConfirm"),
+  jwtModal:$("jwtModal"),jwtInput:$("jwtInput"),jwtCancel:$("jwtCancel"),jwtClear:$("jwtClear"),jwtConfirm:$("jwtConfirm"),injectModal:$("injectModal"),injectCancel:$("injectCancel"),injectConfirm:$("injectConfirm"),kbToast:$("kbToast")
+};
+
+let currentFilter="ALL", currentLogFilter="ALL", searchQuery="", refreshInFlight=false, pollTimer=null;
+let allActions=[], selectedIds=new Set(), focusedRowIndex=-1, kbToastTimer=null, modalOpenCount=0;
+let prevCounts={pending:0,staged:0,approved:0};
+
+const nowStamp = () => new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"});
+const escHtml = value => String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;");
+const cssEscape = value => (window.CSS && typeof CSS.escape === "function") ? CSS.escape(String(value)) : String(value).replace(/[^a-zA-Z0-9_-]/g, "\\$&");
+
+function log(message,type="info"){
+  const line=document.createElement("div");
+  line.className=`log-line ${type}`; line.dataset.type=type;
+  line.innerHTML=`<span class="log-ts">${nowStamp()}</span><span class="log-lvl">${escHtml(type.toUpperCase())}</span><span class="log-msg">${escHtml(message)}</span>`;
+  if(currentLogFilter!=="ALL"&&type!==currentLogFilter) line.hidden=true;
+  el.logConsole.appendChild(line);
+  while(el.logConsole.children.length>CONFIG.MAX_LOG_LINES) el.logConsole.removeChild(el.logConsole.firstElementChild);
+  el.logConsole.scrollTop=el.logConsole.scrollHeight;
+}
+function setStatus(state){el.statusText.textContent=state.toUpperCase();el.statusDot.classList.remove("online","offline");if(state==="Online")el.statusDot.classList.add("online");if(state==="Offline")el.statusDot.classList.add("offline");}
+function flashPoll(){el.pollFlash.classList.add("flash");setTimeout(()=>el.pollFlash.classList.remove("flash"),600);}
+function bumpStat(node){node.classList.add("bump");setTimeout(()=>node.classList.remove("bump"),250);}
+
+const demoBackend=(()=>{
+  const store=new Map();
+  const genId=()=>`ACT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,8)}`.toUpperCase();
+  function make(o={}){const item={id:genId(),action_type:o.action_type||"THREAT_ACTION",status:o.status||(Math.random()>.5?"PENDING":"STAGED"),created_at:o.created_at||new Date().toISOString(),decision_reason:o.decision_reason||"",operator:o.operator||"",payload:{ip:o.ip||"203.0.113.10",source_ip:o.source_ip||o.ip||"203.0.113.10",threat:o.threat||"Suspicious activity"}};store.set(item.id,item);return item;}
+  make({threat:"SQL injection pattern",ip:"198.51.100.22",status:"PENDING"});
+  make({threat:"Credential stuffing detected",ip:"203.0.113.77",status:"STAGED"});
+  make({threat:"High-rate port probe",ip:"192.0.2.41",status:"APPROVED",decision_reason:"Confirmed scanner — allowlisted",operator:"ops@sentinel"});
+  make({threat:"XSS payload in user-agent",ip:"198.51.100.9",status:"PENDING"});
+  make({threat:"Tor exit-node connection",ip:"10.0.0.7",status:"VETOED",decision_reason:"Internal test traffic — false positive",operator:"sec@sentinel"});
+  return {
+    async listActions(){return Array.from(store.values()).sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));},
+    async approve(id,reason){const item=store.get(id);if(!item)throw new Error("Not found");if(item.status!=="STAGED")throw new Error("Only staged actions can be approved");item.status="APPROVED";item.decision_reason=reason;item.operator="operator";return {ok:true};},
+    async veto(id,reason){const item=store.get(id);if(!item)throw new Error("Not found");if(!["PENDING","STAGED"].includes(item.status))throw new Error("Only pending/staged actions can be vetoed");item.status="VETOED";item.decision_reason=reason;item.operator="operator";return {ok:true};},
+    async inject(){make({threat:"Injected test incident",ip:"203.0.113.88",status:Math.random()>.5?"PENDING":"STAGED"});return {ok:true};},
+    async vaultStats(){return {records:12487};}
+  };
+})();
+
+function getAuthHeaders(){
+  const headers={"Content-Type":"application/json"};
+  const token=sessionStorage.getItem("SENTINEL_JWT");
+  if(token) headers.Authorization=`Bearer ${token}`;
+  return headers;
+}
+async function fetchJson(path,opts={}){
+  const response=await fetch(`${CONFIG.API_BASE}${path}`,{...opts,headers:{...getAuthHeaders(),...(opts.headers||{})},credentials:"include"});
+  if(!response.ok){const body=await response.text().catch(()=>"");throw new Error(`${response.status} ${response.statusText}${body?`: ${body.slice(0,500)}`:""}`);}
+  const ct=response.headers.get("content-type")||"";
+  return ct.includes("application/json")?response.json():null;
+}
+const api={
+  listActions:()=>CONFIG.DEMO_MODE?demoBackend.listActions():fetchJson("/actions?limit=250"),
+  approve:(id,reason)=>CONFIG.DEMO_MODE?demoBackend.approve(id,reason):fetchJson(`/actions/${encodeURIComponent(id)}/approve`,{method:"POST",body:JSON.stringify({reason})}),
+  veto:(id,reason)=>CONFIG.DEMO_MODE?demoBackend.veto(id,reason):fetchJson(`/actions/${encodeURIComponent(id)}/veto`,{method:"POST",body:JSON.stringify({reason})}),
+  inject:()=>CONFIG.DEMO_MODE?demoBackend.inject():Promise.reject(new Error("Inject is disabled unless demo mode is enabled")),
+  vaultStats:()=>CONFIG.DEMO_MODE?demoBackend.vaultStats():fetchJson("/vault/stats")
+};
+
+function normalizeAction(raw){
+  const payload=raw?.payload||{};
+  const id=String(raw?.id||"");
+  const createdRaw=raw?.created_at;
+  let createdAt=null, createdMissing=false, createdInvalid=false;
+  if(!createdRaw){createdMissing=true;} else {const t=Date.parse(createdRaw); if(Number.isNaN(t)) createdInvalid=true; else createdAt=new Date(t).toISOString();}
+  if(!id) log("Backend returned action without id; rendering with empty id guard.","warn");
+  if(createdMissing||createdInvalid) log(`Action ${id||"<missing-id>"} has ${createdMissing?"missing":"invalid"} created_at. Timestamp not fabricated.`,"warn");
+  return {id,threat:payload.threat||raw?.action_type||"UNKNOWN",source:payload.source_ip||payload.ip||"n/a",status:String(raw?.status||"UNKNOWN").toUpperCase(),createdAt,createdRaw:createdRaw||"",createdBad:createdMissing||createdInvalid,decisionReason:raw?.decision_reason||"",operator:raw?.operator||"",payload};
+}
+function actionTimeValue(action){return action.createdAt?Date.parse(action.createdAt):0;}
+function applyFilters(actions){let out=currentFilter==="ALL"?actions:actions.filter(a=>a.status===currentFilter);const q=searchQuery.trim().toLowerCase();if(q)out=out.filter(a=>a.id.toLowerCase().includes(q)||a.threat.toLowerCase().includes(q)||a.source.toLowerCase().includes(q));return out;}
+function visibleActionIds(){return new Set(applyFilters(allActions).map(a=>a.id));}
+
+function updateStats(actions){
+  const pending=actions.filter(a=>a.status==="PENDING").length, staged=actions.filter(a=>a.status==="STAGED").length, approved=actions.filter(a=>a.status==="APPROVED"||a.status==="EXECUTED").length, vetoed=actions.filter(a=>a.status==="VETOED").length;
+  if(pending!==prevCounts.pending){bumpStat(el.pendingCount);el.pendingCount.textContent=pending;} if(staged!==prevCounts.staged){bumpStat(el.stagedCount);el.stagedCount.textContent=staged;} if(approved!==prevCounts.approved){bumpStat(el.approvedCount);el.approvedCount.textContent=approved;}
+  prevCounts={pending,staged,approved}; el.queueCount.textContent=pending+staged;
+  for(const [k,v] of Object.entries({ALL:actions.length,PENDING:pending,STAGED:staged,APPROVED:approved,VETOED:vetoed})){const s=$(`fc-${k}`);if(s)s.textContent=v>0?` (${v})`:"";}
+}
+function updateSelectAllState(){const cbs=Array.from(document.querySelectorAll(".row-cb"));const checked=cbs.filter(cb=>cb.checked).length;el.selectAll.checked=cbs.length>0&&checked===cbs.length;el.selectAll.indeterminate=checked>0&&checked<cbs.length;}
+function updateBulkBar(){
+  const count=selectedIds.size, visibleIds=visibleActionIds();
+  const hidden=[...selectedIds].filter(id=>!visibleIds.has(id)).length;
+  el.bulkBar.classList.toggle("visible",count>0); el.bulkLabel.textContent=hidden?`${count} selected (${hidden} hidden by filter/search)`:`${count} selected`;
+  const selectedActions=[...selectedIds].map(id=>allActions.find(x=>x.id===id)).filter(Boolean);
+  el.bulkApproveBtn.disabled=!selectedActions.some(a=>a.status==="STAGED");
+  el.bulkVetoBtn.disabled=!selectedActions.some(a=>a.status==="PENDING"||a.status==="STAGED");
+  updateSelectAllState();
+}
+function clearSelection(){selectedIds.clear();document.querySelectorAll(".row-cb").forEach(cb=>{cb.checked=false;cb.closest("tr")?.classList.remove("selected");});el.selectAll.checked=false;el.selectAll.indeterminate=false;updateBulkBar();}
+function resetFocus(){focusedRowIndex=-1;document.querySelectorAll("tr.focused").forEach(r=>r.classList.remove("focused"));}
+function visibleRows(){return Array.from(el.actionsBody.querySelectorAll("tr[data-id]:not(.expand-row)"));}
+function setFocusedRow(index){const rows=visibleRows();rows.forEach(r=>r.classList.remove("focused"));if(!rows.length){focusedRowIndex=-1;return;}focusedRowIndex=Math.max(0,Math.min(index,rows.length-1));rows[focusedRowIndex].classList.add("focused");rows[focusedRowIndex].scrollIntoView({block:"nearest"});}
+
+function renderActions(actions){
+  el.actionsBody.innerHTML=""; el.emptyState.hidden=!!actions.length; resetFocus();
+  if(!actions.length){updateBulkBar();return;}
+  const validVisibleIds=new Set(actions.map(a=>a.id));
+  selectedIds=new Set([...selectedIds].filter(id=>allActions.some(a=>a.id===id)));
+  actions.forEach((action,idx)=>{
+    const tr=document.createElement("tr"); tr.dataset.id=action.id; tr.dataset.idx=String(idx); if(selectedIds.has(action.id))tr.classList.add("selected");
+    const statusClass=STATUS_CLASSES[action.status]||"unknown";
+    const created=action.createdAt?new Date(action.createdAt).toLocaleString([],{dateStyle:"short",timeStyle:"short"}):"MISSING";
+    const createdStyle=action.createdBad?"color:var(--red);font-size:10px;":"color:var(--muted);font-size:10px;";
+    const canVeto=action.status==="PENDING"||action.status==="STAGED"; const canApprove=action.status==="STAGED";
+    const opCell=canVeto||canApprove?`<div class="act-btns">${canApprove?`<button class="btn green" type="button" style="padding:3px 7px" data-approve="${escHtml(action.id)}" title="Approve (A)" aria-label="Approve ${escHtml(action.id)}">✓</button>`:""}${canVeto?`<button class="btn red" type="button" style="padding:3px 7px" data-veto="${escHtml(action.id)}" title="Veto (V)" aria-label="Veto ${escHtml(action.id)}">✕</button>`:""}</div>`:`<span style="color:var(--muted);font-size:10px;font-family:var(--font-mono);">${escHtml(action.operator)||"—"}</span>`;
+    tr.innerHTML=`<td><input type="checkbox" class="row-cb" data-id="${escHtml(action.id)}"${selectedIds.has(action.id)?" checked":""} aria-label="Select ${escHtml(action.id)}"></td><td><button class="expand-btn" type="button" data-expand="${escHtml(action.id)}" aria-label="Expand ${escHtml(action.id)}">▶</button></td><td class="mono" style="color:var(--cyan)">${escHtml(action.id||"<missing>")}</td><td>${escHtml(action.threat)}</td><td class="mono" style="color:var(--muted)">${escHtml(action.source)}</td><td><span class="tag ${statusClass}">${escHtml(action.status)}</span></td><td class="mono" style="${createdStyle}">${escHtml(created)}</td><td style="max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${action.decisionReason?escHtml(action.decisionReason):`<span style="color:var(--muted)">—</span>`}</td><td>${opCell}</td>`;
+    el.actionsBody.appendChild(tr);
+  });
+  updateBulkBar();
+}
+function toggleExpand(actionId){
+  const safe=cssEscape(actionId);
+  const existing=document.querySelector(`.expand-row[data-for="${safe}"]`);
+  const btn=document.querySelector(`[data-expand="${safe}"]`);
+  if(existing){existing.remove();if(btn)btn.textContent="▶";return;}
+  const action=allActions.find(a=>a.id===actionId); if(!action)return;
+  const tr=document.querySelector(`tr[data-id="${safe}"]`); if(!tr)return;
+  const exp=document.createElement("tr"); exp.className="expand-row"; exp.dataset.for=actionId;
+  exp.innerHTML=`<td colspan="9"><div class="expand-inner"><div class="expand-kv"><div class="k">ACTION ID</div><div class="v">${escHtml(action.id)}</div></div><div class="expand-kv"><div class="k">SOURCE IP</div><div class="v">${escHtml(action.source)}</div></div><div class="expand-kv"><div class="k">THREAT</div><div class="v">${escHtml(action.threat)}</div></div><div class="expand-kv"><div class="k">STATUS</div><div class="v">${escHtml(action.status)}</div></div><div class="expand-kv"><div class="k">CREATED</div><div class="v">${escHtml(action.createdAt||"MISSING / INVALID")}</div></div><div class="expand-kv"><div class="k">OPERATOR</div><div class="v">${escHtml(action.operator||"—")}</div></div><div class="expand-kv"><div class="k">REASON</div><div class="v">${escHtml(action.decisionReason||"—")}</div></div></div></td>`;
+  tr.after(exp); if(btn)btn.textContent="▼";
+}
+
+el.selectAll.addEventListener("change",()=>{const cbs=document.querySelectorAll(".row-cb");if(el.selectAll.checked){cbs.forEach(cb=>{selectedIds.add(cb.dataset.id);cb.checked=true;cb.closest("tr")?.classList.add("selected");});}else{cbs.forEach(cb=>{selectedIds.delete(cb.dataset.id);cb.checked=false;cb.closest("tr")?.classList.remove("selected");});}updateBulkBar();});
+document.addEventListener("change",e=>{const cb=e.target.closest(".row-cb");if(!cb)return;if(cb.checked){selectedIds.add(cb.dataset.id);cb.closest("tr")?.classList.add("selected");}else{selectedIds.delete(cb.dataset.id);cb.closest("tr")?.classList.remove("selected");}updateBulkBar();});
+el.bulkClearBtn.addEventListener("click",clearSelection);
+
+function validateReason(value){const s=(value||"").trim();if(!s)return"Reason is required.";if(s.length<CONFIG.REASON_MIN)return`Minimum ${CONFIG.REASON_MIN} characters required.`;if(s.length>CONFIG.REASON_MAX)return`Maximum ${CONFIG.REASON_MAX} characters.`;return null;}
+function setModalOpen(open){modalOpenCount+=open?1:-1;modalOpenCount=Math.max(0,modalOpenCount);}
+function openReasonModal({title,subtitle,confirmText,confirmClass="green"}){
+  return new Promise(resolve=>{
+    setModalOpen(true);
+    const close=result=>{el.reasonModal.hidden=true;el.reasonModal.setAttribute("aria-hidden","true");el.modalError.textContent="";setModalOpen(false);resolve(result);};
+    el.modalTitle.textContent=title;el.modalSubtitle.textContent=subtitle;el.modalInput.value="";el.modalCharCount.textContent="0 / 500";el.modalConfirm.textContent=confirmText;el.modalConfirm.className=`btn ${confirmClass}`;el.reasonModal.hidden=false;el.reasonModal.setAttribute("aria-hidden","false");setTimeout(()=>el.modalInput.focus(),0);
+    const onInput=()=>{el.modalCharCount.textContent=`${el.modalInput.value.length} / 500`;if(el.modalError.textContent)el.modalError.textContent="";};
+    const onCancel=()=>{cleanup();close(null);};
+    const onConfirm=()=>{const err=validateReason(el.modalInput.value);if(err){el.modalError.textContent=err;return;}cleanup();close(el.modalInput.value.trim());};
+    const onBd=e=>{if(e.target.hasAttribute("data-close"))onCancel();};
+    const onKey=e=>{if(e.key==="Escape")onCancel();if((e.ctrlKey||e.metaKey)&&e.key==="Enter")onConfirm();};
+    function cleanup(){el.modalInput.removeEventListener("input",onInput);el.modalCancel.removeEventListener("click",onCancel);el.modalConfirm.removeEventListener("click",onConfirm);el.reasonModal.removeEventListener("click",onBd);document.removeEventListener("keydown",onKey);}
+    el.modalInput.addEventListener("input",onInput);el.modalCancel.addEventListener("click",onCancel);el.modalConfirm.addEventListener("click",onConfirm);el.reasonModal.addEventListener("click",onBd);document.addEventListener("keydown",onKey);
+  });
+}
+async function revalidateAction(actionId, expectedStatuses){await refreshDashboard(false);const latest=allActions.find(a=>a.id===actionId);if(!latest)throw new Error("Action disappeared before submit");if(!expectedStatuses.includes(latest.status))throw new Error(`Action status changed to ${latest.status}`);}
+async function doApprove(actionId,btn){const reason=await openReasonModal({title:`Approve ${actionId}`,subtitle:"Describe why this action should proceed.",confirmText:"Approve",confirmClass:"green"});if(!reason){log(`Approve cancelled — ${actionId}`,"warn");return false;}if(btn)btn.disabled=true;try{await revalidateAction(actionId,["STAGED"]);await api.approve(actionId,reason);log(`Approved ${actionId}`,"ok");return true;}catch(err){log(`Approve failed — ${actionId}: ${err.message||err}`,"err");return false;}finally{if(btn)btn.disabled=false;}}
+async function doVeto(actionId,btn){const reason=await openReasonModal({title:`Veto ${actionId}`,subtitle:"Explain why this action is being blocked.",confirmText:"Veto",confirmClass:"red"});if(!reason){log(`Veto cancelled — ${actionId}`,"warn");return false;}if(btn)btn.disabled=true;try{await revalidateAction(actionId,["PENDING","STAGED"]);await api.veto(actionId,reason);log(`Vetoed ${actionId}`,"warn");return true;}catch(err){log(`Veto failed — ${actionId}: ${err.message||err}`,"err");return false;}finally{if(btn)btn.disabled=false;}}
+
+el.bulkApproveBtn.addEventListener("click",async()=>{const ids=[...selectedIds].filter(id=>{const a=allActions.find(x=>x.id===id);return a&&a.status==="STAGED";});if(!ids.length)return;const reason=await openReasonModal({title:`Bulk approve ${ids.length} action(s)`,subtitle:"Applies to selected staged actions only.",confirmText:"Approve All",confirmClass:"green"});if(!reason)return;el.bulkApproveBtn.disabled=true;let ok=0;for(const id of ids){try{await revalidateAction(id,["STAGED"]);await api.approve(id,reason);ok++;}catch(e){log(`Bulk approve failed — ${id}: ${e.message}`,"err");}}log(`Bulk approved ${ok}/${ids.length} action(s).`,"ok");clearSelection();await refreshDashboard(true);el.bulkApproveBtn.disabled=false;});
+el.bulkVetoBtn.addEventListener("click",async()=>{const ids=[...selectedIds].filter(id=>{const a=allActions.find(x=>x.id===id);return a&&(a.status==="PENDING"||a.status==="STAGED");});if(!ids.length)return;const reason=await openReasonModal({title:`Bulk veto ${ids.length} action(s)`,subtitle:"Applies to selected actionable items only.",confirmText:"Veto All",confirmClass:"red"});if(!reason)return;el.bulkVetoBtn.disabled=true;let ok=0;for(const id of ids){try{await revalidateAction(id,["PENDING","STAGED"]);await api.veto(id,reason);ok++;}catch(e){log(`Bulk veto failed — ${id}: ${e.message}`,"err");}}log(`Bulk vetoed ${ok}/${ids.length} action(s).`,"warn");clearSelection();await refreshDashboard(true);el.bulkVetoBtn.disabled=false;});
+
+document.addEventListener("click",async e=>{
+  const fb=e.target.closest("[data-filter]");if(fb){currentFilter=fb.dataset.filter;document.querySelectorAll("[data-filter]").forEach(b=>b.classList.remove("active"));fb.classList.add("active");clearSelection();log(`Filter → ${currentFilter}. Selection cleared for safety.`,"info");renderActions(applyFilters(allActions));return;}
+  const lf=e.target.closest("[data-log-filter]");if(lf){currentLogFilter=lf.dataset.logFilter;document.querySelectorAll("[data-log-filter]").forEach(b=>b.classList.remove("active"));lf.classList.add("active");document.querySelectorAll(".log-line").forEach(line=>{line.hidden=currentLogFilter!=="ALL"&&line.dataset.type!==currentLogFilter;});return;}
+  const eb=e.target.closest("[data-expand]");if(eb){toggleExpand(eb.dataset.expand);return;}
+  const ab=e.target.closest("[data-approve]");if(ab){const ok=await doApprove(ab.dataset.approve,ab);if(ok)await refreshDashboard(true);return;}
+  const vb=e.target.closest("[data-veto]");if(vb){const ok=await doVeto(vb.dataset.veto,vb);if(ok)await refreshDashboard(true);}
+});
+el.searchInput.addEventListener("input",()=>{searchQuery=el.searchInput.value;clearSelection();renderActions(applyFilters(allActions));});
+el.clearSearchBtn.addEventListener("click",()=>{el.searchInput.value="";searchQuery="";clearSelection();renderActions(applyFilters(allActions));el.searchInput.focus();});
+
+function updateStaticConfig(){
+  el.apiBaseText.textContent=CONFIG.API_BASE; el.pollText.textContent=`${CONFIG.POLL_MS} ms`; el.demoText.textContent=CONFIG.DEMO_MODE?"ENABLED":"DISABLED"; el.demoText.style.color=CONFIG.DEMO_MODE?"var(--amber)":"var(--green)"; el.demoBadge.hidden=!CONFIG.DEMO_MODE; el.injectBtn.disabled=!CONFIG.DEMO_MODE;
+  const token=sessionStorage.getItem("SENTINEL_JWT"); el.authStateText.textContent=token?"PRESENT":"MISSING"; el.authStateText.style.color=token?"var(--green)":"var(--amber)"; el.jwtRiskBadge.hidden=!token;
+}
+async function refreshDashboard(manual=false){
+  if(refreshInFlight||modalOpenCount>0)return;
+  refreshInFlight=true;if(manual)setStatus("Syncing");
+  try{updateStaticConfig();const [rawActions,vault]=await Promise.all([api.listActions(),api.vaultStats().catch(()=>({records:null}))]);allActions=rawActions.map(normalizeAction).sort((a,b)=>actionTimeValue(b)-actionTimeValue(a));updateStats(allActions);renderActions(applyFilters(allActions));el.vaultCount.textContent=typeof vault?.records==="number"?vault.records.toLocaleString():"--";setStatus("Online");el.lastSync.textContent=`sync ${nowStamp()}`;flashPoll();if(manual)log(`Refresh complete — ${applyFilters(allActions).length} action(s) visible.`,"ok");}
+  catch(err){setStatus("Offline");log(`Refresh failed: ${err.message||err}`,"err");}
+  finally{refreshInFlight=false;}
+}
+function startPolling(){if(pollTimer)clearInterval(pollTimer);pollTimer=setInterval(()=>refreshDashboard(false),CONFIG.POLL_MS);} el.refreshBtn.addEventListener("click",()=>refreshDashboard(true));
+
+el.injectBtn.addEventListener("click",()=>{if(!CONFIG.DEMO_MODE){log("Inject blocked: demo mode is disabled.","warn");return;}el.injectModal.hidden=false;el.injectModal.setAttribute("aria-hidden","false");setModalOpen(true);});
+function closeInject(){el.injectModal.hidden=true;el.injectModal.setAttribute("aria-hidden","true");setModalOpen(false);} el.injectCancel.addEventListener("click",closeInject);el.injectModal.addEventListener("click",e=>{if(e.target.hasAttribute("data-close-inject"))closeInject();});el.injectConfirm.addEventListener("click",async()=>{closeInject();el.injectBtn.disabled=true;try{await api.inject();log("Test action injected.","info");await refreshDashboard(true);}catch(err){log(`Inject failed: ${err.message||err}`,"err");}finally{el.injectBtn.disabled=!CONFIG.DEMO_MODE;}});
+el.exportBtn.addEventListener("click",()=>{const data=allActions.map(a=>({id:a.id,threat:a.threat,source:a.source,status:a.status,createdAt:a.createdAt,createdRaw:a.createdRaw,createdBad:a.createdBad,decisionReason:a.decisionReason,operator:a.operator}));const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});const url=URL.createObjectURL(blob);const link=document.createElement("a");link.href=url;link.download=`sentinel43-export-${Date.now()}.json`;link.click();URL.revokeObjectURL(url);log(`Exported ${data.length} actions as JSON.`,"ok");});
+
+function closeJwt(){el.jwtModal.hidden=true;el.jwtModal.setAttribute("aria-hidden","true");setModalOpen(false);} el.authBtn.addEventListener("click",()=>{el.jwtInput.value=sessionStorage.getItem("SENTINEL_JWT")||"";el.jwtModal.hidden=false;el.jwtModal.setAttribute("aria-hidden","false");setModalOpen(true);setTimeout(()=>el.jwtInput.focus(),0);});el.jwtCancel.addEventListener("click",closeJwt);el.jwtClear.addEventListener("click",()=>{sessionStorage.removeItem("SENTINEL_JWT");log("JWT cleared.","warn");closeJwt();updateStaticConfig();refreshDashboard(true);});el.jwtConfirm.addEventListener("click",()=>{const v=el.jwtInput.value.trim();if(v){sessionStorage.setItem("SENTINEL_JWT",v);log("JWT set in sessionStorage. Dev-only risk badge enabled.","warn");}else{sessionStorage.removeItem("SENTINEL_JWT");log("JWT cleared.","warn");}closeJwt();updateStaticConfig();refreshDashboard(true);});el.jwtModal.addEventListener("click",e=>{if(e.target.hasAttribute("data-close-jwt"))closeJwt();});
+el.clearLogBtn.addEventListener("click",()=>{el.logConsole.innerHTML="";log("Console cleared.","info");});
+
+const htmlEl=document.documentElement;let isLight=false;
+function applyTheme(light){isLight=light;htmlEl.classList.toggle("light",light);el.themeBtn.textContent=light?"☽ Dark":"☀ Light";try{localStorage.setItem("s43-theme",light?"light":"dark");}catch{}}
+function initTheme(){try{const stored=localStorage.getItem("s43-theme");if(stored==="light")return applyTheme(true);if(stored==="dark")return applyTheme(false);}catch{}applyTheme(window.matchMedia&&window.matchMedia("(prefers-color-scheme: light)").matches);} el.themeBtn.addEventListener("click",()=>applyTheme(!isLight));
+el.kbHelpBtn.addEventListener("click",()=>{el.kbToast.classList.add("show");clearTimeout(kbToastTimer);kbToastTimer=setTimeout(()=>el.kbToast.classList.remove("show"),5000);});
+
+document.addEventListener("keydown",e=>{
+  const tag=document.activeElement.tagName;const inInput=tag==="INPUT"||tag==="TEXTAREA"||tag==="SELECT";
+  if(e.key==="Escape"){if(!el.reasonModal.hidden){el.modalCancel.click();return;}if(!el.jwtModal.hidden){closeJwt();return;}if(!el.injectModal.hidden){closeInject();return;}el.kbToast.classList.remove("show");if(selectedIds.size)clearSelection();return;}
+  if(e.key==="/"&&!inInput){e.preventDefault();el.searchInput.focus();return;} if(e.key.toLowerCase()==="r"&&!inInput){refreshDashboard(true);return;} if(inInput)return;
+  const rows=visibleRows();if(!rows.length)return;
+  if(e.key==="ArrowDown"){e.preventDefault();setFocusedRow(focusedRowIndex+1);return;} if(e.key==="ArrowUp"){e.preventDefault();setFocusedRow(focusedRowIndex<0?0:focusedRowIndex-1);return;}
+  if(e.key.toLowerCase()==="a"&&focusedRowIndex>=0&&focusedRowIndex<rows.length){const id=rows[focusedRowIndex].dataset.id;const action=allActions.find(x=>x.id===id);if(action&&action.status==="STAGED")doApprove(id).then(ok=>{if(ok)refreshDashboard(true);});return;}
+  if(e.key.toLowerCase()==="v"&&focusedRowIndex>=0&&focusedRowIndex<rows.length){const id=rows[focusedRowIndex].dataset.id;const action=allActions.find(x=>x.id===id);if(action&&(action.status==="PENDING"||action.status==="STAGED"))doVeto(id).then(ok=>{if(ok)refreshDashboard(true);});}
+});
+window.addEventListener("beforeunload",()=>{if(pollTimer)clearInterval(pollTimer);});
+
+log("Dashboard initializing…","info");
+if(!CONFIG.DEMO_MODE)log("Demo mode disabled. Use ?demo=1 only for local testing.","info");
+initTheme();updateStaticConfig();refreshDashboard(true);startPolling();
+</script>
 </body>
 </html>
