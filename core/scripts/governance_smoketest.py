@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from decimal import Decimal
+from typing import Any
 
-# Adjust these imports if your repo root/package name differs
 from core.config import get_settings
 from core.logging.setup import configure_logging
-from core.governance.orchestrator import build_orchestrator_from_settings, CallerContext
+from core.governance.orchestrator import (
+    CallerContext,
+    build_orchestrator_from_settings,
+)
+
+
+REQUIRED_SETTINGS = (
+    "env",
+    "strict_mode",
+    "default_mode",
+    "data_dir",
+)
 
 
 def _print_banner(title: str) -> None:
@@ -15,18 +25,37 @@ def _print_banner(title: str) -> None:
     print("=" * 72)
 
 
+def _require_setting(settings: Any, name: str) -> Any:
+    if not hasattr(settings, name):
+        raise AttributeError(f"Required setting missing: {name}")
+    return getattr(settings, name)
+
+
+def _decision_reason(decision: Any) -> str:
+    reason = getattr(decision, "reason", None)
+    return reason if isinstance(reason, str) else ""
+
+
+def _decision_mode(decision: Any) -> str | None:
+    mode = getattr(decision, "mode", None)
+    return mode if isinstance(mode, str) else None
+
+
 def main() -> int:
     _print_banner("Sentinel-43 Governance Orchestrator Smoke Test")
 
     settings = get_settings()
-    configure_logging(settings)
 
+    for name in REQUIRED_SETTINGS:
+        _require_setting(settings, name)
+
+    configure_logging(settings)
     orch = build_orchestrator_from_settings(settings)
 
-    print(f"env           : {getattr(settings, 'env', 'unknown')}")
-    print(f"strict_mode   : {getattr(settings, 'strict_mode', 'unknown')}")
-    print(f"default_mode  : {getattr(settings, 'default_mode', 'unknown')}")
-    print(f"data_dir      : {getattr(settings, 'data_dir', 'unknown')}")
+    print(f"env           : {settings.env}")
+    print(f"strict_mode   : {settings.strict_mode}")
+    print(f"default_mode  : {settings.default_mode}")
+    print(f"data_dir      : {settings.data_dir}")
 
     caller_user = CallerContext(
         caller_id="user123",
@@ -46,11 +75,9 @@ def main() -> int:
         "txn_type": "test",
         "channel": "smoke",
         "risk_flags": ["none"],
-        # noise that should be filtered
         "random_junk_field": "should_not_appear_in_filtered_meta",
     }
 
-    # 1) Authorized self transaction (should APPROVE in most policies)
     _print_banner("Test 1: Authorized self transaction")
     d1 = orch.process_transaction(
         caller=caller_user,
@@ -60,7 +87,6 @@ def main() -> int:
     )
     print(d1)
 
-    # 2) Unauthorized access (should BLOCK)
     _print_banner("Test 2: Unauthorized cross-user transaction (expect BLOCKED)")
     d2 = orch.process_transaction(
         caller=caller_user,
@@ -70,7 +96,6 @@ def main() -> int:
     )
     print(d2)
 
-    # 3) Admin cross-user (should pass authz, then policy decides)
     _print_banner("Test 3: Admin cross-user transaction")
     d3 = orch.process_transaction(
         caller=caller_admin,
@@ -80,24 +105,31 @@ def main() -> int:
     )
     print(d3)
 
-    # 4) Velocity trip: spam within window
     _print_banner("Test 4: Velocity trip (spam within window)")
-    for i in range(0, 20):
+
+    velocity_tripped = False
+
+    for i in range(20):
         di = orch.process_transaction(
             caller=caller_user,
             user_id="user123",
             amount_str="1.0000",
             metadata=meta,
         )
-        print(f"Attempt {i+1:02d}: {di}")
-        if di.status == "BLOCKED" and "VELOCITY" in di.reason:
+
+        print(f"Attempt {i + 1:02d}: {di}")
+
+        reason = _decision_reason(di)
+
+        if getattr(di, "status", None) == "BLOCKED" and "VELOCITY" in reason:
+            velocity_tripped = True
             break
 
-    # 5) Human-gated behavior: force HUMAN_GATED mode for a risky action path
-    # Note: our current orchestrator maps txns to action="write".
-    # If your governance marks "write" as allowed in HUMAN_GATED, this will still approve.
-    # This test mostly proves mode plumbs through.
+    if not velocity_tripped:
+        print("WARNING: velocity guard never tripped after 20 attempts")
+
     _print_banner("Test 5: Force HUMAN_GATED mode (plumbing test)")
+
     d5 = orch.process_transaction(
         caller=caller_user,
         user_id="user123",
@@ -105,12 +137,21 @@ def main() -> int:
         metadata=meta,
         mode="HUMAN_GATED",
     )
+
     print(d5)
+
+    observed_mode = _decision_mode(d5)
+
+    if observed_mode != "HUMAN_GATED":
+        print(
+            "WARNING: HUMAN_GATED mode was requested, "
+            f"but decision reported mode={observed_mode!r}"
+        )
 
     _print_banner("Done")
     print("If Test 2 BLOCKED, authz is working.")
     print("If Test 4 BLOCKED with VELOCITY_*, spam gate is working.")
-    print("If outputs are consistent, audit/decision plumbing is working.")
+    print("If Test 5 reports HUMAN_GATED, mode plumbing is working.")
 
     return 0
 
