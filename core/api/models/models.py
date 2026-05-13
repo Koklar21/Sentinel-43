@@ -1,35 +1,48 @@
 # =============================================================================
 # Copyright (c) 2026 Justin [LastName or Entity]
 #
-# Sentinel is dual-licensed:
+# Sentinel-43 is dual-licensed:
 #   (1) AGPL-3.0-or-later, or
 #   (2) a commercial license (see COMMERCIAL_LICENSE.md).
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
-#
-# See LICENSE.md and COMMERCIAL_LICENSE.md at the repository root.
 # =============================================================================
 
-"""Sentinel-43 API layer: shared models (request/response schemas).
+"""Sentinel-43 Watchgate API models.
 
-Why this exists:
-- Your core stays clean and testable.
-- Your API can evolve (versioning, OpenAPI docs) without dragging core types.
-- We keep strict type handling and predictable validation.
+Purpose:
+- Stable API schemas for Sentinel-43.
+- Strict request/response validation.
+- Deterministic serialization behavior.
+- Zero business logic.
+- Zero DB access.
+- Zero side effects.
 
-Design rules:
-- API models should be *stable* and backwards compatible where possible.
-- No business logic here. No DB access. No side effects.
-- Convert between API models <-> core models in the router/service layer.
-
-File: api/models.py
+Design Principles:
+- Advisory-first.
+- Human-gated escalation.
+- Audit-backed responses.
+- Strict schema enforcement.
+- Backwards-compatible API evolution where possible.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+import logging
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
+
+
+logger = logging.getLogger("sentinel43.watchgate.models")
+
+
+# -----------------------------------------------------------------------------
+# Sentinel-43 constants
+# -----------------------------------------------------------------------------
+
+S43_API_NAME = "Sentinel-43 Watchgate API"
+S43_API_VERSION = "1.0.0"
 
 
 # -----------------------------------------------------------------------------
@@ -37,8 +50,13 @@ from typing import Any, Dict, List, Literal, Optional
 # -----------------------------------------------------------------------------
 
 def utc_now_iso() -> str:
-    """UTC timestamp as RFC3339-ish ISO string with 'Z'."""
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    """Return RFC3339 UTC timestamp."""
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -63,30 +81,59 @@ class ActionDecision(str, Enum):
 
 
 # -----------------------------------------------------------------------------
-# Base shapes
+# Pydantic base
 # -----------------------------------------------------------------------------
 
-# NOTE: Pydantic is optional. If you wire FastAPI, it'll be present.
+PYDANTIC_AVAILABLE = False
+
 try:
-    from pydantic import BaseModel, Field, ConfigDict
+    from pydantic import BaseModel, ConfigDict, Field
     from pydantic import field_validator
 
+    PYDANTIC_AVAILABLE = True
+
     class Model(BaseModel):
-        """Common Pydantic base with sane defaults."""
+        """Sentinel-43 strict API model base."""
 
         model_config = ConfigDict(
-            extra="forbid",  # strict inputs
+            extra="forbid",
             populate_by_name=True,
             str_strip_whitespace=True,
+            validate_assignment=True,
+            use_enum_values=False,
         )
 
 except Exception:  # pragma: no cover
-    # Fallback datalike objects so core can import this without pydantic installed.
-    # If you run the API, install pydantic/fastapi.
+
+    logger.warning(
+        "Pydantic unavailable. Sentinel-43 models running in degraded fallback mode."
+    )
+
     class Model:  # type: ignore
+        """
+        Fallback datalike object.
+
+        WARNING:
+        - No validation
+        - No type enforcement
+        - No constraints
+        - No schema protection
+
+        Sentinel-43 API deployments SHOULD NOT run without Pydantic.
+        """
+
         def __init__(self, **data: Any):
             for k, v in data.items():
                 setattr(self, k, v)
+
+        def model_dump(self) -> Dict[str, Any]:
+            return dict(vars(self))
+
+        def model_copy(self, update: Optional[Dict[str, Any]] = None):
+            data = dict(vars(self))
+            if update:
+                data.update(update)
+            return self.__class__(**data)
 
     def Field(default: Any = None, **kwargs: Any) -> Any:  # type: ignore
         return default
@@ -98,18 +145,28 @@ except Exception:  # pragma: no cover
 
 
 # -----------------------------------------------------------------------------
-# Common responses
+# Shared response structures
 # -----------------------------------------------------------------------------
 
 class ErrorDetail(Model):
+    """Structured Sentinel-43 API error."""
+
     code: str = Field(..., description="Machine-readable error code")
     message: str = Field(..., description="Human-readable error message")
-    details: Optional[Dict[str, Any]] = Field(default=None, description="Optional debug details")
+    details: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional debug/context payload",
+    )
 
 
 class ApiResponse(Model):
+    """Base Sentinel-43 API response."""
+
     status: ApiStatus = Field(default=ApiStatus.ok)
-    request_id: Optional[str] = Field(default=None, description="Trace correlation id")
+    request_id: Optional[str] = Field(
+        default=None,
+        description="Correlation identifier",
+    )
     ts: str = Field(default_factory=utc_now_iso)
     error: Optional[ErrorDetail] = Field(default=None)
 
@@ -119,90 +176,223 @@ class ApiResponse(Model):
 # -----------------------------------------------------------------------------
 
 class HealthResponse(ApiResponse):
-    service: str = Field(default="sentinel-43-api")
-    version: str = Field(default="0.1.0")
+    """Sentinel-43 Watchgate health response."""
+
+    service: str = Field(default=S43_API_NAME)
+    version: str = Field(default=S43_API_VERSION)
+    principle: str = Field(
+        default=(
+            "Advisory-first. Human-gated. "
+            "Audit-backed. No autonomous enforcement in core."
+        )
+    )
     uptime_s: Optional[int] = Field(default=None)
 
 
 # -----------------------------------------------------------------------------
-# Assessment ingest
+# Threat assessment
 # -----------------------------------------------------------------------------
 
 class ThreatSignal(Model):
-    """A single observable event/signal coming in from a source."""
+    """Single observed signal/event."""
 
-    source: str = Field(..., description="Sensor/source name")
-    kind: str = Field(..., description="Signal type, e.g. auth_fail, exfil, anomaly")
-    ts: Optional[str] = Field(default=None, description="Event timestamp ISO string")
-    fields: Dict[str, Any] = Field(default_factory=dict, description="Arbitrary signal fields")
+    source: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="Sensor or source identifier",
+    )
+
+    kind: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="Signal category/type",
+    )
+
+    ts: Optional[str] = Field(
+        default=None,
+        description="Signal timestamp ISO string",
+    )
+
+    fields: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional structured signal payload",
+    )
 
 
 class ThreatAssessmentIn(Model):
-    """External request to assess a set of signals."""
+    """Inbound Sentinel-43 assessment request."""
 
     mode: AssessmentMode = Field(default=AssessmentMode.shadow)
-    actor_id: Optional[str] = Field(default=None, description="Operator/account initiating assessment")
-    tenant_id: Optional[str] = Field(default=None, description="Tenant/customer id")
+
+    actor_id: Optional[str] = Field(
+        default=None,
+        max_length=128,
+        description="Operator or account identifier",
+    )
+
+    tenant_id: Optional[str] = Field(
+        default=None,
+        max_length=128,
+        description="Tenant/customer identifier",
+    )
+
     signals: List[ThreatSignal] = Field(default_factory=list)
-    context: Dict[str, Any] = Field(default_factory=dict, description="Extra assessment context")
+
+    context: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional contextual payload",
+    )
+
+    @field_validator("signals")
+    @classmethod
+    def _signals_nonempty(
+        cls,
+        v: List[ThreatSignal],
+    ) -> List[ThreatSignal]:
+        """
+        Validation hook.
+
+        Empty lists are currently allowed intentionally for:
+        - health tests
+        - dry runs
+        - diagnostics
+        """
+
+        if v is None:
+            return []
+
+        return v
 
 
 class ThreatAssessmentOut(ApiResponse):
-    assessment_id: str = Field(..., description="Unique assessment id")
-    severity: int = Field(..., ge=0, le=100, description="0-100 severity")
-    confidence: int = Field(..., ge=0, le=100, description="0-100 confidence")
-    summary: str = Field(..., description="Short human summary")
+    """Normalized Sentinel-43 assessment response."""
+
+    assessment_id: str = Field(
+        ...,
+        min_length=1,
+        description="Unique assessment identifier",
+    )
+
+    severity: int = Field(
+        ...,
+        ge=0,
+        le=100,
+        description="Threat severity score",
+    )
+
+    confidence: int = Field(
+        ...,
+        ge=0,
+        le=100,
+        description="Threat confidence score",
+    )
+
+    summary: str = Field(
+        ...,
+        min_length=1,
+        max_length=4096,
+        description="Human-readable summary",
+    )
+
     tags: List[str] = Field(default_factory=list)
-    raw: Optional[Dict[str, Any]] = Field(default=None, description="Optional raw engine payload")
 
-
-@field_validator("signals")
-def _signals_nonempty(cls, v: List[ThreatSignal]):  # type: ignore
-    # Allow empty signals for now (useful for tests/health), but keep hook.
-    return v
+    raw: Optional[Any] = Field(
+        default=None,
+        description="Optional raw engine payload",
+    )
 
 
 # -----------------------------------------------------------------------------
-# Actions (approve/veto)
+# Action workflows
 # -----------------------------------------------------------------------------
 
 class ActionRequest(Model):
-    action_id: str = Field(..., min_length=3)
-    operator_id: str = Field(..., min_length=2)
-    reason: Optional[str] = Field(default="")
+    """Approve/veto request payload."""
+
+    action_id: Optional[str] = Field(
+        default=None,
+        min_length=3,
+        max_length=256,
+        description="Optional cross-check action identifier",
+    )
+
+    operator_id: str = Field(
+        ...,
+        min_length=2,
+        max_length=256,
+        description="Human operator identifier",
+    )
+
+    reason: Optional[str] = Field(
+        default="",
+        max_length=4096,
+        description="Human-readable action rationale",
+    )
 
 
 class ActionStatus(Model):
-    action_id: str
-    decision: ActionDecision = Field(default=ActionDecision.unknown)
+    """Action decision state."""
+
+    action_id: str = Field(...)
+
+    decision: ActionDecision = Field(
+        default=ActionDecision.unknown,
+    )
+
     decided_by: Optional[str] = Field(default=None)
+
     decided_ts: Optional[str] = Field(default=None)
+
     reason: Optional[str] = Field(default=None)
 
 
 class ActionResponse(ApiResponse):
-    result: bool = Field(..., description="True if operation succeeded")
+    """Single action operation response."""
+
+    result: bool = Field(
+        ...,
+        description="Operation success state",
+    )
+
     action: Optional[ActionStatus] = Field(default=None)
 
 
 # -----------------------------------------------------------------------------
-# Listing
+# Listings / pagination
 # -----------------------------------------------------------------------------
 
 class ActionListResponse(ApiResponse):
+    """Paginated Sentinel-43 action list response."""
+
     items: List[ActionStatus] = Field(default_factory=list)
-    next_cursor: Optional[str] = Field(default=None)
+
+    next_cursor: Optional[str] = Field(
+        default=None,
+        description="Pagination cursor",
+    )
 
 
 # -----------------------------------------------------------------------------
 # Notes
 # -----------------------------------------------------------------------------
-# Next file after this:
-# - api/routes.py (FastAPI routers)
-#   * /health
-#   * /v1/assess
-#   * /v1/actions/{id}/approve
-#   * /v1/actions/{id}/veto
-#   * /v1/actions?status=
-# - api/deps.py (wiring engine/store into request handlers)
-# - api/config.py (env, settings)
+
+"""
+Next recommended files:
+
+- api/routes.py
+    Sentinel-43 Watchgate route layer
+
+- api/deps.py
+    Engine/store dependency resolution
+
+- api/config.py
+    Environment + runtime configuration
+
+- api/auth.py
+    Authorization + request identity layer
+
+- api/audit.py
+    Audit correlation and logging helpers
+"""
