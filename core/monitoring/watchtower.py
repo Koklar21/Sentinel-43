@@ -1,10 +1,19 @@
+```python
 """
 Sentinel-43 Watchtower Node
-Single-file monitoring subsystem with FastAPI runtime.
+Docker-ready monitoring subsystem with FastAPI runtime.
+
+Docker command:
+python -m core.monitoring.watchtower
+
+Recommended production command later:
+uvicorn core.monitoring.watchtower:app --host 0.0.0.0 --port 9100
 """
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import enum
 import logging
 import os
@@ -19,12 +28,24 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 
-logging.basicConfig(
-    level=os.getenv("S43_LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-
 logger = logging.getLogger("SentinelWatchtower")
+
+
+# ============================================================
+# Logging
+# ============================================================
+
+def configure_logging() -> None:
+    if logging.getLogger().handlers:
+        return
+
+    logging.basicConfig(
+        level=os.getenv("S43_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+
+configure_logging()
 
 
 # ============================================================
@@ -64,10 +85,17 @@ def _clamp_int(name: str, value: Any, lo: int, hi: int) -> int:
     except Exception as exc:
         raise ValueError(f"{name} must be an int in [{lo}, {hi}], got {value!r}") from exc
 
-    if not (lo <= iv <= hi):
+    if not lo <= iv <= hi:
         raise ValueError(f"{name} must be in [{lo}, {hi}], got {iv}")
 
     return iv
+
+
+def _safe_metric_int(raw: Any, default: int = 0) -> int:
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return default
 
 
 def _ensure_event_id(event: dict[str, Any]) -> str:
@@ -127,14 +155,20 @@ class TowerConfig:
     sensitivity: int = 5
 
     def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("tower name must be non-empty")
+
+        if not isinstance(self.slot, TowerSlot):
+            raise TypeError("slot must be TowerSlot")
+
+        if not isinstance(self.tower_type, TowerType):
+            raise TypeError("tower_type must be TowerType")
+
         object.__setattr__(
             self,
             "sensitivity",
             _clamp_int("sensitivity", self.sensitivity, 1, 10),
         )
-
-        if not self.name.strip():
-            raise ValueError("tower name must be non-empty")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -156,7 +190,7 @@ class WatchtowerConfig:
     scan_failure_degrade_threshold: int = 2
 
     def __post_init__(self) -> None:
-        if not self.node_id.strip():
+        if not isinstance(self.node_id, str) or not self.node_id.strip():
             raise ValueError("node_id must be non-empty")
 
         object.__setattr__(self, "port", _clamp_int("port", self.port, 1024, 65535))
@@ -170,6 +204,7 @@ class WatchtowerConfig:
                 100,
             ),
         )
+        object.__setattr__(self, "towers", tuple(self.towers))
 
     @property
     def api_url(self) -> str:
@@ -181,7 +216,12 @@ class WatchtowerConfig:
             node_id=node_id,
             environment=os.getenv("S43_ENV", "production"),
             host=os.getenv("S43_WATCHTOWER_HOST", "0.0.0.0"),
-            port=int(os.getenv("S43_WATCHTOWER_PORT", "9100")),
+            port=_clamp_int(
+                "S43_WATCHTOWER_PORT",
+                os.getenv("S43_WATCHTOWER_PORT", "9100"),
+                1024,
+                65535,
+            ),
             towers=(
                 TowerConfig("API Health Sentinel", TowerSlot.N, TowerType.API_HEALTH, sensitivity=5),
                 TowerConfig("Expectation Guard", TowerSlot.NE, TowerType.EXPECTATION_GUARD, sensitivity=7),
@@ -193,6 +233,17 @@ class WatchtowerConfig:
                 TowerConfig("Security Baseline Sentinel", TowerSlot.NW, TowerType.SECURITY_BASELINE, sensitivity=6),
             ),
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "node_id": self.node_id,
+            "environment": self.environment,
+            "host": self.host,
+            "port": self.port,
+            "api_url": self.api_url,
+            "scan_failure_degrade_threshold": self.scan_failure_degrade_threshold,
+            "towers": [tower.to_dict() for tower in self.towers],
+        }
 
 
 # ============================================================
@@ -214,10 +265,9 @@ class WatchtowerSegment:
 
     def _safe_int(self, event: dict[str, Any], field_name: str, default: int = 0) -> tuple[int, int]:
         raw = event.get(field_name, default)
+        value = _safe_metric_int(raw, default)
 
-        try:
-            return int(raw), 0
-        except (TypeError, ValueError):
+        if value == default and raw not in (default, str(default), None):
             logger.warning(
                 "Malformed numeric field field=%s raw=%r event_id=%s tower=%s",
                 field_name,
@@ -227,9 +277,14 @@ class WatchtowerSegment:
             )
             return default, 1
 
+        return value, 0
+
     def scan(self, event: dict[str, Any]) -> dict[str, Any] | None:
         if not self.cfg.enabled:
             return None
+
+        if not isinstance(event, dict):
+            raise TypeError(f"event must be dict, got {type(event).__name__}")
 
         scan_ts = time.time()
         suspicious = False
@@ -331,7 +386,6 @@ class WatchtowerSegment:
         with self._lock:
             self._last_scan_ts = scan_ts
             self._malformed_input_count += malformed_delta
-
             if suspicious:
                 self._alert_count += 1
 
@@ -360,7 +414,7 @@ class WatchtowerSegment:
                 "tower_type": self.cfg.tower_type.value,
                 "enabled": self.cfg.enabled,
                 "sensitivity": self.cfg.sensitivity,
-                "thresholds": self._thresholds.__dict__,
+                "thresholds": dataclasses.asdict(self._thresholds),
                 "last_scan_ts": self._last_scan_ts,
                 "alert_count": self._alert_count,
                 "malformed_input_count": self._malformed_input_count,
@@ -386,6 +440,9 @@ class WatchtowerNode:
     }
 
     def __init__(self, config: WatchtowerConfig) -> None:
+        if not isinstance(config, WatchtowerConfig):
+            raise TypeError(f"config must be WatchtowerConfig, got {type(config).__name__}")
+
         self.config = config
         self._lock = threading.RLock()
         self._state = WatchtowerState.INITIALIZING
@@ -393,11 +450,15 @@ class WatchtowerNode:
 
         for tower_cfg in config.towers:
             segment = WatchtowerSegment(tower_cfg)
-
             if segment.id in self.towers:
                 raise ValueError(f"Duplicate tower id detected: {segment.id}")
-
             self.towers[segment.id] = segment
+
+        logger.info(
+            "[%s] Watchtower initialized with %d segments",
+            self.config.node_id,
+            len(self.towers),
+        )
 
     @property
     def state(self) -> WatchtowerState:
@@ -405,6 +466,9 @@ class WatchtowerNode:
             return self._state
 
     def set_state(self, new_state: WatchtowerState) -> None:
+        if not isinstance(new_state, WatchtowerState):
+            raise TypeError(f"new_state must be WatchtowerState, got {type(new_state).__name__}")
+
         with self._lock:
             current = self._state
             allowed = self._ALLOWED_TRANSITIONS.get(current, set())
@@ -413,10 +477,14 @@ class WatchtowerNode:
                 logger.warning("Invalid state transition ignored: %s -> %s", current.value, new_state.value)
                 return
 
+            if new_state != current:
+                logger.info("Watchtower state changed: %s -> %s", current.value, new_state.value)
+
             self._state = new_state
 
     def start(self) -> bool:
         if self.state == WatchtowerState.FAILED:
+            logger.error("Cannot start FAILED Watchtower node")
             return False
 
         self.set_state(WatchtowerState.ACTIVE)
@@ -426,13 +494,12 @@ class WatchtowerNode:
         if not isinstance(event, dict):
             raise TypeError("event must be a dict")
 
-        local_event = dict(event)
+        local_event = copy.deepcopy(event)
         _ensure_event_id(local_event)
 
         with self._lock:
             if self._state != WatchtowerState.ACTIVE:
                 return []
-
             tower_snapshot = list(self.towers.values())
 
         alerts: list[dict[str, Any]] = []
@@ -441,10 +508,8 @@ class WatchtowerNode:
         for segment in tower_snapshot:
             try:
                 alert = segment.scan(local_event)
-
                 if alert:
                     alerts.append(alert)
-
             except Exception as exc:
                 failures += 1
                 logger.exception("Segment scan failure tower=%s error=%s", segment.id, exc)
@@ -456,82 +521,96 @@ class WatchtowerNode:
 
     def get_status(self) -> dict[str, Any]:
         with self._lock:
-            return {
-                "node_id": self.config.node_id,
-                "state": self._state.value,
-                "environment": self.config.environment,
-                "api_url": self.config.api_url,
-                "scan_failure_degrade_threshold": self.config.scan_failure_degrade_threshold,
-                "towers": [tower.status() for tower in self.towers.values()],
-            }
+            state = self._state
+            tower_snapshot = list(self.towers.values())
+
+        return {
+            "node_id": self.config.node_id,
+            "state": state.value,
+            "environment": self.config.environment,
+            "api_url": self.config.api_url,
+            "config": self.config.to_dict(),
+            "towers": [tower.status() for tower in tower_snapshot],
+        }
 
 
 # ============================================================
-# FastAPI App
+# FastAPI Runtime
 # ============================================================
 
 class AnalyzeRequest(BaseModel):
     event: dict[str, Any] = Field(default_factory=dict)
 
 
-NODE_ID = os.getenv("S43_WATCHTOWER_NODE_ID", "sentinel43-watchtower")
-CONFIG = WatchtowerConfig.default_sentinel_octagon(NODE_ID)
-NODE = WatchtowerNode(CONFIG)
-NODE.start()
-
-app = FastAPI(
-    title="Sentinel-43 Watchtower",
-    version="0.1.0",
-    description="Sentinel-43 monitoring and alert analysis node.",
-)
+def build_node() -> WatchtowerNode:
+    node_id = os.getenv("S43_WATCHTOWER_NODE_ID", "sentinel43-watchtower")
+    config = WatchtowerConfig.default_sentinel_octagon(node_id)
+    node = WatchtowerNode(config)
+    node.start()
+    return node
 
 
-@app.get("/health")
-def health_check() -> dict[str, Any]:
-    return {
-        "status": "ok",
-        "node_state": NODE.state.value,
-        "node_id": NODE.config.node_id,
-    }
+NODE = build_node()
 
 
-@app.get("/status")
-def node_status() -> dict[str, Any]:
-    return NODE.get_status()
+def create_api_app(node: WatchtowerNode) -> FastAPI:
+    if not isinstance(node, WatchtowerNode):
+        raise TypeError(f"node must be WatchtowerNode, got {type(node).__name__}")
 
+    api = FastAPI(
+        title="Sentinel-43 Watchtower",
+        version="0.2.0",
+        description="Sentinel-43 monitoring and alert analysis node.",
+    )
 
-@app.post("/analyze")
-def analyze_event(payload: AnalyzeRequest) -> dict[str, Any]:
-    try:
-        alerts = NODE.scan_event(payload.event)
+    @api.get("/health")
+    def health_check() -> dict[str, Any]:
         return {
-            "alerts": alerts,
-            "alert_count": len(alerts),
+            "status": "ok",
+            "node_state": node.state.value,
+            "node_id": node.config.node_id,
         }
-    except Exception as exc:
-        logger.exception("Analyze failed: %s", exc)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @api.get("/status")
+    def node_status() -> dict[str, Any]:
+        return node.get_status()
+
+    @api.post("/analyze")
+    def analyze_event(payload: AnalyzeRequest) -> dict[str, Any]:
+        try:
+            alerts = node.scan_event(payload.event)
+            return {
+                "alerts": alerts,
+                "alert_count": len(alerts),
+            }
+        except Exception as exc:
+            logger.exception("Analyze failed: %s", exc)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @api.post("/state/{state_name}")
+    def change_state(state_name: str) -> dict[str, Any]:
+        try:
+            state = WatchtowerState[state_name.upper()]
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid state: {state_name}") from exc
+
+        node.set_state(state)
+        return {
+            "node_id": node.config.node_id,
+            "state": node.state.value,
+        }
+
+    return api
 
 
-@app.post("/state/{state_name}")
-def change_state(state_name: str) -> dict[str, Any]:
-    try:
-        state = WatchtowerState[state_name.upper()]
-    except KeyError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid state: {state_name}") from exc
-
-    NODE.set_state(state)
-    return {
-        "node_id": NODE.config.node_id,
-        "state": NODE.state.value,
-    }
+app = create_api_app(NODE)
 
 
 def main() -> None:
     uvicorn.run(
-        "core.watchtower:app",
-        host=CONFIG.host,
-        port=CONFIG.port,
+        "core.monitoring.watchtower:app",
+        host=NODE.config.host,
+        port=NODE.config.port,
         reload=False,
         log_level=os.getenv("S43_LOG_LEVEL", "info").lower(),
     )
@@ -539,3 +618,22 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+__all__ = [
+    "ThresholdProfile",
+    "thresholds_for",
+    "WatchtowerState",
+    "TowerSlot",
+    "TowerType",
+    "TowerConfig",
+    "WatchtowerConfig",
+    "WatchtowerSegment",
+    "WatchtowerNode",
+    "AnalyzeRequest",
+    "build_node",
+    "NODE",
+    "app",
+    "create_api_app",
+]
+```
