@@ -73,3 +73,20 @@ services:
 
 volumes:
   s43_pgdata:
+services:
+  sentinel-api:
+    build:
+      context: .
+      dockerfile: core/api/Dockerfile
+    container_name: sentinel43-api
+    ports:
+      - "8000:8000"
+    environment:
+      SENTINEL43_DATA_DIR: /app/sentinel43_state
+      SENTINEL43_DB_PATH: /app/sentinel43_state/sentinel43.sqlite3
+    volumes:
+      - sentinel43_state:/app/sentinel43_state
+    command: uvicorn core.api.main:app --host 0.0.0.0 --port 8000
+
+volumes:
+  sentinel43_state:
