@@ -247,3 +247,4 @@ sentinel43_state/
 *.db
 *.db-wal
 *.db-shm
+.env
