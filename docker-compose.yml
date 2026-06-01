@@ -1,107 +1,91 @@
 services:
-s43-db:
-image: postgres:16.3
-container_name: s43_postgres
-restart: unless-stopped
-environment:
-POSTGRES_DB: s43
-POSTGRES_USER: s43
-POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-healthcheck:
-test: ["CMD-SHELL", "pg_isready -U s43 -d s43"]
-interval: 5s
-timeout: 5s
-retries: 10
-volumes:
-- s43_pgdata:/var/lib/postgresql/data
-networks:
-- s43_net
-
-s43-redis:
-image: redis:7.2
-container_name: s43_redis
-restart: unless-stopped
-command: redis-server --requirepass ${REDIS_PASSWORD}
-networks:
-- s43_net
-
-s43-core:
-build:
-context: .
-dockerfile: core/api/Dockerfile
-container_name: s43_core
-restart: unless-stopped
-
-```
-command: python -m core.monitoring.watchtower
-
-ports:
-  - "9100:9100"
-
-environment:
-  S43_WATCHTOWER_HOST: 0.0.0.0
-  S43_WATCHTOWER_PORT: 9100
-  S43_ENV: production
-  S43_LOG_LEVEL: INFO
-  DATABASE_URL: ${DATABASE_URL}
-  REDIS_URL: redis://:${REDIS_PASSWORD}@s43-redis:6379/0
-
-volumes:
-  - ./logs:/app/logs
-
-depends_on:
   s43-db:
-    condition: service_healthy
+    image: postgres:16.3
+    container_name: s43_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: s43
+      POSTGRES_USER: s43
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U s43 -d s43"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - s43_pgdata:/var/lib/postgresql/data
+    networks:
+      - s43_net
+
   s43-redis:
-    condition: service_started
+    image: redis:7.2
+    container_name: s43_redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    networks:
+      - s43_net
 
-networks:
-  - s43_net
-```
-
-s43-api:
-build:
-context: .
-dockerfile: core/api/Dockerfile
-container_name: s43_api
-restart: unless-stopped
-
-```
-command: uvicorn core.api.main:app --host 0.0.0.0 --port 8000
-
-ports:
-  - "8000:8000"
-
-environment:
-  S43_ENV: production
-  S43_LOG_LEVEL: INFO
-  CORE_URL: http://s43-core:9100
-  DATABASE_URL: ${DATABASE_URL}
-  REDIS_URL: redis://:${REDIS_PASSWORD}@s43-redis:6379/0
-  CORS_ORIGINS: ${CORS_ORIGINS}
-  SENTINEL43_DATA_DIR: /app/sentinel43_state
-  SENTINEL43_DB_PATH: /app/sentinel43_state/sentinel43.sqlite3
-
-volumes:
-  - sentinel43_state:/app/sentinel43_state
-  - ./logs:/app/logs
-
-depends_on:
   s43-core:
-    condition: service_started
-  s43-db:
-    condition: service_healthy
-  s43-redis:
-    condition: service_started
+    build:
+      context: .
+      dockerfile: core/api/Dockerfile
+    container_name: s43_core
+    restart: unless-stopped
+    command: python -m core.monitoring.watchtower
+    ports:
+      - "9100:9100"
+    environment:
+      S43_WATCHTOWER_HOST: 0.0.0.0
+      S43_WATCHTOWER_PORT: 9100
+      S43_ENV: production
+      S43_LOG_LEVEL: INFO
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@s43-redis:6379/0
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      s43-db:
+        condition: service_healthy
+      s43-redis:
+        condition: service_started
+    networks:
+      - s43_net
 
-networks:
-  - s43_net
-```
+  s43-api:
+    build:
+      context: .
+      dockerfile: core/api/Dockerfile
+    container_name: s43_api
+    restart: unless-stopped
+    command: uvicorn core.api.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      S43_ENV: production
+      S43_LOG_LEVEL: INFO
+      CORE_URL: http://s43-core:9100
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@s43-redis:6379/0
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      SENTINEL43_DATA_DIR: /app/sentinel43_state
+      SENTINEL43_DB_PATH: /app/sentinel43_state/sentinel43.sqlite3
+    volumes:
+      - sentinel43_state:/app/sentinel43_state
+      - ./logs:/app/logs
+    depends_on:
+      s43-core:
+        condition: service_started
+      s43-db:
+        condition: service_healthy
+      s43-redis:
+        condition: service_started
+    networks:
+      - s43_net
 
 volumes:
-s43_pgdata:
-sentinel43_state:
+  s43_pgdata:
+  sentinel43_state:
 
 networks:
-s43_net:
-driver: bridge
+  s43_net:
+    driver: bridge
