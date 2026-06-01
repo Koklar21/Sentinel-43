@@ -344,6 +344,7 @@ class AuthKeyStore:
                         logger.info(
                             "Revoked auth key id=%s subject=%s revoked_by=%s",
                             row["id"],
+                            
                             row["subject"],
                             revoked_by,
                         )
