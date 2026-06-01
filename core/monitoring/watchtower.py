@@ -1,4 +1,4 @@
-```python
+
 """
 Sentinel-43 Watchtower Node
 Docker-ready monitoring subsystem with FastAPI runtime.
@@ -636,4 +636,3 @@ __all__ = [
     "app",
     "create_api_app",
 ]
-```
