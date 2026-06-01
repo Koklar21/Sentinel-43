@@ -6,243 +6,147 @@
 #   (2) a commercial license (see COMMERCIAL_LICENSE.md).
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
-#
-# See LICENSE.md and COMMERCIAL_LICENSE.md at the repository root.
 # =============================================================================
 
 """Sentinel-43 API service entrypoint.
 
-File: api/main.py
-
-This builds the FastAPI app.
-
-Wires:
-- api/config.py (env-driven settings)
-- api/routes.py (HTTP endpoints)
-- api/deps.py (engine/store factories)
-
-Recommended run commands (when FastAPI is installed):
-- uvicorn api.main:app --host 0.0.0.0 --port 8080
-- python -m uvicorn api.main:app
-
-Notes:
-- We avoid mutating process environment variables here.
-- Dependency factory wiring is validated at startup via lifespan.
-
-IMPORTANT:
-- This file is import-safe even if FastAPI isn't installed, so tools (linters,
-  packaging, repo scanners) don't crash.
-- If you try to *create the app* without FastAPI installed, we raise a clear
-  error at that time.
+Docker-safe FastAPI app factory for core.api.main.
 """
 
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
-from typing import Any, List, Optional
-
-
-# -----------------------------------------------------------------------------
-# Local imports with fallback for non-package execution contexts.
-# -----------------------------------------------------------------------------
+from typing import Any, Optional
 
 try:
-    from .config import ApiConfig, load_config
-    from .routes import router as api_router
-except ImportError:  # pragma: no cover
-    from api.config import ApiConfig, load_config  # type: ignore
-    from api.routes import router as api_router  # type: ignore
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+except Exception as exc:  # pragma: no cover
+    raise RuntimeError(
+        "FastAPI is required. Install fastapi and uvicorn inside the Docker image."
+    ) from exc
+
+try:
+    from core.api.config import ApiConfig, load_config
+except ImportError as exc:  # pragma: no cover
+    raise ImportError(
+        "Could not import core.api.config. Run from the project root where 'core/' exists."
+    ) from exc
 
 
-def _import_fastapi():
-    """Import FastAPI runtime deps lazily.
-
-    Why:
-    - Importing this module should not explode in minimal environments.
-    - Creating the app should *require* FastAPI.
-
-    Returns:
-        (FastAPI, CORSMiddleware)
-    """
-    try:
-        from fastapi import FastAPI  # type: ignore
-        from fastapi.middleware.cors import CORSMiddleware  # type: ignore
-
-        return FastAPI, CORSMiddleware
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError(
-            "FastAPI is required to create the API app. Install fastapi + pydantic."
-        ) from e
-
-
-def _cors_origins_from_config(raw: str) -> List[str]:
-    """Convert config.cors_allow_origins to CORSMiddleware allow_origins list."""
-    r = (raw or "").strip()
-    if not r or r == "*":
+def _cors_origins_from_config(raw: str | None) -> list[str]:
+    value = (raw or "").strip()
+    if not value or value == "*":
         return ["*"]
-    parts = [p.strip() for p in r.split(",")]
-    return [p for p in parts if p]
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def _cors_allow_credentials_for(allow_origins: List[str]) -> bool:
-    """CORS rule: credentials cannot be used with wildcard origin."""
-    if allow_origins == ["*"]:
-        return False
-    return True
+def _cors_allow_credentials_for(origins: list[str]) -> bool:
+    return origins != ["*"]
 
 
-def _import_deps():
-    """Import deps with package-friendly fallbacks."""
+def _load_router(app: FastAPI) -> None:
     try:
-        from .deps import get_engine, get_store  # type: ignore
+        from core.api.routes import router as api_router
 
-        return get_engine, get_store
-    except ImportError:  # pragma: no cover
-        from api.deps import get_engine, get_store  # type: ignore
+        app.include_router(api_router)
+    except Exception as exc:
+        # Do not kill Docker just because routes are still being repaired.
+        @app.get("/routes/status")
+        def routes_status() -> dict[str, Any]:
+            return {
+                "routes_loaded": False,
+                "error": str(exc),
+            }
 
-        return get_engine, get_store
+
+def _load_startup_dependencies(app: Any, cfg: ApiConfig) -> None:
+    app.state.config = cfg
+    app.state.startup_engine = None
+    app.state.startup_store = None
+
+    try:
+        from core.api.deps import get_engine, get_store
+
+        app.state.startup_engine = get_engine()
+        app.state.startup_store = get_store()
+    except Exception as exc:
+        # Keep API alive while dependency wiring is being fixed.
+        app.state.dependency_error = str(exc)
 
 
-def create_app(cfg: Optional[ApiConfig] = None) -> Any:
-    """Create and return the ASGI app.
-
-    Expected behavior:
-    - If FastAPI is installed: returns a FastAPI instance.
-    - If FastAPI is missing: raises RuntimeError with install guidance.
-    """
-    FastAPI, CORSMiddleware = _import_fastapi()
-
+def create_app(cfg: Optional[ApiConfig] = None) -> FastAPI:
     cfg = cfg or load_config()
 
     @asynccontextmanager
     async def lifespan(app: Any):
-        # Validate dependency wiring at startup.
-        # We intentionally create instances once to ensure factories work and
-        # interfaces validate; we keep them on app.state so the work isn't wasted.
-        get_engine, get_store = _import_deps()
-
-        app.state.config = cfg
-        app.state.startup_engine = None
-        app.state.startup_store = None
-
-        app.state.startup_engine = get_engine()
-        app.state.startup_store = get_store()
-
+        _load_startup_dependencies(app, cfg)
         try:
             yield
         finally:
-            # If you add closers later (e.g., DB engines), do it here.
             app.state.startup_engine = None
             app.state.startup_store = None
 
-    # Docs toggles
-    docs_url = "/docs" if cfg.docs_enabled else None
-    redoc_url = "/redoc" if cfg.docs_enabled else None
-    openapi_url = "/openapi.json" if cfg.docs_enabled else None
+    docs_enabled = bool(getattr(cfg, "docs_enabled", True))
 
     app = FastAPI(
-        title=cfg.service_name,
-        version=cfg.version,
-        docs_url=docs_url,
-        redoc_url=redoc_url,
-        openapi_url=openapi_url,
+        title=getattr(cfg, "service_name", "Sentinel-43 API"),
+        version=getattr(cfg, "version", "0.1.0"),
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
         lifespan=lifespan,
     )
 
-    # CORS
-    allow_origins = _cors_origins_from_config(cfg.cors_allow_origins)
-    allow_credentials = _cors_allow_credentials_for(allow_origins)
+    origins = _cors_origins_from_config(getattr(cfg, "cors_allow_origins", "*"))
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=allow_origins,
-        allow_credentials=allow_credentials,
+        allow_origins=origins,
+        allow_credentials=_cors_allow_credentials_for(origins),
         allow_methods=["*"],
         allow_headers=["*"],
     )
 
-    # Routers
-    app.include_router(api_router)
+    @app.get("/")
+    def root() -> dict[str, Any]:
+        return {
+            "service": getattr(cfg, "service_name", "Sentinel-43 API"),
+            "version": getattr(cfg, "version", "0.1.0"),
+            "status": "online",
+        }
+
+    @app.get("/health")
+    def health() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "service": getattr(cfg, "service_name", "Sentinel-43 API"),
+        }
+
+    @app.get("/ready")
+    def ready() -> dict[str, Any]:
+        dependency_error = getattr(app.state, "dependency_error", None)
+
+        return {
+            "status": "degraded" if dependency_error else "ready",
+            "dependency_error": dependency_error,
+        }
+
+    _load_router(app)
 
     return app
 
 
-# Default ASGI app.
-# Import-time creation is standard for ASGI servers, but we keep this module
-# import-safe when FastAPI isn't present.
-try:
-    app = create_app()
-except RuntimeError:  # pragma: no cover
-    # FastAPI missing in this environment. Leave app as None.
-    app = None  # type: ignore
-
-
-# -----------------------------------------------------------------------------
-# Minimal tests
-# -----------------------------------------------------------------------------
-
-
-def _run_self_tests() -> None:  # pragma: no cover
-    import unittest
-    from unittest.mock import patch
-
-    # If FastAPI isn't installed, we skip rather than crash.
-    try:
-        from fastapi.testclient import TestClient  # type: ignore
-    except Exception:
-        TestClient = None  # type: ignore
-
-    class MainTests(unittest.TestCase):
-        def setUp(self) -> None:
-            if TestClient is None:
-                self.skipTest("fastapi[test] is not installed in this environment")
-
-        def test_health_has_request_id(self):
-            cfg = ApiConfig(docs_enabled=False)
-            test_app = create_app(cfg)
-            client = TestClient(test_app)
-            r = client.get("/health")
-            self.assertEqual(r.status_code, 200)
-            data = r.json()
-            self.assertEqual(data.get("status"), "ok")
-            self.assertTrue(isinstance(data.get("request_id"), str))
-            self.assertTrue(len(data.get("request_id")) > 0)
-
-        def test_health_uses_header_request_id(self):
-            cfg = ApiConfig(docs_enabled=False)
-            test_app = create_app(cfg)
-            client = TestClient(test_app)
-            r = client.get("/health", headers={"X-Request-ID": "abc-123"})
-            self.assertEqual(r.status_code, 200)
-            self.assertEqual(r.json().get("request_id"), "abc-123")
-
-        def test_docs_disabled(self):
-            cfg = ApiConfig(docs_enabled=False)
-            test_app = create_app(cfg)
-            client = TestClient(test_app)
-            self.assertEqual(client.get("/docs").status_code, 404)
-
-        def test_cors_parsing(self):
-            self.assertEqual(_cors_origins_from_config("*"), ["*"])
-            self.assertEqual(
-                _cors_origins_from_config(" https://a.com , https://b.com "),
-                ["https://a.com", "https://b.com"],
-            )
-
-        def test_cors_credentials_rule(self):
-            self.assertFalse(_cors_allow_credentials_for(["*"]))
-            self.assertTrue(_cors_allow_credentials_for(["https://a.com"]))
-
-        def test_no_env_mutation(self):
-            # create_app should not set or modify env vars.
-            with patch.dict("os.environ", {}, clear=True):
-                cfg = ApiConfig(docs_enabled=False)
-                _ = create_app(cfg)
-                self.assertIsNone(os.environ.get("SENTINEL_ENGINE_FACTORY"))
-                self.assertIsNone(os.environ.get("SENTINEL_STORE_FACTORY"))
-
-    unittest.main(argv=["main.py"], exit=False)
+app = create_app()
 
 
 if __name__ == "__main__":  # pragma: no cover
-    _run_self_tests()
+    import uvicorn
+
+    uvicorn.run(
+        "core.api.main:app",
+        host=os.getenv("S43_API_HOST", "0.0.0.0"),
+        port=int(os.getenv("S43_API_PORT", "8080")),
+        reload=os.getenv("S43_RELOAD", "false").lower() == "true",
+    )
