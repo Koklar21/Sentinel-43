@@ -8,38 +8,34 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
 
-"""Sentinel-43 API service entrypoint.
-
-Docker-safe FastAPI app factory for core.api.main.
-"""
+"""Sentinel-43 API service entrypoint."""
 
 from __future__ import annotations
 
-import os
+import logging
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any, Iterable
 
-try:
-    from fastapi import FastAPI
-    from fastapi.middleware.cors import CORSMiddleware
-except Exception as exc:  # pragma: no cover
-    raise RuntimeError(
-        "FastAPI is required. Install fastapi and uvicorn inside the Docker image."
-    ) from exc
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-try:
-    from core.api.config import ApiConfig, load_config
-except ImportError as exc:  # pragma: no cover
-    raise ImportError(
-        "Could not import core.api.config. Run from the project root where 'core/' exists."
-    ) from exc
+from core.api.config import ApiConfig, load_config
+
+logger = logging.getLogger(__name__)
 
 
-def _cors_origins_from_config(raw: str | None) -> list[str]:
-    value = (raw or "").strip()
-    if not value or value == "*":
+def _cors_origins_from_config(raw: str | Iterable[str] | None) -> list[str]:
+    if raw is None:
         return ["*"]
-    return [item.strip() for item in value.split(",") if item.strip()]
+
+    if isinstance(raw, str):
+        value = raw.strip()
+        if not value or value == "*":
+            return ["*"]
+        return [item.strip() for item in value.split(",") if item.strip()]
+
+    origins = [str(item).strip() for item in raw if str(item).strip()]
+    return origins or ["*"]
 
 
 def _cors_allow_credentials_for(origins: list[str]) -> bool:
@@ -47,24 +43,44 @@ def _cors_allow_credentials_for(origins: list[str]) -> bool:
 
 
 def _load_router(app: FastAPI) -> None:
+    router_error: str | None = None
+
+    try:
+        from core.api.routers import router as api_router
+
+        app.include_router(api_router)
+        app.state.routes_loaded = True
+        return
+    except Exception as exc:
+        router_error = f"core.api.routers failed: {exc}"
+        logger.warning(router_error)
+
     try:
         from core.api.routes import router as api_router
 
         app.include_router(api_router)
+        app.state.routes_loaded = True
+        return
     except Exception as exc:
-        # Do not kill Docker just because routes are still being repaired.
-        @app.get("/routes/status")
-        def routes_status() -> dict[str, Any]:
-            return {
-                "routes_loaded": False,
-                "error": str(exc),
-            }
+        router_error = f"{router_error}; core.api.routes failed: {exc}"
+        logger.warning(router_error)
+
+    app.state.routes_loaded = False
+    app.state.routes_error = router_error
+
+    @app.get("/routes/status")
+    def routes_status() -> dict[str, Any]:
+        return {
+            "routes_loaded": False,
+            "error": getattr(app.state, "routes_error", "unknown route error"),
+        }
 
 
-def _load_startup_dependencies(app: Any, cfg: ApiConfig) -> None:
+def _load_startup_dependencies(app: FastAPI, cfg: ApiConfig) -> None:
     app.state.config = cfg
     app.state.startup_engine = None
     app.state.startup_store = None
+    app.state.dependency_error = None
 
     try:
         from core.api.deps import get_engine, get_store
@@ -72,15 +88,15 @@ def _load_startup_dependencies(app: Any, cfg: ApiConfig) -> None:
         app.state.startup_engine = get_engine()
         app.state.startup_store = get_store()
     except Exception as exc:
-        # Keep API alive while dependency wiring is being fixed.
         app.state.dependency_error = str(exc)
+        logger.warning("API dependency startup degraded: %s", exc)
 
 
-def create_app(cfg: Optional[ApiConfig] = None) -> FastAPI:
+def create_app(cfg: ApiConfig | None = None) -> FastAPI:
     cfg = cfg or load_config()
 
     @asynccontextmanager
-    async def lifespan(app: Any):
+    async def lifespan(app: FastAPI):
         _load_startup_dependencies(app, cfg)
         try:
             yield
@@ -88,18 +104,18 @@ def create_app(cfg: Optional[ApiConfig] = None) -> FastAPI:
             app.state.startup_engine = None
             app.state.startup_store = None
 
-    docs_enabled = bool(getattr(cfg, "docs_enabled", True))
+    docs_enabled = bool(cfg.docs_enabled)
 
     app = FastAPI(
-        title=getattr(cfg, "service_name", "Sentinel-43 API"),
-        version=getattr(cfg, "version", "0.1.0"),
+        title=cfg.service_name,
+        version=cfg.version,
         docs_url="/docs" if docs_enabled else None,
         redoc_url="/redoc" if docs_enabled else None,
         openapi_url="/openapi.json" if docs_enabled else None,
         lifespan=lifespan,
     )
 
-    origins = _cors_origins_from_config(getattr(cfg, "cors_allow_origins", "*"))
+    origins = _cors_origins_from_config(cfg.cors_allow_origins)
 
     app.add_middleware(
         CORSMiddleware,
@@ -112,8 +128,8 @@ def create_app(cfg: Optional[ApiConfig] = None) -> FastAPI:
     @app.get("/")
     def root() -> dict[str, Any]:
         return {
-            "service": getattr(cfg, "service_name", "Sentinel-43 API"),
-            "version": getattr(cfg, "version", "0.1.0"),
+            "service": cfg.service_name,
+            "version": cfg.version,
             "status": "online",
         }
 
@@ -121,15 +137,17 @@ def create_app(cfg: Optional[ApiConfig] = None) -> FastAPI:
     def health() -> dict[str, Any]:
         return {
             "status": "ok",
-            "service": getattr(cfg, "service_name", "Sentinel-43 API"),
+            "service": cfg.service_name,
         }
 
     @app.get("/ready")
     def ready() -> dict[str, Any]:
         dependency_error = getattr(app.state, "dependency_error", None)
+        routes_loaded = getattr(app.state, "routes_loaded", False)
 
         return {
-            "status": "degraded" if dependency_error else "ready",
+            "status": "ready" if not dependency_error else "degraded",
+            "routes_loaded": routes_loaded,
             "dependency_error": dependency_error,
         }
 
@@ -144,9 +162,12 @@ app = create_app()
 if __name__ == "__main__":  # pragma: no cover
     import uvicorn
 
+    cfg = load_config()
+
     uvicorn.run(
-        "core.api.main:app",
-        host=os.getenv("S43_API_HOST", "0.0.0.0"),
-        port=int(os.getenv("S43_API_PORT", "8080")),
-        reload=os.getenv("S43_RELOAD", "false").lower() == "true",
+        app,
+        host=cfg.host,
+        port=cfg.port,
+        reload=False,
+        log_level=cfg.log_level.lower(),
     )
