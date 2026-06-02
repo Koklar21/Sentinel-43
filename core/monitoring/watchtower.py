@@ -1,4 +1,3 @@
-
 """
 Sentinel-43 Watchtower Node
 Docker-ready monitoring subsystem with FastAPI runtime.
