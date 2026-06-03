@@ -1,42 +1,90 @@
 from __future__ import annotations
 
+import json
+import os
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
+
+
+WATCHTOWER_URL = os.getenv("S43_WATCHTOWER_URL", "http://s43-watchtower:9100").rstrip("/")
+WATCHTOWER_TIMEOUT = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
+EXCEPTIONS_MODULE_ID = os.getenv("S43_EXCEPTIONS_MODULE_ID", "sentinel43-exceptions")
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _report_exception_to_watchtower(
+    *,
+    code: str,
+    message: str,
+    error_type: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    payload = {
+        "event": {
+            "kind": "runtime",
+            "source": EXCEPTIONS_MODULE_ID,
+            "status": "failed",
+            "error_code": code,
+            "error_type": error_type,
+            "message": message,
+            "details": details or {},
+            "timestamp": utc_now(),
+        }
+    }
+
+    try:
+        request = urllib.request.Request(
+            f"{WATCHTOWER_URL}/watchtower/analyze",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(request, timeout=WATCHTOWER_TIMEOUT)
+    except Exception:
+        pass
 
 
 @dataclass(slots=True)
 class SentinelError(Exception):
-    """
-    Base class for all Sentinel-43 custom errors.
-
-    Provides a consistent structure for:
-    - logging
-    - audit events
-    - API error translation
-    - internal exception classification
-
-    Notes:
-    - We explicitly call Exception.__init__ in __post_init__ so that
-      `args`, pickling, and traceback behavior remain correct.
-    - We do NOT store a custom `cause` field. Use Python's built-in
-      exception chaining via `raise ... from ...`.
-    """
-
     code: str
     message: str
     details: dict[str, Any] | None = None
+    report: bool = True
 
     def __post_init__(self) -> None:
         super().__init__(self.message)
+
+        if self.report:
+            _report_exception_to_watchtower(
+                code=self.code,
+                message=self.message,
+                error_type=self.__class__.__name__,
+                details=self.details,
+            )
 
     def __str__(self) -> str:
         if self.details:
             return f"{self.code}: {self.message} | details={self.details}"
         return f"{self.code}: {self.message}"
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": self.__class__.__name__,
+            "code": self.code,
+            "message": self.message,
+            "details": self.details or {},
+            "timestamp": utc_now(),
+        }
+
 
 # ============================================================
-# Expectations (invariants / requirements)
+# Expectations
 # ============================================================
 
 class ExpectationFailed(SentinelError):
