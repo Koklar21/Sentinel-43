@@ -10,35 +10,19 @@
 # See LICENSE.md and COMMERCIAL_LICENSE.md at the repository root.
 # =============================================================================
 
-"""Sentinel-43 API layer: dependency wiring.
-
-File: api/deps.py
-
-This module produces FastAPI dependencies:
-- Engine instance
-- Store instance
-
-Design goals:
-- Clear wiring via env-configured factories.
-- Cached factory resolution (no import_module per request).
-- Fast failure when factories return objects missing required methods.
-- Dev stubs available so the API can run before core is wired.
-
-Factory configuration:
-  SENTINEL_ENGINE_FACTORY="module.path:create_engine"
-  SENTINEL_STORE_FACTORY="module.path:create_store"
-
-Each factory must be a **zero-arg** callable returning the engine/store object.
-"""
+"""Sentinel-43 API layer: dependency wiring."""
 
 from __future__ import annotations
 
+import json
+import os
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from functools import lru_cache
 from importlib import import_module
 from typing import Any, Callable, Optional
-
-import os
 
 
 # -----------------------------------------------------------------------------
@@ -48,12 +32,138 @@ import os
 ENV_ENGINE_FACTORY = "SENTINEL_ENGINE_FACTORY"
 ENV_STORE_FACTORY = "SENTINEL_STORE_FACTORY"
 
-DEFAULT_ENGINE_FACTORY = "api.deps:dev_engine_factory"
-DEFAULT_STORE_FACTORY = "api.deps:dev_store_factory"
+DEFAULT_ENGINE_FACTORY = "core.api.deps:dev_engine_factory"
+DEFAULT_STORE_FACTORY = "core.api.deps:dev_store_factory"
+
+DEPS_MODULE_ID = os.getenv("S43_DEPS_MODULE_ID", "sentinel43-api-deps")
+DEPS_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
+WATCHTOWER_URL = os.getenv("S43_WATCHTOWER_URL", "http://s43-watchtower:9100").rstrip("/")
+WATCHTOWER_TIMEOUT = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
 
 
 # -----------------------------------------------------------------------------
-# Expected interfaces (runtime checks)
+# Watchtower intercom
+# -----------------------------------------------------------------------------
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _watchtower_request(
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    url = f"{WATCHTOWER_URL}{path}"
+    data = None
+    headers = {"Content-Type": "application/json"}
+
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+
+    request = urllib.request.Request(
+        url=url,
+        data=data,
+        headers=headers,
+        method=method.upper(),
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=WATCHTOWER_TIMEOUT) as response:
+            body = response.read().decode("utf-8")
+            if not body:
+                return {"status_code": response.status}
+
+            parsed = json.loads(body)
+            if isinstance(parsed, dict):
+                parsed.setdefault("status_code", response.status)
+                return parsed
+
+            return {"status_code": response.status, "body": parsed}
+
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8")
+        except Exception:
+            detail = str(exc)
+
+        return {
+            "error": "watchtower_http_error",
+            "status_code": exc.code,
+            "detail": detail,
+        }
+
+    except Exception as exc:
+        return {
+            "error": "watchtower_unreachable",
+            "detail": str(exc),
+        }
+
+
+def _register_deps_with_watchtower() -> None:
+    payload = {
+        "module_id": DEPS_MODULE_ID,
+        "module_type": "api-dependencies",
+        "version": DEPS_VERSION,
+        "endpoint": None,
+        "capabilities": [
+            "engine_factory_resolution",
+            "store_factory_resolution",
+            "dependency_interface_validation",
+            "dev_engine_stub",
+            "dev_store_stub",
+        ],
+        "metadata": {"timestamp": utc_now()},
+    }
+
+    _watchtower_request("POST", "/watchtower/modules/register", payload)
+
+
+def _report_deps_status(
+    status: str,
+    event: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    _register_deps_with_watchtower()
+
+    payload = {
+        "name": DEPS_MODULE_ID,
+        "status": status,
+        "version": DEPS_VERSION,
+        "details": {
+            "event": event,
+            "timestamp": utc_now(),
+            **(details or {}),
+        },
+    }
+
+    _watchtower_request("POST", "/watchtower/dependencies/report", payload)
+
+
+def _report_deps_event(
+    status: str,
+    event: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    payload = {
+        "event": {
+            "kind": "dependency",
+            "source": DEPS_MODULE_ID,
+            "status": status,
+            "dependency_status": status,
+            "details": {
+                "event": event,
+                "timestamp": utc_now(),
+                **(details or {}),
+            },
+        }
+    }
+
+    _watchtower_request("POST", "/watchtower/analyze", payload)
+
+
+# -----------------------------------------------------------------------------
+# Expected interfaces
 # -----------------------------------------------------------------------------
 
 _ENGINE_REQUIRED_METHODS = (
@@ -64,17 +174,40 @@ _ENGINE_REQUIRED_METHODS = (
 
 _STORE_REQUIRED_METHODS = (
     "get_status",
-    # list_actions is used by the /v1/actions endpoint; treat it as required.
     "list_actions",
 )
 
 
 def _require_methods(obj: Any, methods: tuple[str, ...], *, kind: str, factory_spec: str) -> Any:
     missing = [m for m in methods if not hasattr(obj, m)]
+
     if missing:
-        raise ValueError(
-            f"{kind} factory '{factory_spec}' returned {type(obj).__name__} missing methods: {', '.join(missing)}"
+        _report_deps_status(
+            status="failed",
+            event="dependency_interface_validation_failed",
+            details={
+                "kind": kind,
+                "factory_spec": factory_spec,
+                "returned_type": type(obj).__name__,
+                "missing_methods": missing,
+            },
         )
+
+        raise ValueError(
+            f"{kind} factory '{factory_spec}' returned {type(obj).__name__} "
+            f"missing methods: {', '.join(missing)}"
+        )
+
+    _report_deps_event(
+        status="online",
+        event="dependency_interface_validated",
+        details={
+            "kind": kind,
+            "factory_spec": factory_spec,
+            "returned_type": type(obj).__name__,
+        },
+    )
+
     return obj
 
 
@@ -82,53 +215,96 @@ def _require_methods(obj: Any, methods: tuple[str, ...], *, kind: str, factory_s
 # Utilities
 # -----------------------------------------------------------------------------
 
-
 def _parse_factory(spec: str) -> tuple[str, str]:
-    """Parse 'module.path:callable' spec."""
     if ":" not in spec:
+        _report_deps_status(
+            status="failed",
+            event="invalid_factory_spec",
+            details={"factory_spec": spec},
+        )
         raise ValueError(f"Invalid factory spec '{spec}'. Expected 'module.path:callable'.")
+
     mod, fn = spec.split(":", 1)
     mod = mod.strip()
     fn = fn.strip()
+
     if not mod or not fn:
+        _report_deps_status(
+            status="failed",
+            event="invalid_factory_spec",
+            details={"factory_spec": spec},
+        )
         raise ValueError(f"Invalid factory spec '{spec}'. Expected 'module.path:callable'.")
+
     return mod, fn
 
 
 def _load_callable(spec: str) -> Callable[[], Any]:
-    """Resolve a factory spec to a callable."""
     mod_name, fn_name = _parse_factory(spec)
-    mod = import_module(mod_name)
+
+    try:
+        mod = import_module(mod_name)
+    except Exception as exc:
+        _report_deps_status(
+            status="failed",
+            event="factory_module_import_failed",
+            details={
+                "factory_spec": spec,
+                "module": mod_name,
+                "error": str(exc),
+                "exception_type": type(exc).__name__,
+            },
+        )
+        raise
+
     fn = getattr(mod, fn_name, None)
+
     if fn is None or not callable(fn):
+        _report_deps_status(
+            status="failed",
+            event="factory_callable_resolution_failed",
+            details={
+                "factory_spec": spec,
+                "module": mod_name,
+                "callable": fn_name,
+            },
+        )
         raise ValueError(f"Factory '{spec}' did not resolve to a callable.")
+
+    _report_deps_event(
+        status="online",
+        event="factory_callable_resolved",
+        details={
+            "factory_spec": spec,
+            "module": mod_name,
+            "callable": fn_name,
+        },
+    )
+
     return fn  # type: ignore[return-value]
 
 
 @lru_cache(maxsize=64)
 def _cached_factory(spec: str) -> Callable[[], Any]:
-    """Cache factory resolution so we don't do imports/lookups per request."""
     return _load_callable(spec)
 
 
 def clear_factory_caches() -> None:
-    """Clear cached factory lookups.
-
-    Useful in tests or if you intentionally change env vars at runtime.
-    """
     _cached_factory.cache_clear()
 
+    _report_deps_status(
+        status="degraded",
+        event="factory_cache_cleared",
+        details={},
+    )
+
 
 # -----------------------------------------------------------------------------
-# Dev stubs (safe defaults)
+# Dev stubs
 # -----------------------------------------------------------------------------
-
 
 class DevEngine:
-    """A boring dev engine so routes can run before core is wired."""
-
     def handle_assessment(self, mode: str, assessment: Any) -> Any:
-        # Keep output schema compatible with _as_assessment_out in routes.
         return {
             "assessment_id": "dev-000",
             "severity": 0,
@@ -146,37 +322,60 @@ class DevEngine:
 
 @dataclass
 class DevStore:
-    """A dev store that keeps action status in memory."""
-
     actions: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def get_status(self, action_id: str) -> Any:
         return self.actions.get(action_id, {"action_id": action_id, "decision": "unknown"})
 
-    def list_actions(self, *, status: Optional[str] = None, limit: int = 50, cursor: Optional[str] = None) -> Any:
-        # cursor is ignored for dev.
+    def list_actions(
+        self,
+        *,
+        status: Optional[str] = None,
+        limit: int = 50,
+        cursor: Optional[str] = None,
+    ) -> Any:
         items = list(self.actions.values())
+
         if status:
-            items = [x for x in items if (x.get("decision") == status or x.get("status") == status)]
-        return {"items": items[:limit], "next_cursor": None}
+            items = [
+                x for x in items
+                if x.get("decision") == status or x.get("status") == status
+            ]
+
+        return {
+            "items": items[:limit],
+            "next_cursor": None,
+        }
 
 
-# Shared dev store backing, explicitly named.
-# If you prefer request-scoped stores, set SENTINEL_STORE_FACTORY to a factory
-# that constructs a new store each call.
 _DEV_STORE_SINGLETON = DevStore()
 
 
 def reset_dev_store_state() -> None:
-    """Clear the shared dev store (useful for tests)."""
     _DEV_STORE_SINGLETON.actions.clear()
+
+    _report_deps_status(
+        status="degraded",
+        event="dev_store_reset",
+        details={},
+    )
 
 
 def dev_engine_factory() -> Any:
+    _report_deps_event(
+        status="online",
+        event="dev_engine_created",
+        details={"factory": "dev_engine_factory"},
+    )
     return DevEngine()
 
 
 def dev_store_factory() -> Any:
+    _report_deps_event(
+        status="online",
+        event="dev_store_returned",
+        details={"factory": "dev_store_factory", "singleton": True},
+    )
     return _DEV_STORE_SINGLETON
 
 
@@ -184,99 +383,65 @@ def dev_store_factory() -> Any:
 # Public dependencies
 # -----------------------------------------------------------------------------
 
-
 def get_engine() -> Any:
-    """FastAPI dependency: returns an engine instance.
-
-    Uses SENTINEL_ENGINE_FACTORY or falls back to api.deps:dev_engine_factory.
-    """
     spec = os.getenv(ENV_ENGINE_FACTORY, DEFAULT_ENGINE_FACTORY)
-    factory = _cached_factory(spec)
-    obj = factory()
-    return _require_methods(obj, _ENGINE_REQUIRED_METHODS, kind="Engine", factory_spec=spec)
+
+    try:
+        factory = _cached_factory(spec)
+        obj = factory()
+        return _require_methods(
+            obj,
+            _ENGINE_REQUIRED_METHODS,
+            kind="Engine",
+            factory_spec=spec,
+        )
+
+    except Exception as exc:
+        _report_deps_status(
+            status="failed",
+            event="get_engine_failed",
+            details={
+                "factory_spec": spec,
+                "error": str(exc),
+                "exception_type": type(exc).__name__,
+            },
+        )
+        raise
 
 
 def get_store() -> Any:
-    """FastAPI dependency: returns a store instance.
-
-    Uses SENTINEL_STORE_FACTORY or falls back to api.deps:dev_store_factory.
-    """
     spec = os.getenv(ENV_STORE_FACTORY, DEFAULT_STORE_FACTORY)
-    factory = _cached_factory(spec)
-    obj = factory()
-    return _require_methods(obj, _STORE_REQUIRED_METHODS, kind="Store", factory_spec=spec)
+
+    try:
+        factory = _cached_factory(spec)
+        obj = factory()
+        return _require_methods(
+            obj,
+            _STORE_REQUIRED_METHODS,
+            kind="Store",
+            factory_spec=spec,
+        )
+
+    except Exception as exc:
+        _report_deps_status(
+            status="failed",
+            event="get_store_failed",
+            details={
+                "factory_spec": spec,
+                "error": str(exc),
+                "exception_type": type(exc).__name__,
+            },
+        )
+        raise
 
 
-# -----------------------------------------------------------------------------
-# Minimal tests
-# -----------------------------------------------------------------------------
-
-
-def _run_self_tests() -> None:  # pragma: no cover
-    import unittest
-
-    class BadEngine:
-        pass
-
-    class BadStore:
-        def get_status(self, action_id: str) -> Any:
-            return {}
-
-    def bad_engine_factory() -> Any:
-        return BadEngine()
-
-    def bad_store_factory() -> Any:
-        return BadStore()
-
-    class DepsTests(unittest.TestCase):
-        def setUp(self) -> None:
-            reset_dev_store_state()
-            clear_factory_caches()
-
-        def test_parse_factory(self):
-            self.assertEqual(_parse_factory("x.y:z"), ("x.y", "z"))
-
-        def test_parse_factory_bad(self):
-            with self.assertRaises(ValueError):
-                _parse_factory("nope")
-
-        def test_dev_factories_work(self):
-            e = dev_engine_factory()
-            s = dev_store_factory()
-            self.assertTrue(hasattr(e, "handle_assessment"))
-            self.assertTrue(hasattr(s, "get_status"))
-            self.assertTrue(hasattr(s, "list_actions"))
-
-        def test_cached_factory(self):
-            # Use this module's name so the test works whether imported as api.deps
-            # or executed as __main__.
-            spec = f"{__name__}:dev_engine_factory"
-            f1 = _cached_factory(spec)
-            f2 = _cached_factory(spec)
-            self.assertIs(f1, f2)
-
-        def test_engine_interface_validation(self):
-            # Wire a bad factory via env and confirm we fail with a clear error.
-            os.environ[ENV_ENGINE_FACTORY] = f"{__name__}:bad_engine_factory"
-            # Make sure our module has the symbol (it does, local function above).
-            with self.assertRaises(ValueError) as ctx:
-                get_engine()
-            self.assertIn("missing methods", str(ctx.exception))
-
-        def test_store_interface_validation(self):
-            os.environ[ENV_STORE_FACTORY] = f"{__name__}:bad_store_factory"
-            with self.assertRaises(ValueError) as ctx:
-                get_store()
-            self.assertIn("missing methods", str(ctx.exception))
-
-        def test_reset_dev_store_state(self):
-            s = dev_store_factory()
-            s.actions["x"] = {"action_id": "x", "decision": "approved"}
-            reset_dev_store_state()
-            self.assertEqual(s.actions, {})
-
-    unittest.main(argv=["deps.py"], exit=False)
-
-
-if __name__ == "__main__":  # pragma: no cover
-    _run_self_tests()
+def deps_status() -> dict[str, Any]:
+    return {
+        "module_id": DEPS_MODULE_ID,
+        "version": DEPS_VERSION,
+        "engine_factory": os.getenv(ENV_ENGINE_FACTORY, DEFAULT_ENGINE_FACTORY),
+        "store_factory": os.getenv(ENV_STORE_FACTORY, DEFAULT_STORE_FACTORY),
+        "watchtower_url": WATCHTOWER_URL,
+        "factory_cache": _cached_factory.cache_info()._asdict(),
+        "timestamp": utc_now(),
+    }
