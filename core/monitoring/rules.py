@@ -6,9 +6,111 @@ Clean rule/threshold layer for Watchtower and API health evaluation.
 
 from __future__ import annotations
 
+import json
+import os
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable
+
+
+WATCHTOWER_URL = os.getenv("S43_WATCHTOWER_URL", "http://s43-watchtower:9100").rstrip("/")
+WATCHTOWER_TIMEOUT = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
+RULES_MODULE_ID = os.getenv("S43_RULES_MODULE_ID", "sentinel43-rules")
+RULES_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _watchtower_request(
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    url = f"{WATCHTOWER_URL}{path}"
+    data = None
+    headers = {"Content-Type": "application/json"}
+
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+
+    request = urllib.request.Request(
+        url=url,
+        data=data,
+        headers=headers,
+        method=method.upper(),
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=WATCHTOWER_TIMEOUT) as response:
+            body = response.read().decode("utf-8")
+            if not body:
+                return {"status_code": response.status}
+
+            parsed = json.loads(body)
+            if isinstance(parsed, dict):
+                parsed.setdefault("status_code", response.status)
+                return parsed
+
+            return {"status_code": response.status, "body": parsed}
+
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8")
+        except Exception:
+            detail = str(exc)
+
+        return {
+            "error": "watchtower_http_error",
+            "status_code": exc.code,
+            "detail": detail,
+        }
+
+    except Exception as exc:
+        return {
+            "error": "watchtower_unreachable",
+            "detail": str(exc),
+        }
+
+
+def _report_rule_dependency(
+    status: str,
+    details: dict[str, Any],
+) -> dict[str, Any]:
+    payload = {
+        "name": RULES_MODULE_ID,
+        "status": status,
+        "version": RULES_VERSION,
+        "details": {
+            "timestamp": utc_now(),
+            **details,
+        },
+    }
+
+    return _watchtower_request("POST", "/watchtower/dependencies/report", payload)
+
+
+def _report_rule_event(
+    status: str,
+    details: dict[str, Any],
+) -> dict[str, Any]:
+    payload = {
+        "event": {
+            "kind": "runtime",
+            "source": RULES_MODULE_ID,
+            "status": status,
+            "details": {
+                "timestamp": utc_now(),
+                **details,
+            },
+        }
+    }
+
+    return _watchtower_request("POST", "/watchtower/analyze", payload)
 
 
 class ThresholdProfile(str, Enum):
@@ -38,8 +140,18 @@ class Thresholds:
 
 
 def thresholds_for(profile: ThresholdProfile | str = ThresholdProfile.DEV) -> Thresholds:
-    if isinstance(profile, str):
-        profile = ThresholdProfile(profile.lower())
+    try:
+        if isinstance(profile, str):
+            profile = ThresholdProfile(profile.lower())
+    except ValueError:
+        _report_rule_dependency(
+            status="degraded",
+            details={
+                "event": "invalid_threshold_profile",
+                "profile": str(profile),
+            },
+        )
+        profile = ThresholdProfile.DEV
 
     if profile == ThresholdProfile.PROD:
         return Thresholds(
@@ -80,11 +192,61 @@ RuleCallable = Callable[[dict[str, Any]], RuleResult]
 class RuleRegistry:
     def __init__(self) -> None:
         self._rules: dict[str, RuleCallable] = {}
+        self._registered_with_watchtower = False
+
+    def _register_with_watchtower_if_needed(self) -> None:
+        if self._registered_with_watchtower:
+            return
+
+        payload = {
+            "module_id": RULES_MODULE_ID,
+            "module_type": "rules-engine",
+            "version": RULES_VERSION,
+            "endpoint": None,
+            "capabilities": [
+                "api_health_rule",
+                "dependency_health_rule",
+                "resource_pressure_rule",
+                "threshold_profile_evaluation",
+                "rule_failure_reporting",
+            ],
+            "metadata": {
+                "timestamp": utc_now(),
+            },
+        }
+
+        result = _watchtower_request("POST", "/watchtower/modules/register", payload)
+        self._registered_with_watchtower = "error" not in result
 
     def register(self, name: str, rule: RuleCallable) -> None:
+        self._register_with_watchtower_if_needed()
+
         if not name:
+            _report_rule_dependency(
+                status="degraded",
+                details={"event": "empty_rule_name_registration"},
+            )
             raise ValueError("Rule name cannot be empty.")
+
+        if name in self._rules:
+            _report_rule_dependency(
+                status="degraded",
+                details={
+                    "event": "duplicate_rule_registration",
+                    "rule": name,
+                },
+            )
+
         self._rules[name] = rule
+
+        _report_rule_event(
+            status="registered",
+            details={
+                "event": "rule_registered",
+                "rule": name,
+                "rule_count": len(self._rules),
+            },
+        )
 
     def get(self, name: str) -> RuleCallable | None:
         return self._rules.get(name)
@@ -93,95 +255,24 @@ class RuleRegistry:
         return sorted(self._rules.keys())
 
     def run(self, name: str, payload: dict[str, Any]) -> RuleResult:
+        self._register_with_watchtower_if_needed()
+
         rule = self.get(name)
+
         if rule is None:
-            return RuleResult(
+            result = RuleResult(
                 name=name,
                 passed=False,
                 message=f"Rule '{name}' is not registered.",
                 severity="error",
             )
-        return rule(payload)
 
-    def run_all(self, payload: dict[str, Any]) -> list[RuleResult]:
-        return [rule(payload) for rule in self._rules.values()]
+            _report_rule_dependency(
+                status="degraded",
+                details={
+                    "event": "rule_not_registered",
+                    "rule": name,
+                },
+            )
 
-
-def api_health_rule(payload: dict[str, Any]) -> RuleResult:
-    status = str(payload.get("status", "")).lower()
-    passed = status in {"ok", "online", "healthy", "active"}
-
-    return RuleResult(
-        name="api_health",
-        passed=passed,
-        message="API health check passed." if passed else "API health check failed.",
-        severity="info" if passed else "critical",
-        details={"status": status},
-    )
-
-
-def dependency_health_rule(payload: dict[str, Any]) -> RuleResult:
-    unhealthy = payload.get("unhealthy_dependencies", [])
-
-    passed = not unhealthy
-
-    return RuleResult(
-        name="dependency_health",
-        passed=passed,
-        message="All dependencies are healthy." if passed else "One or more dependencies are unhealthy.",
-        severity="info" if passed else "warning",
-        details={"unhealthy_dependencies": unhealthy},
-    )
-
-
-def resource_pressure_rule(payload: dict[str, Any]) -> RuleResult:
-    profile = payload.get("profile", ThresholdProfile.DEV)
-    thresholds = thresholds_for(profile)
-
-    cpu = float(payload.get("cpu_percent", 0.0))
-    memory = float(payload.get("memory_percent", 0.0))
-
-    failed = cpu >= thresholds.cpu_fail or memory >= thresholds.memory_fail
-    warned = cpu >= thresholds.cpu_warn or memory >= thresholds.memory_warn
-
-    if failed:
-        severity = "critical"
-        passed = False
-        message = "Resource pressure exceeded failure threshold."
-    elif warned:
-        severity = "warning"
-        passed = True
-        message = "Resource pressure exceeded warning threshold."
-    else:
-        severity = "info"
-        passed = True
-        message = "Resource pressure normal."
-
-    return RuleResult(
-        name="resource_pressure",
-        passed=passed,
-        message=message,
-        severity=severity,
-        details={
-            "cpu_percent": cpu,
-            "memory_percent": memory,
-            "thresholds": thresholds.__dict__,
-        },
-    )
-
-
-registry = RuleRegistry()
-registry.register("api_health", api_health_rule)
-registry.register("dependency_health", dependency_health_rule)
-registry.register("resource_pressure", resource_pressure_rule)
-
-
-__all__ = [
-    "ThresholdProfile",
-    "Thresholds",
-    "RuleResult",
-    "RuleRegistry",
-    "RuleCallable",
-    "thresholds_for",
-    "registry",
-]
+            return result
