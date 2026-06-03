@@ -1,11 +1,11 @@
 """
 Sentinel-43 Watchtower Node
-Docker-ready monitoring subsystem with FastAPI runtime.
+v1.2.1 Hardened Interconnect
 
 Docker command:
 python -m core.monitoring.watchtower
 
-Recommended production command later:
+Production command:
 uvicorn core.monitoring.watchtower:app --host 0.0.0.0 --port 9100
 """
 
@@ -19,20 +19,17 @@ import os
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-import uvicorn
 
 
 logger = logging.getLogger("SentinelWatchtower")
 
-
-# ============================================================
-# Logging
-# ============================================================
 
 def configure_logging() -> None:
     if logging.getLogger().handlers:
@@ -78,6 +75,10 @@ def thresholds_for(sensitivity: int) -> ThresholdProfile:
 # Utilities
 # ============================================================
 
+def _now() -> float:
+    return time.time()
+
+
 def _clamp_int(name: str, value: Any, lo: int, hi: int) -> int:
     try:
         iv = int(value)
@@ -90,14 +91,17 @@ def _clamp_int(name: str, value: Any, lo: int, hi: int) -> int:
     return iv
 
 
-def _safe_metric_int(raw: Any, default: int = 0) -> int:
+def _safe_metric_int(raw: Any, default: int = 0) -> tuple[int, int]:
+    if isinstance(raw, bool):
+        return default, 1
+
     try:
-        return int(float(raw))
+        return int(float(raw)), 0
     except (TypeError, ValueError):
-        return default
+        return default, 1
 
 
-def _ensure_event_id(event: dict[str, Any]) -> str:
+def _assign_event_id(event: dict[str, Any]) -> str:
     event_id = event.get("id")
 
     if isinstance(event_id, str) and event_id.strip():
@@ -187,6 +191,8 @@ class WatchtowerConfig:
     port: int = 9100
     towers: tuple[TowerConfig, ...] = field(default_factory=tuple)
     scan_failure_degrade_threshold: int = 2
+    module_stale_seconds: int = 60
+    max_recent_events: int = 250
 
     def __post_init__(self) -> None:
         if not isinstance(self.node_id, str) or not self.node_id.strip():
@@ -202,6 +208,16 @@ class WatchtowerConfig:
                 1,
                 100,
             ),
+        )
+        object.__setattr__(
+            self,
+            "module_stale_seconds",
+            _clamp_int("module_stale_seconds", self.module_stale_seconds, 5, 3600),
+        )
+        object.__setattr__(
+            self,
+            "max_recent_events",
+            _clamp_int("max_recent_events", self.max_recent_events, 10, 5000),
         )
         object.__setattr__(self, "towers", tuple(self.towers))
 
@@ -221,6 +237,18 @@ class WatchtowerConfig:
                 1024,
                 65535,
             ),
+            module_stale_seconds=_clamp_int(
+                "S43_MODULE_STALE_SECONDS",
+                os.getenv("S43_MODULE_STALE_SECONDS", "60"),
+                5,
+                3600,
+            ),
+            max_recent_events=_clamp_int(
+                "S43_WATCHTOWER_MAX_EVENTS",
+                os.getenv("S43_WATCHTOWER_MAX_EVENTS", "250"),
+                10,
+                5000,
+            ),
             towers=(
                 TowerConfig("API Health Sentinel", TowerSlot.N, TowerType.API_HEALTH, sensitivity=5),
                 TowerConfig("Expectation Guard", TowerSlot.NE, TowerType.EXPECTATION_GUARD, sensitivity=7),
@@ -233,20 +261,58 @@ class WatchtowerConfig:
             ),
         )
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
+    def to_dict(self, expose_bind_host: bool = False) -> dict[str, Any]:
+        payload = {
             "node_id": self.node_id,
             "environment": self.environment,
-            "host": self.host,
             "port": self.port,
             "api_url": self.api_url,
             "scan_failure_degrade_threshold": self.scan_failure_degrade_threshold,
+            "module_stale_seconds": self.module_stale_seconds,
+            "max_recent_events": self.max_recent_events,
             "towers": [tower.to_dict() for tower in self.towers],
         }
 
+        if expose_bind_host:
+            payload["host"] = self.host
+
+        return payload
+
 
 # ============================================================
-# Runtime
+# API Models
+# ============================================================
+
+class AnalyzeRequest(BaseModel):
+    event: dict[str, Any] = Field(default_factory=dict)
+
+
+class ModuleRegisterRequest(BaseModel):
+    module_id: str = Field(min_length=1)
+    module_type: str = Field(default="generic")
+    version: str = Field(default="unknown")
+    endpoint: str | None = None
+    capabilities: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ModuleHeartbeatRequest(BaseModel):
+    module_id: str = Field(min_length=1)
+    status: str = Field(default="online")
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    message: str | None = None
+
+
+class DependencyReportRequest(BaseModel):
+    name: str = Field(min_length=1)
+    status: str = Field(default="online")
+    latency_ms: int | None = None
+    version: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+# ============================================================
+# Runtime Segment
 # ============================================================
 
 class WatchtowerSegment:
@@ -264,9 +330,9 @@ class WatchtowerSegment:
 
     def _safe_int(self, event: dict[str, Any], field_name: str, default: int = 0) -> tuple[int, int]:
         raw = event.get(field_name, default)
-        value = _safe_metric_int(raw, default)
+        value, malformed = _safe_metric_int(raw, default)
 
-        if value == default and raw not in (default, str(default), None):
+        if malformed:
             logger.warning(
                 "Malformed numeric field field=%s raw=%r event_id=%s tower=%s",
                 field_name,
@@ -285,7 +351,7 @@ class WatchtowerSegment:
         if not isinstance(event, dict):
             raise TypeError(f"event must be dict, got {type(event).__name__}")
 
-        scan_ts = time.time()
+        scan_ts = _now()
         suspicious = False
         reason: str | None = None
         malformed_delta = 0
@@ -300,6 +366,9 @@ class WatchtowerSegment:
             if status_code >= 500:
                 suspicious = True
                 reason = f"API returned server error ({status_code})"
+            elif status_code == 404:
+                suspicious = True
+                reason = "API route not found (404)"
             elif latency_ms > 2000:
                 suspicious = True
                 reason = f"High API latency ({latency_ms}ms)"
@@ -348,7 +417,7 @@ class WatchtowerSegment:
         elif tower_type == TowerType.DEPENDENCY_HEALTH and event.get("kind") == "dependency":
             dep_status = event.get("dependency_status")
 
-            if dep_status in {"down", "degraded", "timeout"}:
+            if dep_status in {"down", "degraded", "timeout", "offline", "failed"}:
                 suspicious = True
                 reason = f"Dependency unhealthy ({dep_status})"
             elif event.get("version_mismatch", False):
@@ -383,7 +452,8 @@ class WatchtowerSegment:
                 reason = "Debug mode enabled in protected environment"
 
         with self._lock:
-            self._last_scan_ts = scan_ts
+            current_last = self._last_scan_ts or 0.0
+            self._last_scan_ts = max(current_last, scan_ts)
             self._malformed_input_count += malformed_delta
             if suspicious:
                 self._alert_count += 1
@@ -391,7 +461,7 @@ class WatchtowerSegment:
         if not suspicious:
             return None
 
-        event_id = _ensure_event_id(event)
+        event_id = _assign_event_id(event)
 
         return {
             "tower_id": self.id,
@@ -420,6 +490,10 @@ class WatchtowerSegment:
             }
 
 
+# ============================================================
+# Runtime Node
+# ============================================================
+
 class WatchtowerNode:
     _ALLOWED_TRANSITIONS: dict[WatchtowerState, set[WatchtowerState]] = {
         WatchtowerState.INITIALIZING: {
@@ -446,6 +520,14 @@ class WatchtowerNode:
         self._lock = threading.RLock()
         self._state = WatchtowerState.INITIALIZING
         self.towers: dict[str, WatchtowerSegment] = {}
+        self.modules: dict[str, dict[str, Any]] = {}
+        self.dependencies: dict[str, dict[str, Any]] = {}
+        self.recent_events: deque[dict[str, Any]] = deque(maxlen=config.max_recent_events)
+        self.created_ts = _now()
+
+        self._total_scan_failures = 0
+        self._consecutive_scan_failures = 0
+        self._last_scan_failure_ts: float | None = None
 
         for tower_cfg in config.towers:
             segment = WatchtowerSegment(tower_cfg)
@@ -494,17 +576,25 @@ class WatchtowerNode:
             raise TypeError("event must be a dict")
 
         local_event = copy.deepcopy(event)
-        _ensure_event_id(local_event)
+        event_id = _assign_event_id(local_event)
+        local_event.setdefault("received_ts", _now())
 
         with self._lock:
+            self.recent_events.append(local_event)
+
             if self._state != WatchtowerState.ACTIVE:
                 return []
+
             tower_snapshot = list(self.towers.values())
 
         alerts: list[dict[str, Any]] = []
         failures = 0
 
         for segment in tower_snapshot:
+            with self._lock:
+                if self._state != WatchtowerState.ACTIVE:
+                    break
+
             try:
                 alert = segment.scan(local_event)
                 if alert:
@@ -513,33 +603,260 @@ class WatchtowerNode:
                 failures += 1
                 logger.exception("Segment scan failure tower=%s error=%s", segment.id, exc)
 
-        if failures >= self.config.scan_failure_degrade_threshold:
+        if alerts:
+            alert_event = {
+                "id": str(uuid.uuid4()),
+                "kind": "watchtower_alerts",
+                "source_event_id": event_id,
+                "alerts": alerts,
+                "created_ts": _now(),
+            }
+            with self._lock:
+                self.recent_events.append(alert_event)
+
+        should_degrade = False
+
+        with self._lock:
+            if failures:
+                self._total_scan_failures += failures
+                self._consecutive_scan_failures += failures
+                self._last_scan_failure_ts = _now()
+            else:
+                self._consecutive_scan_failures = 0
+
+            should_degrade = (
+                failures >= self.config.scan_failure_degrade_threshold
+                or self._consecutive_scan_failures >= self.config.scan_failure_degrade_threshold
+            )
+
+        if should_degrade:
             self.set_state(WatchtowerState.DEGRADED)
 
         return alerts
 
+    def register_module(self, payload: ModuleRegisterRequest) -> dict[str, Any]:
+        now = _now()
+        record = {
+            "module_id": payload.module_id,
+            "module_type": payload.module_type,
+            "version": payload.version,
+            "endpoint": payload.endpoint,
+            "capabilities": payload.capabilities,
+            "metadata": payload.metadata,
+            "registered_ts": now,
+            "last_heartbeat_ts": now,
+            "status": "registered",
+        }
+
+        with self._lock:
+            self.modules[payload.module_id] = record
+            snapshot = copy.deepcopy(record)
+
+        self.scan_event({
+            "kind": "dependency",
+            "dependency_name": payload.module_id,
+            "dependency_status": "online",
+            "version": payload.version,
+        })
+
+        return snapshot
+
+    def heartbeat_module(self, payload: ModuleHeartbeatRequest) -> dict[str, Any]:
+        now = _now()
+
+        with self._lock:
+            record = self.modules.get(payload.module_id)
+
+            if record is None:
+                record = {
+                    "module_id": payload.module_id,
+                    "module_type": "unknown",
+                    "version": "unknown",
+                    "endpoint": None,
+                    "capabilities": [],
+                    "metadata": {},
+                    "registered_ts": now,
+                }
+
+            record.update({
+                "last_heartbeat_ts": now,
+                "status": payload.status,
+                "metrics": payload.metrics,
+                "message": payload.message,
+            })
+
+            self.modules[payload.module_id] = record
+            snapshot = copy.deepcopy(record)
+
+        self.scan_event({
+            "kind": "dependency",
+            "dependency_name": payload.module_id,
+            "dependency_status": payload.status,
+        })
+
+        return snapshot
+
+    def report_dependency(self, payload: DependencyReportRequest) -> dict[str, Any]:
+        now = _now()
+        record = {
+            "name": payload.name,
+            "status": payload.status,
+            "latency_ms": payload.latency_ms,
+            "version": payload.version,
+            "details": payload.details,
+            "last_report_ts": now,
+        }
+
+        with self._lock:
+            self.dependencies[payload.name] = record
+            snapshot = copy.deepcopy(record)
+
+        self.scan_event({
+            "kind": "dependency",
+            "dependency_name": payload.name,
+            "dependency_status": payload.status,
+            "latency_ms": payload.latency_ms,
+            "version": payload.version,
+        })
+
+        return snapshot
+
+    def module_snapshot(self) -> dict[str, Any]:
+        now = _now()
+
+        with self._lock:
+            modules = copy.deepcopy(self.modules)
+
+        for module in modules.values():
+            last = module.get("last_heartbeat_ts")
+            stale = last is None or (now - float(last)) > self.config.module_stale_seconds
+            module["stale"] = stale
+
+            if stale and module.get("status") not in {"offline", "down", "failed"}:
+                module["computed_status"] = "stale"
+            else:
+                module["computed_status"] = module.get("status", "unknown")
+
+        return {
+            "module_count": len(modules),
+            "stale_after_seconds": self.config.module_stale_seconds,
+            "modules": list(modules.values()),
+        }
+
+    def dependency_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            dependencies = copy.deepcopy(self.dependencies)
+
+        return {
+            "dependency_count": len(dependencies),
+            "dependencies": list(dependencies.values()),
+        }
+
+    def readiness_from_snapshots(
+        self,
+        modules: dict[str, Any],
+        dependencies: dict[str, Any],
+    ) -> dict[str, Any]:
+        module_records = modules.get("modules", [])
+        dependency_records = dependencies.get("dependencies", [])
+
+        stale_modules = [
+            item["module_id"]
+            for item in module_records
+            if item.get("computed_status") == "stale"
+        ]
+
+        bad_modules = [
+            item["module_id"]
+            for item in module_records
+            if item.get("status") in {"down", "offline", "failed", "degraded"}
+        ]
+
+        bad_dependencies = [
+            item["name"]
+            for item in dependency_records
+            if item.get("status") in {"down", "offline", "failed", "timeout"}
+        ]
+
+        with self._lock:
+            state = self._state
+            total_failures = self._total_scan_failures
+            consecutive_failures = self._consecutive_scan_failures
+
+        ready = (
+            state == WatchtowerState.ACTIVE
+            and not stale_modules
+            and not bad_modules
+            and not bad_dependencies
+        )
+
+        return {
+            "ready": ready,
+            "node_id": self.config.node_id,
+            "state": state.value,
+            "module_count": modules.get("module_count", 0),
+            "dependency_count": dependencies.get("dependency_count", 0),
+            "stale_modules": stale_modules,
+            "bad_modules": bad_modules,
+            "bad_dependencies": bad_dependencies,
+            "scan_failures": {
+                "total": total_failures,
+                "consecutive": consecutive_failures,
+            },
+        }
+
+    def readiness(self) -> dict[str, Any]:
+        modules = self.module_snapshot()
+        dependencies = self.dependency_snapshot()
+        return self.readiness_from_snapshots(modules, dependencies)
+
     def get_status(self) -> dict[str, Any]:
+        modules = self.module_snapshot()
+        dependencies = self.dependency_snapshot()
+        readiness = self.readiness_from_snapshots(modules, dependencies)
+
         with self._lock:
             state = self._state
             tower_snapshot = list(self.towers.values())
+            total_failures = self._total_scan_failures
+            consecutive_failures = self._consecutive_scan_failures
+            last_failure_ts = self._last_scan_failure_ts
 
         return {
             "node_id": self.config.node_id,
             "state": state.value,
             "environment": self.config.environment,
-            "api_url": self.config.api_url,
-            "config": self.config.to_dict(),
+            "uptime_seconds": int(_now() - self.created_ts),
+            "ready": readiness["ready"],
+            "version": "1.2.1",
+            "config": self.config.to_dict(expose_bind_host=False),
+            "scan_failures": {
+                "total": total_failures,
+                "consecutive": consecutive_failures,
+                "last_failure_ts": last_failure_ts,
+            },
+            "modules": modules,
+            "dependencies": dependencies,
+            "readiness": readiness,
             "towers": [tower.status() for tower in tower_snapshot],
+        }
+
+    def recent_event_snapshot(self, limit: int = 50) -> dict[str, Any]:
+        limit = max(1, min(limit, self.config.max_recent_events))
+
+        with self._lock:
+            events = list(self.recent_events)[-limit:]
+
+        return {
+            "count": len(events),
+            "limit": limit,
+            "events": events,
         }
 
 
 # ============================================================
-# FastAPI Runtime
+# Build
 # ============================================================
-
-class AnalyzeRequest(BaseModel):
-    event: dict[str, Any] = Field(default_factory=dict)
-
 
 def build_node() -> WatchtowerNode:
     node_id = os.getenv("S43_WATCHTOWER_NODE_ID", "sentinel43-watchtower")
@@ -552,27 +869,104 @@ def build_node() -> WatchtowerNode:
 NODE = build_node()
 
 
+# ============================================================
+# FastAPI Runtime
+# ============================================================
+
 def create_api_app(node: WatchtowerNode) -> FastAPI:
     if not isinstance(node, WatchtowerNode):
         raise TypeError(f"node must be WatchtowerNode, got {type(node).__name__}")
 
     api = FastAPI(
         title="Sentinel-43 Watchtower",
-        version="0.2.0",
-        description="Sentinel-43 monitoring and alert analysis node.",
+        version="1.2.1",
+        description="Sentinel-43 hardened monitoring, module registry, heartbeat, dependency, and alert analysis node.",
     )
+
+    @api.get("/")
+    def root() -> dict[str, Any]:
+        return {
+            "service": "sentinel-43-watchtower",
+            "version": "1.2.1",
+            "status": "online",
+            "node_id": node.config.node_id,
+            "routes": [
+                "/health",
+                "/ready",
+                "/status",
+                "/modules",
+                "/modules/register",
+                "/modules/heartbeat",
+                "/dependencies",
+                "/dependencies/report",
+                "/events/recent",
+                "/analyze",
+                "/watchtower/health",
+                "/watchtower/ready",
+                "/watchtower/status",
+                "/watchtower/modules",
+                "/watchtower/modules/register",
+                "/watchtower/modules/heartbeat",
+                "/watchtower/dependencies",
+                "/watchtower/dependencies/report",
+                "/watchtower/events/recent",
+                "/watchtower/analyze",
+            ],
+        }
 
     @api.get("/health")
     def health_check() -> dict[str, Any]:
         return {
             "status": "ok",
+            "version": "1.2.1",
             "node_state": node.state.value,
             "node_id": node.config.node_id,
+        }
+
+    @api.get("/ready")
+    def ready_check() -> dict[str, Any]:
+        result = node.readiness()
+        return {
+            **result,
+            "status": "ready" if result["ready"] else "not_ready",
         }
 
     @api.get("/status")
     def node_status() -> dict[str, Any]:
         return node.get_status()
+
+    @api.get("/modules")
+    def modules_status() -> dict[str, Any]:
+        return node.module_snapshot()
+
+    @api.post("/modules/register")
+    def register_module(payload: ModuleRegisterRequest) -> dict[str, Any]:
+        return {
+            "status": "registered",
+            "module": node.register_module(payload),
+        }
+
+    @api.post("/modules/heartbeat")
+    def module_heartbeat(payload: ModuleHeartbeatRequest) -> dict[str, Any]:
+        return {
+            "status": "heartbeat_accepted",
+            "module": node.heartbeat_module(payload),
+        }
+
+    @api.get("/dependencies")
+    def dependencies_status() -> dict[str, Any]:
+        return node.dependency_snapshot()
+
+    @api.post("/dependencies/report")
+    def report_dependency(payload: DependencyReportRequest) -> dict[str, Any]:
+        return {
+            "status": "dependency_report_accepted",
+            "dependency": node.report_dependency(payload),
+        }
+
+    @api.get("/events/recent")
+    def recent_events(limit: int = 50) -> dict[str, Any]:
+        return node.recent_event_snapshot(limit)
 
     @api.post("/analyze")
     def analyze_event(payload: AnalyzeRequest) -> dict[str, Any]:
@@ -598,6 +992,50 @@ def create_api_app(node: WatchtowerNode) -> FastAPI:
             "node_id": node.config.node_id,
             "state": node.state.value,
         }
+
+    # ========================================================
+    # /watchtower aliases
+    # ========================================================
+
+    @api.get("/watchtower/health")
+    def wt_health_check() -> dict[str, Any]:
+        return health_check()
+
+    @api.get("/watchtower/ready")
+    def wt_ready_check() -> dict[str, Any]:
+        return ready_check()
+
+    @api.get("/watchtower/status")
+    def wt_node_status() -> dict[str, Any]:
+        return node_status()
+
+    @api.get("/watchtower/modules")
+    def wt_modules_status() -> dict[str, Any]:
+        return modules_status()
+
+    @api.post("/watchtower/modules/register")
+    def wt_register_module(payload: ModuleRegisterRequest) -> dict[str, Any]:
+        return register_module(payload)
+
+    @api.post("/watchtower/modules/heartbeat")
+    def wt_module_heartbeat(payload: ModuleHeartbeatRequest) -> dict[str, Any]:
+        return module_heartbeat(payload)
+
+    @api.get("/watchtower/dependencies")
+    def wt_dependencies_status() -> dict[str, Any]:
+        return dependencies_status()
+
+    @api.post("/watchtower/dependencies/report")
+    def wt_report_dependency(payload: DependencyReportRequest) -> dict[str, Any]:
+        return report_dependency(payload)
+
+    @api.get("/watchtower/events/recent")
+    def wt_recent_events(limit: int = 50) -> dict[str, Any]:
+        return recent_events(limit)
+
+    @api.post("/watchtower/analyze")
+    def wt_analyze_event(payload: AnalyzeRequest) -> dict[str, Any]:
+        return analyze_event(payload)
 
     return api
 
@@ -630,6 +1068,9 @@ __all__ = [
     "WatchtowerSegment",
     "WatchtowerNode",
     "AnalyzeRequest",
+    "ModuleRegisterRequest",
+    "ModuleHeartbeatRequest",
+    "DependencyReportRequest",
     "build_node",
     "NODE",
     "app",
