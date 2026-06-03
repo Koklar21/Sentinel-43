@@ -1,8 +1,52 @@
 from __future__ import annotations
 
+import json
+import os
+import urllib.request
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict
 import uuid
+
+
+EVENT_TYPES_MODULE_ID = os.getenv("S43_EVENT_TYPES_MODULE_ID", "sentinel43-event-types")
+EVENT_TYPES_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
+WATCHTOWER_URL = os.getenv("S43_WATCHTOWER_URL", "http://s43-watchtower:9100").rstrip("/")
+WATCHTOWER_TIMEOUT = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _report_event_type_issue(
+    status: str,
+    issue: str,
+    details: dict[str, Any],
+) -> None:
+    payload = {
+        "event": {
+            "kind": "runtime",
+            "source": EVENT_TYPES_MODULE_ID,
+            "status": status,
+            "details": {
+                "issue": issue,
+                "timestamp": utc_now(),
+                **details,
+            },
+        }
+    }
+
+    try:
+        request = urllib.request.Request(
+            f"{WATCHTOWER_URL}/watchtower/analyze",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(request, timeout=WATCHTOWER_TIMEOUT)
+    except Exception:
+        pass
 
 
 @dataclass
@@ -89,17 +133,50 @@ def normalize_event(event: Dict[str, Any]) -> BaseEvent:
     Convert a raw event dict into the appropriate typed event object.
     Falls back to BaseEvent if the kind is unknown.
     """
-    kind = str(event.get("kind", "base")).lower()
+
+    if not isinstance(event, dict):
+        _report_event_type_issue(
+            status="failed",
+            issue="event_not_dict",
+            details={"received_type": type(event).__name__},
+        )
+        return BaseEvent(kind="base")
+
+    raw_kind = event.get("kind", "base")
+    kind = str(raw_kind).lower().strip() or "base"
     event_cls = _EVENT_TYPE_MAP.get(kind, BaseEvent)
 
-    if "id" not in event or not event["id"]:
-        event["id"] = str(uuid.uuid4())
+    local_event = dict(event)
+
+    if "id" not in local_event or not local_event["id"]:
+        local_event["id"] = str(uuid.uuid4())
+
+    if kind not in _EVENT_TYPE_MAP and kind != "base":
+        _report_event_type_issue(
+            status="degraded",
+            issue="unknown_event_kind",
+            details={
+                "kind": kind,
+                "event_id": local_event["id"],
+            },
+        )
 
     try:
-        return event_cls(**event)
-    except TypeError:
-        # If extra/unexpected fields appear, preserve minimum compatibility
+        return event_cls(**local_event)
+
+    except TypeError as exc:
+        _report_event_type_issue(
+            status="degraded",
+            issue="event_type_coercion_failed",
+            details={
+                "kind": kind,
+                "event_id": local_event["id"],
+                "error": str(exc),
+                "fallback": "BaseEvent",
+            },
+        )
+
         return BaseEvent(
-            id=event["id"],
+            id=local_event["id"],
             kind=kind,
         )
