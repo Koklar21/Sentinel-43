@@ -1,256 +1,203 @@
-# Sentinel-43 AuthManager Audit
+from __future__ import annotations
 
-## Source Under Review
-
-```python
-from datetime import datetime, timezone
-from typing import Optional
+import base64
+import hashlib
+import hmac
+import json
+import os
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from .models import AuthContext, AuthResult
 from .exceptions import InvalidTokenError, ExpiredTokenError
 from .hashing import constant_time_compare
 
 
+WATCHTOWER_URL = os.getenv("S43_WATCHTOWER_URL", "http://s43-watchtower:9100").rstrip("/")
+WATCHTOWER_TIMEOUT = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
+AUTH_MODULE_ID = os.getenv("S43_AUTH_MODULE_ID", "sentinel43-auth-manager")
+AUTH_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _watchtower_report(status: str, event: str, details: dict[str, Any]) -> None:
+    payload = {
+        "event": {
+            "kind": "security",
+            "source": AUTH_MODULE_ID,
+            "status": status,
+            "auth_event": event,
+            "details": {
+                "timestamp": utc_now(),
+                **details,
+            },
+        }
+    }
+
+    try:
+        request = urllib.request.Request(
+            f"{WATCHTOWER_URL}/watchtower/analyze",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(request, timeout=WATCHTOWER_TIMEOUT)
+    except Exception:
+        pass
+
+
+def _b64url_decode(value: str) -> bytes:
+    padded = value + "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(padded.encode("utf-8"))
+
+
+def _b64url_json_decode(value: str) -> dict[str, Any]:
+    raw = _b64url_decode(value)
+    parsed = json.loads(raw.decode("utf-8"))
+    if not isinstance(parsed, dict):
+        raise InvalidTokenError("invalid_token_payload", "Token payload must be an object")
+    return parsed
+
+
 class AuthManager:
     """
-    Sentinel-43 unified authentication manager
+    Sentinel-43 unified authentication manager.
+
+    Token format:
+        base64url(header).base64url(payload).base64url(signature)
+
+    Signature:
+        HMAC-SHA256(secret, header.payload)
     """
 
     def __init__(self, secret: bytes, issuer: str):
+        if not secret:
+            raise ValueError("AuthManager secret cannot be empty.")
+        if not issuer:
+            raise ValueError("AuthManager issuer cannot be empty.")
+
         self._secret = secret
         self._issuer = issuer
 
     def verify_token(self, token: str) -> AuthResult:
-        """
-        Verify token and return AuthResult
-        """
-
         try:
             context = self._decode_token(token)
 
             if context.expires_at < datetime.now(timezone.utc):
-                raise ExpiredTokenError("Token expired")
+                raise ExpiredTokenError("token_expired", "Token expired")
 
             return AuthResult(
                 success=True,
                 context=context,
             )
 
-        except Exception as e:
+        except (InvalidTokenError, ExpiredTokenError) as exc:
+            _watchtower_report(
+                status="degraded",
+                event="auth_rejected",
+                details={
+                    "reason": str(exc),
+                    "error_type": type(exc).__name__,
+                },
+            )
+
             return AuthResult(
                 success=False,
                 context=None,
-                reason=str(e),
+                reason=str(exc),
             )
 
+        except Exception as exc:
+            _watchtower_report(
+                status="failed",
+                event="auth_internal_failure",
+                details={
+                    "reason": str(exc),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise
+
     def _decode_token(self, token: str) -> AuthContext:
-        """
-        Replace this with JWT decode or signed token decode
-        """
+        if not token or not token.strip():
+            raise InvalidTokenError("token_missing", "Token missing")
 
-        # placeholder logic — replace with real JWT or signed blob
-        if not token:
-            raise InvalidTokenError("Token missing")
+        parts = token.split(".")
+        if len(parts) != 3:
+            raise InvalidTokenError("token_malformed", "Token must have header.payload.signature")
 
-        now = datetime.now(timezone.utc)
+        header_b64, payload_b64, signature_b64 = parts
+        signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
+
+        expected_signature = hmac.new(
+            self._secret,
+            signing_input,
+            hashlib.sha256,
+        ).digest()
+
+        try:
+            provided_signature = _b64url_decode(signature_b64)
+        except Exception as exc:
+            raise InvalidTokenError("token_bad_signature_encoding", "Invalid token signature encoding") from exc
+
+        expected_hex = expected_signature.hex()
+        provided_hex = provided_signature.hex()
+
+        if not constant_time_compare(provided_hex, expected_hex):
+            raise InvalidTokenError("token_bad_signature", "Invalid token signature")
+
+        header = _b64url_json_decode(header_b64)
+        payload = _b64url_json_decode(payload_b64)
+
+        alg = header.get("alg")
+        if alg != "HS256":
+            raise InvalidTokenError("token_bad_alg", "Unsupported token algorithm")
+
+        issuer = str(payload.get("iss", ""))
+        if issuer != self._issuer:
+            raise InvalidTokenError("token_bad_issuer", "Invalid token issuer")
+
+        subject_id = str(payload.get("sub", "")).strip()
+        if not subject_id:
+            raise InvalidTokenError("token_missing_subject", "Token subject missing")
+
+        now_ts = int(time.time())
+        exp = payload.get("exp")
+        iat = payload.get("iat", now_ts)
+
+        try:
+            exp_ts = int(exp)
+            iat_ts = int(iat)
+        except (TypeError, ValueError) as exc:
+            raise InvalidTokenError("token_bad_time_claims", "Invalid token time claims") from exc
+
+        if exp_ts < now_ts:
+            raise ExpiredTokenError("token_expired", "Token expired")
+
+        roles_raw = payload.get("roles", [])
+        if isinstance(roles_raw, str):
+            roles = {roles_raw}
+        elif isinstance(roles_raw, list):
+            roles = {str(role) for role in roles_raw if str(role).strip()}
+        else:
+            roles = set()
+
+        if not roles:
+            roles = {"guest"}
+
+        device_id = str(payload.get("device_id", "unknown"))
 
         return AuthContext(
-            subject_id="system",
-            device_id="local",
-            roles={"core"},
-            issued_at=now,
-            expires_at=now.replace(year=now.year + 1),
-            issuer=self._issuer,
+            subject_id=subject_id,
+            device_id=device_id,
+            roles=roles,
+            issued_at=datetime.fromtimestamp(iat_ts, tz=timezone.utc),
+            expires_at=datetime.fromtimestamp(exp_ts, tz=timezone.utc),
+            issuer=issuer,
         )
-```
-
----
-
-## BUG-001 — `verify_token` Swallows All Exceptions
-
-**Severity:** High
-**Location:** `auth_manager.py` → `AuthManager.verify_token()`
-
-### Problem
-
-`verify_token()` catches every exception with a broad `except Exception as e` block:
-
-```python
-except Exception as e:
-    return AuthResult(
-        success=False,
-        context=None,
-        reason=str(e),
-    )
-```
-
-This converts all failures into the same `success=False` result. That includes expected authentication failures such as `InvalidTokenError` and `ExpiredTokenError`, but it also includes internal programming errors, malformed decoded payloads, `AttributeError`, type errors, broken model construction, and unexpected runtime failures.
-
-As a result, callers cannot distinguish between a legitimate token rejection and a broken authentication subsystem. That is dangerous because internal defects can be hidden as normal authentication failures instead of surfacing during development, logging, monitoring, or incident review.
-
-### Impact
-
-A broken `_decode_token()` implementation or corrupted `AuthContext` construction could fail silently. The system would report an ordinary failed authentication attempt instead of exposing an internal failure. That makes debugging harder and can hide production defects.
-
-### Recommendation
-
-Catch only expected authentication exceptions and let unexpected exceptions either propagate or be logged separately before returning failure.
-
-Example direction:
-
-```python
-except (InvalidTokenError, ExpiredTokenError) as e:
-    return AuthResult(success=False, context=None, reason=str(e))
-```
-
-Unexpected exceptions should not be silently flattened into normal auth rejection responses. That is how bugs get fake IDs and walk past the bouncer.
-
----
-
-## BUG-002 — `_secret` Is Accepted but Never Used
-
-**Severity:** High
-**Location:** `auth_manager.py` → `AuthManager.__init__()`, `AuthManager._decode_token()`
-
-### Problem
-
-The constructor accepts and stores a secret:
-
-```python
-self._secret = secret
-```
-
-However, `_secret` is never referenced anywhere in the class. `_decode_token()` does not perform JWT validation, HMAC verification, signature verification, or any other secret-backed token validation.
-
-Instead, the current placeholder logic accepts any non-empty token:
-
-```python
-if not token:
-    raise InvalidTokenError("Token missing")
-```
-
-After that check, the method fabricates an `AuthContext`:
-
-```python
-return AuthContext(
-    subject_id="system",
-    device_id="local",
-    roles={"core"},
-    issued_at=now,
-    expires_at=now.replace(year=now.year + 1),
-    issuer=self._issuer,
-)
-```
-
-This means every non-empty token string is treated as valid and granted the same hardcoded privileged identity.
-
-### Impact
-
-If this placeholder is reachable in any real execution path, authentication is effectively bypassed. A token such as `"abc"`, `"test"`, or `"let-me-in"` would produce a successful `AuthResult` with `roles={"core"}`.
-
-The class interface implies secret-backed verification, but no such verification exists. That mismatch is especially risky because downstream code may trust `AuthManager` as if it performs real authentication.
-
-### Recommendation
-
-Fail closed until real decoding and verification are implemented.
-
-Example direction:
-
-```python
-def _decode_token(self, token: str) -> AuthContext:
-    if not token:
-        raise InvalidTokenError("Token missing")
-
-    raise InvalidTokenError("Token decoding not implemented")
-```
-
-When implemented for real, `_decode_token()` should verify token integrity using the configured secret before constructing an `AuthContext`.
-
----
-
-## BUG-003 — `constant_time_compare` Is Imported but Never Used
-
-**Severity:** Medium
-**Location:** `auth_manager.py` → imports
-
-### Problem
-
-The module imports `constant_time_compare`:
-
-```python
-from .hashing import constant_time_compare
-```
-
-But the function is never called. This appears directly related to the missing secret-backed verification in BUG-002. The import suggests signature or MAC comparison was intended, but the verification path was never wired up.
-
-### Impact
-
-This is not just cosmetic dead code. In an authentication component, an unused constant-time comparison helper is a warning sign that signature verification was started but not completed.
-
-If real token verification is added later and this issue is missed, a developer may use a naive `==` comparison for signatures or token hashes, creating a timing side-channel risk.
-
-### Recommendation
-
-Either remove the unused import until verification is implemented, or wire it into real HMAC/signature verification logic.
-
-For security-sensitive comparisons, avoid direct equality checks such as:
-
-```python
-provided_signature == expected_signature
-```
-
-Use the constant-time comparison helper instead.
-
----
-
-## BUG-004 — `expires_at` Calculation Can Crash on Leap Day
-
-**Severity:** Medium
-**Location:** `auth_manager.py` → `AuthManager._decode_token()`
-
-### Problem
-
-The placeholder expiration uses `datetime.replace()` to add one year:
-
-```python
-expires_at=now.replace(year=now.year + 1)
-```
-
-This is not safe date arithmetic. If `now` is February 29 during a leap year, replacing the year with a non-leap year raises `ValueError` because February 29 does not exist in the target year.
-
-### Impact
-
-This creates an intermittent date-dependent crash. It would only appear on leap day, which makes it easy to miss in testing and annoying to diagnose later. Humanity has apparently decided calendars were not already hostile enough.
-
-Although this code is placeholder logic, the pattern is dangerous if copied into real token generation or expiration logic.
-
-### Recommendation
-
-Use duration-based arithmetic instead of direct year replacement.
-
-Example direction:
-
-```python
-from datetime import timedelta
-
-expires_at = now + timedelta(days=365)
-```
-
-For true calendar-year behavior, use a calendar-aware library such as `dateutil.relativedelta`, but for token TTLs, a fixed duration is usually clearer and safer.
-
----
-
-## Summary
-
-| ID      | Location                        | Severity | Issue                                                                     |
-| ------- | ------------------------------- | -------: | ------------------------------------------------------------------------- |
-| BUG-001 | `verify_token()`                |     High | Broad exception handling hides internal failures as normal auth rejection |
-| BUG-002 | `__init__()`, `_decode_token()` |     High | `_secret` is stored but never used; any non-empty token is accepted       |
-| BUG-003 | imports                         |   Medium | `constant_time_compare` is imported but unused                            |
-| BUG-004 | `_decode_token()`               |   Medium | `now.replace(year=now.year + 1)` can crash on February 29                 |
-
----
-
-## Bottom Line
-
-The class shape is usable, but the current implementation is not performing real authentication. The highest-risk issue is that any non-empty token currently becomes a valid `AuthContext` with `roles={"core"}`. Until real token verification is implemented, `_decode_token()` should fail closed instead of fabricating a privileged context.
