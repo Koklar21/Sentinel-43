@@ -1,0 +1,253 @@
+/* ==========================================================
+   Sentinel-43 Dashboard
+   layout.css
+   ========================================================== */
+
+/* ==========================================================
+   Main Layout
+   ========================================================== */
+
+.layout {
+    display: flex;
+    min-height: 100vh;
+    background-color: var(--bg-primary);
+}
+
+.layout-main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+/* ==========================================================
+   Sidebar
+   ========================================================== */
+
+.sidebar {
+    width: var(--sidebar-width);
+    min-width: var(--sidebar-width);
+
+    background-color: var(--bg-secondary);
+
+    border-right: 1px solid var(--border-color);
+
+    display: flex;
+    flex-direction: column;
+}
+
+.sidebar-header {
+    padding: 20px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.sidebar-title {
+    font-size: 1.2rem;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.sidebar-subtitle {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+}
+
+.sidebar-nav {
+    flex: 1;
+    padding: 10px;
+}
+
+.sidebar-nav ul {
+    list-style: none;
+}
+
+.sidebar-nav li {
+    margin-bottom: 6px;
+}
+
+.sidebar-nav a {
+    display: block;
+
+    padding: 12px;
+
+    border-radius: 8px;
+
+    color: var(--text-secondary);
+    text-decoration: none;
+
+    transition: all 0.2s ease;
+}
+
+.sidebar-nav a:hover {
+    background-color: var(--bg-tertiary);
+    color: var(--text-primary);
+}
+
+.sidebar-nav a.active {
+    background-color: var(--info);
+    color: white;
+}
+
+/* ==========================================================
+   Topbar
+   ========================================================== */
+
+.topbar {
+    height: var(--header-height);
+
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+
+    padding: 0 20px;
+
+    background-color: var(--bg-secondary);
+
+    border-bottom: 1px solid var(--border-color);
+}
+
+.topbar-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.topbar-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.topbar-title {
+    font-size: 1.2rem;
+    font-weight: 700;
+}
+
+.topbar-status {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+}
+
+/* ==========================================================
+   Content Area
+   ========================================================== */
+
+.content {
+    flex: 1;
+    padding: 20px;
+    overflow-x: hidden;
+}
+
+.content-header {
+    margin-bottom: 20px;
+}
+
+.content-title {
+    font-size: 1.6rem;
+    font-weight: 700;
+}
+
+.content-subtitle {
+    color: var(--text-muted);
+    margin-top: 4px;
+}
+
+/* ==========================================================
+   Footer
+   ========================================================== */
+
+.footer {
+    padding: 12px 20px;
+
+    background-color: var(--bg-secondary);
+
+    border-top: 1px solid var(--border-color);
+
+    color: var(--text-muted);
+
+    font-size: 0.85rem;
+}
+
+.footer-content {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+/* ==========================================================
+   Navigation Groups
+   ========================================================== */
+
+.nav-section {
+    margin-bottom: 20px;
+}
+
+.nav-section-title {
+    padding: 8px 12px;
+
+    font-size: 0.75rem;
+    font-weight: 700;
+
+    color: var(--text-muted);
+
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+
+/* ==========================================================
+   Scrollbars
+   ========================================================== */
+
+.sidebar::-webkit-scrollbar,
+.content::-webkit-scrollbar {
+    width: 8px;
+}
+
+.sidebar::-webkit-scrollbar-track,
+.content::-webkit-scrollbar-track {
+    background: var(--bg-primary);
+}
+
+.sidebar::-webkit-scrollbar-thumb,
+.content::-webkit-scrollbar-thumb {
+    background: var(--border-color);
+    border-radius: 4px;
+}
+
+/* ==========================================================
+   Responsive Layout
+   ========================================================== */
+
+@media (max-width: 1024px) {
+    .sidebar {
+        width: 220px;
+        min-width: 220px;
+    }
+}
+
+@media (max-width: 768px) {
+    .layout {
+        flex-direction: column;
+    }
+
+    .sidebar {
+        width: 100%;
+        min-width: 100%;
+        border-right: none;
+        border-bottom: 1px solid var(--border-color);
+    }
+
+    .topbar {
+        padding: 0 12px;
+    }
+
+    .content {
+        padding: 12px;
+    }
+
+    .footer-content {
+        flex-direction: column;
+        gap: 8px;
+        text-align: center;
+    }
+}

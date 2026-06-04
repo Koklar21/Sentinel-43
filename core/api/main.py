@@ -15,6 +15,8 @@ from .routers.remote_gateway import router as remote_gateway_router
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from .routers.remote_gateway import router as remote_gateway_router
+
 APP_NAME = "sentinel-43-api"
 APP_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
 SENTINEL_ENV = os.getenv("SENTINEL_ENV", "development")
@@ -120,6 +122,8 @@ def register_api_with_watchtower() -> dict[str, Any]:
             "metrics",
             "core_bridge",
             "watchtower_bridge",
+            "remote_gateway",
+            "remote_operations",
         ],
         "metadata": {
             "environment": SENTINEL_ENV,
@@ -684,6 +688,7 @@ def compat_api_watchtower_ready() -> dict[str, Any]:
 # ============================================================
 
 app.include_router(root_router)
+app.include_router(remote_gateway_router)
 app.include_router(watchtower_router)
 app.include_router(core_router)
 app.include_router(rules_router)

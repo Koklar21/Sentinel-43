@@ -1,0 +1,305 @@
+/* ==========================================================
+   Sentinel-43 Dashboard
+   remote_ops.css
+   ========================================================== */
+
+/* ==========================================================
+   Page Container
+   ========================================================== */
+
+.remote-ops-container {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.remote-ops-header {
+    margin-bottom: 10px;
+}
+
+.remote-ops-title {
+    font-size: 1.75rem;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.remote-ops-subtitle {
+    color: var(--text-muted);
+    margin-top: 4px;
+}
+
+/* ==========================================================
+   Gateway Status
+   ========================================================== */
+
+.gateway-status {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+
+    padding: 16px;
+
+    background: var(--bg-secondary);
+
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+}
+
+.gateway-indicator {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+}
+
+.gateway-online {
+    background-color: var(--success);
+}
+
+.gateway-warning {
+    background-color: var(--warning);
+}
+
+.gateway-offline {
+    background-color: var(--danger);
+}
+
+.gateway-info {
+    display: flex;
+    flex-direction: column;
+}
+
+.gateway-name {
+    font-weight: 600;
+}
+
+.gateway-state {
+    color: var(--text-muted);
+}
+
+/* ==========================================================
+   Target Selection
+   ========================================================== */
+
+.target-selector {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.target-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 12px;
+}
+
+.target-card {
+    background: var(--bg-secondary);
+
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+
+    padding: 14px;
+
+    cursor: pointer;
+
+    transition: 0.2s ease-in-out;
+}
+
+.target-card:hover {
+    border-color: var(--info);
+}
+
+.target-card.selected {
+    border-color: var(--info);
+    box-shadow: 0 0 10px rgba(52, 152, 219, 0.25);
+}
+
+.target-name {
+    font-weight: 700;
+}
+
+.target-environment {
+    font-size: 0.9rem;
+    color: var(--text-muted);
+}
+
+/* ==========================================================
+   Event Form
+   ========================================================== */
+
+.remote-event-form {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+
+    background: var(--bg-secondary);
+
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+
+    padding: 20px;
+}
+
+.remote-event-form textarea {
+    min-height: 120px;
+}
+
+.remote-event-form select,
+.remote-event-form input,
+.remote-event-form textarea {
+    width: 100%;
+}
+
+.form-row {
+    display: flex;
+    gap: 12px;
+}
+
+.form-row > div {
+    flex: 1;
+}
+
+/* ==========================================================
+   Dry Run Controls
+   ========================================================== */
+
+.dry-run-panel {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+
+    padding: 12px;
+
+    background: rgba(241, 196, 15, 0.1);
+
+    border: 1px solid rgba(241, 196, 15, 0.4);
+    border-radius: 8px;
+}
+
+.dry-run-label {
+    font-weight: 600;
+}
+
+.dry-run-description {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+}
+
+/* ==========================================================
+   Event Results
+   ========================================================== */
+
+.remote-results {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.result-card {
+    padding: 16px;
+
+    border-radius: 10px;
+
+    border-left: 4px solid var(--info);
+
+    background: var(--bg-secondary);
+}
+
+.result-success {
+    border-left-color: var(--success);
+}
+
+.result-warning {
+    border-left-color: var(--warning);
+}
+
+.result-error {
+    border-left-color: var(--danger);
+}
+
+.result-title {
+    font-weight: 700;
+}
+
+.result-message {
+    margin-top: 6px;
+    color: var(--text-secondary);
+}
+
+.result-correlation {
+    margin-top: 10px;
+
+    font-family: monospace;
+
+    color: var(--info);
+}
+
+/* ==========================================================
+   Audit Results
+   ========================================================== */
+
+.audit-results {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.audit-entry {
+    background: var(--bg-secondary);
+
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+
+    padding: 12px;
+}
+
+.audit-entry-id {
+    font-family: monospace;
+    color: var(--info);
+}
+
+.audit-entry-time {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+}
+
+.audit-entry-message {
+    margin-top: 6px;
+}
+
+/* ==========================================================
+   Action Buttons
+   ========================================================== */
+
+.remote-actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.remote-actions .btn {
+    min-width: 140px;
+}
+
+/* ==========================================================
+   Responsive
+   ========================================================== */
+
+@media (max-width: 768px) {
+    .form-row {
+        flex-direction: column;
+    }
+
+    .gateway-status {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+
+    .remote-actions {
+        flex-direction: column;
+    }
+
+    .remote-actions .btn {
+        width: 100%;
+    }
+}
