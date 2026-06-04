@@ -1,48 +1,41 @@
 """
-dashboard/layouts/main_layout.py
-
-Main dashboard layout assembly for Sentinel-43.
+Sentinel-43 Dashboard Layout
+Main Layout
 """
 
 from __future__ import annotations
 
-from dash import dcc, html
+from typing import Any
 
-from dashboard.layouts.footer import build_footer
-from dashboard.layouts.header import build_header
-from dashboard.pages.remote_operations import build_remote_operations_page
+from dashboard.layouts.footer import footer
+from dashboard.layouts.sidebar import sidebar
+from dashboard.layouts.topbar import topbar
 
 
-def build_main_layout() -> html.Div:
+class MainLayout:
     """
-    Build the primary Sentinel-43 dashboard layout.
+    Primary dashboard layout.
 
-    Returns:
-        html.Div: Complete dashboard shell.
+    Composes:
+    - Topbar
+    - Sidebar
+    - Page Content
+    - Footer
     """
-    return html.Div(
-        [
-            dcc.Location(id="url", refresh=False),
 
-            html.Div(
-                [
-                    build_header(),
+    def render(
+        self,
+        *,
+        page_title: str,
+        page_content: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "title": page_title,
+            "topbar": topbar.render(page_title=page_title),
+            "sidebar": sidebar.render(),
+            "content": page_content,
+            "footer": footer.render(),
+        }
 
-                    html.Main(
-                        [
-                            html.Div(
-                                id="page-content",
-                                children=build_remote_operations_page(),
-                                className="page-content-inner",
-                            )
-                        ],
-                        className="dashboard-main",
-                    ),
 
-                    build_footer(),
-                ],
-                className="dashboard-shell",
-            ),
-        ],
-        className="dashboard-root",
-    )
+main_layout = MainLayout()
