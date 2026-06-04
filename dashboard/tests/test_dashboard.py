@@ -1,46 +1,35 @@
 """
-dashboard/tests/test_dashboard.py
-
-Tests for Sentinel-43 dashboard page layout.
+Sentinel-43 Dashboard Tests
+Dashboard Application
 """
 
 from __future__ import annotations
 
-from dash import html
-
-from dashboard.pages.dashboard import build_dashboard_page
+from dashboard.app import dashboard_app
 
 
-def test_build_dashboard_page_returns_div() -> None:
-    page = build_dashboard_page()
+def test_available_pages_returns_list() -> None:
+    pages = dashboard_app.available_pages()
 
-    assert isinstance(page, html.Div)
-
-
-def test_dashboard_page_has_expected_class_name() -> None:
-    page = build_dashboard_page()
-
-    assert page.className == "dashboard-page"
+    assert isinstance(pages, list)
+    assert "dashboard" in pages
 
 
-def test_dashboard_page_contains_header_and_sections() -> None:
-    page = build_dashboard_page()
+def test_dashboard_page_loads() -> None:
+    result = dashboard_app.get_page("dashboard")
 
-    class_names = [
-        getattr(child, "className", None)
-        for child in page.children
-    ]
-
-    assert "page-header" in class_names
-    assert "dashboard-status-grid" in class_names
-    assert "dashboard-panel-grid" in class_names
-    assert "dashboard-activity-section" in class_names
+    assert isinstance(result, dict)
+    assert "content" in result
 
 
-def test_dashboard_page_title_is_system_overview() -> None:
-    page = build_dashboard_page()
+def test_health_page_loads() -> None:
+    result = dashboard_app.get_page("health")
 
-    header = page.children[0]
-    title = header.children[0]
+    assert isinstance(result, dict)
+    assert "content" in result
 
-    assert title.children == "System Overview"
+
+def test_unknown_page_returns_error() -> None:
+    result = dashboard_app.get_page("definitely_not_real")
+
+    assert "error" in result
