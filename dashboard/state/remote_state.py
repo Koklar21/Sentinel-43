@@ -1,105 +1,70 @@
 """
-dashboard/state/remote_state.py
-
-Remote Gateway state management for Sentinel-43 Dashboard.
+Sentinel-43 Dashboard State
+Remote State
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import Any
 
 
 @dataclass(slots=True)
 class RemoteState:
-    """
-    Stores Remote Gateway status and event records.
-    """
+    gateway_health: dict[str, Any] = field(default_factory=dict)
+    targets: list[dict[str, Any]] = field(default_factory=list)
 
-    status: str = "UNKNOWN"
-    connection_status: str = "UNKNOWN"
-    records: list[dict[str, Any]] = field(default_factory=list)
+    selected_target: str | None = None
+    selected_event: str | None = None
 
-    last_submitted_event: dict[str, Any] | None = None
-    last_updated: datetime | None = None
+    last_operation: dict[str, Any] = field(default_factory=dict)
+
+    loading: bool = False
     error: str | None = None
 
-    def update(
-        self,
-        *,
-        status: str | None = None,
-        connection_status: str | None = None,
-        records: list[dict[str, Any]] | None = None,
-    ) -> None:
-        """
-        Update Remote Gateway state.
-        """
+    def set_gateway_health(self, value: dict[str, Any]) -> None:
+        self.gateway_health = value
 
-        if status is not None:
-            self.status = status
+    def set_targets(self, value: list[dict[str, Any]]) -> None:
+        self.targets = value
 
-        if connection_status is not None:
-            self.connection_status = connection_status
+    def set_selected_target(self, target_id: str | None) -> None:
+        self.selected_target = target_id
 
-        if records is not None:
-            self.records = records
+    def set_selected_event(self, event_name: str | None) -> None:
+        self.selected_event = event_name
 
-        self.last_updated = datetime.now(UTC)
-        self.error = None
+    def set_last_operation(self, operation: dict[str, Any]) -> None:
+        self.last_operation = operation
 
-    def record_submission(
-        self,
-        payload: dict[str, Any],
-    ) -> None:
-        """
-        Store last submitted remote event payload.
-        """
+    def set_loading(self, value: bool) -> None:
+        self.loading = value
 
-        self.last_submitted_event = payload
-        self.last_updated = datetime.now(UTC)
-
-    def set_error(
-        self,
-        message: str,
-    ) -> None:
-        """
-        Record Remote Gateway error state.
-        """
-
-        self.error = message
-        self.last_updated = datetime.now(UTC)
+    def set_error(self, error: str | None) -> None:
+        self.error = error
 
     def clear(self) -> None:
-        """
-        Reset Remote Gateway state.
-        """
+        self.gateway_health.clear()
+        self.targets.clear()
 
-        self.status = "UNKNOWN"
-        self.connection_status = "UNKNOWN"
-        self.records.clear()
-        self.last_submitted_event = None
-        self.last_updated = None
+        self.selected_target = None
+        self.selected_event = None
+
+        self.last_operation.clear()
+
+        self.loading = False
         self.error = None
 
-    @property
-    def total_records(self) -> int:
-        """
-        Return total remote records.
-        """
-
-        return len(self.records)
-
-    @property
-    def is_connected(self) -> bool:
-        """
-        Return whether Remote Gateway appears connected.
-        """
-
-        return self.connection_status.upper() in {
-            "CONNECTED",
-            "ONLINE",
-            "ACTIVE",
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "gateway_health": self.gateway_health,
+            "targets": self.targets,
+            "selected_target": self.selected_target,
+            "selected_event": self.selected_event,
+            "last_operation": self.last_operation,
+            "loading": self.loading,
+            "error": self.error,
+            "target_count": len(self.targets),
         }
 
 
