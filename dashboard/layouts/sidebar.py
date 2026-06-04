@@ -1,55 +1,63 @@
 """
-dashboard/layouts/sidebar.py
-
-Sentinel-43 dashboard sidebar navigation.
+Sentinel-43 Dashboard Layout
+Sidebar
 """
 
 from __future__ import annotations
 
-from dash import dcc, html
+from typing import Any
 
 
-def build_sidebar() -> html.Div:
+class Sidebar:
     """
-    Build dashboard sidebar navigation.
-
-    Returns:
-        html.Div: Sidebar component.
+    Dashboard navigation sidebar.
     """
 
-    nav_items = [
-        ("Dashboard", "/"),
-        ("Remote Operations", "/remote-operations"),
-        ("System Health", "/health"),
-        ("Activity Feed", "/activity"),
-        ("Audit Logs", "/audit"),
-        ("Watchtower", "/watchtower"),
-        ("Settings", "/settings"),
-    ]
+    def __init__(self) -> None:
+        self.navigation = [
+            {
+                "id": "dashboard",
+                "label": "Dashboard",
+                "route": "/dashboard",
+            },
+            {
+                "id": "health",
+                "label": "Health",
+                "route": "/health",
+            },
+            {
+                "id": "watchtower",
+                "label": "Watchtower",
+                "route": "/watchtower",
+            },
+            {
+                "id": "nodes",
+                "label": "Nodes",
+                "route": "/nodes",
+            },
+            {
+                "id": "audit",
+                "label": "Audit",
+                "route": "/audit",
+            },
+            {
+                "id": "remote_operations",
+                "label": "Remote Operations",
+                "route": "/remote-operations",
+            },
+            {
+                "id": "settings",
+                "label": "Settings",
+                "route": "/settings",
+            },
+        ]
 
-    return html.Div(
-        [
-            html.Div(
-                [
-                    html.H3(
-                        "Sentinel-43",
-                        className="sidebar-title",
-                    ),
-                    html.Hr(className="sidebar-divider"),
-                ]
-            ),
+    def render(self) -> dict[str, Any]:
+        return {
+            "title": "Sentinel-43",
+            "navigation": self.navigation,
+            "navigation_count": len(self.navigation),
+        }
 
-            html.Nav(
-                [
-                    dcc.Link(
-                        label,
-                        href=route,
-                        className="sidebar-link",
-                    )
-                    for label, route in nav_items
-                ],
-                className="sidebar-nav",
-            ),
-        ],
-        className="dashboard-sidebar",
-    )
+
+sidebar = Sidebar()
