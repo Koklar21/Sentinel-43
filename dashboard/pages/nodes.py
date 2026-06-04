@@ -1,71 +1,49 @@
 """
-dashboard/pages/nodes.py
-
-Node overview page for Sentinel-43 Dashboard.
+Sentinel-43 Dashboard Page
+Nodes
 """
 
 from __future__ import annotations
 
-from dash import html
+from typing import Any
 
-from dashboard.components.node_card import build_node_card
+from dashboard.services.watchtower_client import (
+    get_watchtower_nodes,
+    get_watchtower_status,
+)
 
 
-def build_nodes_page() -> html.Div:
+PAGE_ID = "nodes"
+PAGE_TITLE = "Nodes"
+
+
+def load_nodes_page() -> dict[str, Any]:
     """
-    Build the node overview page.
-
-    Returns:
-        html.Div: Nodes page layout.
+    Load node status page data.
     """
 
-    node_items = [
-        {
-            "name": "Watchtower",
-            "status": "ACTIVE",
-            "description": "System oversight, degradation tracking, and escalation monitoring.",
-        },
-        {
-            "name": "Remote Gateway",
-            "status": "CONNECTED",
-            "description": "Remote command intake, event submission, and operator-facing control bridge.",
-        },
-        {
-            "name": "Audit Layer",
-            "status": "READY",
-            "description": "Audit trail review, integrity checks, and event traceability.",
-        },
-        {
-            "name": "Health Monitor",
-            "status": "ONLINE",
-            "description": "API readiness, dependency checks, and operational health reporting.",
-        },
-    ]
+    return {
+        "page_id": PAGE_ID,
+        "page_title": PAGE_TITLE,
+        "nodes": get_watchtower_nodes(),
+        "status": get_watchtower_status(),
+    }
 
-    return html.Div(
-        [
-            html.Div(
-                [
-                    html.H2("Nodes", className="page-title"),
-                    html.P(
-                        "Review registered Sentinel-43 system nodes and their current operating state.",
-                        className="page-subtitle",
-                    ),
-                ],
-                className="page-header",
-            ),
 
-            html.Div(
-                [
-                    build_node_card(
-                        name=node["name"],
-                        status=node["status"],
-                        description=node["description"],
-                    )
-                    for node in node_items
-                ],
-                className="nodes-grid",
-            ),
-        ],
-        className="nodes-page",
-    )
+def get_nodes_summary() -> dict[str, Any]:
+    data = load_nodes_page()
+
+    nodes = data.get("nodes", {})
+    status = data.get("status", {})
+
+    node_count = 0
+
+    if isinstance(nodes.get("data"), list):
+        node_count = len(nodes["data"])
+
+    return {
+        "page": PAGE_TITLE,
+        "nodes_ok": nodes.get("ok", False),
+        "status_ok": status.get("ok", False),
+        "node_count": node_count,
+    }
