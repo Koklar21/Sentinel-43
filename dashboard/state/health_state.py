@@ -1,113 +1,60 @@
 """
-dashboard/state/health_state.py
-
-Health monitoring state for Sentinel-43 Dashboard.
+Sentinel-43 Dashboard State
+Health State
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import Any
 
 
 @dataclass(slots=True)
 class HealthState:
-    """
-    Stores system health information.
-    """
+    api_health: dict[str, Any] = field(default_factory=dict)
+    ready_status: dict[str, Any] = field(default_factory=dict)
+    system_status: dict[str, Any] = field(default_factory=dict)
+    metrics: dict[str, Any] = field(default_factory=dict)
 
-    api_status: str = "UNKNOWN"
-    ready_status: str = "UNKNOWN"
-
-    database_status: str = "UNKNOWN"
-    redis_status: str = "UNKNOWN"
-
-    dependencies: dict[str, Any] = field(default_factory=dict)
-
-    last_updated: datetime | None = None
+    loading: bool = False
     error: str | None = None
 
-    def update(
-        self,
-        *,
-        api_status: str | None = None,
-        ready_status: str | None = None,
-        database_status: str | None = None,
-        redis_status: str | None = None,
-        dependencies: dict[str, Any] | None = None,
-    ) -> None:
-        """
-        Update health state.
-        """
+    def set_api_health(self, value: dict[str, Any]) -> None:
+        self.api_health = value
 
-        if api_status is not None:
-            self.api_status = api_status
+    def set_ready_status(self, value: dict[str, Any]) -> None:
+        self.ready_status = value
 
-        if ready_status is not None:
-            self.ready_status = ready_status
+    def set_system_status(self, value: dict[str, Any]) -> None:
+        self.system_status = value
 
-        if database_status is not None:
-            self.database_status = database_status
+    def set_metrics(self, value: dict[str, Any]) -> None:
+        self.metrics = value
 
-        if redis_status is not None:
-            self.redis_status = redis_status
+    def set_loading(self, value: bool) -> None:
+        self.loading = value
 
-        if dependencies is not None:
-            self.dependencies = dependencies
-
-        self.last_updated = datetime.now(UTC)
-        self.error = None
-
-    def set_error(
-        self,
-        message: str,
-    ) -> None:
-        """
-        Record health-related error.
-        """
-
-        self.error = message
-        self.last_updated = datetime.now(UTC)
+    def set_error(self, error: str | None) -> None:
+        self.error = error
 
     def clear(self) -> None:
-        """
-        Reset health state.
-        """
+        self.api_health.clear()
+        self.ready_status.clear()
+        self.system_status.clear()
+        self.metrics.clear()
 
-        self.api_status = "UNKNOWN"
-        self.ready_status = "UNKNOWN"
-
-        self.database_status = "UNKNOWN"
-        self.redis_status = "UNKNOWN"
-
-        self.dependencies.clear()
-
-        self.last_updated = None
+        self.loading = False
         self.error = None
 
-    @property
-    def is_healthy(self) -> bool:
-        """
-        Determine if the system appears healthy.
-        """
-
-        unhealthy_states = {
-            "FAILED",
-            "OFFLINE",
-            "ERROR",
-            "CRITICAL",
-            "DEGRADED",
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "api_health": self.api_health,
+            "ready_status": self.ready_status,
+            "system_status": self.system_status,
+            "metrics": self.metrics,
+            "loading": self.loading,
+            "error": self.error,
         }
-
-        statuses = {
-            self.api_status.upper(),
-            self.ready_status.upper(),
-            self.database_status.upper(),
-            self.redis_status.upper(),
-        }
-
-        return not bool(statuses & unhealthy_states)
 
 
 health_state = HealthState()
