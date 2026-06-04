@@ -1,67 +1,71 @@
 """
-dashboard/services/remote_gateway_client.py
+Sentinel-43 Dashboard Service
+Remote Gateway Client
 
-Remote Gateway service wrapper for Sentinel-43 Dashboard.
+Calls the authorized Remote Gateway API endpoints.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from dashboard.services.api_client import api_client
+from dashboard.services.api_client import api_get, api_post
 
 
-def fetch_remote_operations() -> dict[str, Any]:
-    """
-    Fetch remote operations status/events from the Sentinel-43 API.
-    """
-    return api_client.get_remote_operations()
+def get_remote_gateway_health() -> dict[str, Any]:
+    return api_get("/remote/health")
 
 
-def submit_remote_gateway_event(payload: dict[str, Any]) -> dict[str, Any]:
-    """
-    Submit a remote gateway event to the Sentinel-43 API.
-    """
-    if not payload:
+def get_remote_targets() -> dict[str, Any]:
+    return api_get("/remote/targets")
+
+
+def activate_remote_event(
+    *,
+    operator_id: str,
+    operator_role: str,
+    target_id: str,
+    event_type: str,
+    reason: str,
+    correlation_id: str,
+    dry_run: bool = True,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    body = {
+        "operator_id": operator_id,
+        "operator_role": operator_role,
+        "target_id": target_id,
+        "event_type": event_type,
+        "reason": reason,
+        "correlation_id": correlation_id,
+        "dry_run": dry_run,
+        "payload": payload or {},
+    }
+
+    return api_post("/remote/events/activate", body)
+
+
+def get_remote_audit_records(correlation_id: str) -> dict[str, Any]:
+    cleaned = correlation_id.strip()
+
+    if not cleaned:
         return {
-            "success": False,
-            "error": "Remote gateway payload cannot be empty.",
+            "ok": False,
+            "status_code": None,
+            "data": None,
+            "error": "correlation_id is required",
+            "headers": {},
         }
 
-    return api_client.submit_remote_event(payload)
+    return api_get(f"/remote/audit/{cleaned}")
 
 
-def normalize_remote_operations(response: dict[str, Any]) -> list[dict[str, Any]]:
-    """
-    Normalize remote gateway API response into dashboard-ready records.
-    """
+def get_remote_gateway_snapshot() -> dict[str, Any]:
+    health = get_remote_gateway_health()
+    targets = get_remote_targets()
 
-    if not response:
-        return []
-
-    if isinstance(response.get("records"), list):
-        return response["records"]
-
-    if isinstance(response.get("events"), list):
-        return response["events"]
-
-    if isinstance(response.get("remote_events"), list):
-        return response["remote_events"]
-
-    if isinstance(response.get("items"), list):
-        return response["items"]
-
-    return []
-
-
-def get_remote_gateway_records() -> list[dict[str, Any]]:
-    """
-    Fetch and normalize remote gateway records.
-    """
-
-    response = fetch_remote_operations()
-
-    if response.get("success") is False:
-        return []
-
-    return normalize_remote_operations(response)
+    return {
+        "ok": health.get("ok", False) and targets.get("ok", False),
+        "health": health,
+        "targets": targets,
+    }
