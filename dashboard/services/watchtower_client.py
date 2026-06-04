@@ -1,78 +1,50 @@
 """
-dashboard/services/watchtower_client.py
+Sentinel-43 Dashboard Service
+Watchtower Client
 
-Watchtower-specific service wrapper for Sentinel-43 Dashboard.
+Provides dashboard access to Watchtower endpoints.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from dashboard.services.api_client import api_client
+from dashboard.services.api_client import api_get
 
 
-DEFAULT_TOWERS: list[dict[str, Any]] = [
-    {"name": "API_HEALTH", "status": "UNKNOWN"},
-    {"name": "EXPECTATION_GUARD", "status": "UNKNOWN"},
-    {"name": "CONFIG_DRIFT", "status": "UNKNOWN"},
-    {"name": "LOGGING_AUDIT", "status": "UNKNOWN"},
-    {"name": "ERROR_RATE", "status": "UNKNOWN"},
-    {"name": "DEPENDENCY_HEALTH", "status": "UNKNOWN"},
-    {"name": "RESOURCE_PRESSURE", "status": "UNKNOWN"},
-    {"name": "SECURITY_BASELINE", "status": "UNKNOWN"},
-]
+def get_watchtower_health() -> dict[str, Any]:
+    return api_get("/watchtower/health")
 
 
-def fetch_watchtower_status() -> dict[str, Any]:
-    """
-    Fetch Watchtower status from the Sentinel-43 API.
-    """
-    return api_client.get_watchtower_status()
+def get_watchtower_status() -> dict[str, Any]:
+    return api_get("/watchtower/status")
 
 
-def normalize_watchtower_status(response: dict[str, Any]) -> dict[str, Any]:
-    """
-    Normalize Watchtower API response into dashboard-ready status data.
-    """
+def get_watchtower_nodes() -> dict[str, Any]:
+    return api_get("/watchtower/nodes")
 
-    if not response or response.get("success") is False:
-        return {
-            "overall_status": "UNKNOWN",
-            "tower_count": len(DEFAULT_TOWERS),
-            "degraded_towers": 0,
-            "active_alerts": 0,
-            "towers": DEFAULT_TOWERS,
-        }
 
-    towers = response.get("towers")
+def get_watchtower_alerts() -> dict[str, Any]:
+    return api_get("/watchtower/alerts")
 
-    if not isinstance(towers, list):
-        towers = response.get("items")
 
-    if not isinstance(towers, list):
-        towers = DEFAULT_TOWERS
+def get_watchtower_metrics() -> dict[str, Any]:
+    return api_get("/watchtower/metrics")
 
-    degraded_count = sum(
-        1
-        for tower in towers
-        if str(tower.get("status", "")).upper() in {"DEGRADED", "FAILED", "OFFLINE"}
-    )
+
+def get_watchtower_snapshot() -> dict[str, Any]:
+    health = get_watchtower_health()
+    status = get_watchtower_status()
+    nodes = get_watchtower_nodes()
+    alerts = get_watchtower_alerts()
 
     return {
-        "overall_status": response.get("overall_status")
-        or response.get("status")
-        or "UNKNOWN",
-        "tower_count": response.get("tower_count") or len(towers),
-        "degraded_towers": response.get("degraded_towers") or degraded_count,
-        "active_alerts": response.get("active_alerts") or response.get("alerts") or 0,
-        "towers": towers,
+        "ok": (
+            health.get("ok", False)
+            and status.get("ok", False)
+        ),
+        "health": health,
+        "status": status,
+        "nodes": nodes,
+        "alerts": alerts,
     }
-
-
-def get_watchtower_dashboard_status() -> dict[str, Any]:
-    """
-    Fetch and normalize Watchtower status for dashboard display.
-    """
-
-    response = fetch_watchtower_status()
-    return normalize_watchtower_status(response)
