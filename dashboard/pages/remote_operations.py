@@ -1,8 +1,6 @@
 """
-Sentinel-43 Dashboard Page: Remote Operations.
-
-This page is the dashboard-facing UI logic for authorized remote operations.
-It does NOT perform backend authorization directly. It calls the API service layer.
+Sentinel-43 Dashboard Page
+Remote Operations
 """
 
 from __future__ import annotations
@@ -11,35 +9,32 @@ from typing import Any
 
 from dashboard.services.remote_gateway_client import (
     activate_remote_event,
+    get_remote_audit_records,
     get_remote_gateway_health,
+    get_remote_gateway_snapshot,
     get_remote_targets,
 )
 
 
+PAGE_ID = "remote_operations"
 PAGE_TITLE = "Remote Operations"
 
 
 def load_remote_operations_page() -> dict[str, Any]:
     """
-    Load initial remote operations page data.
-
-    Used by the dashboard app to render:
-      - Gateway health
-      - Registered targets
-      - Available event types
+    Load Remote Operations page data.
     """
-    gateway_health = get_remote_gateway_health()
-    targets = get_remote_targets()
 
     return {
-        "page": PAGE_TITLE,
-        "gateway_health": gateway_health,
-        "targets": targets,
-        "ready": gateway_health.get("enabled", False),
+        "page_id": PAGE_ID,
+        "page_title": PAGE_TITLE,
+        "snapshot": get_remote_gateway_snapshot(),
+        "health": get_remote_gateway_health(),
+        "targets": get_remote_targets(),
     }
 
 
-def submit_remote_event(
+def submit_remote_operation(
     *,
     operator_id: str,
     operator_role: str,
@@ -50,16 +45,6 @@ def submit_remote_event(
     dry_run: bool = True,
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """
-    Submit a remote event activation request through the service client.
-
-    The backend remote gateway still performs:
-      - token validation
-      - role validation
-      - target validation
-      - event validation
-      - audit logging
-    """
     return activate_remote_event(
         operator_id=operator_id,
         operator_role=operator_role,
@@ -72,18 +57,19 @@ def submit_remote_event(
     )
 
 
-def render_remote_operations_summary() -> dict[str, Any]:
-    """
-    Lightweight page summary.
+def get_remote_operation_audit(
+    correlation_id: str,
+) -> dict[str, Any]:
+    return get_remote_audit_records(correlation_id)
 
-    This keeps dashboard/app.py from needing to know endpoint details.
-    """
+
+def get_remote_operations_summary() -> dict[str, Any]:
     data = load_remote_operations_page()
+    snapshot = data.get("snapshot", {})
 
     return {
-        "title": PAGE_TITLE,
-        "gateway_state": data.get("gateway_health", {}).get("state", "unknown"),
-        "gateway_enabled": data.get("gateway_health", {}).get("enabled", False),
-        "target_count": len(data.get("targets", [])),
-        "targets": data.get("targets", []),
+        "page": PAGE_TITLE,
+        "ok": snapshot.get("ok", False),
+        "health_ok": data["health"].get("ok", False),
+        "targets_ok": data["targets"].get("ok", False),
     }
