@@ -120,6 +120,8 @@ def register_api_with_watchtower() -> dict[str, Any]:
             "metrics",
             "core_bridge",
             "watchtower_bridge",
+            "remote_gateway",
+            "remote_operations",
         ],
         "metadata": {
             "environment": SENTINEL_ENV,
