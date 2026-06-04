@@ -1,0 +1,149 @@
+/* ==========================================================
+   Sentinel-43 Dashboard
+   cards.css
+   ========================================================== */
+
+.card {
+    background: #1b1f24;
+    border: 1px solid #2f3742;
+    border-radius: 12px;
+    padding: 16px;
+    margin: 12px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+
+.card-header {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: #ffffff;
+    margin-bottom: 12px;
+}
+
+.card-body {
+    color: #d7dde5;
+}
+
+.card-footer {
+    margin-top: 12px;
+    padding-top: 8px;
+    border-top: 1px solid #2f3742;
+    color: #9aa7b5;
+    font-size: 0.9rem;
+}
+
+/* ==========================================================
+   Status Cards
+   ========================================================== */
+
+.status-card {
+    display: flex;
+    flex-direction: column;
+    min-height: 120px;
+}
+
+.status-title {
+    font-size: 0.9rem;
+    color: #9aa7b5;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.status-value {
+    font-size: 2rem;
+    font-weight: 700;
+    margin-top: 8px;
+    color: #ffffff;
+}
+
+.status-online {
+    border-left: 4px solid #2ecc71;
+}
+
+.status-warning {
+    border-left: 4px solid #f1c40f;
+}
+
+.status-error {
+    border-left: 4px solid #e74c3c;
+}
+
+/* ==========================================================
+   Node Cards
+   ========================================================== */
+
+.node-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.node-name {
+    font-weight: 600;
+    color: #ffffff;
+}
+
+.node-state {
+    font-size: 0.9rem;
+}
+
+.node-active {
+    color: #2ecc71;
+}
+
+.node-degraded {
+    color: #f1c40f;
+}
+
+.node-failed {
+    color: #e74c3c;
+}
+
+/* ==========================================================
+   Audit Cards
+   ========================================================== */
+
+.audit-card {
+    border-left: 4px solid #3498db;
+}
+
+.audit-id {
+    font-family: monospace;
+    color: #8ecdf5;
+}
+
+.audit-timestamp {
+    color: #9aa7b5;
+    font-size: 0.85rem;
+}
+
+/* ==========================================================
+   Remote Operations Cards
+   ========================================================== */
+
+.remote-card {
+    border-left: 4px solid #8e44ad;
+}
+
+.remote-target {
+    font-weight: 600;
+}
+
+.remote-event {
+    font-family: monospace;
+    color: #d6b3ff;
+}
+
+/* ==========================================================
+   Responsive
+   ========================================================== */
+
+@media (max-width: 768px) {
+    .card {
+        margin: 8px;
+        padding: 12px;
+    }
+
+    .status-value {
+        font-size: 1.5rem;
+    }
+}
