@@ -1,53 +1,30 @@
 """
-dashboard/layouts/topbar.py
-
-Top navigation/status bar for Sentinel-43.
+Sentinel-43 Dashboard Layout
+Topbar
 """
 
 from __future__ import annotations
 
-from dash import html
+from datetime import datetime, timezone
+from typing import Any
 
 
-def build_topbar() -> html.Div:
+class Topbar:
     """
-    Build dashboard top status bar.
-
-    Returns:
-        html.Div: Topbar component.
+    Dashboard top navigation bar.
     """
 
-    return html.Div(
-        [
-            html.Div(
-                [
-                    html.Span(
-                        "●",
-                        className="status-indicator online",
-                    ),
-                    html.Span(
-                        "System Online",
-                        className="status-label",
-                    ),
-                ],
-                className="topbar-status",
-            ),
+    def render(
+        self,
+        *,
+        page_title: str,
+    ) -> dict[str, Any]:
+        return {
+            "page_title": page_title,
+            "system_name": "Sentinel-43",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": "online",
+        }
 
-            html.Div(
-                [
-                    html.Span(
-                        "Active Nodes: --",
-                        id="topbar-active-nodes",
-                        className="topbar-metric",
-                    ),
-                    html.Span(
-                        "Alerts: --",
-                        id="topbar-alert-count",
-                        className="topbar-metric",
-                    ),
-                ],
-                className="topbar-metrics",
-            ),
-        ],
-        className="dashboard-topbar",
-    )
+
+topbar = Topbar()
