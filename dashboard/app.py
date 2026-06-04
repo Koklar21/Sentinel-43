@@ -1,45 +1,57 @@
 """
-dashboard/app.py
-
-Dash application factory for Sentinel-43 Dashboard.
+Sentinel-43 Dashboard Application
 """
 
 from __future__ import annotations
 
-import os
+from typing import Any
 
-from dash import Dash
+from dashboard.layouts.main_layout import main_layout
 
-from dashboard.layouts.main_layout import build_main_layout
+from dashboard.pages.dashboard import load_dashboard_page
+from dashboard.pages.health import load_health_page
+from dashboard.pages.watchtower import load_watchtower_page
+from dashboard.pages.nodes import load_nodes_page
+from dashboard.pages.audit import load_audit_page
+from dashboard.pages.remote_operations import (
+    load_remote_operations_page,
+)
+from dashboard.pages.settings import load_settings_page
 
 
-def create_dashboard_app() -> Dash:
+PAGE_LOADERS = {
+    "dashboard": load_dashboard_page,
+    "health": load_health_page,
+    "watchtower": load_watchtower_page,
+    "nodes": load_nodes_page,
+    "audit": load_audit_page,
+    "remote_operations": load_remote_operations_page,
+    "settings": load_settings_page,
+}
+
+
+class DashboardApplication:
     """
-    Create and configure the Sentinel-43 Dash app.
+    Sentinel-43 Dashboard Controller.
     """
 
-    app = Dash(
-        __name__,
-        title="Sentinel-43 Dashboard",
-        suppress_callback_exceptions=True,
-        assets_folder="assets",
-    )
+    def get_page(self, page_name: str) -> dict[str, Any]:
+        loader = PAGE_LOADERS.get(page_name)
 
-    app.layout = build_main_layout()
+        if loader is None:
+            return {
+                "error": f"Unknown page: {page_name}",
+            }
 
-    return app
+        page = loader()
+
+        return main_layout.render(
+            page_title=page.get("page_title", page_name),
+            page_content=page,
+        )
+
+    def available_pages(self) -> list[str]:
+        return sorted(PAGE_LOADERS.keys())
 
 
-app = create_dashboard_app()
-
-
-if __name__ == "__main__":
-    host = os.getenv("DASH_HOST", "0.0.0.0")
-    port = int(os.getenv("DASH_PORT", "8050"))
-    debug = os.getenv("DASH_DEBUG", "false").lower() == "true"
-
-    app.run(
-        host=host,
-        port=port,
-        debug=debug,
-    )
+dashboard_app = DashboardApplication()
