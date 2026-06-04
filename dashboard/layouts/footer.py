@@ -1,29 +1,35 @@
 """
-dashboard/layouts/footer.py
-
-Dashboard footer layout component.
+Sentinel-43 Dashboard Layout
+Footer
 """
 
-from dash import html
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
 
 
-def build_footer() -> html.Footer:
+class Footer:
     """
-    Build application footer.
-
-    Returns:
-        html.Footer: Dashboard footer component.
+    Dashboard footer component.
     """
-    return html.Footer(
-        [
-            html.Div(
-                [
-                    html.Span("Sentinel-43"),
-                    html.Span(" | "),
-                    html.Span("Operational Monitoring Platform"),
-                ],
-                className="footer-content",
-            )
-        ],
-        className="dashboard-footer",
-    )
+
+    def __init__(
+        self,
+        *,
+        application_name: str = "Sentinel-43",
+        version: str = "0.1.0",
+    ) -> None:
+        self.application_name = application_name
+        self.version = version
+
+    def render(self) -> dict[str, Any]:
+        return {
+            "application": self.application_name,
+            "version": self.version,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "message": "Sentinel-43 Dashboard Online",
+        }
+
+
+footer = Footer()
