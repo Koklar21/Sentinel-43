@@ -1,73 +1,50 @@
 """
-dashboard/pages/health.py
-
-System health page for Sentinel-43.
+Sentinel-43 Dashboard Page
+Health
 """
 
 from __future__ import annotations
 
-from dash import html
+from typing import Any
 
-from dashboard.components.health_panel import build_health_panel
-from dashboard.components.status_card import build_status_card
+from dashboard.services.health_client import (
+    get_api_health,
+    get_api_metrics,
+    get_api_ready,
+    get_api_status,
+    get_health_snapshot,
+)
 
 
-def build_health_page() -> html.Div:
+PAGE_ID = "health"
+PAGE_TITLE = "System Health"
+
+
+def load_health_page() -> dict[str, Any]:
     """
-    Build the system health page.
-
-    Returns:
-        html.Div: Health page layout.
+    Load health page data.
     """
 
-    return html.Div(
-        [
-            html.Div(
-                [
-                    html.H2(
-                        "System Health",
-                        className="page-title",
-                    ),
-                    html.P(
-                        "Monitor overall platform health and operational readiness.",
-                        className="page-subtitle",
-                    ),
-                ],
-                className="page-header",
-            ),
+    return {
+        "page_id": PAGE_ID,
+        "page_title": PAGE_TITLE,
+        "snapshot": get_health_snapshot(),
+        "health": get_api_health(),
+        "ready": get_api_ready(),
+        "status": get_api_status(),
+        "metrics": get_api_metrics(),
+    }
 
-            html.Div(
-                [
-                    build_status_card(
-                        title="API",
-                        value="ONLINE",
-                        status="healthy",
-                    ),
-                    build_status_card(
-                        title="Watchtower",
-                        value="ACTIVE",
-                        status="healthy",
-                    ),
-                    build_status_card(
-                        title="Database",
-                        value="CONNECTED",
-                        status="healthy",
-                    ),
-                    build_status_card(
-                        title="Remote Gateway",
-                        value="CONNECTED",
-                        status="healthy",
-                    ),
-                ],
-                className="health-status-grid",
-            ),
 
-            html.Div(
-                [
-                    build_health_panel(),
-                ],
-                className="health-panel-section",
-            ),
-        ],
-        className="health-page",
-    )
+def get_health_summary() -> dict[str, Any]:
+    data = load_health_page()
+    snapshot = data.get("snapshot", {})
+
+    return {
+        "page": PAGE_TITLE,
+        "ok": snapshot.get("ok", False),
+        "health_ok": data["health"].get("ok", False),
+        "ready_ok": data["ready"].get("ok", False),
+        "status_ok": data["status"].get("ok", False),
+        "metrics_ok": data["metrics"].get("ok", False),
+    }
