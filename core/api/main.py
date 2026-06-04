@@ -10,6 +10,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
+from .routers.remote_gateway import router as remote_gateway_router
+
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
