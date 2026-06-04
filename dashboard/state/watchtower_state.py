@@ -1,95 +1,64 @@
 """
-dashboard/state/watchtower_state.py
-
-Watchtower state management for Sentinel-43 Dashboard.
+Sentinel-43 Dashboard State
+Watchtower State
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import Any
 
 
 @dataclass(slots=True)
 class WatchtowerState:
-    """
-    Stores Watchtower dashboard status.
-    """
+    health: dict[str, Any] = field(default_factory=dict)
+    status: dict[str, Any] = field(default_factory=dict)
 
-    overall_status: str = "UNKNOWN"
-    tower_count: int = 0
-    degraded_towers: int = 0
-    active_alerts: int = 0
+    nodes: list[dict[str, Any]] = field(default_factory=list)
+    alerts: list[dict[str, Any]] = field(default_factory=list)
 
-    towers: list[dict[str, Any]] = field(default_factory=list)
-
-    last_updated: datetime | None = None
+    loading: bool = False
     error: str | None = None
 
-    def update(
-        self,
-        *,
-        overall_status: str | None = None,
-        tower_count: int | None = None,
-        degraded_towers: int | None = None,
-        active_alerts: int | None = None,
-        towers: list[dict[str, Any]] | None = None,
-    ) -> None:
-        """
-        Update Watchtower state.
-        """
+    def set_health(self, value: dict[str, Any]) -> None:
+        self.health = value
 
-        if overall_status is not None:
-            self.overall_status = overall_status
+    def set_status(self, value: dict[str, Any]) -> None:
+        self.status = value
 
-        if tower_count is not None:
-            self.tower_count = tower_count
+    def set_nodes(self, value: list[dict[str, Any]]) -> None:
+        self.nodes = value
 
-        if degraded_towers is not None:
-            self.degraded_towers = degraded_towers
+    def set_alerts(self, value: list[dict[str, Any]]) -> None:
+        self.alerts = value
 
-        if active_alerts is not None:
-            self.active_alerts = active_alerts
+    def set_loading(self, value: bool) -> None:
+        self.loading = value
 
-        if towers is not None:
-            self.towers = towers
-
-        self.last_updated = datetime.now(UTC)
-        self.error = None
-
-    def set_error(self, message: str) -> None:
-        """
-        Record Watchtower error state.
-        """
-
-        self.error = message
-        self.last_updated = datetime.now(UTC)
+    def set_error(self, error: str | None) -> None:
+        self.error = error
 
     def clear(self) -> None:
-        """
-        Reset Watchtower state.
-        """
+        self.health.clear()
+        self.status.clear()
 
-        self.overall_status = "UNKNOWN"
-        self.tower_count = 0
-        self.degraded_towers = 0
-        self.active_alerts = 0
-        self.towers.clear()
-        self.last_updated = None
+        self.nodes.clear()
+        self.alerts.clear()
+
+        self.loading = False
         self.error = None
 
-    @property
-    def is_healthy(self) -> bool:
-        """
-        Return whether Watchtower appears healthy.
-        """
-
-        return (
-            self.overall_status.upper() in {"ACTIVE", "ONLINE", "HEALTHY"}
-            and self.degraded_towers == 0
-            and self.active_alerts == 0
-        )
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "health": self.health,
+            "status": self.status,
+            "nodes": self.nodes,
+            "alerts": self.alerts,
+            "loading": self.loading,
+            "error": self.error,
+            "node_count": len(self.nodes),
+            "alert_count": len(self.alerts),
+        }
 
 
 watchtower_state = WatchtowerState()
