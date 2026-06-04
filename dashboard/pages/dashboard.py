@@ -1,83 +1,47 @@
 """
-dashboard/pages/dashboard.py
-
-Main dashboard page for Sentinel-43.
+Sentinel-43 Dashboard Page
+Dashboard
 """
 
 from __future__ import annotations
 
-from dash import html
+from typing import Any
 
-from dashboard.components.activity_feed import build_activity_feed
-from dashboard.components.alert_panel import build_alert_panel
-from dashboard.components.health_panel import build_health_panel
-from dashboard.components.status_card import build_status_card
+from dashboard.services.health_client import get_health_snapshot
+from dashboard.services.watchtower_client import get_watchtower_snapshot
+from dashboard.services.remote_gateway_client import (
+    get_remote_gateway_snapshot,
+)
 
 
-def build_dashboard_page() -> html.Div:
+PAGE_ID = "dashboard"
+PAGE_TITLE = "Sentinel-43 Dashboard"
+
+
+def load_dashboard_page() -> dict[str, Any]:
     """
-    Build the primary Sentinel-43 dashboard page.
-
-    Returns:
-        html.Div: Dashboard page layout.
+    Load primary dashboard data.
     """
 
-    return html.Div(
-        [
-            html.Div(
-                [
-                    html.H2(
-                        "System Overview",
-                        className="page-title",
-                    ),
-                    html.P(
-                        "Real-time operational status of Sentinel-43.",
-                        className="page-subtitle",
-                    ),
-                ],
-                className="page-header",
-            ),
+    health = get_health_snapshot()
+    watchtower = get_watchtower_snapshot()
+    remote_gateway = get_remote_gateway_snapshot()
 
-            html.Div(
-                [
-                    build_status_card(
-                        title="API Status",
-                        value="ONLINE",
-                        status="healthy",
-                    ),
-                    build_status_card(
-                        title="Watchtower",
-                        value="ACTIVE",
-                        status="healthy",
-                    ),
-                    build_status_card(
-                        title="Remote Gateway",
-                        value="CONNECTED",
-                        status="healthy",
-                    ),
-                    build_status_card(
-                        title="Alerts",
-                        value="0",
-                        status="healthy",
-                    ),
-                ],
-                className="dashboard-status-grid",
-            ),
+    return {
+        "page_id": PAGE_ID,
+        "page_title": PAGE_TITLE,
+        "health": health,
+        "watchtower": watchtower,
+        "remote_gateway": remote_gateway,
+    }
 
-            html.Div(
-                [
-                    build_health_panel(),
-                    build_alert_panel(),
-                ],
-                className="dashboard-panel-grid",
-            ),
 
-            html.Div(
-                [
-                    build_activity_feed(),
-                ],
-                className="dashboard-activity-section",
-            ),
-        ],
-        className="dashboard-page",
-    )
+def get_dashboard_summary() -> dict[str, Any]:
+    data = load_dashboard_page()
+
+    return {
+        "page": PAGE_TITLE,
+        "api_online": data["health"].get("ok", False),
+        "watchtower_online": data["watchtower"].get("ok", False),
+        "remote_gateway_online": data["remote_gateway"].get("ok", False),
+    }
