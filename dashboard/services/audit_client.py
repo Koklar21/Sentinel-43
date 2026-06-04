@@ -1,63 +1,46 @@
 """
-dashboard/services/audit_client.py
+Sentinel-43 Dashboard Service
+Audit Client
 
-Audit-specific service wrapper for Sentinel-43 Dashboard.
+Provides dashboard access to audit-related API endpoints.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from dashboard.services.api_client import api_client
+from dashboard.services.api_client import api_get
 
 
-def fetch_audit_logs() -> dict[str, Any]:
-    """
-    Fetch audit log records from the Sentinel-43 API.
-
-    Returns:
-        dict[str, Any]: Audit log response payload.
-    """
-    return api_client.get_audit_logs()
+def get_audit_records() -> dict[str, Any]:
+    return api_get("/audit")
 
 
-def normalize_audit_logs(response: dict[str, Any]) -> list[dict[str, Any]]:
-    """
-    Normalize audit API response into a list of audit records.
-
-    Returns:
-        list[dict[str, Any]]: Normalized audit log records.
-    """
-
-    if not response:
-        return []
-
-    if isinstance(response.get("records"), list):
-        return response["records"]
-
-    if isinstance(response.get("logs"), list):
-        return response["logs"]
-
-    if isinstance(response.get("audit_logs"), list):
-        return response["audit_logs"]
-
-    if isinstance(response.get("items"), list):
-        return response["items"]
-
-    return []
+def get_audit_status() -> dict[str, Any]:
+    return api_get("/audit/status")
 
 
-def get_audit_records() -> list[dict[str, Any]]:
-    """
-    Fetch and normalize audit records.
+def get_audit_record(audit_id: str) -> dict[str, Any]:
+    cleaned = audit_id.strip()
 
-    Returns:
-        list[dict[str, Any]]: Audit records ready for dashboard display.
-    """
+    if not cleaned:
+        return {
+            "ok": False,
+            "status_code": None,
+            "data": None,
+            "error": "audit_id is required",
+            "headers": {},
+        }
 
-    response = fetch_audit_logs()
+    return api_get(f"/audit/{cleaned}")
 
-    if response.get("success") is False:
-        return []
 
-    return normalize_audit_logs(response)
+def get_audit_snapshot() -> dict[str, Any]:
+    records = get_audit_records()
+    status = get_audit_status()
+
+    return {
+        "ok": records.get("ok", False) and status.get("ok", False),
+        "records": records,
+        "status": status,
+    }
