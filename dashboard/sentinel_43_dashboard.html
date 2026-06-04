@@ -4,6 +4,12 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Sentinel-43 Dashboard</title>
+
+ <script>
+    window.SENTINEL_API_BASE_URL = "http://localhost:8000";
+    window.SENTINEL_WS_URL = "ws://localhost:8000/ws";
+</script>
+  
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
@@ -382,5 +388,7 @@ log("Dashboard initializing…","info");
 if(!CONFIG.DEMO_MODE)log("Demo mode disabled. Use ?demo=1 only for local testing.","info");
 initTheme();updateStaticConfig();refreshDashboard(true);startPolling();
 </script>
+<script src="assets/js/dashboard.js"></script>
+<script src="assets/js/websocket.js"></script>
 </body>
 </html>
