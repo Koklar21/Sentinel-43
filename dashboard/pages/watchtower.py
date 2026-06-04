@@ -1,100 +1,53 @@
 """
-dashboard/pages/watchtower.py
-
-Watchtower monitoring page for Sentinel-43.
+Sentinel-43 Dashboard Page
+Watchtower
 """
 
 from __future__ import annotations
 
-from dash import html
+from typing import Any
 
-from dashboard.components.alert_panel import build_alert_panel
-from dashboard.components.status_card import build_status_card
+from dashboard.services.watchtower_client import (
+    get_watchtower_alerts,
+    get_watchtower_health,
+    get_watchtower_metrics,
+    get_watchtower_nodes,
+    get_watchtower_snapshot,
+    get_watchtower_status,
+)
 
 
-def build_watchtower_page() -> html.Div:
+PAGE_ID = "watchtower"
+PAGE_TITLE = "Watchtower"
+
+
+def load_watchtower_page() -> dict[str, Any]:
     """
-    Build the Watchtower monitoring page.
-
-    Returns:
-        html.Div: Watchtower page layout.
+    Load Watchtower page data.
     """
 
-    return html.Div(
-        [
-            html.Div(
-                [
-                    html.H2(
-                        "Watchtower",
-                        className="page-title",
-                    ),
-                    html.P(
-                        (
-                            "Monitor Sentinel-43 tower health, "
-                            "degradation state, and escalation conditions."
-                        ),
-                        className="page-subtitle",
-                    ),
-                ],
-                className="page-header",
-            ),
+    return {
+        "page_id": PAGE_ID,
+        "page_title": PAGE_TITLE,
+        "snapshot": get_watchtower_snapshot(),
+        "health": get_watchtower_health(),
+        "status": get_watchtower_status(),
+        "nodes": get_watchtower_nodes(),
+        "alerts": get_watchtower_alerts(),
+        "metrics": get_watchtower_metrics(),
+    }
 
-            html.Div(
-                [
-                    build_status_card(
-                        title="Overall Status",
-                        value="ACTIVE",
-                        status="healthy",
-                    ),
-                    build_status_card(
-                        title="Tower Count",
-                        value="8",
-                        status="healthy",
-                    ),
-                    build_status_card(
-                        title="Degraded Towers",
-                        value="0",
-                        status="healthy",
-                    ),
-                    build_status_card(
-                        title="Active Alerts",
-                        value="0",
-                        status="healthy",
-                    ),
-                ],
-                className="watchtower-status-grid",
-            ),
 
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.H3(
-                                "Tower Overview",
-                                className="section-title",
-                            ),
+def get_watchtower_summary() -> dict[str, Any]:
+    data = load_watchtower_page()
+    snapshot = data.get("snapshot", {})
 
-                            html.Ul(
-                                [
-                                    html.Li("API_HEALTH"),
-                                    html.Li("EXPECTATION_GUARD"),
-                                    html.Li("CONFIG_DRIFT"),
-                                    html.Li("LOGGING_AUDIT"),
-                                    html.Li("ERROR_RATE"),
-                                    html.Li("DEPENDENCY_HEALTH"),
-                                    html.Li("RESOURCE_PRESSURE"),
-                                    html.Li("SECURITY_BASELINE"),
-                                ],
-                                className="tower-list",
-                            ),
-                        ],
-                        className="card watchtower-overview",
-                    ),
-
-                    build_alert_panel(),
-                ],
-                className="watchtower-panel-grid",
-            ),
-        ],
-        className="watchtower-page",
-    )
+    return {
+        "page": PAGE_TITLE,
+        "ok": snapshot.get("ok", False),
+        "health_ok": data["health"].get("ok", False),
+        "status_ok": data["status"].get("ok", False),
+        "nodes_ok": data["nodes"].get("ok", False),
+        "alerts_ok": data["alerts"].get("ok", False),
+        "metrics_ok": data["metrics"].get("ok", False),
+    }
