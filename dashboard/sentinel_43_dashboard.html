@@ -51,11 +51,38 @@
     .modal-overlay{position:fixed;inset:0;z-index:400;display:grid;place-items:center}.modal-overlay[hidden]{display:none}.modal-bd{position:absolute;inset:0;background:rgba(0,0,0,.72);backdrop-filter:blur(4px)}.modal-card{position:relative;width:min(500px,calc(100vw - 28px));background:var(--panel);border:1px solid var(--border2);border-radius:10px;padding:18px}.modal-card h3{font-size:14px;font-weight:700;margin-bottom:4px}.modal-card p{font-size:12px;color:var(--muted);margin-bottom:10px}.modal-card input[type=text],.modal-card textarea{width:100%;padding:9px 11px;border-radius:var(--r);border:1px solid var(--border2);background:var(--surface);color:var(--text);font-family:var(--font-mono);font-size:12px;outline:none;transition:border-color 120ms}.modal-card textarea{min-height:90px;resize:vertical;font-family:var(--font-body);font-size:13px}.modal-card input[type=text]:focus,.modal-card textarea:focus{border-color:var(--cyan-glow)}.modal-err{min-height:15px;font-size:11px;color:var(--red);margin-top:5px;font-family:var(--font-mono)}.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:10px;flex-wrap:wrap}
     .log-toolbar{display:flex;gap:5px;align-items:center}.log-console{height:300px;overflow-y:auto;padding:7px;font-family:var(--font-mono);font-size:11px;scrollbar-width:thin;scrollbar-color:var(--border2) transparent}.log-line{display:grid;grid-template-columns:auto auto 1fr;gap:7px;padding:4px 6px;border-radius:3px;line-height:1.4;word-break:break-word}.log-line+.log-line{margin-top:1px}.log-ts{color:var(--muted);white-space:nowrap}.log-lvl{font-size:9px;letter-spacing:.08em;padding:1px 5px;border-radius:3px;align-self:start;margin-top:1px;white-space:nowrap}.log-line.ok .log-lvl{background:var(--green-dim);color:var(--green)}.log-line.warn .log-lvl{background:var(--amber-dim);color:var(--amber)}.log-line.err .log-lvl{background:var(--red-dim);color:var(--red)}.log-line.info .log-lvl{background:var(--surface);color:var(--muted)}.log-line.ok .log-msg{color:#a3e6cc}.log-line.warn .log-msg{color:var(--amber)}.log-line.err .log-msg{color:var(--red)}.log-line.info .log-msg{color:#94a3b8}.log-line.err{background:rgba(244,63,94,.05)}.empty-state{padding:28px;text-align:center;color:var(--muted);font-family:var(--font-mono);font-size:11px}
     ::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+
+    .skip-link{position:fixed;left:12px;top:8px;z-index:10000;transform:translateY(-150%);background:var(--cyan);color:#001018;padding:7px 10px;border-radius:var(--r);font-weight:700;text-decoration:none;transition:transform 120ms}
+    .skip-link:focus{transform:translateY(0)}
+    .btn:focus-visible,input:focus-visible,textarea:focus-visible,.expand-btn:focus-visible,.table-scroll-wrap:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
+    .status-pill{display:inline-flex;align-items:center;gap:6px}
+    .reason-cell{max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .sticky-actions{position:sticky;right:0;background:var(--panel);box-shadow:-12px 0 18px rgba(0,0,0,.16)}
+    html.light .sticky-actions{box-shadow:-12px 0 18px rgba(255,255,255,.72)}
+    tbody tr:hover .sticky-actions,tbody tr.selected .sticky-actions,tbody tr.focused .sticky-actions{background:inherit}
+    .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+    @media(max-width:760px){
+      header{align-items:flex-start}
+      .hdr-right{width:100%;justify-content:flex-start}
+      .brand{width:100%}
+      .chip{font-size:9px}
+      .btn{padding:6px 9px}
+      main{padding:10px;gap:10px}
+      .panel-hdr{align-items:flex-start}
+      .toolbar{width:100%;overflow-x:auto;flex-wrap:nowrap;padding-bottom:2px}
+      .toolbar .btn{flex:0 0 auto}
+      .search-wrap{position:sticky;top:0;z-index:3;background:var(--panel)}
+      .log-console{height:230px}
+      tbody td,thead th{padding:9px 8px}
+      .stat-value{font-size:25px}
+    }
+
     @media(max-width:1100px){main{grid-template-columns:1fr}}@media(max-width:700px){.stat-row{grid-template-columns:1fr 1fr}.cfg-grid{grid-template-columns:1fr}header{height:auto;padding:10px 14px;flex-wrap:wrap}}@media(max-width:440px){.stat-row{grid-template-columns:1fr}}
     @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}.stat-value.bump{transform:none}}
   </style>
 </head>
 <body>
+<a class="skip-link" href="#actionsPanel">Skip to actions table</a>
 <header>
   <div class="brand">
     <div class="brand-icon" aria-hidden="true">
@@ -87,7 +114,8 @@
     <button id="kbHelpBtn" class="btn ghost" type="button" title="Keyboard shortcuts" aria-label="Keyboard shortcuts">?</button>
   </div>
 </header>
-<main>
+<div id="liveRegion" class="sr-only" aria-live="polite"></div>
+<main id="mainContent">
   <div class="col">
     <div class="stat-row">
       <div class="stat-card s-amber"><div class="stat-label">Pending</div><div id="pendingCount" class="stat-value">0</div><div class="stat-sub">Awaiting decision</div></div>
@@ -95,7 +123,7 @@
       <div class="stat-card s-green"><div class="stat-label">Approved</div><div id="approvedCount" class="stat-value">0</div><div class="stat-sub">Approved / executed</div></div>
       <div class="stat-card s-purple"><div class="stat-label">Vault Records</div><div id="vaultCount" class="stat-value">--</div><div class="stat-sub">Reported by backend</div></div>
     </div>
-    <div class="panel" style="flex:1;">
+    <div id="actionsPanel" class="panel" style="flex:1;">
       <div class="panel-hdr">
         <div class="panel-title"><span>//</span>PENDING ACTIONS</div>
         <div class="toolbar">
@@ -111,8 +139,8 @@
         <input id="searchInput" type="text" placeholder="Search by threat, IP, or action ID…" autocomplete="off" spellcheck="false" />
         <button id="clearSearchBtn" class="btn ghost" type="button" style="font-size:12px;padding:2px 6px;" title="Clear" aria-label="Clear search">✕</button>
       </div>
-      <div class="table-scroll-wrap">
-        <table>
+      <div class="table-scroll-wrap" tabindex="0" aria-label="Pending actions table scroll area">
+        <table aria-label="Pending Sentinel actions">
           <thead><tr><th class="sel-col"><input type="checkbox" id="selectAll" title="Select all visible" aria-label="Select all visible rows" /></th><th></th><th>Action ID</th><th>Threat</th><th>Source IP</th><th>Status</th><th>Created</th><th>Reason</th><th>Operator</th></tr></thead>
           <tbody id="actionsBody"></tbody>
         </table>
@@ -127,7 +155,7 @@
   </div>
 </main>
 <div id="reasonModal" class="modal-overlay" hidden aria-hidden="true" role="dialog" aria-modal="true"><div class="modal-bd" data-close></div><div class="modal-card"><h3 id="modalTitle">Provide reason</h3><p id="modalSubtitle">Reason is required. Ctrl+Enter confirms.</p><textarea id="modalInput" maxlength="500" placeholder="Enter a substantive reason (min 10 characters)…"></textarea><div style="display:flex;justify-content:space-between;align-items:center;margin-top:5px;"><div id="modalError" class="modal-err"></div><div id="modalCharCount" style="font-size:10px;font-family:var(--font-mono);color:var(--muted);">0 / 500</div></div><div class="modal-actions"><button id="modalCancel" class="btn" type="button">Cancel</button><button id="modalConfirm" class="btn green" type="button">Confirm</button></div></div></div>
-<div id="jwtModal" class="modal-overlay" hidden aria-hidden="true" role="dialog" aria-modal="true"><div class="modal-bd" data-close-jwt></div><div class="modal-card"><h3>Set SENTINEL JWT</h3><p>Development mode only. Production should use secure HttpOnly cookies, because apparently browsers enjoy giving attackers tiny treasure chests.</p><input type="text" id="jwtInput" placeholder="eyJ…" autocomplete="off" spellcheck="false" /><div class="modal-actions"><button id="jwtCancel" class="btn" type="button">Cancel</button><button id="jwtClear" class="btn red" type="button">Clear JWT</button><button id="jwtConfirm" class="btn cyan" type="button">Set JWT</button></div></div></div>
+<div id="jwtModal" class="modal-overlay" hidden aria-hidden="true" role="dialog" aria-modal="true"><div class="modal-bd" data-close-jwt></div><div class="modal-card"><h3>Set SENTINEL JWT</h3><p>Development mode only. Production should use secure HttpOnly cookies instead of browser-accessible storage.</p><input type="text" id="jwtInput" placeholder="eyJ…" autocomplete="off" spellcheck="false" /><div class="modal-actions"><button id="jwtCancel" class="btn" type="button">Cancel</button><button id="jwtClear" class="btn red" type="button">Clear JWT</button><button id="jwtConfirm" class="btn cyan" type="button">Set JWT</button></div></div></div>
 <div id="injectModal" class="modal-overlay" hidden aria-hidden="true" role="dialog" aria-modal="true"><div class="modal-bd" data-close-inject></div><div class="modal-card"><h3>Inject test action?</h3><p>Adds a synthetic incident to the queue. Only available when demo mode is enabled.</p><div class="modal-actions"><button id="injectCancel" class="btn" type="button">Cancel</button><button id="injectConfirm" class="btn amber" type="button">⚡ Confirm Inject</button></div></div></div>
 <div id="kbToast"><table><tr><td><kbd>/</kbd></td><td>Focus search</td></tr><tr><td><kbd>R</kbd></td><td>Refresh</td></tr><tr><td><kbd>↑↓</kbd></td><td>Navigate rows</td></tr><tr><td><kbd>A</kbd></td><td>Approve focused staged row</td></tr><tr><td><kbd>V</kbd></td><td>Veto focused actionable row</td></tr><tr><td><kbd>Esc</kbd></td><td>Clear selection / close</td></tr></table></div>
 <script>
@@ -166,7 +194,7 @@ function log(message,type="info"){
   line.className=`log-line ${type}`; line.dataset.type=type;
   line.innerHTML=`<span class="log-ts">${nowStamp()}</span><span class="log-lvl">${escHtml(type.toUpperCase())}</span><span class="log-msg">${escHtml(message)}</span>`;
   if(currentLogFilter!=="ALL"&&type!==currentLogFilter) line.hidden=true;
-  el.logConsole.appendChild(line);
+  el.logConsole.appendChild(line); if(type==="err"||type==="warn") $("liveRegion").textContent=message;
   while(el.logConsole.children.length>CONFIG.MAX_LOG_LINES) el.logConsole.removeChild(el.logConsole.firstElementChild);
   el.logConsole.scrollTop=el.logConsole.scrollHeight;
 }
@@ -259,18 +287,19 @@ function renderActions(actions){
     const createdStyle=action.createdBad?"color:var(--red);font-size:10px;":"color:var(--muted);font-size:10px;";
     const canVeto=action.status==="PENDING"||action.status==="STAGED"; const canApprove=action.status==="STAGED";
     const opCell=canVeto||canApprove?`<div class="act-btns">${canApprove?`<button class="btn green" type="button" style="padding:3px 7px" data-approve="${escHtml(action.id)}" title="Approve (A)" aria-label="Approve ${escHtml(action.id)}">✓</button>`:""}${canVeto?`<button class="btn red" type="button" style="padding:3px 7px" data-veto="${escHtml(action.id)}" title="Veto (V)" aria-label="Veto ${escHtml(action.id)}">✕</button>`:""}</div>`:`<span style="color:var(--muted);font-size:10px;font-family:var(--font-mono);">${escHtml(action.operator)||"—"}</span>`;
-    tr.innerHTML=`<td><input type="checkbox" class="row-cb" data-id="${escHtml(action.id)}"${selectedIds.has(action.id)?" checked":""} aria-label="Select ${escHtml(action.id)}"></td><td><button class="expand-btn" type="button" data-expand="${escHtml(action.id)}" aria-label="Expand ${escHtml(action.id)}">▶</button></td><td class="mono" style="color:var(--cyan)">${escHtml(action.id||"<missing>")}</td><td>${escHtml(action.threat)}</td><td class="mono" style="color:var(--muted)">${escHtml(action.source)}</td><td><span class="tag ${statusClass}">${escHtml(action.status)}</span></td><td class="mono" style="${createdStyle}">${escHtml(created)}</td><td style="max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${action.decisionReason?escHtml(action.decisionReason):`<span style="color:var(--muted)">—</span>`}</td><td>${opCell}</td>`;
+    tr.innerHTML=`<td><input type="checkbox" class="row-cb" data-id="${escHtml(action.id)}"${selectedIds.has(action.id)?" checked":""} aria-label="Select ${escHtml(action.id)}"></td><td><button class="expand-btn" type="button" data-expand="${escHtml(action.id)}" aria-label="Expand ${escHtml(action.id)}">▶</button></td><td class="mono" style="color:var(--cyan)">${escHtml(action.id||"<missing>")}</td><td>${escHtml(action.threat)}</td><td class="mono" style="color:var(--muted)">${escHtml(action.source)}</td><td><span class="tag ${statusClass}">${escHtml(action.status)}</span></td><td class="mono" style="${createdStyle}">${escHtml(created)}</td><td class="reason-cell" title="${escHtml(action.decisionReason||"")}">${action.decisionReason?escHtml(action.decisionReason):`<span style="color:var(--muted)">—</span>`}</td><td class="sticky-actions">${opCell}</td>`;
     el.actionsBody.appendChild(tr);
   });
   updateBulkBar();
 }
+function findRowByData(attr,value){return Array.from(document.querySelectorAll(`[${attr}]`)).find(node=>node.dataset[attr.replace("data-","")]===value);}
 function toggleExpand(actionId){
   const safe=cssEscape(actionId);
-  const existing=document.querySelector(`.expand-row[data-for="${safe}"]`);
-  const btn=document.querySelector(`[data-expand="${safe}"]`);
+  const existing=Array.from(document.querySelectorAll(".expand-row")).find(row=>row.dataset.for===actionId);
+  const btn=Array.from(document.querySelectorAll("[data-expand]")).find(node=>node.dataset.expand===actionId);
   if(existing){existing.remove();if(btn)btn.textContent="▶";return;}
   const action=allActions.find(a=>a.id===actionId); if(!action)return;
-  const tr=document.querySelector(`tr[data-id="${safe}"]`); if(!tr)return;
+  const tr=Array.from(document.querySelectorAll("tr[data-id]")).find(row=>row.dataset.id===actionId); if(!tr)return;
   const exp=document.createElement("tr"); exp.className="expand-row"; exp.dataset.for=actionId;
   exp.innerHTML=`<td colspan="9"><div class="expand-inner"><div class="expand-kv"><div class="k">ACTION ID</div><div class="v">${escHtml(action.id)}</div></div><div class="expand-kv"><div class="k">SOURCE IP</div><div class="v">${escHtml(action.source)}</div></div><div class="expand-kv"><div class="k">THREAT</div><div class="v">${escHtml(action.threat)}</div></div><div class="expand-kv"><div class="k">STATUS</div><div class="v">${escHtml(action.status)}</div></div><div class="expand-kv"><div class="k">CREATED</div><div class="v">${escHtml(action.createdAt||"MISSING / INVALID")}</div></div><div class="expand-kv"><div class="k">OPERATOR</div><div class="v">${escHtml(action.operator||"—")}</div></div><div class="expand-kv"><div class="k">REASON</div><div class="v">${escHtml(action.decisionReason||"—")}</div></div></div></td>`;
   tr.after(exp); if(btn)btn.textContent="▼";
@@ -319,18 +348,18 @@ function updateStaticConfig(){
 }
 async function refreshDashboard(manual=false){
   if(refreshInFlight||modalOpenCount>0)return;
-  refreshInFlight=true;if(manual)setStatus("Syncing");
+  refreshInFlight=true;document.body.setAttribute("aria-busy","true");if(manual)setStatus("Syncing");
   try{updateStaticConfig();const [rawActions,vault]=await Promise.all([api.listActions(),api.vaultStats().catch(()=>({records:null}))]);allActions=rawActions.map(normalizeAction).sort((a,b)=>actionTimeValue(b)-actionTimeValue(a));updateStats(allActions);renderActions(applyFilters(allActions));el.vaultCount.textContent=typeof vault?.records==="number"?vault.records.toLocaleString():"--";setStatus("Online");el.lastSync.textContent=`sync ${nowStamp()}`;flashPoll();if(manual)log(`Refresh complete — ${applyFilters(allActions).length} action(s) visible.`,"ok");}
   catch(err){setStatus("Offline");log(`Refresh failed: ${err.message||err}`,"err");}
-  finally{refreshInFlight=false;}
+  finally{refreshInFlight=false;document.body.removeAttribute("aria-busy");}
 }
 function startPolling(){if(pollTimer)clearInterval(pollTimer);pollTimer=setInterval(()=>refreshDashboard(false),CONFIG.POLL_MS);} el.refreshBtn.addEventListener("click",()=>refreshDashboard(true));
 
 el.injectBtn.addEventListener("click",()=>{if(!CONFIG.DEMO_MODE){log("Inject blocked: demo mode is disabled.","warn");return;}el.injectModal.hidden=false;el.injectModal.setAttribute("aria-hidden","false");setModalOpen(true);});
-function closeInject(){el.injectModal.hidden=true;el.injectModal.setAttribute("aria-hidden","true");setModalOpen(false);} el.injectCancel.addEventListener("click",closeInject);el.injectModal.addEventListener("click",e=>{if(e.target.hasAttribute("data-close-inject"))closeInject();});el.injectConfirm.addEventListener("click",async()=>{closeInject();el.injectBtn.disabled=true;try{await api.inject();log("Test action injected.","info");await refreshDashboard(true);}catch(err){log(`Inject failed: ${err.message||err}`,"err");}finally{el.injectBtn.disabled=!CONFIG.DEMO_MODE;}});
-el.exportBtn.addEventListener("click",()=>{const data=allActions.map(a=>({id:a.id,threat:a.threat,source:a.source,status:a.status,createdAt:a.createdAt,createdRaw:a.createdRaw,createdBad:a.createdBad,decisionReason:a.decisionReason,operator:a.operator}));const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});const url=URL.createObjectURL(blob);const link=document.createElement("a");link.href=url;link.download=`sentinel43-export-${Date.now()}.json`;link.click();URL.revokeObjectURL(url);log(`Exported ${data.length} actions as JSON.`,"ok");});
+function closeInject(){if(el.injectModal.hidden)return;el.injectModal.hidden=true;el.injectModal.setAttribute("aria-hidden","true");setModalOpen(false);} el.injectCancel.addEventListener("click",closeInject);el.injectModal.addEventListener("click",e=>{if(e.target.hasAttribute("data-close-inject"))closeInject();});el.injectConfirm.addEventListener("click",async()=>{closeInject();el.injectBtn.disabled=true;try{await api.inject();log("Test action injected.","info");await refreshDashboard(true);}catch(err){log(`Inject failed: ${err.message||err}`,"err");}finally{el.injectBtn.disabled=!CONFIG.DEMO_MODE;}});
+el.exportBtn.addEventListener("click",()=>{const source=applyFilters(allActions);const data=source.map(a=>({id:a.id,threat:a.threat,source:a.source,status:a.status,createdAt:a.createdAt,createdRaw:a.createdRaw,createdBad:a.createdBad,decisionReason:a.decisionReason,operator:a.operator}));const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});const url=URL.createObjectURL(blob);const link=document.createElement("a");link.href=url;link.download=`sentinel43-export-${Date.now()}.json`;link.click();URL.revokeObjectURL(url);log(`Exported ${data.length} visible action(s) as JSON.`,"ok");});
 
-function closeJwt(){el.jwtModal.hidden=true;el.jwtModal.setAttribute("aria-hidden","true");setModalOpen(false);} el.authBtn.addEventListener("click",()=>{el.jwtInput.value=sessionStorage.getItem("SENTINEL_JWT")||"";el.jwtModal.hidden=false;el.jwtModal.setAttribute("aria-hidden","false");setModalOpen(true);setTimeout(()=>el.jwtInput.focus(),0);});el.jwtCancel.addEventListener("click",closeJwt);el.jwtClear.addEventListener("click",()=>{sessionStorage.removeItem("SENTINEL_JWT");log("JWT cleared.","warn");closeJwt();updateStaticConfig();refreshDashboard(true);});el.jwtConfirm.addEventListener("click",()=>{const v=el.jwtInput.value.trim();if(v){sessionStorage.setItem("SENTINEL_JWT",v);log("JWT set in sessionStorage. Dev-only risk badge enabled.","warn");}else{sessionStorage.removeItem("SENTINEL_JWT");log("JWT cleared.","warn");}closeJwt();updateStaticConfig();refreshDashboard(true);});el.jwtModal.addEventListener("click",e=>{if(e.target.hasAttribute("data-close-jwt"))closeJwt();});
+function closeJwt(){if(el.jwtModal.hidden)return;el.jwtModal.hidden=true;el.jwtModal.setAttribute("aria-hidden","true");setModalOpen(false);} el.authBtn.addEventListener("click",()=>{el.jwtInput.value=sessionStorage.getItem("SENTINEL_JWT")||"";el.jwtModal.hidden=false;el.jwtModal.setAttribute("aria-hidden","false");setModalOpen(true);setTimeout(()=>el.jwtInput.focus(),0);});el.jwtCancel.addEventListener("click",closeJwt);el.jwtClear.addEventListener("click",()=>{sessionStorage.removeItem("SENTINEL_JWT");log("JWT cleared.","warn");closeJwt();updateStaticConfig();refreshDashboard(true);});el.jwtConfirm.addEventListener("click",()=>{const v=el.jwtInput.value.trim();if(v){sessionStorage.setItem("SENTINEL_JWT",v);log("JWT set in sessionStorage. Dev-only risk badge enabled.","warn");}else{sessionStorage.removeItem("SENTINEL_JWT");log("JWT cleared.","warn");}closeJwt();updateStaticConfig();refreshDashboard(true);});el.jwtModal.addEventListener("click",e=>{if(e.target.hasAttribute("data-close-jwt"))closeJwt();});
 el.clearLogBtn.addEventListener("click",()=>{el.logConsole.innerHTML="";log("Console cleared.","info");});
 
 const htmlEl=document.documentElement;let isLight=false;
