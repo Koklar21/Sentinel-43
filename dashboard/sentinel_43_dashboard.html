@@ -386,7 +386,15 @@ window.addEventListener("beforeunload",()=>{if(pollTimer)clearInterval(pollTimer
 
 log("Dashboard initializing…","info");
 if(!CONFIG.DEMO_MODE)log("Demo mode disabled. Use ?demo=1 only for local testing.","info");
-initTheme();updateStaticConfig();refreshDashboard(true);startPolling();
+initTheme();
+updateStaticConfig();
+
+// Temporarily disable old action polling until /actions exists.
+// refreshDashboard(true);
+// startPolling();
+
+log("Dashboard shell initialized. Live bridge owns backend refresh.", "ok");
+setStatus("Online");
 </script>
 <script src="assets/js/dashboard.js"></script>
 <script src="assets/js/websocket.js"></script>
