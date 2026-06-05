@@ -4,7 +4,9 @@
    Live backend bridge
    ========================================================== */
 
-"use strict";console.log("S43 EXTERNAL DASHBOARD.JS LOADED - TEST MARKER");
+"use strict";
+
+console.log("S43 EXTERNAL DASHBOARD.JS LOADED - TEST MARKER");
 
 (() => {
     const API_BASE = window.SENTINEL_API_BASE_URL || "http://localhost:8000";
