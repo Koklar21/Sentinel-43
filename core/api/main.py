@@ -10,8 +10,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from .routers.remote_gateway import router as remote_gateway_router
-
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -585,7 +583,9 @@ def system_routes() -> dict[str, Any]:
     route_list = []
 
     for route in app.routes:
-        methods = sorted(route.methods) if hasattr(route, "methods") else []
+        methods_raw = getattr(route, "methods", None)
+        methods = sorted(methods_raw) if methods_raw else []
+
         path = getattr(route, "path", None)
         name = getattr(route, "name", None)
 
@@ -604,7 +604,6 @@ def system_routes() -> dict[str, Any]:
         "routes": route_list,
         "timestamp": utc_now(),
     }
-
 
 @system_router.get("/routes/status")
 def routes_status() -> dict[str, Any]:
