@@ -134,7 +134,7 @@ console.log("S43 EXTERNAL DASHBOARD.JS LOADED - TEST MARKER");
         }
     }
 
-   document.addEventListener("DOMContentLoaded", () => {
+  document.addEventListener("DOMContentLoaded", () => {
     logBridge("Sentinel-43 live bridge attached.", "info");
 
     const refreshBtn = document.getElementById("refreshBtn");
@@ -152,18 +152,22 @@ console.log("S43 EXTERNAL DASHBOARD.JS LOADED - TEST MARKER");
         themeBtn.addEventListener("click", () => {
             document.documentElement.classList.toggle("light");
 
-            const isLight = document.documentElement.classList.contains("light");
+            const isLight =
+                document.documentElement.classList.contains("light");
 
-            themeBtn.textContent = isLight ? "☽ Dark" : "☀ Light";
+            themeBtn.textContent = isLight
+                ? "☽ Dark"
+                : "☀ Light";
 
             logBridge(
                 `Theme switched to ${isLight ? "light" : "dark"} mode.`,
-                "info",
+                "info"
             );
         });
     }
 
-      refreshLiveBackend();
+    refreshLiveBackend();
     window.setInterval(refreshLiveBackend, POLL_MS);
 });
+
 })();
