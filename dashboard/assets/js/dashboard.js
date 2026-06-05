@@ -132,9 +132,35 @@
         }
     }
 
-    document.addEventListener("DOMContentLoaded", () => {
-        logBridge("Sentinel-43 live bridge attached.", "info");
-        refreshLiveBackend();
-        window.setInterval(refreshLiveBackend, POLL_MS);
-    });
-})();
+   document.addEventListener("DOMContentLoaded", () => {
+    logBridge("Sentinel-43 live bridge attached.", "info");
+
+    const refreshBtn = document.getElementById("refreshBtn");
+
+    if (refreshBtn) {
+        refreshBtn.addEventListener("click", () => {
+            logBridge("Manual refresh requested.", "info");
+            refreshLiveBackend();
+        });
+    }
+
+    const themeBtn = document.getElementById("themeBtn");
+
+    if (themeBtn) {
+        themeBtn.addEventListener("click", () => {
+            document.documentElement.classList.toggle("light");
+
+            const isLight = document.documentElement.classList.contains("light");
+
+            themeBtn.textContent = isLight ? "☽ Dark" : "☀ Light";
+
+            logBridge(
+                `Theme switched to ${isLight ? "light" : "dark"} mode.`,
+                "info",
+            );
+        });
+    }
+
+    refreshLiveBackend();
+    window.setInterval(refreshLiveBackend, POLL_MS);
+})
