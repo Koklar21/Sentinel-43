@@ -161,6 +161,7 @@
         });
     }
 
-    refreshLiveBackend();
+      refreshLiveBackend();
     window.setInterval(refreshLiveBackend, POLL_MS);
-})
+});
+})();
