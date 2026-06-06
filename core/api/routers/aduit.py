@@ -1,10 +1,13 @@
+from __future__ import annotations
+
 from fastapi import APIRouter
 
-router = APIRouter(
-    prefix="/audit",
-    tags=["audit"]
-)
+router = APIRouter(prefix="/audit", tags=["audit"])
+
 
 @router.get("/health")
-async def audit_health():
-    return {"status": "ok"}
+def audit_health() -> dict[str, str]:
+    return {
+        "status": "ok",
+        "module": "audit",
+    }
