@@ -1,197 +1,117 @@
 /* ==========================================================
    Sentinel-43 Dashboard
-   layout.css
+   sidebar.css
    ========================================================== */
+
+"use strict";
+
+/* Remove this line if this is a normal CSS file:
+   "use strict"; only belongs in JS.
+*/
+
+/* ==========================================================
+   Layout Variables
+   ========================================================== */
+
+:root {
+    --sidebar-width: 260px;
+    --sidebar-width-tablet: 220px;
+    --header-height: 64px;
+}
 
 /* ==========================================================
    Main Layout
    ========================================================== */
 
-.layout {
+.dashboard-shell {
     display: flex;
     min-height: 100vh;
-    background-color: var(--bg-primary);
+    background: var(--bg-primary);
+    color: var(--text-primary);
 }
-
-.layout-main {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
-}
-
-/* ==========================================================
-   Sidebar
-   ========================================================== */
 
 .sidebar {
     width: var(--sidebar-width);
-    min-width: var(--sidebar-width);
-
-    background-color: var(--bg-secondary);
-
+    min-height: 100vh;
+    max-height: 100vh;
+    overflow-y: auto;
+    overflow-x: hidden;
+    background: var(--bg-secondary);
     border-right: 1px solid var(--border-color);
-
-    display: flex;
-    flex-direction: column;
+    flex-shrink: 0;
 }
 
+.content {
+    flex: 1;
+    min-width: 0;
+    min-height: 100vh;
+    overflow-y: auto;
+    background: var(--bg-primary);
+}
+
+/* ==========================================================
+   Sidebar Header
+   ========================================================== */
+
 .sidebar-header {
-    padding: 20px;
+    min-height: var(--header-height);
+    padding: 1rem;
     border-bottom: 1px solid var(--border-color);
 }
 
 .sidebar-title {
-    font-size: 1.2rem;
+    margin: 0;
+    font-size: 1.1rem;
     font-weight: 700;
     color: var(--text-primary);
 }
 
 .sidebar-subtitle {
+    margin-top: 0.25rem;
+    font-size: 0.8rem;
     color: var(--text-muted);
-    font-size: 0.85rem;
 }
 
+/* ==========================================================
+   Sidebar Navigation
+   ========================================================== */
+
 .sidebar-nav {
-    flex: 1;
-    padding: 10px;
+    padding: 0.75rem;
 }
 
 .sidebar-nav ul {
     list-style: none;
+    margin: 0;
+    padding: 0;
 }
 
 .sidebar-nav li {
-    margin-bottom: 6px;
+    margin-bottom: 0.25rem;
 }
 
 .sidebar-nav a {
     display: block;
-
-    padding: 12px;
-
-    border-radius: 8px;
-
+    padding: 0.75rem 0.9rem;
+    border-radius: 0.5rem;
     color: var(--text-secondary);
     text-decoration: none;
-
-    transition: all 0.2s ease;
+    transition:
+        background-color 0.2s ease,
+        color 0.2s ease;
 }
 
-.sidebar-nav a:hover {
-    background-color: var(--bg-tertiary);
+.sidebar-nav a:hover,
+.sidebar-nav a.active {
+    background-color: var(--sidebar-hover-bg);
     color: var(--text-primary);
 }
 
-.sidebar-nav a.active {
-    background-color: var(--info);
-    color: white;
-}
-
-/* ==========================================================
-   Topbar
-   ========================================================== */
-
-.topbar {
-    height: var(--header-height);
-
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-
-    padding: 0 20px;
-
-    background-color: var(--bg-secondary);
-
-    border-bottom: 1px solid var(--border-color);
-}
-
-.topbar-left {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-}
-
-.topbar-right {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-}
-
-.topbar-title {
-    font-size: 1.2rem;
-    font-weight: 700;
-}
-
-.topbar-status {
-    font-size: 0.85rem;
-    color: var(--text-muted);
-}
-
-/* ==========================================================
-   Content Area
-   ========================================================== */
-
-.content {
-    flex: 1;
-    padding: 20px;
-    overflow-x: hidden;
-}
-
-.content-header {
-    margin-bottom: 20px;
-}
-
-.content-title {
-    font-size: 1.6rem;
-    font-weight: 700;
-}
-
-.content-subtitle {
-    color: var(--text-muted);
-    margin-top: 4px;
-}
-
-/* ==========================================================
-   Footer
-   ========================================================== */
-
-.footer {
-    padding: 12px 20px;
-
-    background-color: var(--bg-secondary);
-
-    border-top: 1px solid var(--border-color);
-
-    color: var(--text-muted);
-
-    font-size: 0.85rem;
-}
-
-.footer-content {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-}
-
-/* ==========================================================
-   Navigation Groups
-   ========================================================== */
-
-.nav-section {
-    margin-bottom: 20px;
-}
-
-.nav-section-title {
-    padding: 8px 12px;
-
-    font-size: 0.75rem;
-    font-weight: 700;
-
-    color: var(--text-muted);
-
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
+.sidebar-nav a:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 2px;
+    background-color: var(--sidebar-hover-bg);
+    color: var(--text-primary);
 }
 
 /* ==========================================================
@@ -200,18 +120,23 @@
 
 .sidebar::-webkit-scrollbar,
 .content::-webkit-scrollbar {
-    width: 8px;
+    width: 10px;
 }
 
 .sidebar::-webkit-scrollbar-track,
 .content::-webkit-scrollbar-track {
-    background: var(--bg-primary);
+    background: var(--bg-secondary);
 }
 
 .sidebar::-webkit-scrollbar-thumb,
 .content::-webkit-scrollbar-thumb {
     background: var(--border-color);
-    border-radius: 4px;
+    border-radius: 999px;
+}
+
+.sidebar::-webkit-scrollbar-thumb:hover,
+.content::-webkit-scrollbar-thumb:hover {
+    background: var(--text-muted);
 }
 
 /* ==========================================================
@@ -220,34 +145,42 @@
 
 @media (max-width: 1024px) {
     .sidebar {
-        width: 220px;
-        min-width: 220px;
+        width: var(--sidebar-width-tablet);
     }
 }
 
 @media (max-width: 768px) {
-    .layout {
+    .dashboard-shell {
         flex-direction: column;
     }
 
     .sidebar {
         width: 100%;
-        min-width: 100%;
+        min-height: auto;
+        max-height: none;
         border-right: none;
         border-bottom: 1px solid var(--border-color);
     }
 
-    .topbar {
-        padding: 0 12px;
-    }
-
     .content {
-        padding: 12px;
+        min-height: auto;
     }
 
-    .footer-content {
-        flex-direction: column;
-        gap: 8px;
-        text-align: center;
+    .sidebar-nav {
+        padding: 0.5rem;
+    }
+
+    .sidebar-nav ul {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+    }
+
+    .sidebar-nav li {
+        margin-bottom: 0;
+    }
+
+    .sidebar-nav a {
+        padding: 0.6rem 0.75rem;
     }
 }
