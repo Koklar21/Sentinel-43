@@ -680,9 +680,7 @@ def compat_api_watchtower_ready() -> dict[str, Any]:
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    bootstrap_expectations(
-        os.getenv("S43_BOOTSTRAP_PROFILE", "sentinel43")
-    )
+    bootstrap_expectations()
 
 
 # ============================================================
