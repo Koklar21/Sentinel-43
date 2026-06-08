@@ -5,17 +5,22 @@ Activity Feed
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
+
+ActivitySeverity = Literal["info", "warning", "error"]
+
+VALID_SEVERITIES: set[str] = {"info", "warning", "error"}
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class ActivityEvent:
     timestamp: str
     event_type: str
     message: str
-    severity: str = "info"
+    severity: ActivitySeverity = "info"
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -31,29 +36,35 @@ class ActivityFeed:
     """
 
     def __init__(self, max_events: int = 100) -> None:
+        if max_events <= 0:
+            raise ValueError("max_events must be greater than zero")
+
         self.max_events = max_events
-        self._events: list[ActivityEvent] = []
+        self._events: deque[ActivityEvent] = deque(maxlen=max_events)
 
     def add_event(
         self,
         *,
         event_type: str,
         message: str,
-        severity: str = "info",
+        severity: ActivitySeverity = "info",
         metadata: dict[str, Any] | None = None,
     ) -> ActivityEvent:
+        if severity not in VALID_SEVERITIES:
+            raise ValueError(
+                f"Invalid activity severity '{severity}'. "
+                f"Expected one of: {', '.join(sorted(VALID_SEVERITIES))}"
+            )
+
         event = ActivityEvent(
             timestamp=datetime.now(timezone.utc).isoformat(),
             event_type=event_type,
             message=message,
             severity=severity,
-            metadata=metadata or {},
+            metadata=dict(metadata or {}),
         )
 
-        self._events.insert(0, event)
-
-        if len(self._events) > self.max_events:
-            self._events = self._events[: self.max_events]
+        self._events.appendleft(event)
 
         return event
 
@@ -69,17 +80,9 @@ class ActivityFeed:
     def to_dict(self) -> dict[str, Any]:
         return {
             "event_count": len(self._events),
-            "events": [
-                {
-                    "timestamp": event.timestamp,
-                    "event_type": event.event_type,
-                    "message": event.message,
-                    "severity": event.severity,
-                    "metadata": event.metadata,
-                }
-                for event in self._events
-            ],
+            "events": [asdict(event) for event in self._events],
         }
 
 
-activity_feed = ActivityFeed()
+def create_activity_feed(max_events: int = 100) -> ActivityFeed:
+    return ActivityFeed(max_events=max_events)
