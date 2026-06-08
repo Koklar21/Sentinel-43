@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 
 from .routers.remote_gateway import router as remote_gateway_router
 from .routers.audit import router as audit_router
-from core.bootstrap import bootstrap_expectations 
+from ..bootstrap import bootstrap_expectations
 
 APP_NAME = "sentinel-43-api"
 APP_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
