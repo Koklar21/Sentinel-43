@@ -14,7 +14,7 @@ from typing import Any
 
 from Core.logging_init import init_logging, get_logger
 from Core.runtime import SentinelRuntime
-
+from ..bootstrap import bootstrap_expectations
 
 APP_NAME = "sentinel-43-core"
 APP_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
