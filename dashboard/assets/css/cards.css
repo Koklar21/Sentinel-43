@@ -4,30 +4,54 @@
    ========================================================== */
 
 .card {
-    background: #1b1f24;
-    border: 1px solid #2f3742;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
     border-radius: 12px;
     padding: 16px;
-    margin: 12px;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+    box-shadow: var(--shadow-card, 0 2px 8px rgba(0, 0, 0, 0.25));
+}
+
+.card[role="button"],
+.card.clickable,
+.card.is-clickable {
+    cursor: pointer;
+    transition:
+        border-color 0.2s ease,
+        box-shadow 0.2s ease,
+        transform 0.2s ease;
+}
+
+.card[role="button"]:hover,
+.card.clickable:hover,
+.card.is-clickable:hover {
+    border-color: var(--accent-color);
+    box-shadow: var(--shadow-card-hover, 0 4px 14px rgba(0, 0, 0, 0.35));
+    transform: translateY(-1px);
+}
+
+.card[role="button"]:focus-visible,
+.card.clickable:focus-visible,
+.card.is-clickable:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 3px;
 }
 
 .card-header {
     font-size: 1.1rem;
     font-weight: 600;
-    color: #ffffff;
+    color: var(--text-primary);
     margin-bottom: 12px;
 }
 
 .card-body {
-    color: #d7dde5;
+    color: var(--text-secondary);
 }
 
 .card-footer {
     margin-top: 12px;
     padding-top: 8px;
-    border-top: 1px solid #2f3742;
-    color: #9aa7b5;
+    border-top: 1px solid var(--border-color);
+    color: var(--text-muted);
     font-size: 0.9rem;
 }
 
@@ -43,7 +67,7 @@
 
 .status-title {
     font-size: 0.9rem;
-    color: #9aa7b5;
+    color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.05em;
 }
@@ -52,19 +76,23 @@
     font-size: 2rem;
     font-weight: 700;
     margin-top: 8px;
-    color: #ffffff;
+    color: var(--text-primary);
 }
 
-.status-online {
-    border-left: 4px solid #2ecc71;
+/* Scoped to cards so dashboard-wide status classes do not get hijacked */
+.status-card.status-online,
+.status-card--online {
+    border-left: 4px solid var(--success);
 }
 
-.status-warning {
-    border-left: 4px solid #f1c40f;
+.status-card.status-warning,
+.status-card--warning {
+    border-left: 4px solid var(--warning);
 }
 
-.status-error {
-    border-left: 4px solid #e74c3c;
+.status-card.status-error,
+.status-card--error {
+    border-left: 4px solid var(--danger);
 }
 
 /* ==========================================================
@@ -79,7 +107,7 @@
 
 .node-name {
     font-weight: 600;
-    color: #ffffff;
+    color: var(--text-primary);
 }
 
 .node-state {
@@ -87,15 +115,15 @@
 }
 
 .node-active {
-    color: #2ecc71;
+    color: var(--success);
 }
 
 .node-degraded {
-    color: #f1c40f;
+    color: var(--warning);
 }
 
 .node-failed {
-    color: #e74c3c;
+    color: var(--danger);
 }
 
 /* ==========================================================
@@ -103,16 +131,16 @@
    ========================================================== */
 
 .audit-card {
-    border-left: 4px solid #3498db;
+    border-left: 4px solid var(--info);
 }
 
 .audit-id {
     font-family: monospace;
-    color: #8ecdf5;
+    color: var(--info-light, var(--info));
 }
 
 .audit-timestamp {
-    color: #9aa7b5;
+    color: var(--text-muted);
     font-size: 0.85rem;
 }
 
@@ -121,16 +149,17 @@
    ========================================================== */
 
 .remote-card {
-    border-left: 4px solid #8e44ad;
+    border-left: 4px solid var(--purple, var(--accent-color));
 }
 
 .remote-target {
     font-weight: 600;
+    color: var(--text-primary);
 }
 
 .remote-event {
     font-family: monospace;
-    color: #d6b3ff;
+    color: var(--purple-light, var(--accent-color));
 }
 
 /* ==========================================================
@@ -139,7 +168,6 @@
 
 @media (max-width: 768px) {
     .card {
-        margin: 8px;
         padding: 12px;
     }
 
