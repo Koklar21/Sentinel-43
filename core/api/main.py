@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from .routers.remote_gateway import router as remote_gateway_router
 from .routers.audit import router as audit_router
 from ..bootstrap import bootstrap_expectations
+from fastapi.middleware.core import CORSMiddleware
 
 APP_NAME = "sentinel-43-api"
 APP_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
@@ -243,6 +244,18 @@ def root() -> dict[str, Any]:
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://127.0.0.1:5500",
+        "http://localhost:5500",
+        "http://127.0.0.1:8000",
+        "http://localhost:8000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 @root_router.get("/health")
