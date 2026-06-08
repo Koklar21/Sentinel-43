@@ -245,12 +245,6 @@ app = FastAPI(
     version=APP_VERSION,
 )
 
-@app.on_event("startup")
-async def startup_event() -> None:
-    bootstrap_expectations(
-        os.getenv("S43_BOOTSTRAP_PROFILE", "sentinel43")
-    )
-
 @root_router.get("/health")
 def health() -> dict[str, Any]:
     return {
