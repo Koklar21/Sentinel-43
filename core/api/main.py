@@ -678,6 +678,12 @@ def compat_api_watchtower_health() -> dict[str, Any]:
 def compat_api_watchtower_ready() -> dict[str, Any]:
     return api_watchtower_ready()
 
+@app.on_event("startup")
+async def startup_event() -> None:
+    bootstrap_expectations(
+        os.getenv("S43_BOOTSTRAP_PROFILE", "sentinel43")
+    )
+
 
 # ============================================================
 # Register Routers
