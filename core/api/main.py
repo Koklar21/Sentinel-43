@@ -262,7 +262,7 @@ def ready() -> JSONResponse:
     with _watchtower_lock:
         wt_local = dict(_watchtower_last_status)
 
-    is_ready = wt["reachable"] and wt_local.get("registered", False)
+    is_ready = wt["reachable"]
 
     return JSONResponse(
         status_code=200 if is_ready else 503,
