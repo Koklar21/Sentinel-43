@@ -240,6 +240,16 @@ def root() -> dict[str, Any]:
         "timestamp": utc_now(),
     }
 
+app = FastAPI(
+    title=APP_NAME,
+    version=APP_VERSION,
+)
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    bootstrap_expectations(
+        os.getenv("S43_BOOTSTRAP_PROFILE", "sentinel43")
+    )
 
 @root_router.get("/health")
 def health() -> dict[str, Any]:
@@ -678,12 +688,6 @@ def compat_api_watchtower_health() -> dict[str, Any]:
 def compat_api_watchtower_ready() -> dict[str, Any]:
     return api_watchtower_ready()
 
-@app.on_event("startup")
-async def startup_event() -> None:
-    bootstrap_expectations(
-        os.getenv("S43_BOOTSTRAP_PROFILE", "sentinel43")
-    )
-
 
 # ============================================================
 # Register Routers
@@ -715,4 +719,4 @@ async def not_found_handler(request: Request, exc: Exception) -> JSONResponse:
             "timestamp": utc_now(),
         },
     )
-L
+
