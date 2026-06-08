@@ -196,8 +196,11 @@ _heartbeat_thread: threading.Thread | None = None
 async def lifespan(api: FastAPI):
     global _heartbeat_thread
 
+    bootstrap_expectations()   # <-- INSERT HERE
+
     register_api_with_watchtower()
     send_api_heartbeat()
+
     report_dependency_to_watchtower(
         "sentinel-43-api",
         "online",
@@ -217,14 +220,6 @@ async def lifespan(api: FastAPI):
 
     _stop_heartbeat.set()
     send_api_heartbeat()
-
-
-app = FastAPI(
-    title=APP_NAME,
-    version=APP_VERSION,
-    description="Sentinel-43 API control surface with Watchtower intercommunication bridge",
-    lifespan=lifespan,
-)
 
 
 # ============================================================
