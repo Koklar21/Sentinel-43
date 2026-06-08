@@ -1,6 +1,7 @@
 /* ==========================================================
    Sentinel-43 Dashboard
    websocket.js
+   Hardened WebSocket bridge
    ========================================================== */
 
 "use strict";
@@ -17,10 +18,13 @@ const SentinelWebSocket = {
     reconnectDelayMs: 3000,
     maxReconnectDelayMs: 30000,
     heartbeatIntervalMs: 15000,
+    maxLogMessageLength: 2000,
 
     socket: null,
     reconnectAttempts: 0,
     heartbeatTimer: null,
+    reconnectTimer: null,
+    lastMessageAt: 0,
     manuallyClosed: false,
 };
 
@@ -65,6 +69,16 @@ function wsSetStatus(state) {
     }
 }
 
+function clampLogMessage(message) {
+    const text = String(message ?? "");
+
+    if (text.length <= SentinelWebSocket.maxLogMessageLength) {
+        return text;
+    }
+
+    return `${text.slice(0, SentinelWebSocket.maxLogMessageLength)}... [truncated]`;
+}
+
 function wsLogEvent(message, level = "info") {
     const feed = document.querySelector("[data-ws-feed]");
 
@@ -72,15 +86,20 @@ function wsLogEvent(message, level = "info") {
         return;
     }
 
+    const safeLevel = String(level || "info").replace(/[^a-z0-9_-]/gi, "");
     const entry = document.createElement("div");
-    entry.className = `audit-entry ws-event ws-event-${level}`;
+    entry.className = `audit-entry ws-event ws-event-${safeLevel}`;
 
-    const timestamp = new Date().toISOString();
+    const timeElement = document.createElement("div");
+    timeElement.className = "audit-entry-time";
+    timeElement.textContent = new Date().toISOString();
 
-    entry.innerHTML = `
-        <div class="audit-entry-time">${timestamp}</div>
-        <div class="audit-entry-message">${message}</div>
-    `;
+    const messageElement = document.createElement("div");
+    messageElement.className = "audit-entry-message";
+    messageElement.textContent = clampLogMessage(message);
+
+    entry.appendChild(timeElement);
+    entry.appendChild(messageElement);
 
     feed.prepend(entry);
 
@@ -91,8 +110,43 @@ function wsLogEvent(message, level = "info") {
     }
 }
 
+function getDashboardAuthToken() {
+    return (
+        window.SENTINEL_WS_TOKEN ||
+        window.SENTINEL_AUTH_TOKEN ||
+        window.localStorage.getItem("sentinel_token") ||
+        window.sessionStorage.getItem("sentinel_token") ||
+        ""
+    );
+}
+
 function buildWebSocketUrl() {
-    return SentinelWebSocket.wsUrl;
+    const token = getDashboardAuthToken();
+
+    if (!token) {
+        return SentinelWebSocket.wsUrl;
+    }
+
+    const url = new URL(SentinelWebSocket.wsUrl, window.location.href);
+    url.searchParams.set("token", token);
+
+    return url.toString();
+}
+
+function clearReconnectTimer() {
+    if (SentinelWebSocket.reconnectTimer) {
+        window.clearTimeout(SentinelWebSocket.reconnectTimer);
+        SentinelWebSocket.reconnectTimer = null;
+    }
+}
+
+function getReconnectDelay() {
+    const attempt = Math.max(0, SentinelWebSocket.reconnectAttempts - 1);
+    const exponential = SentinelWebSocket.reconnectDelayMs * Math.pow(2, attempt);
+    const capped = Math.min(exponential, SentinelWebSocket.maxReconnectDelayMs);
+    const jitter = Math.floor(Math.random() * 1000);
+
+    return capped + jitter;
 }
 
 /* ==========================================================
@@ -100,16 +154,18 @@ function buildWebSocketUrl() {
    ========================================================== */
 
 function handleWebSocketMessage(event) {
+    SentinelWebSocket.lastMessageAt = Date.now();
+
     let data = null;
 
     try {
         data = JSON.parse(event.data);
     } catch {
-        wsLogEvent(`Non-JSON message received: ${event.data}`, "warning");
+        wsLogEvent(`Non-JSON message received: ${clampLogMessage(event.data)}`, "warning");
         return;
     }
 
-    const eventType = data.event_type || data.type || "unknown";
+    const eventType = String(data.event_type || data.type || "unknown");
     const message = data.message || JSON.stringify(data);
 
     wsSetText("[data-last-event-type]", eventType);
@@ -131,17 +187,34 @@ function handleWebSocketMessage(event) {
 function startHeartbeat() {
     stopHeartbeat();
 
+    SentinelWebSocket.lastMessageAt = Date.now();
+
     SentinelWebSocket.heartbeatTimer = window.setInterval(() => {
-        if (
-            SentinelWebSocket.socket &&
-            SentinelWebSocket.socket.readyState === WebSocket.OPEN
-        ) {
-            SentinelWebSocket.socket.send(
+        const socket = SentinelWebSocket.socket;
+
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+            return;
+        }
+
+        const staleMs = Date.now() - SentinelWebSocket.lastMessageAt;
+        const staleLimitMs = SentinelWebSocket.heartbeatIntervalMs * 2;
+
+        if (staleMs > staleLimitMs) {
+            wsLogEvent("WebSocket heartbeat timeout; forcing reconnect", "warning");
+            socket.close();
+            return;
+        }
+
+        try {
+            socket.send(
                 JSON.stringify({
                     type: "dashboard_ping",
                     timestamp: new Date().toISOString(),
                 }),
             );
+        } catch (error) {
+            wsLogEvent(`Heartbeat send failed: ${error.message}`, "error");
+            socket.close();
         }
     }, SentinelWebSocket.heartbeatIntervalMs);
 }
@@ -158,6 +231,10 @@ function stopHeartbeat() {
    ========================================================== */
 
 function connectSentinelWebSocket() {
+    if (document.hidden) {
+        return;
+    }
+
     if (
         SentinelWebSocket.socket &&
         (
@@ -167,6 +244,8 @@ function connectSentinelWebSocket() {
     ) {
         return;
     }
+
+    clearReconnectTimer();
 
     SentinelWebSocket.manuallyClosed = false;
     wsSetStatus("connecting");
@@ -180,8 +259,11 @@ function connectSentinelWebSocket() {
         return;
     }
 
-    SentinelWebSocket.socket.addEventListener("open", () => {
+    const socket = SentinelWebSocket.socket;
+
+    socket.addEventListener("open", () => {
         SentinelWebSocket.reconnectAttempts = 0;
+        SentinelWebSocket.lastMessageAt = Date.now();
 
         wsSetStatus("connected");
         wsLogEvent("WebSocket connected", "info");
@@ -189,20 +271,24 @@ function connectSentinelWebSocket() {
         startHeartbeat();
     });
 
-    SentinelWebSocket.socket.addEventListener("message", handleWebSocketMessage);
+    socket.addEventListener("message", handleWebSocketMessage);
 
-    SentinelWebSocket.socket.addEventListener("error", () => {
+    socket.addEventListener("error", () => {
         wsSetStatus("error");
         wsLogEvent("WebSocket error detected", "error");
     });
 
-    SentinelWebSocket.socket.addEventListener("close", () => {
+    socket.addEventListener("close", () => {
         stopHeartbeat();
+
+        if (SentinelWebSocket.socket === socket) {
+            SentinelWebSocket.socket = null;
+        }
 
         wsSetStatus("closed");
         wsLogEvent("WebSocket closed", "warning");
 
-        if (!SentinelWebSocket.manuallyClosed) {
+        if (!SentinelWebSocket.manuallyClosed && !document.hidden) {
             scheduleReconnect();
         }
     });
@@ -211,6 +297,7 @@ function connectSentinelWebSocket() {
 function disconnectSentinelWebSocket() {
     SentinelWebSocket.manuallyClosed = true;
 
+    clearReconnectTimer();
     stopHeartbeat();
 
     if (SentinelWebSocket.socket) {
@@ -222,18 +309,23 @@ function disconnectSentinelWebSocket() {
 }
 
 function scheduleReconnect() {
+    if (SentinelWebSocket.manuallyClosed || document.hidden) {
+        return;
+    }
+
+    clearReconnectTimer();
+
     SentinelWebSocket.reconnectAttempts += 1;
 
-    const delay = Math.min(
-        SentinelWebSocket.reconnectDelayMs * SentinelWebSocket.reconnectAttempts,
-        SentinelWebSocket.maxReconnectDelayMs,
-    );
+    const delay = getReconnectDelay();
 
     wsSetStatus("reconnecting");
     wsLogEvent(`Reconnecting in ${delay}ms`, "warning");
 
-    window.setTimeout(() => {
-        if (!SentinelWebSocket.manuallyClosed) {
+    SentinelWebSocket.reconnectTimer = window.setTimeout(() => {
+        SentinelWebSocket.reconnectTimer = null;
+
+        if (!SentinelWebSocket.manuallyClosed && !document.hidden) {
             connectSentinelWebSocket();
         }
     }, delay);
@@ -252,9 +344,33 @@ function sendSentinelWebSocketMessage(payload) {
         return false;
     }
 
-    SentinelWebSocket.socket.send(JSON.stringify(payload));
-    return true;
+    try {
+        SentinelWebSocket.socket.send(JSON.stringify(payload));
+        return true;
+    } catch (error) {
+        wsLogEvent(`WebSocket send failed: ${error.message}`, "error");
+        return false;
+    }
 }
+
+/* ==========================================================
+   Page Visibility Handling
+   ========================================================== */
+
+document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+        disconnectSentinelWebSocket();
+        return;
+    }
+
+    const shouldConnect =
+        document.body.dataset.websocket === "true" ||
+        document.querySelector("[data-ws-status]") !== null;
+
+    if (shouldConnect) {
+        connectSentinelWebSocket();
+    }
+});
 
 /* ==========================================================
    Startup
