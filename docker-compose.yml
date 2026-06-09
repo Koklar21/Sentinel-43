@@ -61,7 +61,12 @@ services:
     ports:
       - "8000:8000"
     environment:
-      S43_ENV: production
+     environment:
+      S43_ENV: development
+      SENTINEL_ENV: development
+      S43_ENABLE_TEST_INJECTION: "true"
+      S43_LOG_LEVEL: INFO
+      CORE_URL: http://s43-core:9100
       S43_LOG_LEVEL: INFO
       CORE_URL: http://s43-core:9100
       DATABASE_URL: ${DATABASE_URL}
