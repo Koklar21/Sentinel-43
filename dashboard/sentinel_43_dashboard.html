@@ -159,7 +159,7 @@
 </main>
 <div id="reasonModal" class="modal-overlay" hidden aria-hidden="true" role="dialog" aria-modal="true"><div class="modal-bd" data-close></div><div class="modal-card"><h3 id="modalTitle">Provide reason</h3><p id="modalSubtitle">Reason is required. Ctrl+Enter confirms.</p><textarea id="modalInput" maxlength="500" placeholder="Enter a substantive reason (min 10 characters)…"></textarea><div style="display:flex;justify-content:space-between;align-items:center;margin-top:5px;"><div id="modalError" class="modal-err"></div><div id="modalCharCount" style="font-size:10px;font-family:var(--font-mono);color:var(--muted);">0 / 500</div></div><div class="modal-actions"><button id="modalCancel" class="btn" type="button">Cancel</button><button id="modalConfirm" class="btn green" type="button">Confirm</button></div></div></div>
 <div id="jwtModal" class="modal-overlay" hidden aria-hidden="true" role="dialog" aria-modal="true"><div class="modal-bd" data-close-jwt></div><div class="modal-card"><h3>Set SENTINEL JWT</h3><p>Development mode only. Production should use secure HttpOnly cookies instead of browser-accessible storage.</p><input type="text" id="jwtInput" placeholder="eyJ…" autocomplete="off" spellcheck="false" /><div class="modal-actions"><button id="jwtCancel" class="btn" type="button">Cancel</button><button id="jwtClear" class="btn red" type="button">Clear JWT</button><button id="jwtConfirm" class="btn cyan" type="button">Set JWT</button></div></div></div>
-<div id="injectModal" class="modal-overlay" hidden aria-hidden="true" role="dialog" aria-modal="true"><div class="modal-bd" data-close-inject></div><div class="modal-card"><h3>Inject test action?</h3><p>Adds a synthetic incident to the queue. Only available when demo mode is enabled.</p><div class="modal-actions"><button id="injectCancel" class="btn" type="button">Cancel</button><button id="injectConfirm" class="btn amber" type="button">⚡ Confirm Inject</button></div></div></div>
+<div id="injectModal" class="modal-overlay" hidden aria-hidden="true" role="dialog" aria-modal="true"><div class="modal-bd" data-close-inject></div><div class="modal-card"><h3>Inject test action?</h3><p>Adds one synthetic incident to the queue. Available only in demo mode or local live-test mode.</p><div class="modal-actions"><button id="injectCancel" class="btn" type="button">Cancel</button><button id="injectConfirm" class="btn amber" type="button">⚡ Confirm Inject</button></div></div></div>
 <div id="kbToast"><table><tr><td><kbd>/</kbd></td><td>Focus search</td></tr><tr><td><kbd>R</kbd></td><td>Refresh</td></tr><tr><td><kbd>↑↓</kbd></td><td>Navigate rows</td></tr><tr><td><kbd>A</kbd></td><td>Approve focused staged row</td></tr><tr><td><kbd>V</kbd></td><td>Veto focused actionable row</td></tr><tr><td><kbd>Esc</kbd></td><td>Clear selection / close</td></tr></table></div>
 <script>
 "use strict";
@@ -179,8 +179,8 @@ const CONFIG = Object.freeze({
   REASON_MAX: 500,
   DEMO_MODE: new URLSearchParams(location.search).get("demo") === "1",
   LIVE_TEST_MODE:
-  locationIsLocal &&
-  new URLSearchParams(location.search).get("test") === "1",
+    locationIsLocal &&
+    new URLSearchParams(location.search).get("test") === "1",
   MAX_LOG_LINES: 500,
   MAX_DEMO_ACTIONS: 500,
   MAX_WS_FRAME_BYTES: 64 * 1024,
@@ -407,20 +407,18 @@ const api = {
   approve: (id, reason) => CONFIG.DEMO_MODE ? demoBackend.approve(id, reason) : fetchJson(`/actions/${encodeURIComponent(id)}/approve`, {method: "POST", body: JSON.stringify({reason})}),
   veto: (id, reason) => CONFIG.DEMO_MODE ? demoBackend.veto(id, reason) : fetchJson(`/actions/${encodeURIComponent(id)}/veto`, {method: "POST", body: JSON.stringify({reason})}),
   inject: () =>
-  CONFIG.DEMO_MODE
-    ? demoBackend.inject()
-    : CONFIG.LIVE_TEST_MODE
-      ? fetchJson(
-          "/actions/test-inject",
-          {
-            method: "POST",
-          }
-        )
-      : Promise.reject(
-          new Error(
-            "Inject is disabled unless demo mode or local test mode is enabled"
+    CONFIG.DEMO_MODE
+      ? demoBackend.inject()
+      : CONFIG.LIVE_TEST_MODE
+        ? fetchJson(
+            "/actions/test-inject",
+            {method: "POST"}
           )
-        ),
+        : Promise.reject(
+            new Error(
+              "Inject is disabled unless demo mode or local test mode is enabled"
+            )
+          ),
   vaultStats: () => CONFIG.DEMO_MODE ? demoBackend.vaultStats() : fetchJson("/vault/stats")
 };
 
@@ -899,10 +897,16 @@ function startPollingFallback() {
 function updateStaticConfig() {
   el.apiBaseText.textContent = CONFIG.API_BASE;
   el.pollText.textContent = `fallback ${CONFIG.FALLBACK_POLL_MS} ms`;
-  el.demoText.textContent = CONFIG.DEMO_MODE ? "ENABLED" : "DISABLED";
-  el.demoText.style.color = CONFIG.DEMO_MODE ? "var(--amber)" : "var(--green)";
+  el.demoText.textContent = CONFIG.DEMO_MODE
+    ? "DEMO ENABLED"
+    : CONFIG.LIVE_TEST_MODE
+      ? "LIVE TEST ENABLED"
+      : "DISABLED";
+  el.demoText.style.color = (CONFIG.DEMO_MODE || CONFIG.LIVE_TEST_MODE)
+    ? "var(--amber)"
+    : "var(--green)";
   el.demoBadge.hidden = !CONFIG.DEMO_MODE;
- el.injectBtn.disabled = (!CONFIG.DEMO_MODE && !CONFIG.LIVE_TEST_MODE) ||injectInFlight;
+  el.injectBtn.disabled = (!CONFIG.DEMO_MODE && !CONFIG.LIVE_TEST_MODE) || injectInFlight;
 
   const token = getDevToken();
   el.authStateText.textContent = token ? "DEV TOKEN PRESENT" : CONFIG.ALLOW_DEV_JWT_STORAGE ? "COOKIE / MISSING" : "COOKIE ONLY";
@@ -982,21 +986,17 @@ el.clearSearchBtn.addEventListener("click", () => { el.searchInput.value = ""; s
 el.refreshBtn.addEventListener("click", () => refreshDashboard(true, {force: true}));
 el.exportBtn.addEventListener("click", exportVisibleActions);
 
-inject: () =>
-  CONFIG.DEMO_MODE
-    ? demoBackend.inject()
-    : CONFIG.LIVE_TEST_MODE
-      ? fetchJson(
-          "/actions/test-inject",
-          {
-            method: "POST",
-          }
-        )
-      : Promise.reject(
-          new Error(
-            "Inject is disabled unless demo mode or local test mode is enabled"
-          )
-        ),
+el.injectBtn.addEventListener("click", () => {
+  if ((!CONFIG.DEMO_MODE && !CONFIG.LIVE_TEST_MODE) || injectInFlight) {
+    log("Inject blocked: demo mode and local test mode are disabled, or an inject is already in flight.", "warn");
+    return;
+  }
+  el.injectBtn.disabled = true;
+  el.injectModal.hidden = false;
+  el.injectModal.setAttribute("aria-hidden", "false");
+  setModalOpen(true);
+});
+
 function closeInject() {
   if (el.injectModal.hidden) return;
   el.injectModal.hidden = true;
@@ -1076,6 +1076,7 @@ window.addEventListener("beforeunload", () => {
 
 log("Dashboard initializing...", "info");
 if (!CONFIG.DEMO_MODE) log("Demo mode disabled. Use ?demo=1 only for local testing.", "info");
+if (CONFIG.LIVE_TEST_MODE) log("Local live-test injection enabled with ?test=1.", "warn");
 initTheme();
 updateStaticConfig();
 setStatus("Booting");
