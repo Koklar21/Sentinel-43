@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from .routers.remote_gateway import router as remote_gateway_router
@@ -244,7 +244,9 @@ def root() -> dict[str, Any]:
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
+    lifespan=lifespan,
 )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -258,14 +260,81 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@root_router.get("/health")
-def health() -> dict[str, Any]:
-    return {
-        "status": "ok",
-        "service": APP_NAME,
-        "version": APP_VERSION,
-        "timestamp": utc_now(),
-    }
+@app.websocket("/ws")
+async def dashboard_websocket(websocket: WebSocket) -> None:
+    """
+    Local-development WebSocket bridge for the Sentinel-43 dashboard.
+
+    Authentication can be added after the connection path is verified.
+    """
+
+    await websocket.accept()
+
+    await websocket.send_json(
+        {
+            "type": "connected",
+            "payload": {
+                "status": "ok",
+                "service": APP_NAME,
+                "timestamp": utc_now(),
+            },
+        }
+    )
+
+    try:
+        while True:
+            message = await websocket.receive_json()
+
+            event_type = message.get("type")
+            payload = message.get("payload") or {}
+
+            if event_type == "ping":
+                await websocket.send_json(
+                    {
+                        "type": "pong",
+                        "payload": {
+                            "timestamp": utc_now(),
+                        },
+                    }
+                )
+                continue
+
+            if event_type == "subscribe":
+                await websocket.send_json(
+                    {
+                        "type": "subscribed",
+                        "payload": {
+                            "channel": payload.get("channel"),
+                            "timestamp": utc_now(),
+                        },
+                    }
+                )
+                continue
+
+            if event_type == "unsubscribe":
+                await websocket.send_json(
+                    {
+                        "type": "unsubscribed",
+                        "payload": {
+                            "channel": payload.get("channel"),
+                            "timestamp": utc_now(),
+                        },
+                    }
+                )
+                continue
+
+            await websocket.send_json(
+                {
+                    "type": "ack",
+                    "payload": {
+                        "received_type": event_type,
+                        "timestamp": utc_now(),
+                    },
+                }
+            )
+
+    except WebSocketDisconnect:
+        return
 
 
 @root_router.get("/ready")
