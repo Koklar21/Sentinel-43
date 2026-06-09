@@ -178,6 +178,9 @@ const CONFIG = Object.freeze({
   REASON_MIN: 10,
   REASON_MAX: 500,
   DEMO_MODE: new URLSearchParams(location.search).get("demo") === "1",
+  LIVE_TEST_MODE:
+  locationIsLocal &&
+  new URLSearchParams(location.search).get("test") === "1",
   MAX_LOG_LINES: 500,
   MAX_DEMO_ACTIONS: 500,
   MAX_WS_FRAME_BYTES: 64 * 1024,
@@ -403,7 +406,21 @@ const api = {
   listActions: () => CONFIG.DEMO_MODE ? demoBackend.listActions() : fetchJson("/actions?limit=250"),
   approve: (id, reason) => CONFIG.DEMO_MODE ? demoBackend.approve(id, reason) : fetchJson(`/actions/${encodeURIComponent(id)}/approve`, {method: "POST", body: JSON.stringify({reason})}),
   veto: (id, reason) => CONFIG.DEMO_MODE ? demoBackend.veto(id, reason) : fetchJson(`/actions/${encodeURIComponent(id)}/veto`, {method: "POST", body: JSON.stringify({reason})}),
-  inject: () => CONFIG.DEMO_MODE ? demoBackend.inject() : Promise.reject(new Error("Inject is disabled unless demo mode is enabled")),
+  inject: () =>
+  CONFIG.DEMO_MODE
+    ? demoBackend.inject()
+    : CONFIG.LIVE_TEST_MODE
+      ? fetchJson(
+          "/actions/test-inject",
+          {
+            method: "POST",
+          }
+        )
+      : Promise.reject(
+          new Error(
+            "Inject is disabled unless demo mode or local test mode is enabled"
+          )
+        ),
   vaultStats: () => CONFIG.DEMO_MODE ? demoBackend.vaultStats() : fetchJson("/vault/stats")
 };
 
@@ -885,7 +902,7 @@ function updateStaticConfig() {
   el.demoText.textContent = CONFIG.DEMO_MODE ? "ENABLED" : "DISABLED";
   el.demoText.style.color = CONFIG.DEMO_MODE ? "var(--amber)" : "var(--green)";
   el.demoBadge.hidden = !CONFIG.DEMO_MODE;
-  el.injectBtn.disabled = !CONFIG.DEMO_MODE || injectInFlight;
+ el.injectBtn.disabled = (!CONFIG.DEMO_MODE && !CONFIG.LIVE_TEST_MODE) ||injectInFlight;
 
   const token = getDevToken();
   el.authStateText.textContent = token ? "DEV TOKEN PRESENT" : CONFIG.ALLOW_DEV_JWT_STORAGE ? "COOKIE / MISSING" : "COOKIE ONLY";
@@ -966,7 +983,7 @@ el.refreshBtn.addEventListener("click", () => refreshDashboard(true, {force: tru
 el.exportBtn.addEventListener("click", exportVisibleActions);
 
 el.injectBtn.addEventListener("click", () => {
-  if (!CONFIG.DEMO_MODE || injectInFlight) { log("Inject blocked: demo mode is disabled or an inject is already in flight.", "warn"); return; }
+  if ((!CONFIG.DEMO_MODE && !CONFIG.LIVE_TEST_MODE) ||injectInFlight) {
   el.injectBtn.disabled = true;
   el.injectModal.hidden = false;
   el.injectModal.setAttribute("aria-hidden", "false");
