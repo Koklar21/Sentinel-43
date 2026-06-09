@@ -67,8 +67,6 @@ services:
       S43_ENABLE_TEST_INJECTION: "true"
       S43_LOG_LEVEL: INFO
       CORE_URL: http://s43-core:9100
-      S43_LOG_LEVEL: INFO
-      CORE_URL: http://s43-core:9100
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: redis://:${REDIS_PASSWORD}@s43-redis:6379/0
       CORS_ORIGINS: ${CORS_ORIGINS}
