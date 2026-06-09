@@ -6,11 +6,21 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import copy
+import re
+from uuid import uuid4
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    FastAPI,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import JSONResponse
 
 from .routers.remote_gateway import router as remote_gateway_router
@@ -27,6 +37,203 @@ WATCHTOWER_TIMEOUT = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
 WATCHTOWER_HEARTBEAT_SECONDS = int(os.getenv("S43_WATCHTOWER_HEARTBEAT_SECONDS", "15"))
 
 START_TIME = time.time()
+
+# ============================================================
+# Dashboard End-to-End Test Harness
+# ============================================================
+
+LOCAL_TEST_ENVIRONMENTS = frozenset({
+    "development",
+    "dev",
+    "local",
+    "test",
+})
+
+TEST_INJECTION_ENABLED = (
+    os.getenv("S43_ENABLE_TEST_INJECTION", "false")
+    .lower()
+    .strip()
+    in {"1", "true", "yes", "on"}
+)
+
+MAX_DASHBOARD_ACTIONS = 500
+ACTION_ID_RE = re.compile(r"^[A-Z0-9_-]{1,64}$")
+
+_action_store_lock = threading.Lock()
+_action_store: dict[str, dict[str, Any]] = {}
+_vault_record_count = 0
+
+_dashboard_ws_clients: set[WebSocket] = set()
+
+
+def _validate_action_id(action_id: str) -> str:
+    if not isinstance(action_id, str):
+        raise HTTPException(
+            status_code=422,
+            detail="action_id must be a string",
+        )
+
+    cleaned = action_id.strip().upper()
+
+    if not ACTION_ID_RE.fullmatch(cleaned):
+        raise HTTPException(
+            status_code=422,
+            detail="action_id has an invalid format",
+        )
+
+    return cleaned
+
+
+def _require_reason(body: dict[str, Any]) -> str:
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=422,
+            detail="request body must be an object",
+        )
+
+    reason = body.get("reason")
+
+    if not isinstance(reason, str):
+        raise HTTPException(
+            status_code=422,
+            detail="reason must be a string",
+        )
+
+    cleaned = reason.strip()
+
+    if len(cleaned) < 10:
+        raise HTTPException(
+            status_code=422,
+            detail="reason must contain at least 10 characters",
+        )
+
+    if len(cleaned) > 500:
+        raise HTTPException(
+            status_code=422,
+            detail="reason must not exceed 500 characters",
+        )
+
+    return cleaned
+
+
+def _create_synthetic_action() -> dict[str, Any]:
+    return {
+        "id": f"ACT-TEST-{uuid4().hex[:10].upper()}",
+        "action_type": "THREAT_ACTION",
+        "status": "STAGED",
+        "created_at": utc_now(),
+        "decision_reason": "",
+        "operator": "",
+        "payload": {
+            "source_ip": "203.0.113.88",
+            "ip": "203.0.113.88",
+            "threat": "Synthetic end-to-end Sentinel-43 test incident",
+            "synthetic": True,
+        },
+    }
+
+
+def _store_action(action: dict[str, Any]) -> dict[str, Any]:
+    global _vault_record_count
+
+    safe_action = copy.deepcopy(action)
+
+    with _action_store_lock:
+        _action_store[safe_action["id"]] = safe_action
+        _vault_record_count += 1
+
+        if len(_action_store) > MAX_DASHBOARD_ACTIONS:
+            oldest_ids = [
+                action_id
+                for action_id, _ in sorted(
+                    _action_store.items(),
+                    key=lambda item: item[1]["created_at"],
+                )[: len(_action_store) - MAX_DASHBOARD_ACTIONS]
+            ]
+
+            for action_id in oldest_ids:
+                del _action_store[action_id]
+
+        return copy.deepcopy(safe_action)
+
+
+def _list_actions(limit: int = 250) -> list[dict[str, Any]]:
+    safe_limit = max(1, min(limit, 500))
+
+    with _action_store_lock:
+        actions = [
+            copy.deepcopy(action)
+            for action in _action_store.values()
+        ]
+
+    return sorted(
+        actions,
+        key=lambda action: action["created_at"],
+        reverse=True,
+    )[:safe_limit]
+
+
+def _vault_records() -> int:
+    with _action_store_lock:
+        return _vault_record_count
+
+
+def _update_action_status(
+    action_id: str,
+    *,
+    allowed_statuses: set[str],
+    new_status: str,
+    reason: str,
+) -> dict[str, Any]:
+    global _vault_record_count
+
+    cleaned_id = _validate_action_id(action_id)
+
+    with _action_store_lock:
+        action = _action_store.get(cleaned_id)
+
+        if action is None:
+            raise HTTPException(
+                status_code=404,
+                detail="action not found",
+            )
+
+        if action["status"] not in allowed_statuses:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"action status is {action['status']}; "
+                    f"expected one of {sorted(allowed_statuses)}"
+                ),
+            )
+
+        action["status"] = new_status
+        action["decision_reason"] = reason
+        action["operator"] = "dashboard-test-operator"
+        _vault_record_count += 1
+
+        return copy.deepcopy(action)
+
+
+async def _broadcast_dashboard_event(
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    dead_clients: list[WebSocket] = []
+
+    for client in tuple(_dashboard_ws_clients):
+        try:
+            await client.send_json(
+                {
+                    "type": event_type,
+                    "payload": payload,
+                }
+            )
+        except Exception:
+            dead_clients.append(client)
+
+    for client in dead_clients:
+        _dashboard_ws_clients.discard(client)
 
 _watchtower_lock = threading.Lock()
 _watchtower_last_status: dict[str, Any] = {
@@ -263,30 +470,50 @@ app.add_middleware(
 @app.websocket("/ws")
 async def dashboard_websocket(websocket: WebSocket) -> None:
     """
-    Local-development WebSocket bridge for the Sentinel-43 dashboard.
+    Dashboard WebSocket bridge.
 
-    Authentication can be added after the connection path is verified.
+    Supports:
+    - initial connection confirmation
+    - actions and vault subscriptions
+    - current-state snapshots
+    - heartbeat pong replies
+    - live action broadcasts
     """
 
     await websocket.accept()
-
-    await websocket.send_json(
-        {
-            "type": "connected",
-            "payload": {
-                "status": "ok",
-                "service": APP_NAME,
-                "timestamp": utc_now(),
-            },
-        }
-    )
+    _dashboard_ws_clients.add(websocket)
 
     try:
+        await websocket.send_json(
+            {
+                "type": "connected",
+                "payload": {
+                    "status": "ok",
+                    "service": APP_NAME,
+                    "timestamp": utc_now(),
+                },
+            }
+        )
+
         while True:
             message = await websocket.receive_json()
 
+            if not isinstance(message, dict):
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "payload": {
+                            "error": "WebSocket message must be an object",
+                        },
+                    }
+                )
+                continue
+
             event_type = message.get("type")
-            payload = message.get("payload") or {}
+            payload = message.get("payload")
+
+            if not isinstance(payload, dict):
+                payload = {}
 
             if event_type == "ping":
                 await websocket.send_json(
@@ -300,15 +527,38 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 continue
 
             if event_type == "subscribe":
+                channel = str(payload.get("channel") or "").strip()
+
                 await websocket.send_json(
                     {
                         "type": "subscribed",
                         "payload": {
-                            "channel": payload.get("channel"),
+                            "channel": channel,
                             "timestamp": utc_now(),
                         },
                     }
                 )
+
+                if channel == "actions":
+                    await websocket.send_json(
+                        {
+                            "type": "actions_snapshot",
+                            "payload": {
+                                "actions": _list_actions(),
+                            },
+                        }
+                    )
+
+                if channel == "vault":
+                    await websocket.send_json(
+                        {
+                            "type": "vault_stats",
+                            "payload": {
+                                "records": _vault_records(),
+                            },
+                        }
+                    )
+
                 continue
 
             if event_type == "unsubscribe":
@@ -325,10 +575,9 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
 
             await websocket.send_json(
                 {
-                    "type": "ack",
+                    "type": "error",
                     "payload": {
-                        "received_type": event_type,
-                        "timestamp": utc_now(),
+                        "error": f"Unsupported WebSocket event: {event_type!r}",
                     },
                 }
             )
@@ -336,18 +585,137 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         return
 
+    finally:
+        _dashboard_ws_clients.discard(websocket)
+
 
 @root_router.get("/actions")
-def dashboard_actions(limit: int = 250) -> list[dict[str, Any]]:
+def dashboard_actions(
+    limit: int = 250,
+) -> list[dict[str, Any]]:
+    return _list_actions(limit)
+
+
+@root_router.get("/vault/stats")
+def dashboard_vault_stats() -> dict[str, Any]:
+    return {
+        "records": _vault_records(),
+        "timestamp": utc_now(),
+    }
+
+
+@root_router.post("/actions/test-inject")
+async def dashboard_test_inject() -> dict[str, Any]:
     """
-    Temporary dashboard action queue endpoint.
+    Create one fixed synthetic incident for local end-to-end testing.
 
-    Returns an empty queue until the live action store is wired in.
+    This route must never be enabled in production.
     """
-    safe_limit = max(1, min(limit, 500))
+    environment = SENTINEL_ENV.lower().strip()
 
-    return []
+    if (
+        environment not in LOCAL_TEST_ENVIRONMENTS
+        or not TEST_INJECTION_ENABLED
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="test injection is disabled",
+        )
 
+    action = _store_action(
+        _create_synthetic_action()
+    )
+
+    await _broadcast_dashboard_event(
+        "action_created",
+        {
+            "action": action,
+        },
+    )
+
+    await _broadcast_dashboard_event(
+        "vault_stats",
+        {
+            "records": _vault_records(),
+        },
+    )
+
+    return {
+        "ok": True,
+        "action": action,
+        "vault_records": _vault_records(),
+        "timestamp": utc_now(),
+    }
+
+
+@root_router.post("/actions/{action_id}/approve")
+async def dashboard_approve_action(
+    action_id: str,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    reason = _require_reason(body)
+
+    action = _update_action_status(
+        action_id,
+        allowed_statuses={"STAGED"},
+        new_status="APPROVED",
+        reason=reason,
+    )
+
+    await _broadcast_dashboard_event(
+        "action_status_changed",
+        {
+            "action": action,
+        },
+    )
+
+    await _broadcast_dashboard_event(
+        "vault_stats",
+        {
+            "records": _vault_records(),
+        },
+    )
+
+    return {
+        "ok": True,
+        "action": action,
+        "timestamp": utc_now(),
+    }
+
+
+@root_router.post("/actions/{action_id}/veto")
+async def dashboard_veto_action(
+    action_id: str,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    reason = _require_reason(body)
+
+    action = _update_action_status(
+        action_id,
+        allowed_statuses={"PENDING", "STAGED"},
+        new_status="VETOED",
+        reason=reason,
+    )
+
+    await _broadcast_dashboard_event(
+        "action_status_changed",
+        {
+            "action": action,
+        },
+    )
+
+    await _broadcast_dashboard_event(
+        "vault_stats",
+        {
+            "records": _vault_records(),
+        },
+    )
+
+    return {
+        "ok": True,
+        "action": action,
+        "timestamp": utc_now(),
+    }
 
 @root_router.get("/vault/stats")
 def dashboard_vault_stats() -> dict[str, Any]:
