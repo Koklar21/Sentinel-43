@@ -982,14 +982,21 @@ el.clearSearchBtn.addEventListener("click", () => { el.searchInput.value = ""; s
 el.refreshBtn.addEventListener("click", () => refreshDashboard(true, {force: true}));
 el.exportBtn.addEventListener("click", exportVisibleActions);
 
-el.injectBtn.addEventListener("click", () => {
-  if ((!CONFIG.DEMO_MODE && !CONFIG.LIVE_TEST_MODE) ||injectInFlight) {
-  el.injectBtn.disabled = true;
-  el.injectModal.hidden = false;
-  el.injectModal.setAttribute("aria-hidden", "false");
-  setModalOpen(true);
-});
-
+inject: () =>
+  CONFIG.DEMO_MODE
+    ? demoBackend.inject()
+    : CONFIG.LIVE_TEST_MODE
+      ? fetchJson(
+          "/actions/test-inject",
+          {
+            method: "POST",
+          }
+        )
+      : Promise.reject(
+          new Error(
+            "Inject is disabled unless demo mode or local test mode is enabled"
+          )
+        ),
 function closeInject() {
   if (el.injectModal.hidden) return;
   el.injectModal.hidden = true;
