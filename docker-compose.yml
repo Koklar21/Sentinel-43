@@ -61,7 +61,6 @@ services:
     ports:
       - "8000:8000"
     environment:
-     environment:
       S43_ENV: development
       SENTINEL_ENV: development
       S43_ENABLE_TEST_INJECTION: "true"
