@@ -40,7 +40,7 @@ from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/remote", tags=["remote-gateway"])
+router = APIRouter(prefix="/remote-gateway",tags=["remote-gateway"],)
 
 
 # =============================================================================
