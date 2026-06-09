@@ -337,25 +337,29 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
         return
 
 
-@root_router.get("/ready")
-def ready() -> JSONResponse:
-    wt = watchtower_health_check()
+@root_router.get("/actions")
+def dashboard_actions(limit: int = 250) -> list[dict[str, Any]]:
+    """
+    Temporary dashboard action queue endpoint.
 
-    with _watchtower_lock:
-        wt_local = dict(_watchtower_last_status)
+    Returns an empty queue until the live action store is wired in.
+    """
+    safe_limit = max(1, min(limit, 500))
 
-    is_ready = wt["reachable"]
+    return []
 
-    return JSONResponse(
-        status_code=200 if is_ready else 503,
-        content={
-            "ready": is_ready,
-            "service": APP_NAME,
-            "watchtower": wt,
-            "watchtower_local_state": wt_local,
-            "timestamp": utc_now(),
-        },
-    )
+
+@root_router.get("/vault/stats")
+def dashboard_vault_stats() -> dict[str, Any]:
+    """
+    Temporary dashboard vault statistics endpoint.
+
+    Replace the placeholder count when the persistent vault is connected.
+    """
+    return {
+        "records": 0,
+        "timestamp": utc_now(),
+    }
 
 
 @root_router.get("/status")
