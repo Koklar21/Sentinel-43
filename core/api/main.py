@@ -711,7 +711,37 @@ def intercom_status() -> dict[str, Any]:
         "modules": wt_modules,
         "timestamp": utc_now(),
     }
+    
+# ============================================================
+# Dashboard Compatibility Router
+# ============================================================
 
+dashboard_router = APIRouter(tags=["dashboard"])
+
+
+@dashboard_router.get("/actions")
+def dashboard_actions(limit: int = 250) -> list[dict[str, Any]]:
+    """
+    Dashboard action queue compatibility endpoint.
+
+    Temporary empty queue until the live action store is wired in.
+    """
+    safe_limit = max(1, min(limit, 500))
+
+    return []
+
+
+@dashboard_router.get("/vault/stats")
+def dashboard_vault_stats() -> dict[str, Any]:
+    """
+    Dashboard vault statistics compatibility endpoint.
+
+    Temporary placeholder until the persistent audit vault is wired in.
+    """
+    return {
+        "records": 0,
+        "timestamp": utc_now(),
+    }
 
 # ============================================================
 # API Prefix Compatibility Router
