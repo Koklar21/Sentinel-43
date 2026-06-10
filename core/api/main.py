@@ -1,5 +1,41 @@
+# =============================================================================
+# Sentinel-43
+#
+# Copyright (c) 2026 Justin Armstrong
+# All Rights Reserved.
+#
+# This file is part of the Sentinel-43 platform and constitutes original
+# intellectual property of the copyright holder.
+#
+# Sentinel-43 is distributed under a dual-license model:
+#
+#   1. GNU Affero General Public License (AGPL v3.0)
+#      for open-source use, modification, and distribution.
+#
+#   2. Commercial License
+#      for proprietary, enterprise, government, or other commercial use
+#      not permitted under the AGPL v3.0.
+#
+# Unauthorized copying, redistribution, relicensing, reverse engineering,
+# or commercial exploitation outside the terms of the applicable license
+# is strictly prohibited.
+#
+# By accessing, modifying, distributing, or using this software, you agree
+# to comply with the terms of the applicable license.
+#
+# License Information:
+# AGPL v3.0: https://www.gnu.org/licenses/agpl-3.0.en.html
+#
+# Commercial Licensing:
+# Contact the copyright holder for commercial licensing terms.
+#
+# Sentinel-43™
+# Original Work and Protected Intellectual Property.
+# =============================================================================
+
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
@@ -235,6 +271,7 @@ async def _broadcast_dashboard_event(
     for client in dead_clients:
         _dashboard_ws_clients.discard(client)
 
+
 _watchtower_lock = threading.Lock()
 _watchtower_last_status: dict[str, Any] = {
     "reachable": False,
@@ -372,7 +409,9 @@ def send_api_heartbeat() -> dict[str, Any]:
 
     with _watchtower_lock:
         _watchtower_last_status["reachable"] = ok
-        _watchtower_last_status["last_heartbeat_ts"] = utc_now() if ok else _watchtower_last_status["last_heartbeat_ts"]
+        _watchtower_last_status["last_heartbeat_ts"] = (
+            utc_now() if ok else _watchtower_last_status["last_heartbeat_ts"]
+        )
         _watchtower_last_status["last_error"] = None if ok else result
 
     return {
@@ -382,7 +421,11 @@ def send_api_heartbeat() -> dict[str, Any]:
     }
 
 
-def report_dependency_to_watchtower(name: str, status: str, details: dict[str, Any] | None = None) -> dict[str, Any]:
+def report_dependency_to_watchtower(
+    name: str,
+    status: str,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     payload = {
         "name": name,
         "status": status,
@@ -400,16 +443,18 @@ _stop_heartbeat = threading.Event()
 _heartbeat_thread: threading.Thread | None = None
 
 
+# FIX #4: All blocking urllib calls wrapped in asyncio.to_thread so they
+# don't block the event loop during startup and shutdown.
 @asynccontextmanager
 async def lifespan(api: FastAPI):
     global _heartbeat_thread
 
-    bootstrap_expectations()   # <-- INSERT HERE
+    bootstrap_expectations()
 
-    register_api_with_watchtower()
-    send_api_heartbeat()
-
-    report_dependency_to_watchtower(
+    await asyncio.to_thread(register_api_with_watchtower)
+    await asyncio.to_thread(send_api_heartbeat)
+    await asyncio.to_thread(
+        report_dependency_to_watchtower,
         "sentinel-43-api",
         "online",
         {"version": APP_VERSION, "environment": SENTINEL_ENV},
@@ -427,7 +472,7 @@ async def lifespan(api: FastAPI):
     yield
 
     _stop_heartbeat.set()
-    send_api_heartbeat()
+    await asyncio.to_thread(send_api_heartbeat)
 
 
 # ============================================================
@@ -448,6 +493,7 @@ def root() -> dict[str, Any]:
         "timestamp": utc_now(),
     }
 
+
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
@@ -466,6 +512,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @app.websocket("/ws")
 async def dashboard_websocket(websocket: WebSocket) -> None:
@@ -590,9 +637,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
 
 
 @root_router.get("/actions")
-def dashboard_actions(
-    limit: int = 250,
-) -> list[dict[str, Any]]:
+def dashboard_actions(limit: int = 250) -> list[dict[str, Any]]:
     return _list_actions(limit)
 
 
@@ -717,18 +762,6 @@ async def dashboard_veto_action(
         "timestamp": utc_now(),
     }
 
-@root_router.get("/vault/stats")
-def dashboard_vault_stats() -> dict[str, Any]:
-    """
-    Temporary dashboard vault statistics endpoint.
-
-    Replace the placeholder count when the persistent vault is connected.
-    """
-    return {
-        "records": 0,
-        "timestamp": utc_now(),
-    }
-
 
 @root_router.get("/status")
 def status() -> dict[str, Any]:
@@ -830,6 +863,11 @@ def watchtower_check() -> dict[str, Any]:
     ready_result = _watchtower_request("GET", "/watchtower/ready")
     status_result = _watchtower_request("GET", "/watchtower/status")
 
+    # FIX #3: snapshot under lock before reading — heartbeat thread writes
+    # _watchtower_last_status concurrently.
+    with _watchtower_lock:
+        wt_snapshot = dict(_watchtower_last_status)
+
     return {
         "service": "watchtower_bridge",
         "watchtower_url": WATCHTOWER_URL,
@@ -837,7 +875,7 @@ def watchtower_check() -> dict[str, Any]:
             "health": "ok" if health_result["reachable"] else "failed",
             "ready": "ok" if "error" not in ready_result else "failed",
             "status": "ok" if "error" not in status_result else "failed",
-            "api_registered": _watchtower_last_status.get("registered", False),
+            "api_registered": wt_snapshot.get("registered", False),
         },
         "responses": {
             "health": health_result,
@@ -1060,6 +1098,7 @@ def system_routes() -> dict[str, Any]:
         "timestamp": utc_now(),
     }
 
+
 @system_router.get("/routes/status")
 def routes_status() -> dict[str, Any]:
     return {
@@ -1083,37 +1122,7 @@ def intercom_status() -> dict[str, Any]:
         "modules": wt_modules,
         "timestamp": utc_now(),
     }
-    
-# ============================================================
-# Dashboard Compatibility Router
-# ============================================================
 
-dashboard_router = APIRouter(tags=["dashboard"])
-
-
-@dashboard_router.get("/actions")
-def dashboard_actions(limit: int = 250) -> list[dict[str, Any]]:
-    """
-    Dashboard action queue compatibility endpoint.
-
-    Temporary empty queue until the live action store is wired in.
-    """
-    safe_limit = max(1, min(limit, 500))
-
-    return []
-
-
-@dashboard_router.get("/vault/stats")
-def dashboard_vault_stats() -> dict[str, Any]:
-    """
-    Dashboard vault statistics compatibility endpoint.
-
-    Temporary placeholder until the persistent audit vault is wired in.
-    """
-    return {
-        "records": 0,
-        "timestamp": utc_now(),
-    }
 
 # ============================================================
 # API Prefix Compatibility Router
@@ -1140,8 +1149,9 @@ def ready() -> dict[str, str]:
     }
 
 
+# FIX #5: return type corrected from JSONResponse to dict[str, str].
 @api_router.get("/ready")
-def compat_api_ready() -> JSONResponse:
+def compat_api_ready() -> dict[str, str]:
     return ready()
 
 
@@ -1195,6 +1205,7 @@ app.include_router(system_router)
 app.include_router(api_router)
 app.include_router(audit_router)
 
+
 # ============================================================
 # Error Handling
 # ============================================================
@@ -1210,4 +1221,3 @@ async def not_found_handler(request: Request, exc: Exception) -> JSONResponse:
             "timestamp": utc_now(),
         },
     )
-
