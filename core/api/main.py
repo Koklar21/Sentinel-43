@@ -1122,9 +1122,22 @@ def dashboard_vault_stats() -> dict[str, Any]:
 api_router = APIRouter(prefix="/api", tags=["api-compat"])
 
 
-@api_router.get("/health")
-def compat_api_health() -> dict[str, Any]:
-    return health()
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {
+        "status": "ok",
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "environment": SENTINEL_ENV,
+    }
+
+
+@app.get("/ready")
+def ready() -> dict[str, str]:
+    return {
+        "status": "ready",
+        "service": APP_NAME,
+    }
 
 
 @api_router.get("/ready")
