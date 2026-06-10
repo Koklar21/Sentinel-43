@@ -1,19 +1,37 @@
-"""
-SENTINEL-43 Nexus (sentinel43_nexus.py)
-
-# SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 Justin
-
-Public-facing, Murphy's-Law-hardened security nexus core:
-- ThreatEvent ingestion (typed)
-- Policy evaluation (deterministic, testable)
-- Oversight boundary (dedupe, budget, corroboration, gating)
-- Single-thread scheduler (no Timer pileups)
-- Restart-resistant state (SQLite)
-- Tamper-evident audit chain (hash-chained events, optimistic locking)
-
-All real-world effects must terminate in IntegrationHub.
-"""
+# =============================================================================
+# Sentinel-43
+#
+# Copyright (c) 2026 Justin Armstrong
+# All Rights Reserved.
+#
+# This file is part of the Sentinel-43 platform and constitutes original
+# intellectual property of the copyright holder.
+#
+# Sentinel-43 is distributed under a dual-license model:
+#
+#   1. GNU Affero General Public License (AGPL v3.0)
+#      for open-source use, modification, and distribution.
+#
+#   2. Commercial License
+#      for proprietary, enterprise, government, or other commercial use
+#      not permitted under the AGPL v3.0.
+#
+# Unauthorized copying, redistribution, relicensing, reverse engineering,
+# or commercial exploitation outside the terms of the applicable license
+# is strictly prohibited.
+#
+# By accessing, modifying, distributing, or using this software, you agree
+# to comply with the terms of the applicable license.
+#
+# License Information:
+# AGPL v3.0: https://www.gnu.org/licenses/agpl-3.0.en.html
+#
+# Commercial Licensing:
+# Contact the copyright holder for commercial licensing terms.
+#
+# Sentinel-43™
+# Original Work and Protected Intellectual Property.
+# =============================================================================
 
 from __future__ import annotations
 
