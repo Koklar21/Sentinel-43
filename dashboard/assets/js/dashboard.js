@@ -155,10 +155,15 @@ async function fetchJson(path, opts = {}) {
   const url = buildApiUrl(path);
   const sameOrigin = url.origin === location.origin;
   const response = await fetch(url.toString(), {
-    ...opts,
-    headers: {...getAuthHeaders(), ...(opts.headers || {})},
-    credentials: sameOrigin ? "include" : "omit"
-  });
+  ...opts,
+  cache: "no-store",
+  headers: {
+    ...getAuthHeaders(),
+    "Cache-Control": "no-cache",
+    ...(opts.headers || {})
+  },
+  credentials: sameOrigin ? "include" : "omit"
+});
 
   const contentType = response.headers.get("content-type") || "";
   const isJson = contentType.includes("application/json");
@@ -501,7 +506,7 @@ async function performRefresh(manual = false) {
       api.listActions(),
       api.vaultStats().catch(() => null)
     ]);
-    replaceActions(rawActions, wsConnected ? "live-sync" : "poll-sync");
+    replaceActions(rawActions, "http-sync");
     const records = extractVaultRecords(vault);
     el.vaultCount.textContent = typeof records === "number" ? records.toLocaleString() : "--";
     setStatus(wsConnected ? "Live" : "Online");
@@ -695,6 +700,13 @@ function connectWebSocket() {
       try { applyWsMessage(event.data); }
       catch (error) { log(`Rejected WebSocket message: ${error.message || error}`, "warn"); }
     });
+    case "connected":
+  log("WebSocket server acknowledged connection.", "ok");
+  break;
+
+case "subscribed":
+  log(`WebSocket subscription active: ${normalizeString(payload.channel, "unknown")}`, "ok");
+  break;
     ws.addEventListener("close", () => {
       wsConnected = false;
       stopWsHeartbeat();
@@ -710,8 +722,9 @@ function connectWebSocket() {
 
 function startPollingFallback() {
   if (pollTimer) clearInterval(pollTimer);
+
   pollTimer = setInterval(() => {
-    if (!wsConnected || dataIsStale()) refreshDashboard(false);
+    refreshDashboard(false);
   }, CONFIG.FALLBACK_POLL_MS);
 }
 
