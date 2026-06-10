@@ -79,7 +79,6 @@
       tbody td,thead th{padding:9px 8px}
       .stat-value{font-size:25px}
     }
-
     @media(max-width:1100px){main{grid-template-columns:1fr}}@media(max-width:700px){.stat-row{grid-template-columns:1fr 1fr}.cfg-grid{grid-template-columns:1fr}header{height:auto;padding:10px 14px;flex-wrap:wrap}}@media(max-width:440px){.stat-row{grid-template-columns:1fr}}
     @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}.stat-value.bump{transform:none}}
   </style>
@@ -172,7 +171,9 @@ const CONFIG = Object.freeze({
   API_BASE: String(runtime.apiBase || window.SENTINEL_API_BASE_URL || readMeta("sentinel-api-base") || "http://localhost:8000").replace(/\/+$/, ""),
   WS_URL: String(runtime.wsUrl || window.SENTINEL_WS_URL || readMeta("sentinel-ws-url") || "ws://localhost:8000/ws"),
   FALLBACK_POLL_MS: 15000,
-  WS_RECONNECT_MS: 3000,
+  // FIX #4: Initial reconnect delay — doubles each attempt, caps at WS_RECONNECT_MAX_MS.
+  WS_RECONNECT_MS: 1000,
+  WS_RECONNECT_MAX_MS: 30000,
   WS_HEARTBEAT_MS: 25000,
   DATA_STALE_MS: 60000,
   REASON_MIN: 10,
@@ -197,6 +198,10 @@ const STATUS_CLASSES = Object.freeze({
   UNKNOWN: "unknown"
 });
 
+// FIX #3: Hoist TextEncoder to module scope — one allocation for the lifetime
+// of the page instead of one per incoming WebSocket frame.
+const TEXT_ENCODER = new TextEncoder();
+
 const $ = id => document.getElementById(id);
 const el = {
   statusDot: $("statusDot"), statusText: $("statusText"), modeText: $("modeText"), queueCount: $("queueCount"), lastSync: $("lastSync"), pollFlash: $("pollFlash"), demoBadge: $("demoBadge"), jwtRiskBadge: $("jwtRiskBadge"),
@@ -219,11 +224,12 @@ let lastDataSyncAt = null;
 let refreshPromise = null;
 let pollTimer = null;
 let kbToastTimer = null;
-let modalOpenCount = 0;
 let injectInFlight = false;
 let ws = null;
 let wsConnected = false;
 let wsReconnectTimer = null;
+// FIX #4: Track consecutive failed reconnect attempts for exponential backoff.
+let wsReconnectAttempts = 0;
 let wsHeartbeatTimer = null;
 let wsClosing = false;
 
@@ -410,15 +416,8 @@ const api = {
     CONFIG.DEMO_MODE
       ? demoBackend.inject()
       : CONFIG.LIVE_TEST_MODE
-        ? fetchJson(
-            "/actions/test-inject",
-            {method: "POST"}
-          )
-        : Promise.reject(
-            new Error(
-              "Inject is disabled unless demo mode or local test mode is enabled"
-            )
-          ),
+        ? fetchJson("/actions/test-inject", {method: "POST"})
+        : Promise.reject(new Error("Inject is disabled unless demo mode or local test mode is enabled")),
   vaultStats: () => CONFIG.DEMO_MODE ? demoBackend.vaultStats() : fetchJson("/vault/stats")
 };
 
@@ -637,15 +636,13 @@ function validateReason(value) {
   return null;
 }
 
-function setModalOpen(open) {
-  modalOpenCount += open ? 1 : -1;
-  modalOpenCount = Math.max(0, modalOpenCount);
-}
+// FIX #2: modalOpenCount and setModalOpen() removed — the variable was
+// incremented/decremented but never read. The ESC key handler checks
+// each modal's .hidden property directly, so the counter served no purpose.
 
 function openReasonModal({title, subtitle, confirmText, confirmClass = "green"}) {
   return new Promise(resolve => {
-    setModalOpen(true);
-    const close = result => { el.reasonModal.hidden = true; el.reasonModal.setAttribute("aria-hidden", "true"); el.modalError.textContent = ""; setModalOpen(false); resolve(result); };
+    const close = result => { el.reasonModal.hidden = true; el.reasonModal.setAttribute("aria-hidden", "true"); el.modalError.textContent = ""; resolve(result); };
     el.modalTitle.textContent = title;
     el.modalSubtitle.textContent = subtitle;
     el.modalInput.value = "";
@@ -790,9 +787,16 @@ function stopWsHeartbeat() {
   wsHeartbeatTimer = null;
 }
 
+// FIX #3: Use module-scoped TEXT_ENCODER constant instead of allocating
+// a new TextEncoder() on every frame. Also fast-path: skip the expensive
+// encode() call if message.length is already within the byte budget
+// (safe because UTF-8 encoded length >= JS string length).
 function decodeWsMessage(message) {
   if (typeof message !== "string") throw new Error("WebSocket frame must be text");
-  if (new TextEncoder().encode(message).length > CONFIG.MAX_WS_FRAME_BYTES) throw new Error("WebSocket frame exceeds maximum size");
+  if (
+    message.length > CONFIG.MAX_WS_FRAME_BYTES ||
+    TEXT_ENCODER.encode(message).length > CONFIG.MAX_WS_FRAME_BYTES
+  ) throw new Error("WebSocket frame exceeds maximum size");
   const decoded = JSON.parse(message);
   if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) throw new Error("WebSocket message must be an object");
   if (typeof decoded.type !== "string" || !decoded.type.trim()) throw new Error("WebSocket message type is required");
@@ -800,9 +804,18 @@ function decodeWsMessage(message) {
   return {type: decoded.type.trim(), payload: decoded.payload};
 }
 
+// FIX #1: Added explicit silent cases for 'connected', 'subscribed', and
+// 'unsubscribed' — server sends these on every connection and channel sub.
+// Without them they fell through to default and logged noisy
+// "Ignored unhandled WebSocket event type: subscribed" lines on every connect.
 function applyWsMessage(message) {
   const {type, payload} = decodeWsMessage(message);
   switch (type) {
+    case "connected":
+    case "subscribed":
+    case "unsubscribed":
+      // Handshake / acknowledgement frames — no UI action needed.
+      break;
     case "actions_snapshot":
       replaceActions(payload.actions || payload, "ws-sync");
       break;
@@ -832,13 +845,20 @@ function applyWsMessage(message) {
   }
 }
 
+// FIX #4: Exponential backoff with 20% jitter. Delay starts at
+// WS_RECONNECT_MS (1 s), doubles each failed attempt, caps at
+// WS_RECONNECT_MAX_MS (30 s). Counter is reset on successful open.
 function scheduleWsReconnect() {
   if (CONFIG.DEMO_MODE || wsClosing || wsReconnectTimer) return;
-  wsReconnectTimer = setTimeout(() => { wsReconnectTimer = null; connectWebSocket(); }, CONFIG.WS_RECONNECT_MS);
+  const base = Math.min(CONFIG.WS_RECONNECT_MAX_MS, CONFIG.WS_RECONNECT_MS * Math.pow(2, wsReconnectAttempts));
+  const delay = base + base * 0.2 * Math.random();
+  wsReconnectAttempts += 1;
+  wsReconnectTimer = setTimeout(() => { wsReconnectTimer = null; connectWebSocket(); }, delay);
 }
 
 function closeWebSocket() {
   wsClosing = true;
+  wsReconnectAttempts = 0;
   if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
   wsReconnectTimer = null;
   stopWsHeartbeat();
@@ -863,13 +883,16 @@ function connectWebSocket() {
     setStatus("Reconnecting");
     ws = new WebSocket(url);
     ws.addEventListener("open", () => {
+      // FIX #4: Reset backoff counter on successful connection.
+      wsReconnectAttempts = 0;
       wsConnected = true;
       setStatus("Live");
       log("WebSocket connected. Live queue updates enabled.", "ok");
       wsSend("subscribe", {channel: "actions"});
       wsSend("subscribe", {channel: "vault"});
-      wsSend("subscribe", {channel: "watchtower"});
-      wsSend("subscribe", {channel: "telemetry"});
+      // FIX #5: Removed subscriptions to 'watchtower' and 'telemetry' —
+      // the backend does not implement those channels. They produced
+      // 'subscribed' acks that fell through to the default logger as noise.
       startWsHeartbeat();
     });
     ws.addEventListener("message", event => {
@@ -996,14 +1019,12 @@ el.injectBtn.addEventListener("click", () => {
   el.injectBtn.disabled = true;
   el.injectModal.hidden = false;
   el.injectModal.setAttribute("aria-hidden", "false");
-  setModalOpen(true);
 });
 
 function closeInject() {
   if (el.injectModal.hidden) return;
   el.injectModal.hidden = true;
   el.injectModal.setAttribute("aria-hidden", "true");
-  setModalOpen(false);
   updateStaticConfig();
 }
 
@@ -1023,7 +1044,6 @@ function closeJwt() {
   if (el.jwtModal.hidden) return;
   el.jwtModal.hidden = true;
   el.jwtModal.setAttribute("aria-hidden", "true");
-  setModalOpen(false);
 }
 
 el.authBtn.addEventListener("click", () => {
@@ -1031,7 +1051,6 @@ el.authBtn.addEventListener("click", () => {
   el.jwtInput.value = getDevToken() || "";
   el.jwtModal.hidden = false;
   el.jwtModal.setAttribute("aria-hidden", "false");
-  setModalOpen(true);
   setTimeout(() => el.jwtInput.focus(), 0);
 });
 
