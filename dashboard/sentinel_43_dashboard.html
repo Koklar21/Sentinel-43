@@ -868,6 +868,8 @@ function connectWebSocket() {
       log("WebSocket connected. Live queue updates enabled.", "ok");
       wsSend("subscribe", {channel: "actions"});
       wsSend("subscribe", {channel: "vault"});
+      wsSend("subscribe", {channel: "watchtower"});
+      wsSend("subscribe", {channel: "telemetry"});
       startWsHeartbeat();
     });
     ws.addEventListener("message", event => {
