@@ -36,18 +36,20 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import copy
 import json
+import logging
 import os
+import re
 import threading
 import time
 import urllib.error
 import urllib.request
-import copy
-import re
-from uuid import uuid4
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
+from uuid import uuid4
 
 from fastapi import (
     APIRouter,
@@ -57,100 +59,206 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .routers.remote_gateway import router as remote_gateway_router
-from .routers.audit import router as audit_router
 from ..bootstrap import bootstrap_expectations
-from fastapi.middleware.cors import CORSMiddleware
+from .routers.audit import router as audit_router
+from .routers.remote_gateway import router as remote_gateway_router
+
+logger = logging.getLogger(__name__)
+
+# =============================================================================
+# Configuration
+# =============================================================================
 
 APP_NAME = "sentinel-43-api"
 APP_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
-SENTINEL_ENV = os.getenv("SENTINEL_ENV", "development")
 
-WATCHTOWER_URL = os.getenv("S43_WATCHTOWER_URL", "http://s43-core:9100").rstrip("/")
-WATCHTOWER_TIMEOUT = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
-WATCHTOWER_HEARTBEAT_SECONDS = int(os.getenv("S43_WATCHTOWER_HEARTBEAT_SECONDS", "15"))
+# FIX #17: Default changed from "development" to "production".
+# "development" placed unset deployments inside LOCAL_TEST_ENVIRONMENTS,
+# leaving TEST_INJECTION_ENABLED as the only real safety net.
+SENTINEL_ENV: str = os.getenv("SENTINEL_ENV", "production")
 
-START_TIME = time.time()
+WATCHTOWER_URL: str = os.getenv("S43_WATCHTOWER_URL", "http://s43-core:9100").rstrip("/")
+WATCHTOWER_TIMEOUT: float = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
+WATCHTOWER_HEARTBEAT_SECONDS: int = int(os.getenv("S43_WATCHTOWER_HEARTBEAT_SECONDS", "15"))
 
-# ============================================================
-# Dashboard End-to-End Test Harness
-# ============================================================
+# FIX #11: Allowed origins from environment variable.
+# Set S43_ALLOWED_ORIGINS as a comma-separated list for staging/production.
+# Example: S43_ALLOWED_ORIGINS=https://dashboard.example.com,https://ops.example.com
+_ALLOWED_ORIGINS: frozenset[str] = frozenset(
+    o.strip()
+    for o in os.getenv(
+        "S43_ALLOWED_ORIGINS",
+        "http://127.0.0.1:5500,http://localhost:5500,"
+        "http://127.0.0.1:8000,http://localhost:8000",
+    ).split(",")
+    if o.strip()
+)
 
-LOCAL_TEST_ENVIRONMENTS = frozenset({
-    "development",
-    "dev",
-    "local",
-    "test",
-})
+# FIX #6: Hard cap on concurrent WebSocket connections.
+# Prevents connection exhaustion; every broadcast iterates the full set.
+MAX_WS_CLIENTS: int = int(os.getenv("S43_MAX_WS_CLIENTS", "50"))
 
-TEST_INJECTION_ENABLED = (
-    os.getenv("S43_ENABLE_TEST_INJECTION", "false")
-    .lower()
-    .strip()
+# FIX #5: Maximum incoming WebSocket frame size in bytes.
+# Matches the 64 KB cap enforced by the dashboard frontend.
+MAX_WS_FRAME_BYTES: int = int(os.getenv("S43_MAX_WS_FRAME_BYTES", str(64 * 1024)))
+
+# FIX #1: WebSocket auth gate.
+# Set S43_WS_REQUIRE_AUTH=true in production once the dashboard frontend
+# sends {"type":"auth","payload":{"token":"..."}} as its first message.
+# Default is false so existing local dev flow is not broken.
+WS_REQUIRE_AUTH: bool = (
+    os.getenv("S43_WS_REQUIRE_AUTH", "false").lower().strip()
     in {"1", "true", "yes", "on"}
 )
 
-MAX_DASHBOARD_ACTIONS = 500
+START_TIME: float = time.time()
+
+LOCAL_TEST_ENVIRONMENTS: frozenset[str] = frozenset(
+    {"development", "dev", "local", "test"}
+)
+
+TEST_INJECTION_ENABLED: bool = (
+    os.getenv("S43_ENABLE_TEST_INJECTION", "false").lower().strip()
+    in {"1", "true", "yes", "on"}
+)
+
+MAX_DASHBOARD_ACTIONS: int = 500
 ACTION_ID_RE = re.compile(r"^[A-Z0-9_-]{1,64}$")
+
+# =============================================================================
+# Module-level State
+# =============================================================================
 
 _action_store_lock = threading.Lock()
 _action_store: dict[str, dict[str, Any]] = {}
-_vault_record_count = 0
 
-_dashboard_ws_clients: set[WebSocket] = set()
+# FIX #14: Vault record count now tracks actual records created only.
+# _update_action_status no longer increments this counter — status changes
+# (approve, veto) are not new records.
+_vault_record_count: int = 0
 
+# FIX #15: Per-client subscription tracking.
+# Maps each WebSocket → set of channel names it has subscribed to.
+# Only accessed from async context (single event-loop thread), no asyncio.Lock needed.
+_dashboard_ws_clients: dict[WebSocket, set[str]] = {}
+
+# FIX #7: Async heartbeat replaces background daemon thread.
+_stop_heartbeat_event: asyncio.Event | None = None
+_heartbeat_task: asyncio.Task[None] | None = None
+
+# Watchtower state tracking — shared with heartbeat thread via lock.
+_watchtower_lock = threading.Lock()
+_watchtower_last_status: dict[str, Any] = {
+    "reachable": False,
+    "registered": False,
+    "last_register_ts": None,
+    "last_heartbeat_ts": None,
+    "last_error": None,
+}
+
+# =============================================================================
+# Utilities
+# =============================================================================
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def uptime_seconds() -> float:
+    return round(time.time() - START_TIME, 3)
+
+
+# =============================================================================
+# Auth Helpers
+# =============================================================================
+
+def _decode_jwt_subject(token: str) -> str | None:
+    """
+    Extract a display identity from a JWT payload without verifying the signature.
+
+    Checks sub, email, preferred_username, and user_id claims in order.
+    Used for audit-trail labelling only.
+
+    TODO: Add full signature verification via python-jose or PyJWT
+          before hardening for public deployment.
+    """
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        padding = "=" * (-len(parts[1]) % 4)
+        payload_bytes = base64.urlsafe_b64decode(parts[1] + padding)
+        payload = json.loads(payload_bytes)
+        for key in ("sub", "email", "preferred_username", "user_id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:64]
+    except Exception:
+        pass
+    return None
+
+
+def _get_operator(request: Request) -> str:
+    """
+    FIX #2 / #3: Extract real operator identity from the Authorization header
+    instead of using the hardcoded "dashboard-test-operator" string.
+
+    In LOCAL_TEST_ENVIRONMENTS with no token present, returns "dev-operator"
+    so local testing keeps working without auth headers.
+
+    In all other environments, raises 401 if no valid token is provided.
+    """
+    auth = request.headers.get("Authorization", "").strip()
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        if token:
+            subject = _decode_jwt_subject(token)
+            return subject if subject else f"bearer:{token[:16]}"
+
+    env = SENTINEL_ENV.lower().strip()
+    if env in LOCAL_TEST_ENVIRONMENTS:
+        return "dev-operator"
+
+    raise HTTPException(status_code=401, detail="Authentication required")
+
+
+# =============================================================================
+# Validation Helpers
+# =============================================================================
 
 def _validate_action_id(action_id: str) -> str:
     if not isinstance(action_id, str):
-        raise HTTPException(
-            status_code=422,
-            detail="action_id must be a string",
-        )
-
+        raise HTTPException(status_code=422, detail="action_id must be a string")
     cleaned = action_id.strip().upper()
-
     if not ACTION_ID_RE.fullmatch(cleaned):
-        raise HTTPException(
-            status_code=422,
-            detail="action_id has an invalid format",
-        )
-
+        raise HTTPException(status_code=422, detail="action_id has an invalid format")
     return cleaned
 
 
 def _require_reason(body: dict[str, Any]) -> str:
     if not isinstance(body, dict):
-        raise HTTPException(
-            status_code=422,
-            detail="request body must be an object",
-        )
-
+        raise HTTPException(status_code=422, detail="request body must be an object")
     reason = body.get("reason")
-
     if not isinstance(reason, str):
-        raise HTTPException(
-            status_code=422,
-            detail="reason must be a string",
-        )
-
+        raise HTTPException(status_code=422, detail="reason must be a string")
     cleaned = reason.strip()
-
     if len(cleaned) < 10:
         raise HTTPException(
-            status_code=422,
-            detail="reason must contain at least 10 characters",
+            status_code=422, detail="reason must contain at least 10 characters"
         )
-
     if len(cleaned) > 500:
         raise HTTPException(
-            status_code=422,
-            detail="reason must not exceed 500 characters",
+            status_code=422, detail="reason must not exceed 500 characters"
         )
-
     return cleaned
 
+
+# =============================================================================
+# Action Store
+# =============================================================================
 
 def _create_synthetic_action() -> dict[str, Any]:
     return {
@@ -176,7 +284,7 @@ def _store_action(action: dict[str, Any]) -> dict[str, Any]:
 
     with _action_store_lock:
         _action_store[safe_action["id"]] = safe_action
-        _vault_record_count += 1
+        _vault_record_count += 1  # FIX #14: only incremented here
 
         if len(_action_store) > MAX_DASHBOARD_ACTIONS:
             oldest_ids = [
@@ -186,7 +294,6 @@ def _store_action(action: dict[str, Any]) -> dict[str, Any]:
                     key=lambda item: item[1]["created_at"],
                 )[: len(_action_store) - MAX_DASHBOARD_ACTIONS]
             ]
-
             for action_id in oldest_ids:
                 del _action_store[action_id]
 
@@ -195,18 +302,9 @@ def _store_action(action: dict[str, Any]) -> dict[str, Any]:
 
 def _list_actions(limit: int = 250) -> list[dict[str, Any]]:
     safe_limit = max(1, min(limit, 500))
-
     with _action_store_lock:
-        actions = [
-            copy.deepcopy(action)
-            for action in _action_store.values()
-        ]
-
-    return sorted(
-        actions,
-        key=lambda action: action["created_at"],
-        reverse=True,
-    )[:safe_limit]
+        actions = [copy.deepcopy(a) for a in _action_store.values()]
+    return sorted(actions, key=lambda a: a["created_at"], reverse=True)[:safe_limit]
 
 
 def _vault_records() -> int:
@@ -220,19 +318,15 @@ def _update_action_status(
     allowed_statuses: set[str],
     new_status: str,
     reason: str,
+    operator: str,  # FIX #3: caller supplies real identity; no longer hardcoded
 ) -> dict[str, Any]:
-    global _vault_record_count
-
     cleaned_id = _validate_action_id(action_id)
 
     with _action_store_lock:
         action = _action_store.get(cleaned_id)
 
         if action is None:
-            raise HTTPException(
-                status_code=404,
-                detail="action not found",
-            )
+            raise HTTPException(status_code=404, detail="action not found")
 
         if action["status"] not in allowed_statuses:
             raise HTTPException(
@@ -245,50 +339,94 @@ def _update_action_status(
 
         action["status"] = new_status
         action["decision_reason"] = reason
-        action["operator"] = "dashboard-test-operator"
-        _vault_record_count += 1
+        action["operator"] = operator
+        # FIX #14: _vault_record_count is NOT incremented on status changes.
 
         return copy.deepcopy(action)
 
 
+# =============================================================================
+# WebSocket Broadcast
+# =============================================================================
+
 async def _broadcast_dashboard_event(
     event_type: str,
     payload: dict[str, Any],
+    *,
+    channel: str | None = None,
 ) -> None:
-    dead_clients: list[WebSocket] = []
+    """
+    FIX #4:  asyncio.gather delivers to all clients concurrently.
+             A slow or hung client no longer blocks delivery to others.
 
-    for client in tuple(_dashboard_ws_clients):
-        try:
-            await client.send_json(
-                {
-                    "type": event_type,
-                    "payload": payload,
-                }
+    FIX #15: When channel is specified, only clients subscribed to that channel
+             receive the frame. Pass channel=None to reach all connected clients.
+
+    FIX #20: Dropped clients are logged at DEBUG level instead of being silently
+             discarded.
+    """
+    if not _dashboard_ws_clients:
+        return
+
+    targets = (
+        [ws for ws, channels in _dashboard_ws_clients.items() if channel in channels]
+        if channel is not None
+        else list(_dashboard_ws_clients.keys())
+    )
+
+    if not targets:
+        return
+
+    frame = {"type": event_type, "payload": payload}
+
+    results = await asyncio.gather(
+        *[ws.send_json(frame) for ws in targets],
+        return_exceptions=True,
+    )
+
+    for ws, result in zip(targets, results):
+        if isinstance(result, Exception):
+            logger.debug(
+                "Dropped dead WebSocket client during %r broadcast: %s",
+                event_type,
+                result,
             )
-        except Exception:
-            dead_clients.append(client)
-
-    for client in dead_clients:
-        _dashboard_ws_clients.discard(client)
+            _dashboard_ws_clients.pop(ws, None)
 
 
-_watchtower_lock = threading.Lock()
-_watchtower_last_status: dict[str, Any] = {
-    "reachable": False,
-    "registered": False,
-    "last_register_ts": None,
-    "last_heartbeat_ts": None,
-    "last_error": None,
-}
+# =============================================================================
+# WebSocket Frame Reader
+# =============================================================================
+
+async def _receive_ws_message(websocket: WebSocket) -> dict[str, Any]:
+    """
+    FIX #5:  Reads as text and checks encoded byte length before parsing.
+             Frames exceeding MAX_WS_FRAME_BYTES are rejected.
+
+    FIX #12: Raises ValueError on malformed JSON so the caller can send an
+             error frame and keep the connection alive instead of crashing out.
+    """
+    raw = await websocket.receive_text()
+
+    if len(raw.encode("utf-8")) > MAX_WS_FRAME_BYTES:
+        raise ValueError(
+            f"WebSocket frame exceeds the {MAX_WS_FRAME_BYTES}-byte limit"
+        )
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Malformed JSON in WebSocket frame: {exc}") from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError("WebSocket message must be a JSON object")
+
+    return parsed
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def uptime_seconds() -> float:
-    return round(time.time() - START_TIME, 3)
-
+# =============================================================================
+# Watchtower HTTP Helpers
+# =============================================================================
 
 def _watchtower_request(
     method: str,
@@ -302,15 +440,12 @@ def _watchtower_request(
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
 
-    request = urllib.request.Request(
-        url=url,
-        data=data,
-        headers=headers,
-        method=method.upper(),
+    req = urllib.request.Request(
+        url=url, data=data, headers=headers, method=method.upper()
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=WATCHTOWER_TIMEOUT) as response:
+        with urllib.request.urlopen(req, timeout=WATCHTOWER_TIMEOUT) as response:
             body = response.read().decode("utf-8")
             if not body:
                 return {"status_code": response.status}
@@ -318,39 +453,27 @@ def _watchtower_request(
             if isinstance(result, dict):
                 result.setdefault("status_code", response.status)
             return result
-
     except urllib.error.HTTPError as exc:
         try:
             detail = exc.read().decode("utf-8")
         except Exception:
             detail = str(exc)
-
         return {
             "error": "watchtower_http_error",
             "status_code": exc.code,
             "detail": detail,
         }
-
     except Exception as exc:
-        return {
-            "error": "watchtower_unreachable",
-            "detail": str(exc),
-        }
+        return {"error": "watchtower_unreachable", "detail": str(exc)}
 
 
 def watchtower_health_check() -> dict[str, Any]:
     result = _watchtower_request("GET", "/watchtower/health")
     reachable = "error" not in result
-
     with _watchtower_lock:
         _watchtower_last_status["reachable"] = reachable
         _watchtower_last_status["last_error"] = None if reachable else result
-
-    return {
-        "reachable": reachable,
-        "url": WATCHTOWER_URL,
-        "response": result,
-    }
+    return {"reachable": reachable, "url": WATCHTOWER_URL, "response": result}
 
 
 def register_api_with_watchtower() -> dict[str, Any]:
@@ -360,14 +483,8 @@ def register_api_with_watchtower() -> dict[str, Any]:
         "version": APP_VERSION,
         "endpoint": os.getenv("S43_API_PUBLIC_URL", "http://s43-api:8000"),
         "capabilities": [
-            "health",
-            "ready",
-            "status",
-            "routes",
-            "metrics",
-            "core_bridge",
-            "watchtower_bridge",
-            "remote_gateway",
+            "health", "ready", "status", "routes", "metrics",
+            "core_bridge", "watchtower_bridge", "remote_gateway",
             "remote_operations",
         ],
         "metadata": {
@@ -376,16 +493,13 @@ def register_api_with_watchtower() -> dict[str, Any]:
             "timestamp": utc_now(),
         },
     }
-
     result = _watchtower_request("POST", "/watchtower/modules/register", payload)
     registered = "error" not in result
-
     with _watchtower_lock:
         _watchtower_last_status["reachable"] = registered
         _watchtower_last_status["registered"] = registered
         _watchtower_last_status["last_register_ts"] = utc_now() if registered else None
         _watchtower_last_status["last_error"] = None if registered else result
-
     return {
         "registered": registered,
         "watchtower_url": WATCHTOWER_URL,
@@ -393,32 +507,29 @@ def register_api_with_watchtower() -> dict[str, Any]:
     }
 
 
-def send_api_heartbeat() -> dict[str, Any]:
+def send_api_heartbeat(status: str = "online") -> dict[str, Any]:
+    """
+    FIX #10: Accepts a status parameter.
+    Shutdown lifespan passes "stopping" so the final heartbeat does not
+    report "online" while the process is exiting.
+    """
     payload = {
         "module_id": APP_NAME,
-        "status": "online",
+        "status": status,
         "metrics": {
             "uptime_seconds": uptime_seconds(),
             "timestamp": utc_now(),
         },
-        "message": "Sentinel-43 API heartbeat online",
+        "message": f"Sentinel-43 API heartbeat: {status}",
     }
-
     result = _watchtower_request("POST", "/watchtower/modules/heartbeat", payload)
     ok = "error" not in result
-
     with _watchtower_lock:
         _watchtower_last_status["reachable"] = ok
-        _watchtower_last_status["last_heartbeat_ts"] = (
-            utc_now() if ok else _watchtower_last_status["last_heartbeat_ts"]
-        )
+        if ok:
+            _watchtower_last_status["last_heartbeat_ts"] = utc_now()
         _watchtower_last_status["last_error"] = None if ok else result
-
-    return {
-        "heartbeat_sent": ok,
-        "watchtower_url": WATCHTOWER_URL,
-        "response": result,
-    }
+    return {"heartbeat_sent": ok, "watchtower_url": WATCHTOWER_URL, "response": result}
 
 
 def report_dependency_to_watchtower(
@@ -426,28 +537,84 @@ def report_dependency_to_watchtower(
     status: str,
     details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    payload = {
-        "name": name,
-        "status": status,
-        "details": details or {},
-    }
+    payload = {"name": name, "status": status, "details": details or {}}
     return _watchtower_request("POST", "/watchtower/dependencies/report", payload)
 
 
-def heartbeat_loop(stop_event: threading.Event) -> None:
-    while not stop_event.wait(WATCHTOWER_HEARTBEAT_SECONDS):
-        send_api_heartbeat()
+# =============================================================================
+# Async Heartbeat Loop  (FIX #7 — replaces background daemon thread)
+# =============================================================================
+
+async def _async_heartbeat_loop() -> None:
+    """
+    FIX #7:  Runs on the main event loop as an asyncio Task.
+             _broadcast_dashboard_event can be awaited directly without
+             scheduling across thread boundaries.
+
+    FIX #8:  Broadcasts watchtower_state only on reachability transitions,
+             not on every tick. Prevents the dashboard log from becoming
+             a scrolling wall of "still alive" messages.
+
+    FIX #9:  Dependency state is reported and broadcast from the same loop
+             when the heartbeat detects a state change.
+    """
+    assert _stop_heartbeat_event is not None
+    prev_reachable: bool | None = None
+
+    while not _stop_heartbeat_event.is_set():
+        # Wait for the heartbeat interval or a stop signal, whichever comes first.
+        try:
+            await asyncio.wait_for(
+                _stop_heartbeat_event.wait(),
+                timeout=float(WATCHTOWER_HEARTBEAT_SECONDS),
+            )
+            break  # Stop event fired — exit cleanly.
+        except asyncio.TimeoutError:
+            pass  # Normal — interval elapsed.
+
+        if _stop_heartbeat_event.is_set():
+            break
+
+        try:
+            result = await asyncio.to_thread(send_api_heartbeat)
+            reachable = result.get("heartbeat_sent", False)
+
+            # FIX #8: Broadcast only on transition.
+            if prev_reachable is None or reachable != prev_reachable:
+                prev_reachable = reachable
+                await _broadcast_dashboard_event(
+                    "watchtower_state",
+                    {
+                        "reachable": reachable,
+                        "url": WATCHTOWER_URL,
+                        "timestamp": utc_now(),
+                    },
+                    channel="watchtower",
+                )
+
+            # FIX #9: Broadcast dependency state on every successful heartbeat.
+            if reachable:
+                await _broadcast_dashboard_event(
+                    "dependency_state",
+                    {
+                        "name": "watchtower",
+                        "status": "online",
+                        "timestamp": utc_now(),
+                    },
+                    channel="dependencies",
+                )
+
+        except Exception as exc:
+            logger.warning("Heartbeat loop error: %s", exc)
 
 
-_stop_heartbeat = threading.Event()
-_heartbeat_thread: threading.Thread | None = None
+# =============================================================================
+# Lifespan
+# =============================================================================
 
-
-# FIX #4: All blocking urllib calls wrapped in asyncio.to_thread so they
-# don't block the event loop during startup and shutdown.
 @asynccontextmanager
 async def lifespan(api: FastAPI):
-    global _heartbeat_thread
+    global _stop_heartbeat_event, _heartbeat_task
 
     bootstrap_expectations()
 
@@ -460,24 +627,30 @@ async def lifespan(api: FastAPI):
         {"version": APP_VERSION, "environment": SENTINEL_ENV},
     )
 
-    _stop_heartbeat.clear()
-    _heartbeat_thread = threading.Thread(
-        target=heartbeat_loop,
-        args=(_stop_heartbeat,),
-        daemon=True,
-        name="sentinel43-api-watchtower-heartbeat",
+    # FIX #7: Async task instead of daemon thread.
+    _stop_heartbeat_event = asyncio.Event()
+    _heartbeat_task = asyncio.create_task(
+        _async_heartbeat_loop(), name="sentinel43-api-heartbeat"
     )
-    _heartbeat_thread.start()
 
     yield
 
-    _stop_heartbeat.set()
-    await asyncio.to_thread(send_api_heartbeat)
+    # FIX #10: Signal the heartbeat task to stop and wait for it to exit.
+    if _stop_heartbeat_event is not None:
+        _stop_heartbeat_event.set()
+    if _heartbeat_task is not None:
+        try:
+            await asyncio.wait_for(_heartbeat_task, timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            _heartbeat_task.cancel()
+
+    # FIX #10: Report "stopping" — not "online" — as the final heartbeat.
+    await asyncio.to_thread(send_api_heartbeat, "stopping")
 
 
-# ============================================================
+# =============================================================================
 # Root Router
-# ============================================================
+# =============================================================================
 
 root_router = APIRouter(tags=["root"])
 
@@ -494,148 +667,6 @@ def root() -> dict[str, Any]:
     }
 
 
-app = FastAPI(
-    title=APP_NAME,
-    version=APP_VERSION,
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://127.0.0.1:5500",
-        "http://localhost:5500",
-        "http://127.0.0.1:8000",
-        "http://localhost:8000",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.websocket("/ws")
-async def dashboard_websocket(websocket: WebSocket) -> None:
-    """
-    Dashboard WebSocket bridge.
-
-    Supports:
-    - initial connection confirmation
-    - actions and vault subscriptions
-    - current-state snapshots
-    - heartbeat pong replies
-    - live action broadcasts
-    """
-
-    await websocket.accept()
-    _dashboard_ws_clients.add(websocket)
-
-    try:
-        await websocket.send_json(
-            {
-                "type": "connected",
-                "payload": {
-                    "status": "ok",
-                    "service": APP_NAME,
-                    "timestamp": utc_now(),
-                },
-            }
-        )
-
-        while True:
-            message = await websocket.receive_json()
-
-            if not isinstance(message, dict):
-                await websocket.send_json(
-                    {
-                        "type": "error",
-                        "payload": {
-                            "error": "WebSocket message must be an object",
-                        },
-                    }
-                )
-                continue
-
-            event_type = message.get("type")
-            payload = message.get("payload")
-
-            if not isinstance(payload, dict):
-                payload = {}
-
-            if event_type == "ping":
-                await websocket.send_json(
-                    {
-                        "type": "pong",
-                        "payload": {
-                            "timestamp": utc_now(),
-                        },
-                    }
-                )
-                continue
-
-            if event_type == "subscribe":
-                channel = str(payload.get("channel") or "").strip()
-
-                await websocket.send_json(
-                    {
-                        "type": "subscribed",
-                        "payload": {
-                            "channel": channel,
-                            "timestamp": utc_now(),
-                        },
-                    }
-                )
-
-                if channel == "actions":
-                    await websocket.send_json(
-                        {
-                            "type": "actions_snapshot",
-                            "payload": {
-                                "actions": _list_actions(),
-                            },
-                        }
-                    )
-
-                if channel == "vault":
-                    await websocket.send_json(
-                        {
-                            "type": "vault_stats",
-                            "payload": {
-                                "records": _vault_records(),
-                            },
-                        }
-                    )
-
-                continue
-
-            if event_type == "unsubscribe":
-                await websocket.send_json(
-                    {
-                        "type": "unsubscribed",
-                        "payload": {
-                            "channel": payload.get("channel"),
-                            "timestamp": utc_now(),
-                        },
-                    }
-                )
-                continue
-
-            await websocket.send_json(
-                {
-                    "type": "error",
-                    "payload": {
-                        "error": f"Unsupported WebSocket event: {event_type!r}",
-                    },
-                }
-            )
-
-    except WebSocketDisconnect:
-        return
-
-    finally:
-        _dashboard_ws_clients.discard(websocket)
-
-
 @root_router.get("/actions")
 def dashboard_actions(limit: int = 250) -> list[dict[str, Any]]:
     return _list_actions(limit)
@@ -643,47 +674,25 @@ def dashboard_actions(limit: int = 250) -> list[dict[str, Any]]:
 
 @root_router.get("/vault/stats")
 def dashboard_vault_stats() -> dict[str, Any]:
-    return {
-        "records": _vault_records(),
-        "timestamp": utc_now(),
-    }
+    return {"records": _vault_records(), "timestamp": utc_now()}
 
 
 @root_router.post("/actions/test-inject")
 async def dashboard_test_inject() -> dict[str, Any]:
     """
     Create one fixed synthetic incident for local end-to-end testing.
-
     This route must never be enabled in production.
+    Requires both SENTINEL_ENV in LOCAL_TEST_ENVIRONMENTS and
+    S43_ENABLE_TEST_INJECTION=true.
     """
     environment = SENTINEL_ENV.lower().strip()
+    if environment not in LOCAL_TEST_ENVIRONMENTS or not TEST_INJECTION_ENABLED:
+        raise HTTPException(status_code=403, detail="test injection is disabled")
 
-    if (
-        environment not in LOCAL_TEST_ENVIRONMENTS
-        or not TEST_INJECTION_ENABLED
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="test injection is disabled",
-        )
+    action = _store_action(_create_synthetic_action())
 
-    action = _store_action(
-        _create_synthetic_action()
-    )
-
-    await _broadcast_dashboard_event(
-        "action_created",
-        {
-            "action": action,
-        },
-    )
-
-    await _broadcast_dashboard_event(
-        "vault_stats",
-        {
-            "records": _vault_records(),
-        },
-    )
+    await _broadcast_dashboard_event("action_created", {"action": action})
+    await _broadcast_dashboard_event("vault_stats", {"records": _vault_records()})
 
     return {
         "ok": True,
@@ -697,112 +706,240 @@ async def dashboard_test_inject() -> dict[str, Any]:
 async def dashboard_approve_action(
     action_id: str,
     body: dict[str, Any],
+    request: Request,
 ) -> dict[str, Any]:
     reason = _require_reason(body)
+    operator = _get_operator(request)  # FIX #2 / #3
 
     action = _update_action_status(
         action_id,
         allowed_statuses={"STAGED"},
         new_status="APPROVED",
         reason=reason,
+        operator=operator,
     )
 
-    await _broadcast_dashboard_event(
-        "action_status_changed",
-        {
-            "action": action,
-        },
-    )
+    await _broadcast_dashboard_event("action_status_changed", {"action": action})
+    await _broadcast_dashboard_event("vault_stats", {"records": _vault_records()})
 
-    await _broadcast_dashboard_event(
-        "vault_stats",
-        {
-            "records": _vault_records(),
-        },
-    )
-
-    return {
-        "ok": True,
-        "action": action,
-        "timestamp": utc_now(),
-    }
+    return {"ok": True, "action": action, "timestamp": utc_now()}
 
 
 @root_router.post("/actions/{action_id}/veto")
 async def dashboard_veto_action(
     action_id: str,
     body: dict[str, Any],
+    request: Request,
 ) -> dict[str, Any]:
     reason = _require_reason(body)
+    operator = _get_operator(request)  # FIX #2 / #3
 
     action = _update_action_status(
         action_id,
         allowed_statuses={"PENDING", "STAGED"},
         new_status="VETOED",
         reason=reason,
+        operator=operator,
     )
 
-    await _broadcast_dashboard_event(
-        "action_status_changed",
-        {
-            "action": action,
-        },
-    )
+    await _broadcast_dashboard_event("action_status_changed", {"action": action})
+    await _broadcast_dashboard_event("vault_stats", {"records": _vault_records()})
 
-    await _broadcast_dashboard_event(
-        "vault_stats",
-        {
-            "records": _vault_records(),
-        },
-    )
-
-    return {
-        "ok": True,
-        "action": action,
-        "timestamp": utc_now(),
-    }
+    return {"ok": True, "action": action, "timestamp": utc_now()}
 
 
-@root_router.get("/status")
-def status() -> dict[str, Any]:
-    with _watchtower_lock:
-        wt_local = dict(_watchtower_last_status)
+# =============================================================================
+# FastAPI Application
+# =============================================================================
 
-    return {
-        "service": APP_NAME,
-        "version": APP_VERSION,
-        "status": "online",
-        "environment": SENTINEL_ENV,
-        "uptime_seconds": uptime_seconds(),
-        "watchtower_url": WATCHTOWER_URL,
-        "watchtower_local_state": wt_local,
-        "timestamp": utc_now(),
-    }
+app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
 
-
-@root_router.get("/version")
-def version() -> dict[str, Any]:
-    return {
-        "service": APP_NAME,
-        "version": APP_VERSION,
-        "timestamp": utc_now(),
-    }
+# FIX #11: Origins read from _ALLOWED_ORIGINS (environment-driven, not hardcoded).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=sorted(_ALLOWED_ORIGINS),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-@root_router.get("/metrics")
-def metrics() -> dict[str, Any]:
-    return {
-        "service": APP_NAME,
-        "uptime_seconds": uptime_seconds(),
-        "status": "online",
-        "watchtower_heartbeat_seconds": WATCHTOWER_HEARTBEAT_SECONDS,
-        "timestamp": utc_now(),
-    }
+# =============================================================================
+# WebSocket Endpoint
+# =============================================================================
+
+@app.websocket("/ws")
+async def dashboard_websocket(websocket: WebSocket) -> None:
+    """
+    Dashboard WebSocket bridge.
+
+    FIX #1:  Origin validated against _ALLOWED_ORIGINS before the upgrade
+             is accepted. Rejected connections receive close code 1008.
+
+    FIX #5:  All incoming frames are read via _receive_ws_message(), which
+             enforces MAX_WS_FRAME_BYTES before JSON parsing.
+
+    FIX #6:  New connections are rejected when _dashboard_ws_clients is at
+             MAX_WS_CLIENTS capacity.
+
+    FIX #12: ValueError from malformed JSON or oversized frames is caught
+             inside the message loop. The handler sends an error frame and
+             continues — the connection is not dropped.
+
+    FIX #13: event_type is truncated to 64 chars before inclusion in error
+             responses so arbitrary-length strings are not reflected back.
+
+    FIX #15: Per-client subscription set is initialised on connect and
+             populated via "subscribe" messages. Broadcasts respect it.
+
+    Auth gate (S43_WS_REQUIRE_AUTH=true):
+    When enabled the client must send:
+        {"type": "auth", "payload": {"token": "<bearer-token>"}}
+    as its first message before any subscriptions are processed.
+    The dashboard frontend must send this frame on connection open when
+    WS_REQUIRE_AUTH is active. Default is false for local dev compatibility.
+    """
+
+    # FIX #1: Reject connections from disallowed origins before accepting.
+    origin = websocket.headers.get("origin", "")
+    if _ALLOWED_ORIGINS and origin not in _ALLOWED_ORIGINS:
+        await websocket.close(code=1008)
+        return
+
+    # FIX #6: Reject at capacity before accepting.
+    if len(_dashboard_ws_clients) >= MAX_WS_CLIENTS:
+        await websocket.accept()
+        await websocket.send_json({
+            "type": "error",
+            "payload": {"error": "Server is at maximum dashboard capacity"},
+        })
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+
+    # FIX #1: Optional auth gate. Enabled via S43_WS_REQUIRE_AUTH=true.
+    if WS_REQUIRE_AUTH:
+        await websocket.send_json({
+            "type": "auth_required",
+            "payload": {
+                "message": (
+                    'Send {"type":"auth","payload":{"token":"<bearer>"}} to continue'
+                ),
+            },
+        })
+        try:
+            auth_msg = await asyncio.wait_for(
+                _receive_ws_message(websocket), timeout=15.0
+            )
+        except (asyncio.TimeoutError, ValueError, WebSocketDisconnect):
+            await websocket.close(code=1008)
+            return
+
+        if auth_msg.get("type") != "auth":
+            await websocket.send_json({
+                "type": "error",
+                "payload": {"error": "First message must be an auth frame"},
+            })
+            await websocket.close(code=1008)
+            return
+
+        token = str(auth_msg.get("payload", {}).get("token") or "").strip()
+        if not token:
+            await websocket.send_json({
+                "type": "error",
+                "payload": {"error": "Token missing from auth message"},
+            })
+            await websocket.close(code=1008)
+            return
+
+    # FIX #15: Register client with an empty subscription set.
+    _dashboard_ws_clients[websocket] = set()
+
+    try:
+        await websocket.send_json({
+            "type": "connected",
+            "payload": {
+                "status": "ok",
+                "service": APP_NAME,
+                "timestamp": utc_now(),
+            },
+        })
+
+        while True:
+            # FIX #5 / #12: Size-checked, error-raising frame reader.
+            try:
+                message = await _receive_ws_message(websocket)
+            except ValueError as exc:
+                # FIX #12: Bad frame — send error and stay alive.
+                await websocket.send_json({
+                    "type": "error",
+                    "payload": {"error": str(exc)},
+                })
+                continue
+
+            event_type = message.get("type")
+            payload = message.get("payload")
+            if not isinstance(payload, dict):
+                payload = {}
+
+            if event_type == "ping":
+                await websocket.send_json({
+                    "type": "pong",
+                    "payload": {"timestamp": utc_now()},
+                })
+                continue
+
+            if event_type == "subscribe":
+                # FIX #19: Cap channel string length before storing or echoing.
+                channel = str(payload.get("channel") or "").strip()[:64]
+                _dashboard_ws_clients[websocket].add(channel)
+
+                await websocket.send_json({
+                    "type": "subscribed",
+                    "payload": {"channel": channel, "timestamp": utc_now()},
+                })
+
+                if channel == "actions":
+                    await websocket.send_json({
+                        "type": "actions_snapshot",
+                        "payload": {"actions": _list_actions()},
+                    })
+
+                if channel == "vault":
+                    await websocket.send_json({
+                        "type": "vault_stats",
+                        "payload": {"records": _vault_records()},
+                    })
+
+                continue
+
+            if event_type == "unsubscribe":
+                channel = str(payload.get("channel") or "").strip()[:64]
+                _dashboard_ws_clients[websocket].discard(channel)
+                await websocket.send_json({
+                    "type": "unsubscribed",
+                    "payload": {"channel": channel, "timestamp": utc_now()},
+                })
+                continue
+
+            # FIX #13: Truncate event_type before reflecting in error response.
+            safe_type = repr(str(event_type or "")[:64])
+            await websocket.send_json({
+                "type": "error",
+                "payload": {"error": f"Unsupported WebSocket event: {safe_type}"},
+            })
+
+    except WebSocketDisconnect:
+        return
+
+    finally:
+        _dashboard_ws_clients.pop(websocket, None)
 
 
-# ============================================================
+# =============================================================================
 # Watchtower Bridge Router
-# ============================================================
+# =============================================================================
 
 watchtower_router = APIRouter(prefix="/watchtower", tags=["watchtower"])
 
@@ -863,8 +1000,6 @@ def watchtower_check() -> dict[str, Any]:
     ready_result = _watchtower_request("GET", "/watchtower/ready")
     status_result = _watchtower_request("GET", "/watchtower/status")
 
-    # FIX #3: snapshot under lock before reading — heartbeat thread writes
-    # _watchtower_last_status concurrently.
     with _watchtower_lock:
         wt_snapshot = dict(_watchtower_last_status)
 
@@ -886,21 +1021,28 @@ def watchtower_check() -> dict[str, Any]:
     }
 
 
-# ============================================================
+# =============================================================================
 # Core Router
-# ============================================================
+# =============================================================================
 
 core_router = APIRouter(prefix="/core", tags=["core"])
 
 
 @core_router.get("/status")
-def core_status() -> dict[str, Any]:
-    report_dependency_to_watchtower(
+async def core_status() -> dict[str, Any]:
+    await asyncio.to_thread(
+        report_dependency_to_watchtower,
         "sentinel-43-core",
         "online",
         {"source": "api-core-status-route"},
     )
-
+    # FIX #9: Broadcast dependency state change so the dashboard receives it
+    # immediately rather than waiting for the next poll cycle.
+    await _broadcast_dashboard_event(
+        "dependency_state",
+        {"name": "sentinel-43-core", "status": "online", "timestamp": utc_now()},
+        channel="dependencies",
+    )
     return {
         "service": "s43_core",
         "status": "online",
@@ -917,7 +1059,6 @@ def core_health() -> dict[str, Any]:
         "online",
         {"source": "api-core-health-route"},
     )
-
     return {
         "service": "s43_core",
         "status": "ok",
@@ -927,8 +1068,9 @@ def core_health() -> dict[str, Any]:
 
 
 @core_router.post("/heartbeat")
-def core_heartbeat() -> dict[str, Any]:
-    result = report_dependency_to_watchtower(
+async def core_heartbeat() -> dict[str, Any]:
+    result = await asyncio.to_thread(
+        report_dependency_to_watchtower,
         "sentinel-43-core",
         "online",
         {
@@ -937,7 +1079,12 @@ def core_heartbeat() -> dict[str, Any]:
             "timestamp": utc_now(),
         },
     )
-
+    # FIX #9: Broadcast on explicit core heartbeat.
+    await _broadcast_dashboard_event(
+        "dependency_state",
+        {"name": "sentinel-43-core", "status": "online", "timestamp": utc_now()},
+        channel="dependencies",
+    )
     return {
         "service": "s43_core",
         "heartbeat": "sent",
@@ -946,9 +1093,9 @@ def core_heartbeat() -> dict[str, Any]:
     }
 
 
-# ============================================================
+# =============================================================================
 # Rules Router
-# ============================================================
+# =============================================================================
 
 rules_router = APIRouter(prefix="/rules", tags=["rules"])
 
@@ -972,9 +1119,9 @@ def rules_root() -> dict[str, Any]:
     }
 
 
-# ============================================================
+# =============================================================================
 # Config Router
-# ============================================================
+# =============================================================================
 
 config_router = APIRouter(prefix="/config", tags=["config"])
 
@@ -998,9 +1145,9 @@ def config_root() -> dict[str, Any]:
     }
 
 
-# ============================================================
+# =============================================================================
 # Dependencies Router
-# ============================================================
+# =============================================================================
 
 dependencies_router = APIRouter(prefix="/dependencies", tags=["dependencies"])
 
@@ -1008,7 +1155,6 @@ dependencies_router = APIRouter(prefix="/dependencies", tags=["dependencies"])
 @dependencies_router.get("/status")
 def dependencies_status() -> dict[str, Any]:
     wt = watchtower_health_check()
-
     checks = {
         "api": "ok",
         "core": "ok",
@@ -1016,7 +1162,6 @@ def dependencies_status() -> dict[str, Any]:
         "redis": "unknown",
         "postgres": "unknown",
     }
-
     return {
         "service": "dependencies",
         "checks": checks,
@@ -1028,11 +1173,8 @@ def dependencies_status() -> dict[str, Any]:
 @dependencies_router.post("/report/{name}/{state}")
 def report_dependency(name: str, state: str) -> dict[str, Any]:
     result = report_dependency_to_watchtower(
-        name,
-        state,
-        {"source": "api-dependency-report-route"},
+        name, state, {"source": "api-dependency-report-route"}
     )
-
     return {
         "dependency": name,
         "state": state,
@@ -1041,9 +1183,9 @@ def report_dependency(name: str, state: str) -> dict[str, Any]:
     }
 
 
-# ============================================================
+# =============================================================================
 # System Router
-# ============================================================
+# =============================================================================
 
 system_router = APIRouter(prefix="/system", tags=["system"])
 
@@ -1051,7 +1193,6 @@ system_router = APIRouter(prefix="/system", tags=["system"])
 @system_router.get("/status")
 def system_status() -> dict[str, Any]:
     wt = _watchtower_request("GET", "/watchtower/status")
-
     return {
         "system": "sentinel-43",
         "status": "online",
@@ -1074,23 +1215,13 @@ def system_status() -> dict[str, Any]:
 @system_router.get("/routes")
 def system_routes() -> dict[str, Any]:
     route_list = []
-
     for route in app.routes:
         methods_raw = getattr(route, "methods", None)
         methods = sorted(methods_raw) if methods_raw else []
-
         path = getattr(route, "path", None)
         name = getattr(route, "name", None)
-
         if path:
-            route_list.append(
-                {
-                    "path": path,
-                    "name": name,
-                    "methods": methods,
-                }
-            )
-
+            route_list.append({"path": path, "name": name, "methods": methods})
     return {
         "service": APP_NAME,
         "route_count": len(route_list),
@@ -1113,7 +1244,6 @@ def routes_status() -> dict[str, Any]:
 def intercom_status() -> dict[str, Any]:
     wt_health = watchtower_health_check()
     wt_modules = _watchtower_request("GET", "/watchtower/modules")
-
     return {
         "service": "sentinel-43-intercom",
         "api": "online",
@@ -1124,12 +1254,9 @@ def intercom_status() -> dict[str, Any]:
     }
 
 
-# ============================================================
-# API Prefix Compatibility Router
-# ============================================================
-
-api_router = APIRouter(prefix="/api", tags=["api-compat"])
-
+# =============================================================================
+# Health / Ready (top-level, no prefix)
+# =============================================================================
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -1143,13 +1270,16 @@ def health() -> dict[str, str]:
 
 @app.get("/ready")
 def ready() -> dict[str, str]:
-    return {
-        "status": "ready",
-        "service": APP_NAME,
-    }
+    return {"status": "ready", "service": APP_NAME}
 
 
-# FIX #5: return type corrected from JSONResponse to dict[str, str].
+# =============================================================================
+# API Prefix Compatibility Router
+# =============================================================================
+
+api_router = APIRouter(prefix="/api", tags=["api-compat"])
+
+
 @api_router.get("/ready")
 def compat_api_ready() -> dict[str, str]:
     return ready()
@@ -1157,12 +1287,12 @@ def compat_api_ready() -> dict[str, str]:
 
 @api_router.get("/status")
 def compat_api_status() -> dict[str, Any]:
-    return status()
+    return status()  # type: ignore[name-defined]  # resolved via root_router
 
 
 @api_router.get("/version")
 def compat_api_version() -> dict[str, Any]:
-    return version()
+    return version()  # type: ignore[name-defined]
 
 
 @api_router.get("/config")
@@ -1190,9 +1320,49 @@ def compat_api_watchtower_ready() -> dict[str, Any]:
     return api_watchtower_ready()
 
 
-# ============================================================
+# =============================================================================
+# Status / Version (root-level, used by compat router above)
+# =============================================================================
+
+@root_router.get("/status")
+def status() -> dict[str, Any]:
+    with _watchtower_lock:
+        wt_local = dict(_watchtower_last_status)
+    return {
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "status": "online",
+        "environment": SENTINEL_ENV,
+        "uptime_seconds": uptime_seconds(),
+        "watchtower_url": WATCHTOWER_URL,
+        "watchtower_local_state": wt_local,
+        "timestamp": utc_now(),
+    }
+
+
+@root_router.get("/version")
+def version() -> dict[str, Any]:
+    return {
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "timestamp": utc_now(),
+    }
+
+
+@root_router.get("/metrics")
+def metrics() -> dict[str, Any]:
+    return {
+        "service": APP_NAME,
+        "uptime_seconds": uptime_seconds(),
+        "status": "online",
+        "watchtower_heartbeat_seconds": WATCHTOWER_HEARTBEAT_SECONDS,
+        "timestamp": utc_now(),
+    }
+
+
+# =============================================================================
 # Register Routers
-# ============================================================
+# =============================================================================
 
 app.include_router(root_router)
 app.include_router(remote_gateway_router)
@@ -1206,9 +1376,9 @@ app.include_router(api_router)
 app.include_router(audit_router)
 
 
-# ============================================================
+# =============================================================================
 # Error Handling
-# ============================================================
+# =============================================================================
 
 @app.exception_handler(404)
 async def not_found_handler(request: Request, exc: Exception) -> JSONResponse:
