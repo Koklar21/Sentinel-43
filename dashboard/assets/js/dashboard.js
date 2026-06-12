@@ -1,1999 +1,1480 @@
+// =============================================================================
+// Sentinel-43 Dashboard
+// dashboard.js
+// UI logic module. WebSocket transport is handled by websocket.js which
+// dispatches sentinel:ws:* events consumed here.
+// =============================================================================
+
 "use strict";
 
-const $ = id => document.getElementById(id);
-const readMeta = name => document.querySelector(`meta[name="${name}"]`)?.content?.trim() || "";
-const runtime = window.SENTINEL_RUNTIME_CONFIG || {};
-const locationIsLocal = ["", "localhost", "127.0.0.1", "::1"].includes(location.hostname);
+// =============================================================================
+// Config
+// =============================================================================
+
+const _readMeta = name =>
+    document.querySelector(`meta[name="${name}"]`)?.content?.trim() ?? "";
+
+const _runtime = window.SENTINEL_RUNTIME_CONFIG ?? {};
+const _locationIsLocal = ["", "localhost", "127.0.0.1", "::1"]
+    .includes(location.hostname);
 
 const CONFIG = Object.freeze({
-API_BASE: String(runtime.apiBase || window.SENTINEL_API_BASE_URL || readMeta("sentinel-api-base") || "[http://localhost:8000").replace(/\/+$/](http://localhost:8000%22%29.replace%28/\/+$/), ""),
-WS_URL: String(runtime.wsUrl || window.SENTINEL_WS_URL || readMeta("sentinel-ws-url") || "ws://localhost:8000/ws"),
-FALLBACK_POLL_MS: 15000,
-WS_RECONNECT_MS: 3000,
-WS_HEARTBEAT_MS: 25000,
-DATA_STALE_MS: 60000,
-REASON_MIN: 10,
-REASON_MAX: 500,
-MAX_LOG_LINES: 500,
-MAX_WS_FRAME_BYTES: 64 * 1024,
-DEMO_MODE: new URLSearchParams(location.search).get("demo") === "1",
-ALLOW_DEV_JWT_STORAGE: locationIsLocal
+    API_BASE: String(
+        _runtime.apiBase
+        ?? window.SENTINEL_API_BASE_URL
+        ?? _readMeta("sentinel-api-base")
+        ?? "http://localhost:8000"
+    ).replace(/\/+$/, ""),
+
+    FALLBACK_POLL_MS:  15_000,
+    DATA_STALE_MS:     60_000,
+    REASON_MIN:        10,
+    REASON_MAX:        500,
+    MAX_LOG_LINES:     500,
+    MAX_DEMO_ACTIONS:  500,
+
+    DEMO_MODE: new URLSearchParams(location.search).get("demo") === "1",
+
+    LIVE_TEST_MODE:
+        _locationIsLocal &&
+        new URLSearchParams(location.search).get("test") === "1",
+
+    ALLOW_DEV_JWT_STORAGE: _locationIsLocal,
 });
+
+// =============================================================================
+// Constants
+// =============================================================================
 
 const STATUS_CLASSES = Object.freeze({
-PENDING: "pending",
-STAGED: "staged",
-APPROVED: "approved",
-EXECUTED: "executed",
-VETOED: "vetoed",
-EXPIRED: "expired",
-UNKNOWN: "unknown"
+    PENDING:  "pending",
+    STAGED:   "staged",
+    APPROVED: "approved",
+    EXECUTED: "executed",
+    VETOED:   "vetoed",
+    EXPIRED:  "expired",
+    UNKNOWN:  "unknown",
 });
+
+// =============================================================================
+// Element References
+// =============================================================================
+
+const $ = id => document.getElementById(id);
 
 const el = {
-statusDot: $("statusDot"),
-statusText: $("statusText"),
-queueCount: $("queueCount"),
-lastSync: $("lastSync"),
-pollFlash: $("pollFlash"),
-demoBadge: $("demoBadge"),
-jwtRiskBadge: $("jwtRiskBadge"),
+    // Header
+    statusDot:    $("statusDot"),
+    statusText:   $("statusText"),
+    modeText:     $("modeText"),
+    queueCount:   $("queueCount"),
+    lastSync:     $("lastSync"),
+    pollFlash:    $("pollFlash"),
+    demoBadge:    $("demoBadge"),
+    jwtRiskBadge: $("jwtRiskBadge"),
+    liveRegion:   $("liveRegion"),
 
-pendingCount: $("pendingCount"),
-stagedCount: $("stagedCount"),
-approvedCount: $("approvedCount"),
-vaultCount: $("vaultCount"),
-apiBaseText: $("apiBaseText"),
-authStateText: $("authStateText"),
-pollText: $("pollText"),
-demoText: $("demoText"),
+    // Stats
+    pendingCount:  $("pendingCount"),
+    stagedCount:   $("stagedCount"),
+    approvedCount: $("approvedCount"),
+    vaultCount:    $("vaultCount"),
 
-refreshBtn: $("refreshBtn"),
-exportBtn: $("exportBtn"),
-themeBtn: $("themeBtn"),
-authBtn: $("authBtn"),
-clearLogBtn: $("clearLogBtn"),
+    // Config panel
+    apiBaseText:  $("apiBaseText"),
+    authStateText: $("authStateText"),
+    pollText:     $("pollText"),
+    demoText:     $("demoText"),
 
-actionsBody: $("actionsBody"),
-emptyState: $("emptyState"),
-logConsole: $("logConsole"),
-liveRegion: $("liveRegion"),
+    // Header buttons
+    refreshBtn: $("refreshBtn"),
+    injectBtn:  $("injectBtn"),
+    exportBtn:  $("exportBtn"),
+    themeBtn:   $("themeBtn"),
+    authBtn:    $("authBtn"),
+    kbHelpBtn:  $("kbHelpBtn"),
 
-searchInput: $("searchInput"),
-clearSearchBtn: $("clearSearchBtn"),
-selectAll: $("selectAll"),
-bulkBar: $("bulkBar"),
-bulkLabel: $("bulkLabel"),
-bulkApproveBtn: $("bulkApproveBtn"),
-bulkVetoBtn: $("bulkVetoBtn"),
-bulkClearBtn: $("bulkClearBtn"),
+    // Actions table
+    actionsBody: $("actionsBody"),
+    emptyState:  $("emptyState"),
+    searchInput: $("searchInput"),
+    clearSearchBtn: $("clearSearchBtn"),
+    selectAll:   $("selectAll"),
 
-reasonModal: $("reasonModal"),
-modalTitle: $("modalTitle"),
-modalSubtitle: $("modalSubtitle"),
-modalInput: $("modalInput"),
-modalError: $("modalError"),
-modalCharCount: $("modalCharCount"),
-modalCancel: $("modalCancel"),
-modalConfirm: $("modalConfirm"),
+    // Bulk bar
+    bulkBar:        $("bulkBar"),
+    bulkLabel:      $("bulkLabel"),
+    bulkApproveBtn: $("bulkApproveBtn"),
+    bulkVetoBtn:    $("bulkVetoBtn"),
+    bulkClearBtn:   $("bulkClearBtn"),
 
-jwtModal: $("jwtModal"),
-jwtInput: $("jwtInput"),
-jwtCancel: $("jwtCancel"),
-jwtClear: $("jwtClear"),
-jwtConfirm: $("jwtConfirm")
+    // Log
+    logConsole: $("logConsole"),
+    clearLogBtn: $("clearLogBtn"),
+
+    // Reason modal
+    reasonModal:   $("reasonModal"),
+    modalTitle:    $("modalTitle"),
+    modalSubtitle: $("modalSubtitle"),
+    modalInput:    $("modalInput"),
+    modalError:    $("modalError"),
+    modalCharCount: $("modalCharCount"),
+    modalCancel:   $("modalCancel"),
+    modalConfirm:  $("modalConfirm"),
+
+    // JWT modal
+    jwtModal:   $("jwtModal"),
+    jwtInput:   $("jwtInput"),
+    jwtCancel:  $("jwtCancel"),
+    jwtClear:   $("jwtClear"),
+    jwtConfirm: $("jwtConfirm"),
+
+    // Inject modal
+    injectModal:   $("injectModal"),
+    injectCancel:  $("injectCancel"),
+    injectConfirm: $("injectConfirm"),
+
+    // Keyboard shortcut toast
+    kbToast: $("kbToast"),
 };
 
-let currentFilter = "ALL";
+// =============================================================================
+// State
+// =============================================================================
+
+let currentFilter    = "ALL";
 let currentLogFilter = "ALL";
-let searchQuery = "";
-let allActions = [];
-let selectedIds = new Set();
-let lastDataSyncAt = null;
-let refreshPromise = null;
-let pollTimer = null;
-let ws = null;
-let wsConnected = false;
-let wsReconnectTimer = null;
-let wsHeartbeatTimer = null;
-let wsClosing = false;
-let isLight = false;
+let searchQuery      = "";
+let allActions       = [];
+let selectedIds      = new Set();
+let focusedRowIndex  = -1;
+let focusedActionId  = null;
+let prevCounts       = {pending: null, staged: null, approved: null};
+let lastDataSyncAt   = null;
+let refreshPromise   = null;
+let pollTimer        = null;
+let kbToastTimer     = null;
+let injectInFlight   = false;
+let wsConnected      = false; // updated by sentinel:ws:* events from websocket.js
+let isLight          = false;
+
+// =============================================================================
+// Utilities
+// =============================================================================
 
 const nowStamp = () =>
-new Date().toLocaleTimeString([], {
-hour: "2-digit",
-minute: "2-digit",
-second: "2-digit"
-});
+    new Date().toLocaleTimeString([], {
+        hour:   "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+    });
 
 const escHtml = value =>
-String(value ?? "")
-.replaceAll("&", "&")
-.replaceAll("<", "<")
-.replaceAll(">", ">")
-.replaceAll('"', """)
-.replaceAll("'", "'");
+    String(value ?? "")
+        .replaceAll("&",  "&amp;")
+        .replaceAll("<",  "&lt;")
+        .replaceAll(">",  "&gt;")
+        .replaceAll('"',  "&quot;")
+        .replaceAll("'",  "&#039;");
 
 const normalizeString = (value, fallback = "") =>
-typeof value === "string"
-? value
-: value == null
-? fallback
-: String(value);
+    typeof value === "string" ? value : value == null ? fallback : String(value);
+
+// =============================================================================
+// Logging
+// =============================================================================
 
 function log(message, type = "info") {
-if (!el.logConsole) return;
+    if (!el.logConsole) return;
 
-const safeType = ["info", "ok", "warn", "err"].includes(type)
-? type
-: "info";
+    const safeType = ["info", "ok", "warn", "err"].includes(type) ? type : "info";
 
-const line = document.createElement("div");
-line.className = `log-line ${safeType}`;
-line.dataset.type = safeType;
+    const line = document.createElement("div");
+    line.className  = `log-line ${safeType}`;
+    line.dataset.type = safeType;
 
-line.innerHTML =
-`<span class="log-ts">${escHtml(nowStamp())}</span>` +
-`<span class="log-lvl">${safeType.toUpperCase()}</span>` +
-`<span class="log-msg"></span>`;
+    const ts  = document.createElement("span");
+    ts.className   = "log-ts";
+    ts.textContent = nowStamp();
 
-line.querySelector(".log-msg").textContent =
-normalizeString(message, "Unknown dashboard event");
+    const lvl = document.createElement("span");
+    lvl.className   = "log-lvl";
+    lvl.textContent = safeType.toUpperCase();
 
-if (
-currentLogFilter !== "ALL" &&
-currentLogFilter !== safeType
-) {
-line.hidden = true;
+    const msg = document.createElement("span");
+    msg.className   = "log-msg";
+    msg.textContent = normalizeString(message, "Unknown dashboard event");
+
+    line.append(ts, lvl, msg);
+
+    if (currentLogFilter !== "ALL" && safeType !== currentLogFilter) {
+        line.hidden = true;
+    }
+
+    el.logConsole.appendChild(line);
+
+    if ((safeType === "warn" || safeType === "err") && el.liveRegion) {
+        el.liveRegion.textContent = msg.textContent;
+    }
+
+    while (el.logConsole.children.length > CONFIG.MAX_LOG_LINES) {
+        el.logConsole.removeChild(el.logConsole.firstElementChild);
+    }
+
+    el.logConsole.scrollTop = el.logConsole.scrollHeight;
 }
 
-el.logConsole.appendChild(line);
-
-if (
-(safeType === "warn" || safeType === "err") &&
-el.liveRegion
-) {
-el.liveRegion.textContent = normalizeString(message);
-}
-
-while (el.logConsole.children.length > CONFIG.MAX_LOG_LINES) {
-el.logConsole.removeChild(el.logConsole.firstElementChild);
-}
-
-el.logConsole.scrollTop = el.logConsole.scrollHeight;
-}
+// =============================================================================
+// Status / UI Helpers
+// =============================================================================
 
 function setStatus(state) {
-const normalized =
-normalizeString(state, "unknown").toLowerCase();
-
-if (el.statusText) {
-el.statusText.textContent = normalized.toUpperCase();
+    const normalized = normalizeString(state, "unknown").toLowerCase();
+    if (el.statusText) el.statusText.textContent = normalized.toUpperCase();
+    if (!el.statusDot) return;
+    el.statusDot.classList.remove("online", "offline");
+    if (["online", "live"].includes(normalized)) el.statusDot.classList.add("online");
+    if (normalized === "offline") el.statusDot.classList.add("offline");
 }
 
-if (!el.statusDot) return;
-
-el.statusDot.classList.remove("online", "offline");
-
-if (["online", "live"].includes(normalized)) {
-el.statusDot.classList.add("online");
+function flashPoll() {
+    if (!el.pollFlash) return;
+    el.pollFlash.classList.add("flash");
+    setTimeout(() => el.pollFlash?.classList.remove("flash"), 600);
 }
 
-if (normalized === "offline") {
-el.statusDot.classList.add("offline");
-}
+function bumpStat(node) {
+    if (!node) return;
+    node.classList.add("bump");
+    setTimeout(() => node.classList.remove("bump"), 250);
 }
 
 function markDataSync(source) {
-lastDataSyncAt = new Date();
-
-if (el.lastSync) {
-el.lastSync.textContent = `${source} ${nowStamp()}`;
-}
-
-if (el.pollFlash) {
-el.pollFlash.classList.add("flash");
-
-```
-setTimeout(
-  () => el.pollFlash?.classList.remove("flash"),
-  600
-);
-```
-
-}
+    lastDataSyncAt = new Date();
+    if (el.lastSync) el.lastSync.textContent = `${source} ${nowStamp()}`;
+    flashPoll();
 }
 
 function dataIsStale() {
-return (
-!lastDataSyncAt ||
-Date.now() - lastDataSyncAt.getTime() >
-CONFIG.DATA_STALE_MS
-);
+    return !lastDataSyncAt ||
+        Date.now() - lastDataSyncAt.getTime() > CONFIG.DATA_STALE_MS;
 }
 
-function buildApiUrl(path) {
-if (
-typeof path !== "string" ||
-!path.startsWith("/")
-) {
-throw new Error("API path must be relative");
-}
-
-if (
-path.includes("\r") ||
-path.includes("\n")
-) {
-throw new Error("API path contains invalid characters");
-}
-
-return new URL(
-`${CONFIG.API_BASE}${path}`,
-location.href
-);
-}
+// =============================================================================
+// Auth / API Helpers
+// =============================================================================
 
 function getDevToken() {
-if (!CONFIG.ALLOW_DEV_JWT_STORAGE) return null;
-
-try {
-return sessionStorage.getItem("SENTINEL_JWT");
-} catch {
-return null;
-}
+    if (!CONFIG.ALLOW_DEV_JWT_STORAGE) return null;
+    try { return sessionStorage.getItem("SENTINEL_JWT"); } catch { return null; }
 }
 
 function getAuthHeaders() {
-const headers = {
-"Content-Type": "application/json"
-};
-
-const token = getDevToken();
-
-if (token) {
-headers.Authorization = `Bearer ${token}`;
+    const headers = {"Content-Type": "application/json"};
+    const token = getDevToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return headers;
 }
 
-return headers;
+function buildApiUrl(path) {
+    if (typeof path !== "string" || !path.startsWith("/"))
+        throw new Error("API path must be relative");
+    if (path.includes("\r") || path.includes("\n"))
+        throw new Error("API path contains invalid characters");
+    return new URL(`${CONFIG.API_BASE}${path}`, location.href);
 }
 
 async function fetchJson(path, opts = {}) {
-const url = buildApiUrl(path);
+    const url = buildApiUrl(path);
+    const sameOrigin = url.origin === location.origin;
 
-const response = await fetch(url.toString(), {
-...opts,
-cache: "no-store",
-credentials:
-url.origin === location.origin
-? "include"
-: "omit",
-headers: {
-...getAuthHeaders(),
-"Cache-Control": "no-cache",
-...(opts.headers || {})
-}
-});
+    const response = await fetch(url.toString(), {
+        ...opts,
+        cache: "no-store",
+        credentials: sameOrigin ? "include" : "omit",
+        headers: {
+            ...getAuthHeaders(),
+            "Cache-Control": "no-cache",
+            ...(opts.headers ?? {}),
+        },
+    });
 
-const contentType =
-response.headers.get("content-type") || "";
+    const contentType = response.headers.get("content-type") ?? "";
+    const isJson = contentType.includes("application/json");
 
-const isJson =
-contentType.includes("application/json");
+    if (!response.ok) {
+        let detail = "";
+        if (isJson) {
+            try {
+                const body = await response.json();
+                detail = normalizeString(
+                    body?.detail ?? body?.error ?? body?.message, ""
+                ).slice(0, 240);
+            } catch {}
+        }
+        throw new Error(
+            `${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`
+        );
+    }
 
-if (!response.ok) {
-let detail = "";
-
-```
-if (isJson) {
-  try {
-    const body = await response.json();
-
-    detail = normalizeString(
-      body?.detail ||
-      body?.error ||
-      body?.message,
-      ""
-    ).slice(0, 240);
-  } catch {}
-}
-
-throw new Error(
-  `${response.status} ${response.statusText}` +
-  `${detail ? `: ${detail}` : ""}`
-);
-```
-
-}
-
-return isJson
-? response.json()
-: null;
+    return isJson ? response.json() : null;
 }
 
 function unwrapData(value) {
-return (
-value &&
-typeof value === "object" &&
-!Array.isArray(value) &&
-"data" in value
-)
-? value.data
-: value;
+    return value && typeof value === "object" && !Array.isArray(value) && "data" in value
+        ? value.data
+        : value;
 }
 
 function extractActionList(value) {
-const unwrapped = unwrapData(value);
-
-if (Array.isArray(unwrapped)) {
-return unwrapped;
-}
-
-if (
-unwrapped &&
-typeof unwrapped === "object" &&
-Array.isArray(unwrapped.actions)
-) {
-return unwrapped.actions;
-}
-
-throw new Error(
-"Action endpoint returned an invalid payload shape"
-);
+    const u = unwrapData(value);
+    if (Array.isArray(u)) return u;
+    if (u && typeof u === "object" && Array.isArray(u.actions)) return u.actions;
+    throw new Error("Action endpoint returned an invalid payload shape");
 }
 
 function extractVaultRecords(value) {
-const unwrapped = unwrapData(value);
-
-return (
-unwrapped &&
-typeof unwrapped.records === "number"
-)
-? unwrapped.records
-: null;
+    const u = unwrapData(value);
+    return u && typeof u.records === "number" ? u.records : null;
 }
+
+// =============================================================================
+// Demo Backend  (?demo=1 only)
+// =============================================================================
+
+const demoBackend = (() => {
+    const store = new Map();
+    const genId = () =>
+        `ACT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`.toUpperCase();
+
+    function trimStore() {
+        while (store.size > CONFIG.MAX_DEMO_ACTIONS)
+            store.delete(store.keys().next().value);
+    }
+
+    function make(opts = {}) {
+        const item = {
+            id:              genId(),
+            action_type:     opts.action_type     ?? "THREAT_ACTION",
+            status:          opts.status          ?? (Math.random() > 0.5 ? "PENDING" : "STAGED"),
+            created_at:      opts.created_at      ?? new Date().toISOString(),
+            decision_reason: opts.decision_reason ?? "",
+            operator:        opts.operator        ?? "",
+            payload: {
+                ip:         opts.ip     ?? "203.0.113.10",
+                source_ip:  opts.ip     ?? "203.0.113.10",
+                threat:     opts.threat ?? "Suspicious activity",
+            },
+        };
+        store.set(item.id, item);
+        trimStore();
+        return item;
+    }
+
+    make({threat: "SQL injection pattern",       ip: "198.51.100.22", status: "PENDING"});
+    make({threat: "Credential stuffing detected", ip: "203.0.113.77", status: "STAGED"});
+    make({threat: "High-rate port probe",         ip: "192.0.2.41",   status: "APPROVED",
+          decision_reason: "Confirmed scanner - allowlisted", operator: "ops@sentinel"});
+    make({threat: "XSS payload in user-agent",    ip: "198.51.100.9", status: "PENDING"});
+    make({threat: "Tor exit-node connection",     ip: "10.0.0.7",     status: "VETOED",
+          decision_reason: "Internal test - false positive",  operator: "sec@sentinel"});
+
+    return {
+        listActions: async () =>
+            Array.from(store.values())
+                 .sort((a, b) => new Date(b.created_at) - new Date(a.created_at)),
+        approve: async (id, reason) => {
+            const item = store.get(id);
+            if (!item) throw new Error("Not found");
+            if (item.status !== "STAGED") throw new Error("Only staged actions can be approved");
+            item.status = "APPROVED";
+            item.decision_reason = reason;
+            item.operator = "operator";
+            return {ok: true};
+        },
+        veto: async (id, reason) => {
+            const item = store.get(id);
+            if (!item) throw new Error("Not found");
+            if (!["PENDING", "STAGED"].includes(item.status))
+                throw new Error("Only pending/staged actions can be vetoed");
+            item.status = "VETOED";
+            item.decision_reason = reason;
+            item.operator = "operator";
+            return {ok: true};
+        },
+        inject: async () => {
+            make({threat: "Injected test incident", ip: "203.0.113.88",
+                  status: Math.random() > 0.5 ? "PENDING" : "STAGED"});
+            return {ok: true};
+        },
+        vaultStats: async () => ({records: 12487}),
+    };
+})();
+
+// =============================================================================
+// API
+// =============================================================================
 
 const api = {
-listActions: () =>
-fetchJson("/actions?limit=250"),
+    listActions: () =>
+        CONFIG.DEMO_MODE
+            ? demoBackend.listActions()
+            : fetchJson("/actions?limit=250"),
 
-vaultStats: () =>
-fetchJson("/vault/stats"),
+    vaultStats: () =>
+        CONFIG.DEMO_MODE
+            ? demoBackend.vaultStats()
+            : fetchJson("/vault/stats"),
 
-approve: (id, reason) =>
-fetchJson(
-`/actions/${encodeURIComponent(id)}/approve`,
-{
-method: "POST",
-body: JSON.stringify({reason})
-}
-),
+    approve: (id, reason) =>
+        CONFIG.DEMO_MODE
+            ? demoBackend.approve(id, reason)
+            : fetchJson(`/actions/${encodeURIComponent(id)}/approve`, {
+                method: "POST",
+                body:   JSON.stringify({reason}),
+              }),
 
-veto: (id, reason) =>
-fetchJson(
-`/actions/${encodeURIComponent(id)}/veto`,
-{
-method: "POST",
-body: JSON.stringify({reason})
-}
-)
+    veto: (id, reason) =>
+        CONFIG.DEMO_MODE
+            ? demoBackend.veto(id, reason)
+            : fetchJson(`/actions/${encodeURIComponent(id)}/veto`, {
+                method: "POST",
+                body:   JSON.stringify({reason}),
+              }),
+
+    inject: () =>
+        CONFIG.DEMO_MODE
+            ? demoBackend.inject()
+            : CONFIG.LIVE_TEST_MODE
+                ? fetchJson("/actions/test-inject", {method: "POST"})
+                : Promise.reject(new Error("Inject requires demo or local test mode")),
 };
+
+// =============================================================================
+// Action Normalization
+// =============================================================================
 
 function normalizeAction(raw) {
-const payload =
-raw &&
-typeof raw.payload === "object" &&
-raw.payload !== null
-? raw.payload
-: {};
+    const payload =
+        raw?.payload && typeof raw.payload === "object" && !Array.isArray(raw.payload)
+            ? raw.payload
+            : {};
 
-const createdRaw =
-normalizeString(raw?.created_at, "");
+    const id         = normalizeString(raw?.id, "").trim();
+    const createdRaw = normalizeString(raw?.created_at, "");
+    const parsed     = Date.parse(createdRaw);
+    const createdBad = !createdRaw || Number.isNaN(parsed);
 
-const parsed =
-Date.parse(createdRaw);
+    if (!id)         log("Backend returned action without id.", "warn");
+    if (createdBad)  log(`Action ${id || "<missing-id>"} has missing or invalid created_at.`, "warn");
 
-return {
-id:
-normalizeString(raw?.id, "").trim(),
-
-```
-threat:
-  normalizeString(
-    payload.threat ||
-    raw?.action_type,
-    "UNKNOWN"
-  ),
-
-source:
-  normalizeString(
-    payload.source_ip ||
-    payload.ip,
-    "n/a"
-  ),
-
-status:
-  normalizeString(
-    raw?.status,
-    "UNKNOWN"
-  ).toUpperCase(),
-
-createdAt:
-  Number.isNaN(parsed)
-    ? null
-    : new Date(parsed).toISOString(),
-
-decisionReason:
-  normalizeString(
-    raw?.decision_reason,
-    ""
-  ),
-
-operator:
-  normalizeString(
-    raw?.operator,
-    ""
-  )
-```
-
-};
+    return {
+        id,
+        threat:         normalizeString(payload.threat ?? raw?.action_type, "UNKNOWN"),
+        source:         normalizeString(payload.source_ip ?? payload.ip, "n/a"),
+        status:         normalizeString(raw?.status, "UNKNOWN").toUpperCase(),
+        createdAt:      createdBad ? null : new Date(parsed).toISOString(),
+        createdRaw,
+        createdBad,
+        decisionReason: normalizeString(raw?.decision_reason, ""),
+        operator:       normalizeString(raw?.operator, ""),
+        payload,
+    };
 }
 
-function applyFilters(actions) {
-let output =
-currentFilter === "ALL"
-? actions
-: actions.filter(
-action =>
-action.status === currentFilter
-);
+const actionTimeValue = a => a.createdAt ? Date.parse(a.createdAt) : 0;
 
-const query =
-searchQuery.trim().toLowerCase();
-
-if (query) {
-output = output.filter(
-action =>
-[
-action.id,
-action.threat,
-action.source
-].some(
-value =>
-value
-.toLowerCase()
-.includes(query)
-)
-);
-}
-
-return output;
-}
+// =============================================================================
+// Action Store Operations
+// =============================================================================
 
 function reconcileSelectedIds() {
-const validIds =
-new Set(
-allActions
-.map(action => action.id)
-.filter(Boolean)
-);
-
-selectedIds =
-new Set(
-[...selectedIds].filter(
-id => validIds.has(id)
-)
-);
+    const validIds = new Set(allActions.map(a => a.id).filter(Boolean));
+    const before = selectedIds.size;
+    selectedIds = new Set([...selectedIds].filter(id => validIds.has(id)));
+    if (selectedIds.size !== before)
+        log("Removed stale selections no longer in the live queue.", "info");
 }
+
+function replaceActions(rawActions, source) {
+    allActions = extractActionList(rawActions)
+        .map(normalizeAction)
+        .sort((a, b) => actionTimeValue(b) - actionTimeValue(a));
+    reconcileSelectedIds();
+    updateStats();
+    renderActions();
+    markDataSync(source);
+}
+
+function upsertAction(rawAction, source = "ws-sync") {
+    const action = normalizeAction(rawAction);
+    if (!action.id) return;
+    const idx = allActions.findIndex(a => a.id === action.id);
+    if (idx >= 0) allActions[idx] = action;
+    else allActions.push(action);
+    allActions.sort((a, b) => actionTimeValue(b) - actionTimeValue(a));
+    reconcileSelectedIds();
+    updateStats();
+    renderActions();
+    markDataSync(source);
+}
+
+function removeAction(actionId, source = "ws-sync") {
+    const cleaned = normalizeString(actionId, "").trim();
+    if (!cleaned) return;
+    allActions = allActions.filter(a => a.id !== cleaned);
+    reconcileSelectedIds();
+    updateStats();
+    renderActions();
+    markDataSync(source);
+}
+
+// =============================================================================
+// Filters
+// =============================================================================
+
+function applyFilters(actions) {
+    let out = currentFilter === "ALL"
+        ? actions
+        : actions.filter(a => a.status === currentFilter);
+
+    const q = searchQuery.trim().toLowerCase();
+    if (q) out = out.filter(a =>
+        a.id.toLowerCase().includes(q) ||
+        a.threat.toLowerCase().includes(q) ||
+        a.source.toLowerCase().includes(q)
+    );
+
+    return out;
+}
+
+function visibleActionIds() {
+    return new Set(applyFilters(allActions).map(a => a.id));
+}
+
+// =============================================================================
+// Stats
+// =============================================================================
+
 function updateStats() {
-const pending =
-allActions.filter(
-action => action.status === "PENDING"
-).length;
+    const pending  = allActions.filter(a => a.status === "PENDING").length;
+    const staged   = allActions.filter(a => a.status === "STAGED").length;
+    const approved = allActions.filter(a =>
+        ["APPROVED", "EXECUTED"].includes(a.status)).length;
+    const vetoed   = allActions.filter(a => a.status === "VETOED").length;
 
-const staged =
-allActions.filter(
-action => action.status === "STAGED"
-).length;
+    if (pending  !== prevCounts.pending)  { bumpStat(el.pendingCount);  el.pendingCount.textContent  = pending; }
+    if (staged   !== prevCounts.staged)   { bumpStat(el.stagedCount);   el.stagedCount.textContent   = staged; }
+    if (approved !== prevCounts.approved) { bumpStat(el.approvedCount); el.approvedCount.textContent = approved; }
+    prevCounts = {pending, staged, approved};
 
-const approved =
-allActions.filter(
-action =>
-["APPROVED", "EXECUTED"]
-.includes(action.status)
-).length;
+    if (el.queueCount) el.queueCount.textContent = pending + staged;
 
-const vetoed =
-allActions.filter(
-action => action.status === "VETOED"
-).length;
-
-if (el.pendingCount) {
-el.pendingCount.textContent = pending;
+    for (const [key, value] of Object.entries({
+        ALL: allActions.length, PENDING: pending,
+        STAGED: staged, APPROVED: approved, VETOED: vetoed,
+    })) {
+        const target = $(`fc-${key}`);
+        if (target) target.textContent = value > 0 ? ` (${value})` : "";
+    }
 }
 
-if (el.stagedCount) {
-el.stagedCount.textContent = staged;
-}
+// =============================================================================
+// Selection Management
+// =============================================================================
 
-if (el.approvedCount) {
-el.approvedCount.textContent = approved;
-}
-
-if (el.queueCount) {
-el.queueCount.textContent =
-pending + staged;
-}
-
-for (
-const [key, value]
-of Object.entries({
-ALL: allActions.length,
-PENDING: pending,
-STAGED: staged,
-APPROVED: approved,
-VETOED: vetoed
-})
-) {
-const target = $(`fc-${key}`);
-
-```
-if (target) {
-  target.textContent =
-    value
-      ? ` (${value})`
-      : "";
-}
-```
-
-}
+function updateSelectAllState() {
+    const boxes = Array.from(document.querySelectorAll(".row-cb"));
+    const checked = boxes.filter(b => b.checked).length;
+    if (el.selectAll) {
+        el.selectAll.checked       = boxes.length > 0 && checked === boxes.length;
+        el.selectAll.indeterminate = checked > 0 && checked < boxes.length;
+    }
 }
 
 function updateBulkBar() {
-if (
-!el.bulkBar ||
-!el.bulkLabel
-) {
-return;
-}
+    const count     = selectedIds.size;
+    const visibleIds = visibleActionIds();
+    const hidden    = [...selectedIds].filter(id => !visibleIds.has(id)).length;
 
-el.bulkBar.classList.toggle(
-"visible",
-selectedIds.size > 0
-);
+    el.bulkBar?.classList.toggle("visible", count > 0);
+    if (el.bulkLabel) {
+        el.bulkLabel.textContent = hidden
+            ? `${count} selected (${hidden} hidden by filter/search)`
+            : `${count} selected`;
+    }
 
-el.bulkLabel.textContent =
-`${selectedIds.size} selected`;
+    const selected = [...selectedIds]
+        .map(id => allActions.find(a => a.id === id))
+        .filter(Boolean);
 
-const selected =
-[...selectedIds]
-.map(
-id =>
-allActions.find(
-action =>
-action.id === id
-)
-)
-.filter(Boolean);
+    if (el.bulkApproveBtn)
+        el.bulkApproveBtn.disabled = !selected.some(a => a.status === "STAGED");
+    if (el.bulkVetoBtn)
+        el.bulkVetoBtn.disabled = !selected.some(a =>
+            ["PENDING", "STAGED"].includes(a.status));
 
-if (el.bulkApproveBtn) {
-el.bulkApproveBtn.disabled =
-!selected.some(
-action =>
-action.status === "STAGED"
-);
-}
-
-if (el.bulkVetoBtn) {
-el.bulkVetoBtn.disabled =
-!selected.some(
-action =>
-["PENDING", "STAGED"]
-.includes(action.status)
-);
-}
+    updateSelectAllState();
 }
 
 function clearSelection() {
-selectedIds.clear();
-
-document
-.querySelectorAll(".row-cb")
-.forEach(
-box => {
-box.checked = false;
-
-```
-    box
-      .closest("tr")
-      ?.classList
-      .remove("selected");
-  }
-);
-```
-
-if (el.selectAll) {
-el.selectAll.checked = false;
-el.selectAll.indeterminate = false;
+    selectedIds.clear();
+    document.querySelectorAll(".row-cb").forEach(b => {
+        b.checked = false;
+        b.closest("tr")?.classList.remove("selected");
+    });
+    if (el.selectAll) {
+        el.selectAll.checked       = false;
+        el.selectAll.indeterminate = false;
+    }
+    updateBulkBar();
 }
 
-updateBulkBar();
+// =============================================================================
+// Row Focus Navigation
+// =============================================================================
+
+function resetFocus() {
+    focusedRowIndex = -1;
+    focusedActionId = null;
+    document.querySelectorAll("tr.focused").forEach(r => r.classList.remove("focused"));
 }
+
+function visibleRows() {
+    return Array.from(el.actionsBody?.querySelectorAll("tr[data-id]:not(.expand-row)") ?? []);
+}
+
+function setFocusedRow(index) {
+    const rows = visibleRows();
+    rows.forEach(r => r.classList.remove("focused"));
+    if (!rows.length) { resetFocus(); return; }
+    focusedRowIndex = Math.max(0, Math.min(index, rows.length - 1));
+    const row = rows[focusedRowIndex];
+    focusedActionId = row.dataset.id ?? null;
+    row.classList.add("focused");
+    row.scrollIntoView({block: "nearest"});
+}
+
+function restoreFocus(previousId) {
+    if (!previousId) { resetFocus(); return; }
+    const rows = visibleRows();
+    const idx  = rows.findIndex(r => r.dataset.id === previousId);
+    if (idx < 0) { resetFocus(); return; }
+    setFocusedRow(idx);
+}
+
+// =============================================================================
+// Render
+// =============================================================================
 
 function renderActions() {
-if (
-!el.actionsBody ||
-!el.emptyState
-) {
-return;
-}
-
-const actions =
-applyFilters(allActions);
-
-el.actionsBody.innerHTML = "";
-
-el.emptyState.hidden =
-Boolean(actions.length);
-
-for (const action of actions) {
-const row =
-document.createElement("tr");
-
-```
-row.dataset.id =
-  action.id;
-
-if (
-  selectedIds.has(action.id)
-) {
-  row.classList.add("selected");
-}
-
-const statusClass =
-  STATUS_CLASSES[action.status] ||
-  "unknown";
-
-const created =
-  action.createdAt
-    ? new Date(
-        action.createdAt
-      ).toLocaleString(
-        [],
-        {
-          dateStyle: "short",
-          timeStyle: "short"
-        }
-      )
-    : "MISSING";
-
-const canApprove =
-  action.status === "STAGED";
-
-const canVeto =
-  ["PENDING", "STAGED"]
-    .includes(action.status);
-
-const controls =
-  canApprove || canVeto
-    ? (
-      `<div class="act-btns">` +
-      (
-        canApprove
-          ? (
-            `<button class="btn green" ` +
-            `type="button" ` +
-            `data-approve="${escHtml(action.id)}">` +
-            `✓</button>`
-          )
-          : ""
-      ) +
-      (
-        canVeto
-          ? (
-            `<button class="btn red" ` +
-            `type="button" ` +
-            `data-veto="${escHtml(action.id)}">` +
-            `✕</button>`
-          )
-          : ""
-      ) +
-      `</div>`
-    )
-    : (
-      `<span class="mono">` +
-      `${escHtml(action.operator || "—")}` +
-      `</span>`
-    );
-
-row.innerHTML =
-  `<td>` +
-    `<input type="checkbox" ` +
-    `class="row-cb" ` +
-    `data-id="${escHtml(action.id)}"` +
-    `${selectedIds.has(action.id) ? " checked" : ""}>` +
-  `</td>` +
-  `<td>` +
-    `<button class="expand-btn" ` +
-    `type="button" ` +
-    `data-expand="${escHtml(action.id)}">▶</button>` +
-  `</td>` +
-  `<td class="mono">${escHtml(action.id || "<missing>")}</td>` +
-  `<td>${escHtml(action.threat)}</td>` +
-  `<td class="mono">${escHtml(action.source)}</td>` +
-  `<td>` +
-    `<span class="tag ${statusClass}">` +
-      `${escHtml(action.status)}` +
-    `</span>` +
-  `</td>` +
-  `<td class="mono">${escHtml(created)}</td>` +
-  `<td class="reason-cell">` +
-    `${escHtml(action.decisionReason || "—")}` +
-  `</td>` +
-  `<td class="sticky-actions">${controls}</td>`;
-
-el.actionsBody.appendChild(row);
-```
-
-}
-
-updateBulkBar();
-}
-
-function replaceActions(
-rawActions,
-source
-) {
-allActions =
-extractActionList(rawActions)
-.map(normalizeAction)
-.sort(
-(a, b) =>
-Date.parse(b.createdAt || 0) -
-Date.parse(a.createdAt || 0)
-);
-
-reconcileSelectedIds();
-updateStats();
-renderActions();
-markDataSync(source);
-}
-
-function upsertAction(
-rawAction,
-source = "ws-sync"
-) {
-const action =
-normalizeAction(rawAction);
-
-if (!action.id) return;
-
-const index =
-allActions.findIndex(
-item =>
-item.id === action.id
-);
-
-if (index >= 0) {
-allActions[index] = action;
-} else {
-allActions.push(action);
-}
-
-allActions.sort(
-(a, b) =>
-Date.parse(b.createdAt || 0) -
-Date.parse(a.createdAt || 0)
-);
-
-reconcileSelectedIds();
-updateStats();
-renderActions();
-markDataSync(source);
-}
-
-function removeAction(
-id,
-source = "ws-sync"
-) {
-const cleaned =
-normalizeString(id).trim();
-
-allActions =
-allActions.filter(
-action =>
-action.id !== cleaned
-);
-
-reconcileSelectedIds();
-updateStats();
-renderActions();
-markDataSync(source);
-}
-
-async function performRefresh(
-manual = false
-) {
-document.body.setAttribute(
-"aria-busy",
-"true"
-);
-
-if (manual) {
-setStatus("Syncing");
-}
-
-try {
-const [actions, vault] =
-await Promise.all([
-api.listActions(),
-
-```
-    api
-      .vaultStats()
-      .catch(() => null)
-  ]);
-
-replaceActions(
-  actions,
-  "http-sync"
-);
-
-const records =
-  extractVaultRecords(vault);
-
-if (el.vaultCount) {
-  el.vaultCount.textContent =
-    typeof records === "number"
-      ? records.toLocaleString()
-      : "--";
-}
-
-setStatus(
-  wsConnected
-    ? "Live"
-    : "Online"
-);
-
-if (manual) {
-  log(
-    `Refresh complete - ` +
-    `${applyFilters(allActions).length} ` +
-    `action(s) visible.`,
-    "ok"
-  );
-}
-
-return true;
-```
-
-} catch (error) {
-setStatus(
-wsConnected
-? "Degraded"
-: "Offline"
-);
-
-```
-log(
-  `Refresh failed: ` +
-  `${error.message || error}`,
-  "err"
-);
-
-return false;
-```
-
-} finally {
-document.body.removeAttribute(
-"aria-busy"
-);
-}
-}
-
-async function refreshDashboard(
-manual = false,
-{force = false} = {}
-) {
-if (
-refreshPromise &&
-!force
-) {
-return refreshPromise;
-}
-
-if (
-refreshPromise &&
-force
-) {
-await refreshPromise;
-}
-
-refreshPromise =
-performRefresh(manual)
-.finally(
-() => {
-refreshPromise = null;
-}
-);
-
-return refreshPromise;
-}
-
-function decodeWsMessage(message) {
-if (
-typeof message !== "string"
-) {
-throw new Error(
-"WebSocket frame must be text"
-);
-}
-
-if (
-new TextEncoder()
-.encode(message)
-.length >
-CONFIG.MAX_WS_FRAME_BYTES
-) {
-throw new Error(
-"WebSocket frame exceeds maximum size"
-);
-}
-
-const decoded =
-JSON.parse(message);
-
-if (
-!decoded ||
-typeof decoded !== "object" ||
-Array.isArray(decoded)
-) {
-throw new Error(
-"WebSocket message must be an object"
-);
-}
-
-if (
-typeof decoded.type !== "string" ||
-!decoded.type.trim()
-) {
-throw new Error(
-"WebSocket message type is required"
-);
-}
-
-return {
-type:
-decoded.type.trim(),
-
-```
-payload:
-  decoded.payload &&
-  typeof decoded.payload === "object"
-    ? decoded.payload
-    : {}
-```
-
-};
-}
-
-function applyWsMessage(message) {
-const {
-type,
-payload
-} = decodeWsMessage(message);
-
-switch (type) {
-case "connected":
-log(
-"WebSocket server acknowledged connection.",
-"ok"
-);
-break;
-
-```
-case "subscribed":
-  log(
-    `WebSocket subscription active: ` +
-    `${normalizeString(payload.channel, "unknown")}`,
-    "ok"
-  );
-  break;
-
-case "actions_snapshot":
-  replaceActions(
-    payload.actions || payload,
-    "ws-sync"
-  );
-  break;
-
-case "action_created":
-case "action_updated":
-case "action_status_changed":
-case "action":
-  upsertAction(
-    payload.action || payload
-  );
-  break;
-
-case "action_deleted":
-case "action_removed":
-  removeAction(
-    payload.id ||
-    payload.action_id
-  );
-  break;
-
-case "vault_stats": {
-  const records =
-    extractVaultRecords(payload);
-
-  if (el.vaultCount) {
-    el.vaultCount.textContent =
-      typeof records === "number"
-        ? records.toLocaleString()
-        : "--";
-  }
-
-  markDataSync("ws-sync");
-  break;
-}
-
-case "pong":
-  break;
-
-case "error":
-  log(
-    `WebSocket server error: ` +
-    `${normalizeString(payload.error, "unknown error")}`,
-    "err"
-  );
-  break;
-
-default:
-  log(
-    `Ignored unhandled WebSocket event type: ${type}`,
-    "info"
-  );
-```
-
-}
-}
-
-function safeWsUrl() {
-const url =
-new URL(
-CONFIG.WS_URL,
-location.href
-);
-
-if (
-!["ws:", "wss:"]
-.includes(url.protocol)
-) {
-throw new Error(
-"WebSocket URL must use ws:// or wss://"
-);
-}
-
-if (
-location.protocol === "https:" &&
-url.protocol !== "wss:"
-) {
-throw new Error(
-"Secure pages require wss:// WebSocket URLs"
-);
-}
-
-return url.toString();
-}
-
-function wsSend(
-type,
-payload = {}
-) {
-if (
-!ws ||
-ws.readyState !== WebSocket.OPEN
-) {
-return false;
-}
-
-ws.send(
-JSON.stringify({
-type,
-payload
-})
-);
-
-return true;
-}
-
-function connectWebSocket() {
-if (
-CONFIG.DEMO_MODE ||
-wsClosing ||
-wsConnected ||
-(
-ws &&
-[
-WebSocket.OPEN,
-WebSocket.CONNECTING
-].includes(ws.readyState)
-)
-) {
-return;
-}
-
-try {
-ws =
-new WebSocket(
-safeWsUrl()
-);
-
-```
-ws.addEventListener(
-  "open",
-  () => {
-    wsConnected = true;
-
-    setStatus("Live");
-
-    log(
-      "WebSocket connected. Live queue updates enabled.",
-      "ok"
-    );
-
-    wsSend(
-      "subscribe",
-      {channel: "actions"}
-    );
-
-    wsSend(
-      "subscribe",
-      {channel: "vault"}
-    );
-
-    clearInterval(
-      wsHeartbeatTimer
-    );
-
-    wsHeartbeatTimer =
-      setInterval(
-        () =>
-          wsSend(
-            "ping",
-            {
-              timestamp:
-                new Date()
-                  .toISOString()
-            }
-          ),
-
-        CONFIG.WS_HEARTBEAT_MS
-      );
-  }
-);
-
-ws.addEventListener(
-  "message",
-  event => {
-    try {
-      applyWsMessage(
-        event.data
-      );
-    } catch (error) {
-      log(
-        `Rejected WebSocket message: ` +
-        `${error.message || error}`,
-        "warn"
-      );
+    if (!el.actionsBody || !el.emptyState) return;
+
+    const previousFocusId = focusedActionId;
+    const actions = applyFilters(allActions);
+
+    el.actionsBody.innerHTML = "";
+    el.emptyState.hidden = Boolean(actions.length);
+
+    if (!actions.length) { resetFocus(); updateBulkBar(); return; }
+
+    for (const [index, action] of actions.entries()) {
+        const row = document.createElement("tr");
+        row.dataset.id  = action.id;
+        row.dataset.idx = String(index);
+        if (selectedIds.has(action.id)) row.classList.add("selected");
+
+        const statusClass = STATUS_CLASSES[action.status] ?? "unknown";
+        const created     = action.createdAt
+            ? new Date(action.createdAt).toLocaleString([], {dateStyle: "short", timeStyle: "short"})
+            : "MISSING";
+        const createdStyle = action.createdBad
+            ? "color:var(--red);font-size:10px;"
+            : "color:var(--muted);font-size:10px;";
+
+        const canApprove = action.status === "STAGED";
+        const canVeto    = ["PENDING", "STAGED"].includes(action.status);
+
+        const controls = canApprove || canVeto
+            ? `<div class="act-btns">` +
+              (canApprove
+                  ? `<button class="btn green" type="button" style="padding:3px 7px"` +
+                    ` data-approve="${escHtml(action.id)}"` +
+                    ` aria-label="Approve ${escHtml(action.id)}" title="Approve (A)">✓</button>`
+                  : "") +
+              (canVeto
+                  ? `<button class="btn red" type="button" style="padding:3px 7px"` +
+                    ` data-veto="${escHtml(action.id)}"` +
+                    ` aria-label="Veto ${escHtml(action.id)}" title="Veto (V)">✕</button>`
+                  : "") +
+              `</div>`
+            : `<span style="color:var(--muted);font-size:10px;font-family:var(--font-mono);">` +
+              `${escHtml(action.operator) || "—"}</span>`;
+
+        row.innerHTML =
+            `<td><input type="checkbox" class="row-cb" data-id="${escHtml(action.id)}"` +
+            `${selectedIds.has(action.id) ? " checked" : ""} aria-label="Select ${escHtml(action.id)}"></td>` +
+            `<td><button class="expand-btn" type="button" data-expand="${escHtml(action.id)}" aria-label="Expand ${escHtml(action.id)}">▶</button></td>` +
+            `<td class="mono" style="color:var(--cyan)">${escHtml(action.id || "<missing>")}</td>` +
+            `<td>${escHtml(action.threat)}</td>` +
+            `<td class="mono" style="color:var(--muted)">${escHtml(action.source)}</td>` +
+            `<td><span class="tag ${statusClass}">${escHtml(action.status)}</span></td>` +
+            `<td class="mono" style="${createdStyle}">${escHtml(created)}</td>` +
+            `<td class="reason-cell" title="${escHtml(action.decisionReason)}">` +
+            `${action.decisionReason ? escHtml(action.decisionReason) : '<span style="color:var(--muted)">—</span>'}</td>` +
+            `<td class="sticky-actions">${controls}</td>`;
+
+        el.actionsBody.appendChild(row);
     }
-  }
-);
 
-ws.addEventListener(
-  "close",
-  () => {
-    wsConnected = false;
+    restoreFocus(previousFocusId);
+    updateBulkBar();
+}
 
-    clearInterval(
-      wsHeartbeatTimer
-    );
+// =============================================================================
+// Expand Rows
+// =============================================================================
 
-    wsHeartbeatTimer = null;
+function toggleExpand(actionId) {
+    const existing = el.actionsBody?.querySelector(`.expand-row[data-for="${CSS.escape(actionId)}"]`);
+    const button   = el.actionsBody?.querySelector(`[data-expand="${CSS.escape(actionId)}"]`);
 
-    if (!wsClosing) {
-      setStatus(
-        "Reconnecting"
-      );
-
-      log(
-        "WebSocket disconnected. HTTP polling remains active.",
-        "warn"
-      );
-
-      clearTimeout(
-        wsReconnectTimer
-      );
-
-      wsReconnectTimer =
-        setTimeout(
-          connectWebSocket,
-          CONFIG.WS_RECONNECT_MS
-        );
+    if (existing) {
+        existing.remove();
+        if (button) button.textContent = "▶";
+        return;
     }
-  }
-);
 
-ws.addEventListener(
-  "error",
-  () =>
-    log(
-      "WebSocket transport error. HTTP polling remains active.",
-      "warn"
-    )
-);
-```
+    const action = allActions.find(a => a.id === actionId);
+    const row    = el.actionsBody?.querySelector(`tr[data-id="${CSS.escape(actionId)}"]`);
+    if (!action || !row) return;
 
-} catch (error) {
-log(
-`WebSocket connection failed: ` +
-`${error.message || error}`,
-"warn"
-);
+    const expansion = document.createElement("tr");
+    expansion.className  = "expand-row";
+    expansion.dataset.for = actionId;
+    expansion.innerHTML =
+        `<td colspan="9"><div class="expand-inner">` +
+        `<div class="expand-kv"><div class="k">ACTION ID</div><div class="v">${escHtml(action.id)}</div></div>` +
+        `<div class="expand-kv"><div class="k">SOURCE IP</div><div class="v">${escHtml(action.source)}</div></div>` +
+        `<div class="expand-kv"><div class="k">THREAT</div><div class="v">${escHtml(action.threat)}</div></div>` +
+        `<div class="expand-kv"><div class="k">STATUS</div><div class="v">${escHtml(action.status)}</div></div>` +
+        `<div class="expand-kv"><div class="k">CREATED</div><div class="v">${escHtml(action.createdAt ?? "MISSING / INVALID")}</div></div>` +
+        `<div class="expand-kv"><div class="k">OPERATOR</div><div class="v">${escHtml(action.operator || "—")}</div></div>` +
+        `<div class="expand-kv"><div class="k">REASON</div><div class="v">${escHtml(action.decisionReason || "—")}</div></div>` +
+        `</div></td>`;
 
-```
-clearTimeout(
-  wsReconnectTimer
-);
-
-wsReconnectTimer =
-  setTimeout(
-    connectWebSocket,
-    CONFIG.WS_RECONNECT_MS
-  );
-```
-
-}
-}
-function closeWebSocket() {
-wsClosing = true;
-
-clearTimeout(
-wsReconnectTimer
-);
-
-clearInterval(
-wsHeartbeatTimer
-);
-
-wsReconnectTimer = null;
-wsHeartbeatTimer = null;
-
-if (ws) {
-ws.close();
+    row.after(expansion);
+    if (button) button.textContent = "▼";
 }
 
-ws = null;
-wsConnected = false;
-}
-
-function startPolling() {
-clearInterval(
-pollTimer
-);
-
-pollTimer =
-setInterval(
-() =>
-refreshDashboard(false),
-
-```
-  CONFIG.FALLBACK_POLL_MS
-);
-```
-
-}
+// =============================================================================
+// Reason Modal
+// =============================================================================
 
 function validateReason(value) {
-const reason =
-normalizeString(value).trim();
-
-if (
-reason.length <
-CONFIG.REASON_MIN
-) {
-return (
-`Minimum ` +
-`${CONFIG.REASON_MIN} ` +
-`characters required.`
-);
+    const cleaned = normalizeString(value, "").trim();
+    if (!cleaned) return "Reason is required.";
+    if (cleaned.length < CONFIG.REASON_MIN) return `Minimum ${CONFIG.REASON_MIN} characters required.`;
+    if (cleaned.length > CONFIG.REASON_MAX) return `Maximum ${CONFIG.REASON_MAX} characters.`;
+    return null;
 }
 
-if (
-reason.length >
-CONFIG.REASON_MAX
-) {
-return (
-`Maximum ` +
-`${CONFIG.REASON_MAX} ` +
-`characters.`
-);
+function openReasonModal({title, subtitle, confirmText, confirmClass = "green"}) {
+    return new Promise(resolve => {
+        if (!el.reasonModal) { resolve(null); return; }
+
+        el.modalTitle.textContent    = title;
+        el.modalSubtitle.textContent = subtitle;
+        el.modalInput.value          = "";
+        el.modalCharCount.textContent = `0 / ${CONFIG.REASON_MAX}`;
+        el.modalError.textContent    = "";
+        el.modalConfirm.textContent  = confirmText;
+        el.modalConfirm.className    = `btn ${confirmClass}`;
+        el.reasonModal.hidden        = false;
+        el.reasonModal.setAttribute("aria-hidden", "false");
+        setTimeout(() => el.modalInput.focus(), 0);
+
+        const close = result => {
+            cleanup();
+            el.reasonModal.hidden = true;
+            el.reasonModal.setAttribute("aria-hidden", "true");
+            el.modalError.textContent = "";
+            resolve(result);
+        };
+
+        const onInput    = () => {
+            el.modalCharCount.textContent = `${el.modalInput.value.length} / ${CONFIG.REASON_MAX}`;
+            if (el.modalError.textContent) el.modalError.textContent = "";
+        };
+        const onCancel   = () => close(null);
+        const onConfirm  = () => {
+            const err = validateReason(el.modalInput.value);
+            if (err) { el.modalError.textContent = err; return; }
+            close(el.modalInput.value.trim());
+        };
+        const onBackdrop = e => { if (e.target.hasAttribute("data-close")) onCancel(); };
+        const onKey      = e => {
+            if (e.key === "Escape") onCancel();
+            if ((e.ctrlKey || e.metaKey) && e.key === "Enter") onConfirm();
+        };
+
+        function cleanup() {
+            el.modalInput.removeEventListener("input",   onInput);
+            el.modalCancel.removeEventListener("click",  onCancel);
+            el.modalConfirm.removeEventListener("click", onConfirm);
+            el.reasonModal.removeEventListener("click",  onBackdrop);
+            document.removeEventListener("keydown",      onKey);
+        }
+
+        el.modalInput.addEventListener("input",   onInput);
+        el.modalCancel.addEventListener("click",  onCancel);
+        el.modalConfirm.addEventListener("click", onConfirm);
+        el.reasonModal.addEventListener("click",  onBackdrop);
+        document.addEventListener("keydown",      onKey);
+    });
 }
 
-return null;
-}
+// =============================================================================
+// Refresh / Data Sync
+// =============================================================================
 
-function openReasonModal(
-title,
-subtitle,
-confirmText,
-confirmClass = "green"
-) {
-return new Promise(
-resolve => {
-if (!el.reasonModal) {
-resolve(null);
-return;
-}
-
-```
-  el.modalTitle.textContent =
-    title;
-
-  el.modalSubtitle.textContent =
-    subtitle;
-
-  el.modalInput.value = "";
-
-  el.modalError.textContent = "";
-
-  el.modalCharCount.textContent =
-    `0 / ${CONFIG.REASON_MAX}`;
-
-  el.modalConfirm.textContent =
-    confirmText;
-
-  el.modalConfirm.className =
-    `btn ${confirmClass}`;
-
-  el.reasonModal.hidden = false;
-
-  const cleanup = () => {
-    el.modalCancel.removeEventListener(
-      "click",
-      cancel
-    );
-
-    el.modalConfirm.removeEventListener(
-      "click",
-      confirm
-    );
-
-    el.modalInput.removeEventListener(
-      "input",
-      count
-    );
-
-    el.reasonModal.hidden = true;
-  };
-
-  const cancel = () => {
-    cleanup();
-    resolve(null);
-  };
-
-  const confirm = () => {
-    const error =
-      validateReason(
-        el.modalInput.value
-      );
-
-    if (error) {
-      el.modalError.textContent =
-        error;
-
-      return;
+async function performRefresh(manual = false) {
+    document.body.setAttribute("aria-busy", "true");
+    if (manual) setStatus("Syncing");
+    try {
+        updateStaticConfig();
+        const [rawActions, vault] = await Promise.all([
+            api.listActions(),
+            api.vaultStats().catch(() => null),
+        ]);
+        replaceActions(rawActions, wsConnected ? "live-sync" : "poll-sync");
+        const records = extractVaultRecords(vault);
+        if (el.vaultCount)
+            el.vaultCount.textContent = typeof records === "number"
+                ? records.toLocaleString()
+                : "--";
+        setStatus(wsConnected ? "Live" : "Online");
+        if (manual)
+            log(`Refresh complete — ${applyFilters(allActions).length} action(s) visible.`, "ok");
+        return true;
+    } catch (err) {
+        setStatus(wsConnected ? "Degraded" : "Offline");
+        log(`Refresh failed: ${err.message ?? err}`, "err");
+        return false;
+    } finally {
+        document.body.removeAttribute("aria-busy");
     }
-
-    const value =
-      el.modalInput.value.trim();
-
-    cleanup();
-    resolve(value);
-  };
-
-  const count = () => {
-    el.modalCharCount.textContent =
-      `${el.modalInput.value.length} / ` +
-      `${CONFIG.REASON_MAX}`;
-  };
-
-  el.modalCancel.addEventListener(
-    "click",
-    cancel
-  );
-
-  el.modalConfirm.addEventListener(
-    "click",
-    confirm
-  );
-
-  el.modalInput.addEventListener(
-    "input",
-    count
-  );
-
-  setTimeout(
-    () => el.modalInput.focus(),
-    0
-  );
-}
-```
-
-);
 }
 
-async function updateAction(
-kind,
-id
-) {
-const isApprove =
-kind === "approve";
-
-const reason =
-await openReasonModal(
-`${isApprove ? "Approve" : "Veto"} ${id}`,
-"Provide a reason for this decision.",
-isApprove ? "Approve" : "Veto",
-isApprove ? "green" : "red"
-);
-
-if (!reason) return;
-
-try {
-if (isApprove) {
-await api.approve(
-id,
-reason
-);
-} else {
-await api.veto(
-id,
-reason
-);
+async function refreshDashboard(manual = false, {force = false} = {}) {
+    if (refreshPromise) {
+        const prior = await refreshPromise;
+        if (!force) return prior;
+    }
+    refreshPromise = performRefresh(manual).finally(() => { refreshPromise = null; });
+    return refreshPromise;
 }
 
-```
-log(
-  `${isApprove ? "Approved" : "Vetoed"} ${id}`,
-  isApprove ? "ok" : "warn"
-);
+// =============================================================================
+// Revalidation  (TOCTOU guard before approve/veto)
+// =============================================================================
 
-await refreshDashboard(
-  true,
-  {force: true}
-);
-```
-
-} catch (error) {
-log(
-`${kind} failed - ${id}: ` +
-`${error.message || error}`,
-"err"
-);
-}
+async function revalidateAction(actionId, expectedStatuses) {
+    const refreshed = await refreshDashboard(false, {force: true});
+    if (!refreshed) throw new Error("Unable to refresh live state before submit");
+    const latest = allActions.find(a => a.id === actionId);
+    if (!latest) throw new Error("Action disappeared before submit");
+    if (!expectedStatuses.includes(latest.status))
+        throw new Error(`Action status changed to ${latest.status}`);
 }
 
-function toggleExpand(id) {
-const existing =
-document.querySelector(
-`.expand-row[data-for="${CSS.escape(id)}"]`
-);
+// =============================================================================
+// Approve / Veto
+// =============================================================================
 
-if (existing) {
-existing.remove();
-return;
+async function doApprove(actionId, button) {
+    const reason = await openReasonModal({
+        title:        `Approve ${actionId}`,
+        subtitle:     "Describe why this action should proceed.",
+        confirmText:  "Approve",
+        confirmClass: "green",
+    });
+    if (!reason) { log(`Approve cancelled — ${actionId}`, "warn"); return false; }
+    if (button) button.disabled = true;
+    try {
+        await revalidateAction(actionId, ["STAGED"]);
+        await api.approve(actionId, reason);
+        log(`Approved ${actionId}`, "ok");
+        return true;
+    } catch (err) {
+        log(`Approve failed — ${actionId}: ${err.message ?? err}`, "err");
+        return false;
+    } finally {
+        if (button) button.disabled = false;
+    }
 }
 
-const action =
-allActions.find(
-item =>
-item.id === id
-);
-
-const row =
-document.querySelector(
-`tr[data-id="${CSS.escape(id)}"]`
-);
-
-if (
-!action ||
-!row
-) {
-return;
+async function doVeto(actionId, button) {
+    const reason = await openReasonModal({
+        title:        `Veto ${actionId}`,
+        subtitle:     "Explain why this action is being blocked.",
+        confirmText:  "Veto",
+        confirmClass: "red",
+    });
+    if (!reason) { log(`Veto cancelled — ${actionId}`, "warn"); return false; }
+    if (button) button.disabled = true;
+    try {
+        await revalidateAction(actionId, ["PENDING", "STAGED"]);
+        await api.veto(actionId, reason);
+        log(`Vetoed ${actionId}`, "warn");
+        return true;
+    } catch (err) {
+        log(`Veto failed — ${actionId}: ${err.message ?? err}`, "err");
+        return false;
+    } finally {
+        if (button) button.disabled = false;
+    }
 }
 
-const extra =
-document.createElement("tr");
+// =============================================================================
+// Bulk Actions  (single shared reason, applied to all eligible selections)
+// =============================================================================
 
-extra.className =
-"expand-row";
+async function runBulkAction(kind) {
+    const requestedIds = [...selectedIds];
+    if (!requestedIds.length) return;
+    const isApprove = kind === "approve";
 
-extra.dataset.for =
-id;
+    const reason = await openReasonModal({
+        title:        `Bulk ${kind} ${requestedIds.length} action(s)`,
+        subtitle:     "Applies only to currently eligible selections after a fresh server check.",
+        confirmText:  isApprove ? "Approve All" : "Veto All",
+        confirmClass: isApprove ? "green" : "red",
+    });
+    if (!reason) return;
 
-extra.innerHTML =
-`<td colspan="9">` +
-`<div class="expand-inner">` +
-`<strong>${escHtml(action.id)}</strong><br>` +
-`Source: ${escHtml(action.source)}<br>` +
-`Threat: ${escHtml(action.threat)}<br>` +
-`Status: ${escHtml(action.status)}<br>` +
-`Operator: ${escHtml(action.operator || "—")}<br>` +
-`Reason: ${escHtml(action.decisionReason || "—")}` +
-`</div>` +
-`</td>`;
+    const refreshed = await refreshDashboard(false, {force: true});
+    if (!refreshed) { log(`Bulk ${kind} aborted: live state could not be refreshed.`, "err"); return; }
 
-row.after(extra);
+    const expected = isApprove ? ["STAGED"] : ["PENDING", "STAGED"];
+    const eligible = requestedIds.filter(id => {
+        const a = allActions.find(x => x.id === id);
+        return a && expected.includes(a.status);
+    });
+
+    if (eligible.length !== requestedIds.length)
+        log(`Bulk ${kind}: skipped ${requestedIds.length - eligible.length} ineligible selection(s).`, "warn");
+    if (!eligible.length) { clearSelection(); return; }
+
+    const btn = isApprove ? el.bulkApproveBtn : el.bulkVetoBtn;
+    if (btn) btn.disabled = true;
+    let successes = 0;
+
+    try {
+        for (const id of eligible) {
+            try {
+                if (isApprove) await api.approve(id, reason);
+                else           await api.veto(id, reason);
+                successes += 1;
+            } catch (err) {
+                log(`Bulk ${kind} failed — ${id}: ${err.message ?? err}`, "err");
+            }
+        }
+        log(`Bulk ${kind} complete: ${successes}/${eligible.length} action(s).`,
+            isApprove ? "ok" : "warn");
+    } finally {
+        clearSelection();
+        await refreshDashboard(true, {force: true});
+        if (btn) btn.disabled = false;
+    }
 }
+
+// =============================================================================
+// Inject
+// =============================================================================
+
+let _injectModalOpen = false;
+
+function openInjectModal() {
+    if ((!CONFIG.DEMO_MODE && !CONFIG.LIVE_TEST_MODE) || injectInFlight) {
+        log("Inject blocked: demo/local-test mode disabled or inject in flight.", "warn");
+        return;
+    }
+    _injectModalOpen = true;
+    if (el.injectBtn) el.injectBtn.disabled = true;
+    if (el.injectModal) {
+        el.injectModal.hidden = false;
+        el.injectModal.setAttribute("aria-hidden", "false");
+    }
+}
+
+function closeInjectModal() {
+    if (!_injectModalOpen) return;
+    _injectModalOpen = false;
+    if (el.injectModal) {
+        el.injectModal.hidden = true;
+        el.injectModal.setAttribute("aria-hidden", "true");
+    }
+    updateStaticConfig();
+}
+
+el.injectCancel?.addEventListener("click", closeInjectModal);
+el.injectModal?.addEventListener("click", e => {
+    if (e.target.hasAttribute("data-close-inject")) closeInjectModal();
+});
+el.injectConfirm?.addEventListener("click", async () => {
+    if (injectInFlight) return;
+    injectInFlight = true;
+    closeInjectModal();
+    updateStaticConfig();
+    try {
+        await api.inject();
+        log("Test action injected.", "info");
+        await refreshDashboard(true, {force: true});
+    } catch (err) {
+        log(`Inject failed: ${err.message ?? err}`, "err");
+    } finally {
+        injectInFlight = false;
+        updateStaticConfig();
+    }
+});
+
+// =============================================================================
+// Export
+// =============================================================================
 
 function exportVisibleActions() {
-const actions =
-applyFilters(allActions);
+    const source = applyFilters(allActions);
+    const stale  = dataIsStale();
+    const payload = {
+        exported_at:  new Date().toISOString(),
+        data_as_of:   lastDataSyncAt?.toISOString() ?? null,
+        data_stale:   stale,
+        filter:       currentFilter,
+        search_query: searchQuery,
+        action_count: source.length,
+        actions: source.map(a => ({
+            id:              a.id,
+            threat:          a.threat,
+            source:          a.source,
+            status:          a.status,
+            created_at:      a.createdAt,
+            created_raw:     a.createdRaw,
+            created_invalid: a.createdBad,
+            decision_reason: a.decisionReason,
+            operator:        a.operator,
+        })),
+    };
 
-const payload = {
-exported_at:
-new Date().toISOString(),
-
-```
-data_as_of:
-  lastDataSyncAt
-    ?.toISOString() ||
-  null,
-
-data_stale:
-  dataIsStale(),
-
-actions
-```
-
-};
-
-const blob =
-new Blob(
-[
-JSON.stringify(
-payload,
-null,
-2
-)
-],
-{
-type: "application/json"
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {type: "application/json"});
+    const url  = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href     = url;
+    link.download = `sentinel43-export-${Date.now()}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+    log(`Exported ${source.length} action(s)${stale ? " with stale-data warning" : ""}.`,
+        stale ? "warn" : "ok");
 }
-);
 
-const url =
-URL.createObjectURL(blob);
-
-const link =
-document.createElement("a");
-
-link.href = url;
-
-link.download =
-`sentinel43-export-${Date.now()}.json`;
-
-link.click();
-
-URL.revokeObjectURL(url);
-
-log(
-`Exported ${actions.length} visible action(s).`,
-"ok"
-);
-}
+// =============================================================================
+// Static Config Display
+// =============================================================================
 
 function updateStaticConfig() {
-if (el.apiBaseText) {
-el.apiBaseText.textContent =
-CONFIG.API_BASE;
+    if (el.apiBaseText) el.apiBaseText.textContent = CONFIG.API_BASE;
+    if (el.pollText)    el.pollText.textContent     = `fallback ${CONFIG.FALLBACK_POLL_MS} ms`;
+    if (el.modeText)    el.modeText.textContent     = "HUMAN_GATED";
+
+    const demoActive = CONFIG.DEMO_MODE || CONFIG.LIVE_TEST_MODE;
+    if (el.demoText) {
+        el.demoText.textContent = CONFIG.DEMO_MODE
+            ? "DEMO ENABLED"
+            : CONFIG.LIVE_TEST_MODE
+                ? "LIVE TEST ENABLED"
+                : "DISABLED";
+        el.demoText.style.color = demoActive ? "var(--amber)" : "var(--green)";
+    }
+
+    if (el.demoBadge)  el.demoBadge.hidden  = !CONFIG.DEMO_MODE;
+    if (el.injectBtn)  el.injectBtn.disabled = (!demoActive) || injectInFlight;
+
+    const token = getDevToken();
+    if (el.authStateText) {
+        el.authStateText.textContent = token
+            ? "DEV TOKEN PRESENT"
+            : CONFIG.ALLOW_DEV_JWT_STORAGE ? "COOKIE / MISSING" : "COOKIE ONLY";
+        el.authStateText.style.color = token ? "var(--amber)" : "var(--green)";
+    }
+    if (el.jwtRiskBadge) el.jwtRiskBadge.hidden = !token;
+    if (el.authBtn)      el.authBtn.disabled    = !CONFIG.ALLOW_DEV_JWT_STORAGE;
 }
 
-if (el.pollText) {
-el.pollText.textContent =
-`every ${CONFIG.FALLBACK_POLL_MS} ms`;
+// =============================================================================
+// Theme
+// =============================================================================
+
+function applyTheme(light) {
+    isLight = light;
+    document.documentElement.classList.toggle("light", light);
+    if (el.themeBtn) el.themeBtn.textContent = light ? "☽ Dark" : "☀ Light";
+    try { localStorage.setItem("s43-theme", light ? "light" : "dark"); } catch {}
 }
 
-if (el.demoText) {
-el.demoText.textContent =
-CONFIG.DEMO_MODE
-? "ENABLED"
-: "DISABLED";
-}
-
-if (el.demoBadge) {
-el.demoBadge.hidden =
-!CONFIG.DEMO_MODE;
-}
-
-const token =
-getDevToken();
-
-if (el.authStateText) {
-el.authStateText.textContent =
-token
-? "DEV TOKEN PRESENT"
-: CONFIG.ALLOW_DEV_JWT_STORAGE
-? "COOKIE / MISSING"
-: "COOKIE ONLY";
-}
-
-if (el.jwtRiskBadge) {
-el.jwtRiskBadge.hidden =
-!token;
-}
-
-if (el.authBtn) {
-el.authBtn.disabled =
-!CONFIG.ALLOW_DEV_JWT_STORAGE;
-}
-}
-
-el.refreshBtn
-?.addEventListener(
-"click",
-() =>
-refreshDashboard(
-true,
-{force: true}
-)
-);
-
-el.exportBtn
-?.addEventListener(
-"click",
-exportVisibleActions
-);
-
-el.themeBtn
-?.addEventListener(
-"click",
-() => {
-isLight = !isLight;
-
-```
-  document
-    .documentElement
-    .classList
-    .toggle(
-      "light",
-      isLight
+function initTheme() {
+    try {
+        const stored = localStorage.getItem("s43-theme");
+        if (stored === "light") { applyTheme(true);  return; }
+        if (stored === "dark")  { applyTheme(false); return; }
+    } catch {}
+    applyTheme(
+        window.matchMedia?.("(prefers-color-scheme: light)").matches ?? false
     );
 }
-```
 
-);
+// =============================================================================
+// JWT Modal
+// =============================================================================
 
-el.clearLogBtn
-?.addEventListener(
-"click",
-() => {
-if (el.logConsole) {
-el.logConsole.innerHTML = "";
-}
-}
-);
-
-el.clearSearchBtn
-?.addEventListener(
-"click",
-() => {
-if (el.searchInput) {
-el.searchInput.value = "";
+function closeJwtModal() {
+    if (!el.jwtModal || el.jwtModal.hidden) return;
+    el.jwtModal.hidden = true;
+    el.jwtModal.setAttribute("aria-hidden", "true");
 }
 
-```
-  searchQuery = "";
-
-  renderActions();
-}
-```
-
-);
-
-el.searchInput
-?.addEventListener(
-"input",
-() => {
-searchQuery =
-el.searchInput.value;
-
-```
-  renderActions();
-}
-```
-
-);
-
-el.bulkClearBtn
-?.addEventListener(
-"click",
-clearSelection
-);
-
-el.bulkApproveBtn
-?.addEventListener(
-"click",
-() =>
-[...selectedIds]
-.forEach(
-id =>
-updateAction(
-"approve",
-id
-)
-)
-);
-
-el.bulkVetoBtn
-?.addEventListener(
-"click",
-() =>
-[...selectedIds]
-.forEach(
-id =>
-updateAction(
-"veto",
-id
-)
-)
-);
-
-el.authBtn
-?.addEventListener(
-"click",
-() => {
-if (
-!CONFIG.ALLOW_DEV_JWT_STORAGE ||
-!el.jwtModal
-) {
-return;
+async function handleAuthChanged() {
+    updateStaticConfig();
+    if (!CONFIG.DEMO_MODE) {
+        window.SentinelWS?.disconnect();
+        window.SentinelWS?.connect();
+    }
+    await refreshDashboard(true, {force: true});
 }
 
-```
-  el.jwtInput.value =
-    getDevToken() || "";
+el.authBtn?.addEventListener("click", () => {
+    if (!CONFIG.ALLOW_DEV_JWT_STORAGE || !el.jwtModal) {
+        log("Browser JWT storage is disabled outside local development.", "warn");
+        return;
+    }
+    if (el.jwtInput) el.jwtInput.value = getDevToken() ?? "";
+    el.jwtModal.hidden = false;
+    el.jwtModal.setAttribute("aria-hidden", "false");
+    setTimeout(() => el.jwtInput?.focus(), 0);
+});
 
-  el.jwtModal.hidden =
-    false;
-}
-```
-
-);
-
-el.jwtCancel
-?.addEventListener(
-"click",
-() => {
-el.jwtModal.hidden =
-true;
-}
-);
-
-el.jwtClear
-?.addEventListener(
-"click",
-async () => {
-try {
-sessionStorage.removeItem(
-"SENTINEL_JWT"
-);
-} catch {}
-
-```
-  el.jwtModal.hidden =
-    true;
-
-  updateStaticConfig();
-
-  await refreshDashboard(
-    true,
-    {force: true}
-  );
-}
-```
-
-);
-
-el.jwtConfirm
-?.addEventListener(
-"click",
-async () => {
-try {
-sessionStorage.setItem(
-"SENTINEL_JWT",
-el.jwtInput.value.trim()
-);
-} catch {}
-
-```
-  el.jwtModal.hidden =
-    true;
-
-  updateStaticConfig();
-
-  await refreshDashboard(
-    true,
-    {force: true}
-  );
-}
-```
-
-);
-
-el.selectAll
-?.addEventListener(
-"change",
-() => {
-document
-.querySelectorAll(".row-cb")
-.forEach(
-box => {
-box.checked =
-el.selectAll.checked;
-
-```
-        if (box.checked) {
-          selectedIds.add(
-            box.dataset.id
-          );
+el.jwtCancel?.addEventListener("click", closeJwtModal);
+el.jwtModal?.addEventListener("click", e => {
+    if (e.target.hasAttribute("data-close-jwt")) closeJwtModal();
+});
+el.jwtClear?.addEventListener("click", async () => {
+    try { sessionStorage.removeItem("SENTINEL_JWT"); } catch {}
+    log("Development JWT cleared.", "warn");
+    closeJwtModal();
+    await handleAuthChanged();
+});
+el.jwtConfirm?.addEventListener("click", async () => {
+    if (!CONFIG.ALLOW_DEV_JWT_STORAGE) return;
+    const token = el.jwtInput?.value.trim() ?? "";
+    try {
+        if (token) {
+            sessionStorage.setItem("SENTINEL_JWT", token);
+            log("Development JWT stored in sessionStorage. Local use only.", "warn");
         } else {
-          selectedIds.delete(
-            box.dataset.id
-          );
+            sessionStorage.removeItem("SENTINEL_JWT");
+            log("Development JWT cleared.", "warn");
         }
-      }
-    );
+    } catch { log("Unable to update sessionStorage JWT.", "err"); }
+    closeJwtModal();
+    await handleAuthChanged();
+});
 
-  updateBulkBar();
-}
-```
+// =============================================================================
+// Polling Fallback  (only runs when WebSocket is down or data is stale)
+// =============================================================================
 
-);
-
-document.addEventListener(
-"change",
-event => {
-const box =
-event.target.closest
-?.(".row-cb");
-
-```
-if (!box) return;
-
-if (box.checked) {
-  selectedIds.add(
-    box.dataset.id
-  );
-} else {
-  selectedIds.delete(
-    box.dataset.id
-  );
+function startPollingFallback() {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(() => {
+        if (!wsConnected || dataIsStale()) refreshDashboard(false);
+    }, CONFIG.FALLBACK_POLL_MS);
 }
 
-updateBulkBar();
-```
+// =============================================================================
+// WebSocket Event Listeners  (driven by websocket.js via sentinel:ws:* events)
+// =============================================================================
 
+window.addEventListener("sentinel:ws:open", () => {
+    wsConnected = true;
+    setStatus("Live");
+    log("WebSocket connected. Live queue updates enabled.", "ok");
+});
+
+window.addEventListener("sentinel:ws:close", () => {
+    wsConnected = false;
+    setStatus("Reconnecting");
+    log("WebSocket disconnected. HTTP polling remains active.", "warn");
+});
+
+window.addEventListener("sentinel:ws:reconnecting", event => {
+    setStatus("Reconnecting");
+    log(`WebSocket reconnecting (attempt ${event.detail?.attempt ?? "?"})…`, "info");
+});
+
+window.addEventListener("sentinel:ws:disconnected", () => {
+    wsConnected = false;
+    setStatus("Offline");
+});
+
+window.addEventListener("sentinel:ws:connecting", () => {
+    setStatus("Reconnecting");
+});
+
+window.addEventListener("sentinel:ws:error", event => {
+    log(`WebSocket error: ${event.detail?.error ?? "unknown"}`, "warn");
+});
+
+window.addEventListener("sentinel:ws:frame_error", event => {
+    log(`Rejected WebSocket frame: ${event.detail?.error ?? "unknown"}`, "warn");
+});
+
+window.addEventListener("sentinel:ws:auth_failed", event => {
+    log(`WebSocket auth failed: ${event.detail?.error ?? "unknown"}`, "err");
+});
+
+window.addEventListener("sentinel:ws:stale", () => {
+    log("WebSocket connection stale — forcing reconnect.", "warn");
+});
+
+// All server-to-dashboard messages arrive here after websocket.js has
+// validated the frame, checked the byte limit, and parsed the JSON.
+window.addEventListener("sentinel:ws:message", event => {
+    const {type, payload} = event.detail;
+
+    switch (type) {
+        case "connected":
+            log("WebSocket server acknowledged connection.", "ok");
+            break;
+
+        case "subscribed":
+            log(`Subscription active: ${normalizeString(payload.channel, "unknown")}`, "ok");
+            break;
+
+        case "actions_snapshot":
+            replaceActions(payload.actions ?? payload, "ws-sync");
+            break;
+
+        case "action_created":
+        case "action_updated":
+        case "action_status_changed":
+        case "action":
+            upsertAction(payload.action ?? payload);
+            break;
+
+        case "action_deleted":
+        case "action_removed":
+            removeAction(payload.id ?? payload.action_id);
+            break;
+
+        case "vault_stats": {
+            const records = extractVaultRecords(payload);
+            if (el.vaultCount)
+                el.vaultCount.textContent =
+                    typeof records === "number" ? records.toLocaleString() : "--";
+            markDataSync("ws-sync");
+            break;
+        }
+
+        case "watchtower_state":
+            log(`Watchtower ${payload.reachable ? "reachable" : "unreachable"}.`,
+                payload.reachable ? "ok" : "warn");
+            break;
+
+        case "dependency_state":
+            log(`Dependency ${normalizeString(payload.name, "unknown")}: ${normalizeString(payload.status, "unknown")}`, "info");
+            break;
+
+        case "error":
+            log(`WebSocket server error: ${normalizeString(payload.error, "unknown")}`, "err");
+            break;
+
+        case "auth_required":
+        case "pong":
+        case "unsubscribed":
+            // Handled by websocket.js internally — nothing to do here.
+            break;
+
+        default:
+            log(`Ignored unhandled WebSocket event type: ${type}`, "info");
+    }
+});
+
+// =============================================================================
+// DOM Event Wiring
+// =============================================================================
+
+el.refreshBtn?.addEventListener("click", () => refreshDashboard(true, {force: true}));
+el.exportBtn?.addEventListener("click", exportVisibleActions);
+el.injectBtn?.addEventListener("click", openInjectModal);
+el.themeBtn?.addEventListener("click", () => applyTheme(!isLight));
+el.clearLogBtn?.addEventListener("click", () => {
+    if (el.logConsole) el.logConsole.innerHTML = "";
+    log("Console cleared.", "info");
+});
+
+el.searchInput?.addEventListener("input", () => {
+    searchQuery = el.searchInput.value;
+    clearSelection();
+    renderActions();
+});
+el.clearSearchBtn?.addEventListener("click", () => {
+    if (el.searchInput) el.searchInput.value = "";
+    searchQuery = "";
+    clearSelection();
+    renderActions();
+    el.searchInput?.focus();
+});
+
+el.selectAll?.addEventListener("change", () => {
+    document.querySelectorAll(".row-cb").forEach(box => {
+        box.checked = el.selectAll.checked;
+        if (box.checked) { selectedIds.add(box.dataset.id); box.closest("tr")?.classList.add("selected"); }
+        else             { selectedIds.delete(box.dataset.id); box.closest("tr")?.classList.remove("selected"); }
+    });
+    updateBulkBar();
+});
+
+document.addEventListener("change", e => {
+    const box = e.target.closest?.(".row-cb");
+    if (!box) return;
+    if (box.checked) { selectedIds.add(box.dataset.id); box.closest("tr")?.classList.add("selected"); }
+    else             { selectedIds.delete(box.dataset.id); box.closest("tr")?.classList.remove("selected"); }
+    updateBulkBar();
+});
+
+el.bulkClearBtn?.addEventListener("click", clearSelection);
+el.bulkApproveBtn?.addEventListener("click", () => runBulkAction("approve"));
+el.bulkVetoBtn?.addEventListener("click", () => runBulkAction("veto"));
+
+document.addEventListener("click", async e => {
+    const filterBtn = e.target.closest?.("[data-filter]");
+    if (filterBtn) {
+        currentFilter = filterBtn.dataset.filter;
+        document.querySelectorAll("[data-filter]").forEach(b => b.classList.remove("active"));
+        filterBtn.classList.add("active");
+        clearSelection();
+        log(`Filter → ${currentFilter}. Selection cleared.`, "info");
+        renderActions();
+        return;
+    }
+
+    const logFilterBtn = e.target.closest?.("[data-log-filter]");
+    if (logFilterBtn) {
+        currentLogFilter = logFilterBtn.dataset.logFilter;
+        document.querySelectorAll("[data-log-filter]").forEach(b => b.classList.remove("active"));
+        logFilterBtn.classList.add("active");
+        document.querySelectorAll(".log-line").forEach(line => {
+            line.hidden = currentLogFilter !== "ALL" && line.dataset.type !== currentLogFilter;
+        });
+        return;
+    }
+
+    const expandBtn = e.target.closest?.("[data-expand]");
+    if (expandBtn) { toggleExpand(expandBtn.dataset.expand); return; }
+
+    const approveBtn = e.target.closest?.("[data-approve]");
+    if (approveBtn) {
+        const ok = await doApprove(approveBtn.dataset.approve, approveBtn);
+        if (ok) await refreshDashboard(true, {force: true});
+        return;
+    }
+
+    const vetoBtn = e.target.closest?.("[data-veto]");
+    if (vetoBtn) {
+        const ok = await doVeto(vetoBtn.dataset.veto, vetoBtn);
+        if (ok) await refreshDashboard(true, {force: true});
+    }
+});
+
+// =============================================================================
+// Keyboard Shortcuts
+// =============================================================================
+
+el.kbHelpBtn?.addEventListener("click", () => {
+    el.kbToast?.classList.add("show");
+    clearTimeout(kbToastTimer);
+    kbToastTimer = setTimeout(() => el.kbToast?.classList.remove("show"), 5000);
+});
+
+document.addEventListener("keydown", e => {
+    const tag    = document.activeElement?.tagName ?? "";
+    const inInput = ["INPUT", "TEXTAREA", "SELECT"].includes(tag);
+
+    if (e.key === "Escape") {
+        if (!el.reasonModal?.hidden)  { el.modalCancel?.click(); return; }
+        if (!el.jwtModal?.hidden)     { closeJwtModal(); return; }
+        if (!el.injectModal?.hidden)  { closeInjectModal(); return; }
+        el.kbToast?.classList.remove("show");
+        if (selectedIds.size) clearSelection();
+        return;
+    }
+
+    if (e.key === "/" && !inInput) { e.preventDefault(); el.searchInput?.focus(); return; }
+    if (e.key.toLowerCase() === "r" && !inInput) { refreshDashboard(true, {force: true}); return; }
+    if (inInput) return;
+
+    const rows = visibleRows();
+    if (!rows.length) return;
+
+    if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setFocusedRow(focusedRowIndex < 0 ? 0 : focusedRowIndex + 1);
+        return;
+    }
+    if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setFocusedRow(focusedRowIndex < 0 ? 0 : focusedRowIndex - 1);
+        return;
+    }
+    if (e.key.toLowerCase() === "a" && focusedRowIndex >= 0 && focusedRowIndex < rows.length) {
+        const id     = rows[focusedRowIndex].dataset.id;
+        const action = allActions.find(a => a.id === id);
+        if (action?.status === "STAGED")
+            doApprove(id).then(ok => { if (ok) refreshDashboard(true, {force: true}); });
+        return;
+    }
+    if (e.key.toLowerCase() === "v" && focusedRowIndex >= 0 && focusedRowIndex < rows.length) {
+        const id     = rows[focusedRowIndex].dataset.id;
+        const action = allActions.find(a => a.id === id);
+        if (action && ["PENDING", "STAGED"].includes(action.status))
+            doVeto(id).then(ok => { if (ok) refreshDashboard(true, {force: true}); });
+    }
+});
+
+// =============================================================================
+// Unload Cleanup
+// =============================================================================
+
+window.addEventListener("beforeunload", () => {
+    if (pollTimer) clearInterval(pollTimer);
+});
+
+// =============================================================================
+// Initialization
+// =============================================================================
+
+log("Dashboard initializing…", "info");
+
+if (CONFIG.DEMO_MODE) {
+    // In demo mode, disconnect the WebSocket — all data comes from the in-memory
+    // demo backend. websocket.js auto-connects on load; we cut it immediately.
+    window.SentinelWS?.disconnect();
+    log("Demo mode active. WebSocket disconnected. Use ?demo=1 for local testing only.", "warn");
+} else if (!CONFIG.LIVE_TEST_MODE) {
+    log("Demo mode disabled. Live API mode active.", "info");
 }
-);
 
-document.addEventListener(
-"click",
-event => {
-const filter =
-event.target.closest
-?.("[data-filter]");
-
-```
-if (filter) {
-  currentFilter =
-    filter.dataset.filter;
-
-  renderActions();
-  return;
-}
-
-const logFilter =
-  event.target.closest
-    ?.("[data-log-filter]");
-
-if (logFilter) {
-  currentLogFilter =
-    logFilter.dataset.logFilter;
-
-  document
-    .querySelectorAll(".log-line")
-    .forEach(
-      line => {
-        line.hidden =
-          currentLogFilter !== "ALL" &&
-          line.dataset.type !== currentLogFilter;
-      }
-    );
-
-  return;
-}
-
-const expand =
-  event.target.closest
-    ?.("[data-expand]");
-
-if (expand) {
-  toggleExpand(
-    expand.dataset.expand
-  );
-
-  return;
-}
-
-const approve =
-  event.target.closest
-    ?.("[data-approve]");
-
-if (approve) {
-  updateAction(
-    "approve",
-    approve.dataset.approve
-  );
-
-  return;
-}
-
-const veto =
-  event.target.closest
-    ?.("[data-veto]");
-
-if (veto) {
-  updateAction(
-    "veto",
-    veto.dataset.veto
-  );
-}
-```
-
-}
-);
-
-window.addEventListener(
-"beforeunload",
-() => {
-clearInterval(
-pollTimer
-);
-
-```
-closeWebSocket();
-```
-
-}
-);
-
-log(
-"Dashboard initializing...",
-"info"
-);
-
+initTheme();
 updateStaticConfig();
-
 setStatus("Booting");
-
-startPolling();
-
-connectWebSocket();
-
-refreshDashboard(
-true,
-{force: true}
-);
+startPollingFallback();
+refreshDashboard(true, {force: true});
