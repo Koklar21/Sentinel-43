@@ -1050,17 +1050,7 @@ async def core_status() -> dict[str, Any]:
         "watchtower_reported": True,
         "timestamp": utc_now(),
     }
-await _broadcast_dashboard_event(
-    "action_created",
-    {"action": action},
-    channel="actions",
-)
 
-await _broadcast_dashboard_event(
-    "vault_stats",
-    {"records": _vault_records()},
-    channel="vault",
-)
 
 @core_router.get("/health")
 def core_health() -> dict[str, Any]:
