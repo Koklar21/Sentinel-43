@@ -1,387 +1,470 @@
-/* ==========================================================
+/* =============================================================================
    Sentinel-43 Dashboard
-   websocket.js
-   Hardened WebSocket bridge
-   ========================================================== */
+   websocket.js — Hardened WebSocket bridge
+   Protocol: aligned to core/api/main.py
+   ============================================================================= */
 
 "use strict";
 
-/* ==========================================================
+/* =============================================================================
    Config
-   ========================================================== */
+   Reads from the same sources as the inline dashboard CONFIG block so both
+   can be driven by the same meta tags or window.SENTINEL_RUNTIME_CONFIG.
+   ============================================================================= */
 
-const SentinelWebSocket = {
-    wsUrl:
-        window.SENTINEL_WS_URL ||
-        "ws://localhost:8000/ws",
+const _readMeta = name =>
+    document.querySelector(`meta[name="${name}"]`)?.content?.trim() ?? "";
 
-    reconnectDelayMs: 3000,
-    maxReconnectDelayMs: 30000,
-    heartbeatIntervalMs: 15000,
-    maxLogMessageLength: 2000,
+const _runtime = window.SENTINEL_RUNTIME_CONFIG ?? {};
+const _locationIsLocal = ["", "localhost", "127.0.0.1", "::1"]
+    .includes(location.hostname);
 
-    socket: null,
-    reconnectAttempts: 0,
-    heartbeatTimer: null,
-    reconnectTimer: null,
-    lastMessageAt: 0,
-    manuallyClosed: false,
-};
+const WS_CONFIG = Object.freeze({
+    // URL resolution order matches the inline dashboard.
+    URL: String(
+        _runtime.wsUrl
+        ?? window.SENTINEL_WS_URL
+        ?? _readMeta("sentinel-ws-url")
+        ?? "ws://localhost:8000/ws"
+    ),
 
-/* ==========================================================
-   Helpers
-   ========================================================== */
+    // Reconnect: starts at 1 s, doubles each failed attempt, caps at 30 s,
+    // +20 % jitter — matches the inline dashboard's scheduleWsReconnect().
+    RECONNECT_MS:     1_000,
+    RECONNECT_MAX_MS: 30_000,
 
-function wsSetText(selector, value) {
-    const element = document.querySelector(selector);
+    // Heartbeat: send ping every 25 s, force-reconnect if nothing received
+    // in 2× that window (50 s). Matches inline dashboard WS_HEARTBEAT_MS.
+    HEARTBEAT_MS: 25_000,
 
-    if (element) {
-        element.textContent = value;
-    }
+    // Frame size cap in bytes — matches inline dashboard MAX_WS_FRAME_BYTES.
+    MAX_FRAME_BYTES: 64 * 1_024,
+
+    // Dev-only JWT read from sessionStorage. Never read localStorage.
+    // Only enabled on local hostnames, same gate as the inline dashboard.
+    ALLOW_DEV_TOKEN: _locationIsLocal,
+
+    // Channels to subscribe on connect.
+    // "watchtower" and "dependencies" can be added once the dashboard
+    // has handlers for those event types.
+    CHANNELS: Object.freeze(["actions", "vault"]),
+});
+
+/* =============================================================================
+   Module-scope TextEncoder
+   One allocation per page lifetime — hoisted out of the per-frame hot path.
+   Matches inline dashboard fix for TEXT_ENCODER.
+   ============================================================================= */
+
+const _WS_TEXT_ENCODER = new TextEncoder();
+
+/* =============================================================================
+   Module State
+   ============================================================================= */
+
+let _ws                = null;   // active WebSocket instance
+let _connected         = false;  // true only when OPEN + post-connect setup done
+let _manuallyClosed    = false;  // set by disconnect() to suppress auto-reconnect
+let _reconnectAttempts = 0;      // resets to 0 on successful open
+let _reconnectTimer    = null;
+let _heartbeatTimer    = null;
+let _lastMessageAt     = 0;      // epoch ms of last received frame
+
+/* =============================================================================
+   Token Helper
+   sessionStorage only. No localStorage, no window globals, no URL params.
+   ============================================================================= */
+
+function _getDevToken() {
+    if (!WS_CONFIG.ALLOW_DEV_TOKEN) return null;
+    try { return sessionStorage.getItem("SENTINEL_JWT") || null; } catch { return null; }
 }
 
-function wsSetStatus(state) {
-    const statusElement = document.querySelector("[data-ws-status]");
+/* =============================================================================
+   URL Validation
+   Identical rules to safeWsUrl() in the inline dashboard.
+   Tokens must never appear in the WebSocket URL — they end up in server logs,
+   browser history, and proxy caches.
+   ============================================================================= */
 
-    if (!statusElement) {
-        return;
-    }
+function _safeWsUrl() {
+    const url = new URL(WS_CONFIG.URL, location.href);
 
-    statusElement.textContent = state;
+    if (!["ws:", "wss:"].includes(url.protocol))
+        throw new Error("WebSocket URL must use ws:// or wss://");
 
-    statusElement.classList.remove(
-        "status-online",
-        "status-warning",
-        "status-error",
-        "status-info",
-    );
+    if (location.protocol === "https:" && url.protocol !== "wss:")
+        throw new Error("Secure pages require a wss:// WebSocket URL");
 
-    const normalized = String(state || "").toLowerCase();
-
-    if (["connected", "online", "open"].includes(normalized)) {
-        statusElement.classList.add("status-online");
-    } else if (["connecting", "reconnecting"].includes(normalized)) {
-        statusElement.classList.add("status-warning");
-    } else if (["closed", "error", "offline"].includes(normalized)) {
-        statusElement.classList.add("status-error");
-    } else {
-        statusElement.classList.add("status-info");
-    }
-}
-
-function clampLogMessage(message) {
-    const text = String(message ?? "");
-
-    if (text.length <= SentinelWebSocket.maxLogMessageLength) {
-        return text;
-    }
-
-    return `${text.slice(0, SentinelWebSocket.maxLogMessageLength)}... [truncated]`;
-}
-
-function wsLogEvent(message, level = "info") {
-    const feed = document.querySelector("[data-ws-feed]");
-
-    if (!feed) {
-        return;
-    }
-
-    const safeLevel = String(level || "info").replace(/[^a-z0-9_-]/gi, "");
-    const entry = document.createElement("div");
-    entry.className = `audit-entry ws-event ws-event-${safeLevel}`;
-
-    const timeElement = document.createElement("div");
-    timeElement.className = "audit-entry-time";
-    timeElement.textContent = new Date().toISOString();
-
-    const messageElement = document.createElement("div");
-    messageElement.className = "audit-entry-message";
-    messageElement.textContent = clampLogMessage(message);
-
-    entry.appendChild(timeElement);
-    entry.appendChild(messageElement);
-
-    feed.prepend(entry);
-
-    const maxEntries = 100;
-
-    while (feed.children.length > maxEntries) {
-        feed.removeChild(feed.lastChild);
-    }
-}
-
-function getDashboardAuthToken() {
-    return (
-        window.SENTINEL_WS_TOKEN ||
-        window.SENTINEL_AUTH_TOKEN ||
-        window.localStorage.getItem("sentinel_token") ||
-        window.sessionStorage.getItem("sentinel_token") ||
-        ""
-    );
-}
-
-function buildWebSocketUrl() {
-    const token = getDashboardAuthToken();
-
-    if (!token) {
-        return SentinelWebSocket.wsUrl;
-    }
-
-    const url = new URL(SentinelWebSocket.wsUrl, window.location.href);
-    url.searchParams.set("token", token);
+    if (["token", "access_token", "authorization", "api_key"]
+            .some(key => url.searchParams.has(key)))
+        throw new Error("Credentials must not be placed in the WebSocket URL");
 
     return url.toString();
 }
 
-function clearReconnectTimer() {
-    if (SentinelWebSocket.reconnectTimer) {
-        window.clearTimeout(SentinelWebSocket.reconnectTimer);
-        SentinelWebSocket.reconnectTimer = null;
-    }
+/* =============================================================================
+   Event Dispatch
+   Dispatches two events per message so listeners can subscribe either to
+   the generic stream or to a specific message type.
+
+     "sentinel:ws:message"        detail = full parsed message object
+     "sentinel:ws:<type>"         e.g. "sentinel:ws:actions_snapshot"
+
+   Status-change events (open, close, error, etc.) use named events only.
+   ============================================================================= */
+
+function _dispatch(name, detail = {}) {
+    window.dispatchEvent(new CustomEvent(name, {detail, bubbles: false}));
 }
 
-function getReconnectDelay() {
-    const attempt = Math.max(0, SentinelWebSocket.reconnectAttempts - 1);
-    const exponential = SentinelWebSocket.reconnectDelayMs * Math.pow(2, attempt);
-    const capped = Math.min(exponential, SentinelWebSocket.maxReconnectDelayMs);
-    const jitter = Math.floor(Math.random() * 1000);
-
-    return capped + jitter;
+function _dispatchMessage(parsed) {
+    _dispatch("sentinel:ws:message", parsed);
+    _dispatch(`sentinel:ws:${parsed.type}`, parsed);
 }
 
-/* ==========================================================
-   Message Handling
-   ========================================================== */
+/* =============================================================================
+   Frame Validation
+   Checks byte length before parsing so oversized frames never hit JSON.parse().
+   Fast-path: skip encode() when string character count already exceeds the cap
+   (UTF-8 byte length >= JS character count, so the cap is definitely breached).
+   ============================================================================= */
 
-function handleWebSocketMessage(event) {
-    SentinelWebSocket.lastMessageAt = Date.now();
+function _validateFrame(raw) {
+    if (typeof raw !== "string")
+        throw new Error("WebSocket frame must be a text message");
 
-    let data = null;
+    if (
+        raw.length > WS_CONFIG.MAX_FRAME_BYTES ||
+        _WS_TEXT_ENCODER.encode(raw).length > WS_CONFIG.MAX_FRAME_BYTES
+    ) throw new Error(`WebSocket frame exceeds the ${WS_CONFIG.MAX_FRAME_BYTES}-byte limit`);
 
+    let parsed;
     try {
-        data = JSON.parse(event.data);
-    } catch {
-        wsLogEvent(`Non-JSON message received: ${clampLogMessage(event.data)}`, "warning");
-        return;
+        parsed = JSON.parse(raw);
+    } catch (err) {
+        throw new Error(`Malformed JSON in WebSocket frame: ${err.message}`);
     }
 
-    const eventType = String(data.event_type || data.type || "unknown");
-    const message = data.message || JSON.stringify(data);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+        throw new Error("WebSocket message must be a JSON object");
 
-    wsSetText("[data-last-event-type]", eventType);
-    wsSetText("[data-last-event-time]", new Date().toISOString());
+    if (typeof parsed.type !== "string" || !parsed.type.trim())
+        throw new Error("WebSocket message missing required type field");
 
-    wsLogEvent(`[${eventType}] ${message}`, "info");
+    if ("payload" in parsed &&
+        (parsed.payload === null ||
+         typeof parsed.payload !== "object" ||
+         Array.isArray(parsed.payload)))
+        throw new Error("WebSocket message payload must be an object when present");
 
-    window.dispatchEvent(
-        new CustomEvent("sentinel:ws:event", {
-            detail: data,
-        }),
-    );
+    return {
+        type:    parsed.type.trim(),
+        payload: (parsed.payload && typeof parsed.payload === "object") ? parsed.payload : {},
+    };
 }
 
-/* ==========================================================
+/* =============================================================================
    Heartbeat
-   ========================================================== */
+   Sends {"type":"ping","payload":{...}} — matches main.py's "ping" handler
+   which returns {"type":"pong",...}. The old "dashboard_ping" type is gone.
+   ============================================================================= */
 
-function startHeartbeat() {
-    stopHeartbeat();
+function _startHeartbeat() {
+    _stopHeartbeat();
+    _lastMessageAt = Date.now();
 
-    SentinelWebSocket.lastMessageAt = Date.now();
+    _heartbeatTimer = setInterval(() => {
+        if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
 
-    SentinelWebSocket.heartbeatTimer = window.setInterval(() => {
-        const socket = SentinelWebSocket.socket;
-
-        if (!socket || socket.readyState !== WebSocket.OPEN) {
-            return;
-        }
-
-        const staleMs = Date.now() - SentinelWebSocket.lastMessageAt;
-        const staleLimitMs = SentinelWebSocket.heartbeatIntervalMs * 2;
-
-        if (staleMs > staleLimitMs) {
-            wsLogEvent("WebSocket heartbeat timeout; forcing reconnect", "warning");
-            socket.close();
+        // Force reconnect if the server has gone silent for 2× the heartbeat window.
+        if (Date.now() - _lastMessageAt > WS_CONFIG.HEARTBEAT_MS * 2) {
+            _dispatch("sentinel:ws:stale", {
+                silentMs: Date.now() - _lastMessageAt,
+                timestamp: new Date().toISOString(),
+            });
+            _ws.close();
             return;
         }
 
         try {
-            socket.send(
-                JSON.stringify({
-                    type: "dashboard_ping",
-                    timestamp: new Date().toISOString(),
-                }),
-            );
-        } catch (error) {
-            wsLogEvent(`Heartbeat send failed: ${error.message}`, "error");
-            socket.close();
+            _ws.send(JSON.stringify({
+                type:    "ping",
+                payload: {timestamp: new Date().toISOString()},
+            }));
+        } catch (err) {
+            _dispatch("sentinel:ws:error", {
+                error: `Heartbeat send failed: ${err.message}`,
+            });
+            _ws.close();
         }
-    }, SentinelWebSocket.heartbeatIntervalMs);
+    }, WS_CONFIG.HEARTBEAT_MS);
 }
 
-function stopHeartbeat() {
-    if (SentinelWebSocket.heartbeatTimer) {
-        window.clearInterval(SentinelWebSocket.heartbeatTimer);
-        SentinelWebSocket.heartbeatTimer = null;
-    }
+function _stopHeartbeat() {
+    if (_heartbeatTimer) { clearInterval(_heartbeatTimer); _heartbeatTimer = null; }
 }
 
-/* ==========================================================
-   Connection Lifecycle
-   ========================================================== */
+/* =============================================================================
+   Reconnect — exponential backoff with 20 % jitter
+   ============================================================================= */
 
-function connectSentinelWebSocket() {
-    if (document.hidden) {
-        return;
-    }
+function _clearReconnectTimer() {
+    if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+}
 
-    if (
-        SentinelWebSocket.socket &&
-        (
-            SentinelWebSocket.socket.readyState === WebSocket.OPEN ||
-            SentinelWebSocket.socket.readyState === WebSocket.CONNECTING
-        )
-    ) {
-        return;
-    }
+function _reconnectDelay() {
+    const base = Math.min(
+        WS_CONFIG.RECONNECT_MAX_MS,
+        WS_CONFIG.RECONNECT_MS * Math.pow(2, _reconnectAttempts),
+    );
+    return Math.floor(base + base * 0.2 * Math.random());
+}
 
-    clearReconnectTimer();
-
-    SentinelWebSocket.manuallyClosed = false;
-    wsSetStatus("connecting");
-
-    try {
-        SentinelWebSocket.socket = new WebSocket(buildWebSocketUrl());
-    } catch (error) {
-        wsSetStatus("error");
-        wsLogEvent(`WebSocket creation failed: ${error.message}`, "error");
-        scheduleReconnect();
-        return;
-    }
-
-    const socket = SentinelWebSocket.socket;
-
-    socket.addEventListener("open", () => {
-        SentinelWebSocket.reconnectAttempts = 0;
-        SentinelWebSocket.lastMessageAt = Date.now();
-
-        wsSetStatus("connected");
-        wsLogEvent("WebSocket connected", "info");
-
-        startHeartbeat();
+function _scheduleReconnect() {
+    if (_manuallyClosed || document.hidden || _reconnectTimer) return;
+    const delay = _reconnectDelay();
+    _reconnectAttempts += 1;
+    _dispatch("sentinel:ws:reconnecting", {
+        attempt: _reconnectAttempts,
+        delayMs: delay,
+        timestamp: new Date().toISOString(),
     });
-
-    socket.addEventListener("message", handleWebSocketMessage);
-
-    socket.addEventListener("error", () => {
-        wsSetStatus("error");
-        wsLogEvent("WebSocket error detected", "error");
-    });
-
-    socket.addEventListener("close", () => {
-        stopHeartbeat();
-
-        if (SentinelWebSocket.socket === socket) {
-            SentinelWebSocket.socket = null;
-        }
-
-        wsSetStatus("closed");
-        wsLogEvent("WebSocket closed", "warning");
-
-        if (!SentinelWebSocket.manuallyClosed && !document.hidden) {
-            scheduleReconnect();
-        }
-    });
-}
-
-function disconnectSentinelWebSocket() {
-    SentinelWebSocket.manuallyClosed = true;
-
-    clearReconnectTimer();
-    stopHeartbeat();
-
-    if (SentinelWebSocket.socket) {
-        SentinelWebSocket.socket.close();
-        SentinelWebSocket.socket = null;
-    }
-
-    wsSetStatus("closed");
-}
-
-function scheduleReconnect() {
-    if (SentinelWebSocket.manuallyClosed || document.hidden) {
-        return;
-    }
-
-    clearReconnectTimer();
-
-    SentinelWebSocket.reconnectAttempts += 1;
-
-    const delay = getReconnectDelay();
-
-    wsSetStatus("reconnecting");
-    wsLogEvent(`Reconnecting in ${delay}ms`, "warning");
-
-    SentinelWebSocket.reconnectTimer = window.setTimeout(() => {
-        SentinelWebSocket.reconnectTimer = null;
-
-        if (!SentinelWebSocket.manuallyClosed && !document.hidden) {
-            connectSentinelWebSocket();
-        }
+    _reconnectTimer = setTimeout(() => {
+        _reconnectTimer = null;
+        if (!_manuallyClosed && !document.hidden) connect();
     }, delay);
 }
 
-/* ==========================================================
-   Public Send Helper
-   ========================================================== */
+/* =============================================================================
+   Message Handler
+   ============================================================================= */
 
-function sendSentinelWebSocketMessage(payload) {
-    if (
-        !SentinelWebSocket.socket ||
-        SentinelWebSocket.socket.readyState !== WebSocket.OPEN
-    ) {
-        wsLogEvent("Cannot send WebSocket message: socket is not connected", "error");
-        return false;
+function _handleMessage(event) {
+    _lastMessageAt = Date.now();
+
+    let parsed;
+    try {
+        parsed = _validateFrame(event.data);
+    } catch (err) {
+        // Bad frame — log it but keep the connection alive.
+        _dispatch("sentinel:ws:frame_error", {error: err.message});
+        return;
     }
 
+    // ── auth_required ────────────────────────────────────────────────────────
+    // main.py sends this when S43_WS_REQUIRE_AUTH=true.
+    // Respond immediately with the dev token from sessionStorage.
+    // If no token is available, dispatch an auth failure event and close.
+    if (parsed.type === "auth_required") {
+        const token = _getDevToken();
+        if (!token) {
+            _dispatch("sentinel:ws:auth_failed", {
+                error: "Server requires authentication but no token found in sessionStorage. "
+                     + "Set a JWT via the JWT button in the dashboard before connecting.",
+            });
+            _ws?.close();
+            return;
+        }
+        try {
+            _ws.send(JSON.stringify({
+                type:    "auth",
+                payload: {token},
+            }));
+        } catch (err) {
+            _dispatch("sentinel:ws:auth_failed", {
+                error: `Auth frame send failed: ${err.message}`,
+            });
+        }
+        // Do not surface auth_required to the dashboard.
+        return;
+    }
+
+    // ── pong ─────────────────────────────────────────────────────────────────
+    // Internal heartbeat acknowledgement. Update timestamp, do not surface.
+    if (parsed.type === "pong") {
+        _lastMessageAt = Date.now();
+        return;
+    }
+
+    // ── all other messages ───────────────────────────────────────────────────
+    // Dispatch both generic and type-specific events for the dashboard to handle.
+    // Expected types from main.py:
+    //   connected, subscribed, actions_snapshot,
+    //   action_created, action_updated, action_status_changed,
+    //   action_deleted, action_removed,
+    //   vault_stats, watchtower_state, dependency_state,
+    //   error, unsubscribed
+    _dispatchMessage(parsed);
+}
+
+/* =============================================================================
+   Connection Lifecycle
+   ============================================================================= */
+
+function connect() {
+    if (document.hidden) return;
+    if (_ws && [WebSocket.OPEN, WebSocket.CONNECTING].includes(_ws.readyState)) return;
+
+    _clearReconnectTimer();
+    _manuallyClosed = false;
+
+    let url;
     try {
-        SentinelWebSocket.socket.send(JSON.stringify(payload));
+        url = _safeWsUrl();
+    } catch (err) {
+        _dispatch("sentinel:ws:error", {error: err.message});
+        return;
+    }
+
+    _dispatch("sentinel:ws:connecting", {url, timestamp: new Date().toISOString()});
+
+    try {
+        _ws = new WebSocket(url);
+    } catch (err) {
+        _dispatch("sentinel:ws:error", {
+            error: `WebSocket construction failed: ${err.message}`,
+        });
+        _scheduleReconnect();
+        return;
+    }
+
+    _ws.addEventListener("open", () => {
+        _reconnectAttempts = 0;
+        _connected = true;
+        _lastMessageAt = Date.now();
+
+        _startHeartbeat();
+        _dispatch("sentinel:ws:open", {timestamp: new Date().toISOString()});
+
+        // Subscribe to all configured channels.
+        // main.py will respond with "subscribed" + an immediate snapshot per channel.
+        for (const channel of WS_CONFIG.CHANNELS) {
+            try {
+                _ws.send(JSON.stringify({
+                    type:    "subscribe",
+                    payload: {channel},
+                }));
+            } catch (err) {
+                _dispatch("sentinel:ws:error", {
+                    error: `subscribe(${channel}) failed: ${err.message}`,
+                });
+            }
+        }
+    });
+
+    _ws.addEventListener("message", _handleMessage);
+
+    _ws.addEventListener("close", () => {
+        _connected = false;
+        _stopHeartbeat();
+        _ws = null;
+        _dispatch("sentinel:ws:close", {timestamp: new Date().toISOString()});
+        if (!_manuallyClosed && !document.hidden) _scheduleReconnect();
+    });
+
+    // The "error" event fires before "close" on transport errors.
+    // close always follows, so reconnect is handled there.
+    _ws.addEventListener("error", () => {
+        _dispatch("sentinel:ws:error", {
+            error: "WebSocket transport error",
+            timestamp: new Date().toISOString(),
+        });
+    });
+}
+
+function disconnect() {
+    _manuallyClosed = true;
+    _clearReconnectTimer();
+    _stopHeartbeat();
+    _connected = false;
+    if (_ws) { _ws.close(); _ws = null; }
+    _dispatch("sentinel:ws:disconnected", {timestamp: new Date().toISOString()});
+}
+
+/* =============================================================================
+   Public Send Helper
+   ============================================================================= */
+
+function send(type, payload = {}) {
+    if (!_ws || _ws.readyState !== WebSocket.OPEN) {
+        _dispatch("sentinel:ws:error", {
+            error: "Cannot send: socket is not open",
+        });
+        return false;
+    }
+    try {
+        _ws.send(JSON.stringify({type, payload}));
         return true;
-    } catch (error) {
-        wsLogEvent(`WebSocket send failed: ${error.message}`, "error");
+    } catch (err) {
+        _dispatch("sentinel:ws:error", {error: `Send failed: ${err.message}`});
         return false;
     }
 }
 
-/* ==========================================================
-   Page Visibility Handling
-   ========================================================== */
+/* =============================================================================
+   Page Visibility
+   Disconnect when the operator hides the tab — this is a security console and
+   an unattended live connection is undesirable.
+   Reconnect automatically when the tab becomes visible again.
+   ============================================================================= */
 
 document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
-        disconnectSentinelWebSocket();
+        disconnect();
         return;
     }
-
-    const shouldConnect =
-        document.body.dataset.websocket === "true" ||
-        document.querySelector("[data-ws-status]") !== null;
-
-    if (shouldConnect) {
-        connectSentinelWebSocket();
-    }
+    // Re-enable auto-reconnect and attempt a fresh connection.
+    _manuallyClosed = false;
+    connect();
 });
 
-/* ==========================================================
-   Startup
-   ========================================================== */
+/* =============================================================================
+   Unload Cleanup
+   ============================================================================= */
 
-document.addEventListener("DOMContentLoaded", () => {
-    const shouldConnect =
-        document.body.dataset.websocket === "true" ||
-        document.querySelector("[data-ws-status]") !== null;
+window.addEventListener("beforeunload", disconnect);
 
-    if (shouldConnect) {
-        connectSentinelWebSocket();
-    }
+/* =============================================================================
+   Public API
+   Exposed on window.SentinelWS so the inline dashboard or other scripts
+   can drive the connection without duplicating the protocol logic.
+
+   Integration note:
+   The inline dashboard currently manages its own WebSocket connection.
+   To use this module instead, remove the connectWebSocket / closeWebSocket /
+   wsConnected / wsReconnect* / wsHeartbeat* code from the inline script and
+   add event listeners for the sentinel:ws:* events documented below.
+
+   Events dispatched by this module:
+     sentinel:ws:open              WebSocket opened, subscriptions sent
+     sentinel:ws:close             WebSocket closed (reconnect scheduled if unintentional)
+     sentinel:ws:disconnected      disconnect() called manually
+     sentinel:ws:reconnecting      {attempt, delayMs}
+     sentinel:ws:connecting        {url}
+     sentinel:ws:error             {error}
+     sentinel:ws:frame_error       {error} — bad frame, connection kept alive
+     sentinel:ws:auth_failed       {error} — auth_required received but no token
+     sentinel:ws:stale             {silentMs} — no data received, forcing reconnect
+     sentinel:ws:message           {type, payload} — all server messages (generic)
+     sentinel:ws:<type>            type-specific, e.g. sentinel:ws:actions_snapshot
+   ============================================================================= */
+
+window.SentinelWS = Object.freeze({
+    connect,
+    disconnect,
+    send,
+    get connected()         { return _connected && _ws?.readyState === WebSocket.OPEN; },
+    get reconnectAttempts() { return _reconnectAttempts; },
+    get lastMessageAt()     { return _lastMessageAt; },
 });
+
+/* =============================================================================
+   Auto-connect on load
+   ============================================================================= */
+
+if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", connect);
+} else {
+    connect();
+}
