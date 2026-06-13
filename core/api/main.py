@@ -51,6 +51,8 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+import jwt as pyjwt
+
 from fastapi import (
     APIRouter,
     FastAPI,
@@ -114,6 +116,20 @@ WS_REQUIRE_AUTH: bool = (
     in {"1", "true", "yes", "on"}
 )
 
+# JWT configuration — all values must come from server environment.
+# Never accept an algorithm from the incoming token header.
+JWT_SECRET:    str = os.getenv("S43_JWT_SECRET",    "")
+JWT_ALGORITHM: str = os.getenv("S43_JWT_ALGORITHM", "HS256")
+JWT_ISSUER:    str = os.getenv("S43_JWT_ISSUER",    "sentinel-43")
+JWT_AUDIENCE:  str = os.getenv("S43_JWT_AUDIENCE",  "sentinel-43-dashboard")
+
+# Must match bootstrap.py APPROVED_JWT_ALGORITHMS.
+# HS256 only for initial deployment — add RS256 when key rotation is needed.
+_APPROVED_ALGORITHMS: frozenset[str] = frozenset({"HS256"})
+
+# Roles that are allowed to approve or veto actions.
+_APPROVED_ROLES: frozenset[str] = frozenset({"operator", "admin"})
+
 START_TIME: float = time.time()
 
 LOCAL_TEST_ENVIRONMENTS: frozenset[str] = frozenset(
@@ -159,9 +175,6 @@ _watchtower_last_status: dict[str, Any] = {
     "last_error": None,
 }
 
-# =============================================================================
-# Utilities
-# =============================================================================
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -175,47 +188,87 @@ def uptime_seconds() -> float:
 # Auth Helpers
 # =============================================================================
 
-def _decode_jwt_subject(token: str) -> str | None:
+def _verify_jwt_token(token: str) -> dict[str, Any]:
     """
-    Extract a display identity from a JWT payload without verifying the signature.
+    Verify a JWT token and return the validated claims.
 
-    Checks sub, email, preferred_username, and user_id claims in order.
-    Used for audit-trail labelling only.
+    The algorithm is always taken from server configuration, never from
+    the incoming token header. An attacker sending "alg": "none" or
+    switching algorithms cannot bypass signature verification.
 
-    TODO: Add full signature verification via python-jose or PyJWT
-          before hardening for public deployment.
+    PyJWT's options={"require": [...]} forces claims to exist — not just
+    validates them when present. A token with no expiration claim is
+    rejected, not treated as non-expiring.
+
+    Raises pyjwt.PyJWTError subclasses on any validation failure.
+    Callers map these to HTTP 401/403 or WebSocket close(1008).
     """
-    try:
-        parts = token.split(".")
-        if len(parts) != 3:
-            return None
-        padding = "=" * (-len(parts[1]) % 4)
-        payload_bytes = base64.urlsafe_b64decode(parts[1] + padding)
-        payload = json.loads(payload_bytes)
-        for key in ("sub", "email", "preferred_username", "user_id"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()[:64]
-    except Exception:
-        pass
-    return None
+    if not JWT_SECRET:
+        raise pyjwt.InvalidKeyError("JWT signing key is not configured on this server")
+
+    return pyjwt.decode(
+        token,
+        JWT_SECRET,
+        algorithms=[JWT_ALGORITHM],       # Server config only — never from token
+        issuer=JWT_ISSUER,
+        audience=JWT_AUDIENCE,
+        options={
+            "require": ["exp", "iss", "aud", "sub"],
+        },
+    )
 
 
 def _get_operator(request: Request) -> str:
     """
-    FIX #2 / #3: Extract real operator identity from the Authorization header
-    instead of using the hardcoded "dashboard-test-operator" string.
+    Extract and verify operator identity from the Authorization Bearer header.
 
-    In LOCAL_TEST_ENVIRONMENTS with no token present, returns "dev-operator"
-    so local testing keeps working without auth headers.
+    Replaces the previous unverified payload decode. PyJWT now validates:
+      - Signature (using server-side key and algorithm)
+      - Expiration (exp claim required and checked)
+      - Issuer (iss claim required and matched)
+      - Audience (aud claim required and matched)
+      - Subject (sub claim required — becomes the operator identity)
+      - Role (operator or admin — checked separately after decode)
 
-    In all other environments, raises 401 if no valid token is provided.
+    In LOCAL_TEST_ENVIRONMENTS with no token: returns "dev-operator" so
+    local development keeps working without a configured JWT stack.
+
+    In production with no valid token: raises HTTP 401 or 403.
     """
     auth = request.headers.get("Authorization", "").strip()
+
     if auth.startswith("Bearer "):
         token = auth[7:].strip()
         if token:
-            subject = _decode_jwt_subject(token)
+            try:
+                claims = _verify_jwt_token(token)
+            except pyjwt.ExpiredSignatureError:
+                raise HTTPException(status_code=401, detail="Token has expired")
+            except pyjwt.InvalidIssuerError:
+                raise HTTPException(status_code=401, detail="Invalid token issuer")
+            except pyjwt.InvalidAudienceError:
+                raise HTTPException(status_code=401, detail="Invalid token audience")
+            except pyjwt.MissingRequiredClaimError as exc:
+                raise HTTPException(
+                    status_code=401, detail=f"Missing required claim: {exc}"
+                )
+            except pyjwt.InvalidKeyError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="JWT validation is not configured on this server",
+                )
+            except pyjwt.PyJWTError:
+                raise HTTPException(status_code=401, detail="Invalid token")
+
+            # Role check is separate from claim validation.
+            role = str(claims.get("role") or claims.get("scope") or "").strip()
+            if role not in _APPROVED_ROLES:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Operator role required",
+                )
+
+            subject = str(claims.get("sub") or "").strip()
             return subject if subject else f"bearer:{token[:16]}"
 
     env = SENTINEL_ENV.lower().strip()
@@ -223,6 +276,8 @@ def _get_operator(request: Request) -> str:
         return "dev-operator"
 
     raise HTTPException(status_code=401, detail="Authentication required")
+
+
 
 
 # =============================================================================
@@ -852,6 +907,43 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
             })
             await websocket.close(code=1008)
             return
+
+        # Verify the JWT using the same logic as HTTP endpoints.
+        try:
+            ws_claims = _verify_jwt_token(token)
+        except pyjwt.ExpiredSignatureError:
+            await websocket.send_json({
+                "type": "error",
+                "payload": {"error": "Token has expired"},
+            })
+            await websocket.close(code=1008)
+            return
+        except pyjwt.InvalidKeyError:
+            await websocket.send_json({
+                "type": "error",
+                "payload": {"error": "JWT validation is not configured on this server"},
+            })
+            await websocket.close(code=1008)
+            return
+        except pyjwt.PyJWTError:
+            await websocket.send_json({
+                "type": "error",
+                "payload": {"error": "Invalid token"},
+            })
+            await websocket.close(code=1008)
+            return
+
+        role = str(ws_claims.get("role") or ws_claims.get("scope") or "").strip()
+        if role not in _APPROVED_ROLES:
+            await websocket.send_json({
+                "type": "error",
+                "payload": {"error": "Operator role required"},
+            })
+            await websocket.close(code=1008)
+            return
+
+        ws_operator = str(ws_claims.get("sub") or "").strip() or f"bearer:{token[:16]}"
+        logger.debug("WebSocket authenticated: %s", ws_operator)
 
     # FIX #15: Register client with an empty subscription set.
     _dashboard_ws_clients[websocket] = set()
