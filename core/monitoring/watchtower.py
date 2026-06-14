@@ -35,13 +35,30 @@
 
 """
 Sentinel-43 Watchtower Node
-v1.3.4 Hardened Octagon Interconnect
+v1.3.5 Hardened Octagon Interconnect
 
 Docker:
 python -m core.monitoring.watchtower
 
 Production:
 uvicorn core.monitoring.watchtower:app --host 0.0.0.0 --port 9100
+
+Changes from v1.3.4:
+  - DEGRADED is no longer a one-way trap. scan_event now keeps processing
+    events while DEGRADED (only INITIALIZING/FAILED drop events), so the
+    existing clean-scan-streak bookkeeping can run. After
+    recovery_clean_scan_threshold consecutive clean scans with no failure
+    streak, the node automatically transitions DEGRADED -> ACTIVE.
+  - REQUIRE_HUMAN-classified scans (a single HIGH-severity finding) no
+    longer count toward the clean-scan recovery streak. They reset
+    clean_scan_streak without counting as a fresh failure either.
+  - POST /state/{state_name} now reports whether the requested transition
+    was actually applied. Disallowed/no-op-rejected transitions return
+    409 with the previous and current state instead of a misleading 200.
+  - Dependencies now get the same staleness treatment modules already had:
+    dependency_snapshot() computes `stale`/`computed_status`, and stale
+    dependencies are surfaced in readiness via `stale_dependencies` and
+    counted in `bad_dependencies`.
 """
 
 from __future__ import annotations
@@ -65,7 +82,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 
-VERSION = "1.3.4"
+VERSION = "1.3.5"
 logger = logging.getLogger("SentinelWatchtower")
 
 
@@ -254,6 +271,7 @@ class WatchtowerConfig:
     towers: tuple[TowerConfig, ...] = field(default_factory=tuple)
     scan_failure_degrade_threshold: int = 2
     module_stale_seconds: int = 60
+    dependency_stale_seconds: int = 60
     max_recent_events: int = 250
     recent_query_limit: int = 500
     correlation_window_seconds: int = 30
@@ -276,6 +294,11 @@ class WatchtowerConfig:
             self,
             "module_stale_seconds",
             _clamp_int("module_stale_seconds", self.module_stale_seconds, 5, 3600),
+        )
+        object.__setattr__(
+            self,
+            "dependency_stale_seconds",
+            _clamp_int("dependency_stale_seconds", self.dependency_stale_seconds, 5, 3600),
         )
         object.__setattr__(
             self,
@@ -324,6 +347,7 @@ class WatchtowerConfig:
             host=os.getenv("S43_WATCHTOWER_HOST", "0.0.0.0"),
             port=_env_int("S43_WATCHTOWER_PORT", 9100, 1024, 65535),
             module_stale_seconds=_env_int("S43_MODULE_STALE_SECONDS", 60, 5, 3600),
+            dependency_stale_seconds=_env_int("S43_DEPENDENCY_STALE_SECONDS", 60, 5, 3600),
             max_recent_events=_env_int("S43_WATCHTOWER_MAX_EVENTS", 250, 10, 5000),
             recent_query_limit=_env_int("S43_RECENT_QUERY_LIMIT", 500, 10, 5000),
             correlation_window_seconds=_env_int("S43_CORRELATION_WINDOW_SECONDS", 30, 5, 300),
@@ -349,6 +373,7 @@ class WatchtowerConfig:
             "api_url": self.api_url,
             "scan_failure_degrade_threshold": self.scan_failure_degrade_threshold,
             "module_stale_seconds": self.module_stale_seconds,
+            "dependency_stale_seconds": self.dependency_stale_seconds,
             "max_recent_events": self.max_recent_events,
             "recent_query_limit": self.recent_query_limit,
             "correlation_window_seconds": self.correlation_window_seconds,
@@ -599,6 +624,15 @@ class WatchtowerNode:
         WatchtowerState.FAILED: set(),
     }
 
+    # States in which scan_event drops events outright instead of scanning
+    # them. DEGRADED is intentionally *not* in this set: it must keep
+    # scanning so the clean-scan recovery streak can advance and the node
+    # can automatically return to ACTIVE.
+    _DROP_EVENT_STATES: set[WatchtowerState] = {
+        WatchtowerState.INITIALIZING,
+        WatchtowerState.FAILED,
+    }
+
     def __init__(self, config: WatchtowerConfig) -> None:
         if not isinstance(config, WatchtowerConfig):
             raise TypeError(f"config must be WatchtowerConfig, got {type(config).__name__}")
@@ -633,25 +667,37 @@ class WatchtowerNode:
         with self._lock:
             return self._state
 
-    def _set_state_locked(self, new_state: WatchtowerState) -> None:
+    def _set_state_locked(self, new_state: WatchtowerState) -> bool:
+        """
+        Attempt to transition to new_state.
+
+        Returns True if the resulting state is new_state (either the
+        transition was applied, or the node was already in that state).
+        Returns False if the transition is disallowed and the state did
+        not change.
+        """
         current = self._state
+
+        if new_state == current:
+            return True
+
         allowed = self._ALLOWED_TRANSITIONS.get(current, set())
 
-        if new_state != current and new_state not in allowed:
-            logger.warning("Invalid state transition ignored: %s -> %s", current.value, new_state.value)
-            return
+        if new_state not in allowed:
+            logger.warning("Invalid state transition rejected: %s -> %s", current.value, new_state.value)
+            return False
 
-        if new_state != current:
-            logger.info("Watchtower state changed: %s -> %s", current.value, new_state.value)
-
+        logger.info("Watchtower state changed: %s -> %s", current.value, new_state.value)
         self._state = new_state
+        return True
 
-    def set_state(self, new_state: WatchtowerState) -> None:
+    def set_state(self, new_state: WatchtowerState) -> bool:
+        """Public, locked wrapper around _set_state_locked. Returns True if applied."""
         if not isinstance(new_state, WatchtowerState):
             raise TypeError(f"new_state must be WatchtowerState, got {type(new_state).__name__}")
 
         with self._lock:
-            self._set_state_locked(new_state)
+            return self._set_state_locked(new_state)
 
     def start(self) -> bool:
         with self._lock:
@@ -735,7 +781,7 @@ class WatchtowerNode:
             state_snapshot = self._state
             tower_snapshot = list(self.towers.values())
 
-        if state_snapshot != WatchtowerState.ACTIVE:
+        if state_snapshot in self._DROP_EVENT_STATES:
             dropped_reason = f"node_state_{state_snapshot.value.lower()}"
             dropped_event = {
                 "id": _new_id(),
@@ -795,11 +841,18 @@ class WatchtowerNode:
                 self.recent_events.append(alert_event)
 
             if failures or direct_degrade:
+                # A fresh failure or direct-degrade trigger. This is never
+                # "clean" and always resets recovery progress.
                 self._total_scan_failures += failures
                 self._failure_scan_streak += 1
                 self._clean_scan_streak = 0
                 if failures:
                     self._last_scan_failure_ts = scan_ts
+            elif decision_value == CoordinatorDecision.REQUIRE_HUMAN.value:
+                # An outstanding finding needs human review. Not a fresh
+                # failure (don't grow failure_scan_streak), but also not
+                # "clean" - hold recovery progress until this clears.
+                self._clean_scan_streak = 0
             else:
                 self._clean_scan_streak += 1
                 if self._clean_scan_streak >= self.config.recovery_clean_scan_threshold:
@@ -812,6 +865,18 @@ class WatchtowerNode:
 
             if should_degrade:
                 self._set_state_locked(WatchtowerState.DEGRADED)
+            elif (
+                self._state == WatchtowerState.DEGRADED
+                and self._failure_scan_streak == 0
+                and self._clean_scan_streak >= self.config.recovery_clean_scan_threshold
+            ):
+                recovered = self._set_state_locked(WatchtowerState.ACTIVE)
+                if recovered:
+                    logger.info(
+                        "[%s] Watchtower recovered DEGRADED -> ACTIVE after %d consecutive clean scans",
+                        self.config.node_id,
+                        self._clean_scan_streak,
+                    )
 
         return ScanResult(
             alerts=findings,
@@ -944,11 +1009,29 @@ class WatchtowerNode:
         }
 
     def dependency_snapshot(self) -> dict[str, Any]:
+        now = _now()
+
         with self._lock:
             dependencies = copy.deepcopy(self.dependencies)
 
+        for dependency in dependencies.values():
+            last = dependency.get("last_report_ts")
+
+            try:
+                stale = last is None or (now - float(last)) > self.config.dependency_stale_seconds
+            except (TypeError, ValueError):
+                stale = True
+
+            dependency["stale"] = stale
+
+            if stale and dependency.get("status") not in {"offline", "down", "failed", "timeout"}:
+                dependency["computed_status"] = "stale"
+            else:
+                dependency["computed_status"] = dependency.get("status", "unknown")
+
         return {
             "dependency_count": len(dependencies),
+            "stale_after_seconds": self.config.dependency_stale_seconds,
             "dependencies": list(dependencies.values()),
         }
 
@@ -968,10 +1051,17 @@ class WatchtowerNode:
             if item.get("status") in {"down", "offline", "failed", "degraded"}
         ]
 
+        stale_dependencies = [
+            item["name"]
+            for item in dependency_records
+            if item.get("computed_status") == "stale"
+        ]
+
         bad_dependencies = [
             item["name"]
             for item in dependency_records
             if item.get("status") in {"down", "offline", "failed", "timeout"}
+            or item.get("computed_status") == "stale"
         ]
 
         with self._lock:
@@ -1003,6 +1093,7 @@ class WatchtowerNode:
             "dependency_count": dependencies.get("dependency_count", 0),
             "stale_modules": stale_modules,
             "bad_modules": bad_modules,
+            "stale_dependencies": stale_dependencies,
             "bad_dependencies": bad_dependencies,
             "last_decision": last_decision,
             "recovery": {
@@ -1213,15 +1304,28 @@ def create_watchtower_router(node: WatchtowerNode) -> APIRouter:
         _require_admin_token(x_s43_admin_token)
 
         try:
-            state = WatchtowerState[state_name.upper()]
+            requested_state = WatchtowerState[state_name.upper()]
         except KeyError as exc:
             raise HTTPException(status_code=400, detail=f"Invalid state: {state_name}") from exc
 
-        node.set_state(state)
+        previous_state = node.state
+        applied = node.set_state(requested_state)
+        current_state = node.state
+
+        if not applied:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"State transition {previous_state.value} -> {requested_state.value} "
+                    f"is not allowed. Node remains in state {current_state.value}."
+                ),
+            )
 
         return {
             "node_id": node.config.node_id,
-            "state": node.state.value,
+            "previous_state": previous_state.value,
+            "state": current_state.value,
+            "applied": True,
             "manual_override": True,
             "note": "Admin state change bypasses automatic recovery hysteresis.",
         }
