@@ -579,6 +579,12 @@ class WatchtowerSegment:
             elif event.get("debug_mode_enabled", False):
                 reason = "Debug mode enabled in protected environment"
                 severity = AlertSeverity.HIGH
+            elif event.get("rate_limited", False):
+                reason = "Repeated authentication failures triggered rate limiting"
+                severity = AlertSeverity.HIGH
+            elif event.get("auth_failure", False):
+                reason = "Remote authentication failure detected"
+                severity = AlertSeverity.MEDIUM
 
         with self._lock:
             self._last_scan_ts = max(self._last_scan_ts or 0.0, scan_ts)
