@@ -54,6 +54,24 @@ __all__ = [
 ]
 
 
+# Environments in which a missing S43_AUTH_PEPPER is tolerated (with a
+# warning) by falling back to a hardcoded development-only pepper.
+#
+# Sentinel-43 is distributed under AGPL/source-available terms, so this
+# fallback pepper value is effectively public. Any environment NOT in this
+# set - including an unset S43_ENV - is treated as a real deployment and
+# will fail closed if S43_AUTH_PEPPER is missing.
+_DEV_ENVIRONMENTS: frozenset[str] = frozenset(
+    {
+        "development",
+        "dev",
+        "test",
+        "testing",
+        "local",
+    }
+)
+
+
 @dataclass(frozen=True)
 class AuthKeyConfig:
     """
@@ -116,6 +134,13 @@ class AuthKeyStore:
     - Verification and revocation use constant-time hash comparison.
     - Legacy schema-version-1 keys are revoked during migration because their
       lookup hints cannot be reconstructed from hashes safely.
+    - S43_AUTH_PEPPER is required in any environment not explicitly
+      recognized as a development environment (see _DEV_ENVIRONMENTS); a
+      missing pepper fails closed rather than silently using a known
+      development value.
+    - Text fields (subject, issued_by, scopes) reject control characters to
+      avoid log-injection / display issues when surfaced in dashboards or
+      audit logs.
     """
 
     def __init__(
@@ -476,6 +501,17 @@ class AuthKeyStore:
         return body[: int(self.cfg.key_hint_chars)]
 
     def _pepper(self) -> bytes:
+        """
+        Resolve the PBKDF2 pepper.
+
+        Fails CLOSED: S43_AUTH_PEPPER is required unless S43_ENV is
+        explicitly one of _DEV_ENVIRONMENTS. An unset, misspelled, or
+        unrecognized S43_ENV (e.g. "staging", "internet", "" ) is treated
+        as a real deployment, not a development environment - there is no
+        silent fallback to the hardcoded development pepper outside of
+        S43_ENV values we explicitly recognize as non-production.
+        """
+
         pepper = os.environ.get(self.cfg.pepper_env_var, "")
 
         if pepper:
@@ -483,19 +519,22 @@ class AuthKeyStore:
 
         env = os.environ.get("S43_ENV", "").lower().strip()
 
-        if env in {"production", "prod"}:
-            raise RuntimeError(
-                f"Missing required production secret: {self.cfg.pepper_env_var}"
+        if env in _DEV_ENVIRONMENTS:
+            warnings.warn(
+                f"{self.cfg.pepper_env_var} is not set. "
+                "Using development-only pepper.",
+                RuntimeWarning,
+                stacklevel=4,
             )
+            return b"DEV_ONLY__SET_S43_AUTH_PEPPER"
 
-        warnings.warn(
-            f"{self.cfg.pepper_env_var} is not set. "
-            "Using development-only pepper.",
-            RuntimeWarning,
-            stacklevel=4,
+        raise RuntimeError(
+            f"Missing required secret: {self.cfg.pepper_env_var}. "
+            "This is required in any environment not explicitly recognized "
+            f"as a development environment (S43_ENV in "
+            f"{sorted(_DEV_ENVIRONMENTS)!r}); current S43_ENV="
+            f"{os.environ.get('S43_ENV')!r}."
         )
-
-        return b"DEV_ONLY__SET_S43_AUTH_PEPPER"
 
     def _hash_token(self, token: str, salt: bytes) -> bytes:
         material = token.encode("utf-8") + b"|" + self._pepper()
@@ -847,6 +886,12 @@ class AuthKeyStore:
 
         if not cleaned:
             raise ValueError(f"{name} cannot be empty.")
+
+        # Reject control characters (including DEL) to prevent log
+        # injection and dashboard-rendering issues when these fields are
+        # later surfaced via list_keys(), audit logs, or AlertPanel.
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in cleaned):
+            raise ValueError(f"{name} contains control characters, which are not allowed.")
 
         size = len(cleaned.encode("utf-8"))
 
