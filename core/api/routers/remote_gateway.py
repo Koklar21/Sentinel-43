@@ -11,7 +11,7 @@
 #   - Bypass tenant/client authorization
 #
 # This module DOES:
-#   - Validate approved operators
+#   - Validate approved operators via per-role bearer tokens
 #   - Validate approved targets
 #   - Validate approved remote event types
 #   - Require reason + correlation ID
@@ -19,6 +19,23 @@
 #   - Produce bounded audit records
 #   - Use constant-time token comparison
 #   - Enforce payload key/depth/byte limits
+#   - Rate-limit repeated authentication failures
+#   - Fail CLOSED if no operator tokens are configured
+#
+# Changes from previous revision:
+#   - SENTINEL_REMOTE_OWNER_TOKEN (and friends) no longer optional-with-warning.
+#     If no operator tokens are configured at all, the gateway returns 503
+#     for every authenticated route instead of running open.
+#   - operator_role is now resolved server-side from the bearer token, not
+#     trusted from the request body. A mismatched body.operator_role is a
+#     403, not silently accepted.
+#   - Non-dry-run event activation now requires SENTINEL_REMOTE_LIVE_DISPATCH_ENABLED;
+#     otherwise it returns 501 instead of falsely reporting success.
+#   - Added a simple per-client rate limit on authentication failures.
+#   - ROTATE_REMOTE_TOKEN is now reachable (added to local-sentinel's
+#     allowed_events) since OWNER is the only role permitted to use it.
+#   - Config is loaded lazily via get_config()/reload_config() instead of
+#     a module-level singleton computed at import time.
 # =============================================================================
 
 from __future__ import annotations
@@ -29,22 +46,23 @@ import os
 import secrets
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from functools import lru_cache
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Header, HTTPException, status
+from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/remote-gateway",tags=["remote-gateway"],)
+router = APIRouter(prefix="/remote-gateway", tags=["remote-gateway"])
 
 
 # =============================================================================
-# Config
+# Env helpers
 # =============================================================================
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -71,35 +89,6 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         logger.warning("Invalid integer for %s=%r; using default %s", name, value, default)
         return default
-
-
-@dataclass(frozen=True)
-class RemoteGatewayConfig:
-    enabled: bool
-    gateway_name: str
-    owner_token: str | None
-    max_payload_keys: int
-    max_payload_depth: int
-    max_payload_bytes: int
-    max_reason_length: int
-    max_audit_records: int
-
-
-def load_remote_gateway_config() -> RemoteGatewayConfig:
-    return RemoteGatewayConfig(
-        enabled=_env_bool("SENTINEL_REMOTE_GATEWAY_ENABLED", True),
-        gateway_name=_env("SENTINEL_REMOTE_GATEWAY_NAME", "sentinel-43-remote-gateway")
-        or "sentinel-43-remote-gateway",
-        owner_token=_env("SENTINEL_REMOTE_OWNER_TOKEN"),
-        max_payload_keys=_env_int("SENTINEL_REMOTE_MAX_PAYLOAD_KEYS", 50),
-        max_payload_depth=_env_int("SENTINEL_REMOTE_MAX_PAYLOAD_DEPTH", 6),
-        max_payload_bytes=_env_int("SENTINEL_REMOTE_MAX_PAYLOAD_BYTES", 65_536),
-        max_reason_length=_env_int("SENTINEL_REMOTE_MAX_REASON_LENGTH", 500),
-        max_audit_records=_env_int("SENTINEL_REMOTE_MAX_AUDIT_RECORDS", 10_000),
-    )
-
-
-CONFIG = load_remote_gateway_config()
 
 
 # =============================================================================
@@ -151,12 +140,101 @@ REGISTERED_TARGETS: dict[str, dict[str, Any]] = {
             RemoteEventType.FORCE_HEALTH_CHECK,
             RemoteEventType.FORCE_SYNC,
             RemoteEventType.REQUEST_DIAGNOSTIC_SNAPSHOT,
+            # OWNER-only event; previously unreachable because no target
+            # permitted it. Added here so the OWNER role policy entry
+            # is not dead.
+            RemoteEventType.ROTATE_REMOTE_TOKEN,
         },
     }
 }
 
 
-AUDIT_LOG: deque[dict[str, Any]] = deque(maxlen=CONFIG.max_audit_records)
+# =============================================================================
+# Config
+# =============================================================================
+
+@dataclass(frozen=True)
+class RemoteGatewayConfig:
+    enabled: bool
+    gateway_name: str
+    # token string -> role granted by that token
+    operator_tokens: dict[str, OperatorRole] = field(default_factory=dict)
+    live_dispatch_enabled: bool = False
+    max_payload_keys: int = 50
+    max_payload_depth: int = 6
+    max_payload_bytes: int = 65_536
+    max_reason_length: int = 500
+    max_audit_records: int = 10_000
+    auth_failure_limit: int = 5
+    auth_failure_window_seconds: float = 60.0
+
+
+def _build_config() -> RemoteGatewayConfig:
+    operator_tokens: dict[str, OperatorRole] = {}
+
+    # SENTINEL_REMOTE_OWNER_TOKEN kept for backward compatibility with
+    # existing deployments; SENTINEL_REMOTE_TOKEN_OWNER is the preferred name.
+    owner_token = _env("SENTINEL_REMOTE_TOKEN_OWNER") or _env("SENTINEL_REMOTE_OWNER_TOKEN")
+    admin_token = _env("SENTINEL_REMOTE_TOKEN_ADMIN")
+    auditor_token = _env("SENTINEL_REMOTE_TOKEN_AUDITOR")
+
+    if owner_token:
+        operator_tokens[owner_token] = OperatorRole.OWNER
+    if admin_token:
+        operator_tokens[admin_token] = OperatorRole.ADMIN
+    if auditor_token:
+        operator_tokens[auditor_token] = OperatorRole.AUDITOR
+
+    return RemoteGatewayConfig(
+        enabled=_env_bool("SENTINEL_REMOTE_GATEWAY_ENABLED", True),
+        gateway_name=_env("SENTINEL_REMOTE_GATEWAY_NAME", "sentinel-43-remote-gateway")
+        or "sentinel-43-remote-gateway",
+        operator_tokens=operator_tokens,
+        live_dispatch_enabled=_env_bool("SENTINEL_REMOTE_LIVE_DISPATCH_ENABLED", False),
+        max_payload_keys=_env_int("SENTINEL_REMOTE_MAX_PAYLOAD_KEYS", 50),
+        max_payload_depth=_env_int("SENTINEL_REMOTE_MAX_PAYLOAD_DEPTH", 6),
+        max_payload_bytes=_env_int("SENTINEL_REMOTE_MAX_PAYLOAD_BYTES", 65_536),
+        max_reason_length=_env_int("SENTINEL_REMOTE_MAX_REASON_LENGTH", 500),
+        max_audit_records=_env_int("SENTINEL_REMOTE_MAX_AUDIT_RECORDS", 10_000),
+        auth_failure_limit=_env_int("SENTINEL_REMOTE_AUTH_FAILURE_LIMIT", 5),
+        auth_failure_window_seconds=float(
+            _env_int("SENTINEL_REMOTE_AUTH_FAILURE_WINDOW_SECONDS", 60)
+        ),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_config() -> RemoteGatewayConfig:
+    """
+    Lazily load (and cache) the remote gateway config.
+
+    Using a function instead of a module-level constant means env vars
+    are read on first use rather than at import time, which matters for
+    test setups and for Docker contexts where env injection can happen
+    after the module graph is imported.
+    """
+    return _build_config()
+
+
+def reload_config() -> RemoteGatewayConfig:
+    """Clear the cached config and reload from the environment. Mainly for tests."""
+    get_config.cache_clear()
+    return get_config()
+
+
+# =============================================================================
+# Audit log
+# =============================================================================
+
+# Bounded by max_audit_records at the time of first access. If you need to
+# change the bound at runtime, call reload_config() and reset_audit_log().
+AUDIT_LOG: deque[dict[str, Any]] = deque(maxlen=get_config().max_audit_records)
+
+
+def reset_audit_log() -> None:
+    """Recreate AUDIT_LOG using the current config's max_audit_records. For tests."""
+    global AUDIT_LOG
+    AUDIT_LOG = deque(maxlen=get_config().max_audit_records)
 
 
 # =============================================================================
@@ -244,27 +322,112 @@ class RemoteAuditRecord(BaseModel):
 
 
 # =============================================================================
+# Authentication / rate limiting
+# =============================================================================
+
+# client_id -> timestamps (monotonic) of recent auth failures
+_AUTH_FAILURES: dict[str, deque[float]] = {}
+
+
+def _client_id(request: Request) -> str:
+    if request.client is not None and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def _check_rate_limit(client_id: str) -> None:
+    config = get_config()
+    now = time.monotonic()
+    window = _AUTH_FAILURES.setdefault(client_id, deque())
+
+    while window and now - window[0] > config.auth_failure_window_seconds:
+        window.popleft()
+
+    if len(window) >= config.auth_failure_limit:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed authentication attempts. Try again later.",
+        )
+
+
+def _record_auth_failure(client_id: str) -> None:
+    _AUTH_FAILURES.setdefault(client_id, deque()).append(time.monotonic())
+
+
+def _resolve_operator_role(authorization: str | None) -> OperatorRole:
+    """
+    Resolve the operator role from a bearer token.
+
+    Fails CLOSED: if no operator tokens are configured at all, every
+    authenticated route is unavailable rather than open.
+    """
+    config = get_config()
+
+    if not config.operator_tokens:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Remote gateway has no operator tokens configured. "
+                "Set SENTINEL_REMOTE_TOKEN_OWNER (and optionally "
+                "SENTINEL_REMOTE_TOKEN_ADMIN / SENTINEL_REMOTE_TOKEN_AUDITOR)."
+            ),
+        )
+
+    if authorization is None or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or malformed Authorization header.",
+        )
+
+    token = authorization.removeprefix("Bearer ")
+
+    for candidate, role in config.operator_tokens.items():
+        if secrets.compare_digest(token, candidate):
+            return role
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid remote gateway token.",
+    )
+
+
+def _authenticate(request: Request, authorization: str | None) -> OperatorRole:
+    client_id = _client_id(request)
+    _check_rate_limit(client_id)
+
+    try:
+        return _resolve_operator_role(authorization)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+            _record_auth_failure(client_id)
+        raise
+
+
+# =============================================================================
 # Routes
 # =============================================================================
 
 @router.get("/health", response_model=RemoteHealthResponse)
 async def remote_gateway_health() -> RemoteHealthResponse:
+    config = get_config()
+
     return RemoteHealthResponse(
-        gateway=CONFIG.gateway_name,
-        state=RemoteGatewayState.ONLINE if CONFIG.enabled else RemoteGatewayState.DISABLED,
-        enabled=CONFIG.enabled,
+        gateway=config.gateway_name,
+        state=RemoteGatewayState.ONLINE if config.enabled else RemoteGatewayState.DISABLED,
+        enabled=config.enabled,
         registered_targets=len(REGISTERED_TARGETS),
         available_events=[event.value for event in RemoteEventType],
-        audit_buffer_max=CONFIG.max_audit_records,
+        audit_buffer_max=config.max_audit_records,
     )
 
 
 @router.get("/targets", response_model=list[RemoteTargetResponse])
 async def list_remote_targets(
+    request: Request,
     authorization: str | None = Header(default=None),
 ) -> list[RemoteTargetResponse]:
     _require_gateway_enabled()
-    _require_owner_token_if_configured(authorization)
+    _authenticate(request, authorization)
 
     return [
         RemoteTargetResponse(
@@ -280,22 +443,43 @@ async def list_remote_targets(
 
 @router.post("/events/activate", response_model=RemoteEventActivationResponse)
 async def activate_remote_event(
+    request: Request,
     body: RemoteEventActivationRequest,
     authorization: str | None = Header(default=None),
 ) -> RemoteEventActivationResponse:
     started = time.perf_counter()
+    config = get_config()
 
     _require_gateway_enabled()
-    _require_owner_token_if_configured(authorization)
+    effective_role = _authenticate(request, authorization)
+
+    if body.operator_role != effective_role:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "operator_role does not match the role associated with the "
+                "provided token."
+            ),
+        )
+
     _validate_payload(body.payload)
 
     target = _validate_target(body.target_id)
 
-    _validate_role_event_permission(body.operator_role, body.event_type)
+    _validate_role_event_permission(effective_role, body.event_type)
     _validate_target_event_permission(target, body.event_type)
 
     if body.dry_run:
         message = "Dry-run accepted. No remote event was activated."
+    elif not config.live_dispatch_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=(
+                "Live dispatch is not enabled on this gateway. Set "
+                "SENTINEL_REMOTE_LIVE_DISPATCH_ENABLED=true once an event "
+                "broker is wired up, or use dry_run=true."
+            ),
+        )
     else:
         await _dispatch_remote_event(body)
         message = "Remote event accepted and activated."
@@ -311,7 +495,7 @@ async def activate_remote_event(
     return RemoteEventActivationResponse(
         ok=True,
         dry_run=body.dry_run,
-        gateway=CONFIG.gateway_name,
+        gateway=config.gateway_name,
         target_id=body.target_id,
         event_type=body.event_type.value,
         correlation_id=body.correlation_id,
@@ -323,11 +507,12 @@ async def activate_remote_event(
 
 @router.get("/audit/{correlation_id}", response_model=list[RemoteAuditRecord])
 async def get_remote_audit_records(
+    request: Request,
     correlation_id: str,
     authorization: str | None = Header(default=None),
 ) -> list[RemoteAuditRecord]:
     _require_gateway_enabled()
-    _require_owner_token_if_configured(authorization)
+    _authenticate(request, authorization)
 
     cleaned = correlation_id.strip()
 
@@ -339,42 +524,21 @@ async def get_remote_audit_records(
 
 
 # =============================================================================
-# Validation / Security
+# Validation
 # =============================================================================
 
 def _require_gateway_enabled() -> None:
-    if not CONFIG.enabled:
+    if not get_config().enabled:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Remote gateway is disabled.",
         )
 
 
-def _require_owner_token_if_configured(authorization: str | None) -> None:
-    """
-    Development-safe token check.
-
-    In production:
-      SENTINEL_REMOTE_OWNER_TOKEN must be set.
-    """
-    if CONFIG.owner_token is None:
-        logger.warning(
-            "SENTINEL_REMOTE_OWNER_TOKEN is not configured. "
-            "Remote gateway is running without bearer-token enforcement."
-        )
-        return
-
-    expected = f"Bearer {CONFIG.owner_token}"
-
-    if authorization is None or not secrets.compare_digest(authorization, expected):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing remote gateway authorization token.",
-        )
-
-
 def _validate_payload(payload: dict[str, Any]) -> None:
-    if len(payload.keys()) > CONFIG.max_payload_keys:
+    config = get_config()
+
+    if len(payload.keys()) > config.max_payload_keys:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail="Payload contains too many top-level keys.",
@@ -388,7 +552,7 @@ def _validate_payload(payload: dict[str, Any]) -> None:
             detail="Payload must be JSON serializable.",
         ) from None
 
-    if len(raw) > CONFIG.max_payload_bytes:
+    if len(raw) > config.max_payload_bytes:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail="Payload exceeds configured byte limit.",
@@ -396,7 +560,7 @@ def _validate_payload(payload: dict[str, Any]) -> None:
 
     depth = _payload_depth(payload)
 
-    if depth > CONFIG.max_payload_depth:
+    if depth > config.max_payload_depth:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail="Payload exceeds configured nesting depth.",
@@ -467,14 +631,16 @@ def _validate_target_event_permission(
 
 async def _dispatch_remote_event(body: RemoteEventActivationRequest) -> None:
     """
-    Placeholder for live Sentinel-43 backend integration.
+    Live event dispatch.
 
-    Future recommended wiring:
-      - Redis Streams for early beta
-      - Kafka/NATS/RabbitMQ for enterprise deployments
-      - Internal Watchtower/MonitoringManager event intake
+    Only reached when SENTINEL_REMOTE_LIVE_DISPATCH_ENABLED=true and
+    dry_run=False. Currently still a placeholder for the real event-broker
+    integration (Redis Streams / Kafka / NATS / RabbitMQ / internal
+    Watchtower intake) — operators who enable live dispatch should be aware
+    this currently only logs.
 
-    Keep this async so future event-broker clients do not block the FastAPI loop.
+    Keep this async so future event-broker clients do not block the
+    FastAPI loop.
     """
     logger.info(
         "Remote event activated: operator=%s role=%s target=%s event=%s correlation_id=%s",
