@@ -44,6 +44,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -54,9 +56,43 @@ from typing import Any, Callable
 logger = logging.getLogger("SentinelRules")
 
 WATCHTOWER_URL = os.getenv("S43_WATCHTOWER_URL", "http://s43-core:9100").rstrip("/")
-WATCHTOWER_TIMEOUT = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
 RULES_MODULE_ID = os.getenv("S43_RULES_MODULE_ID", "sentinel43-rules")
-RULES_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
+
+# Fix #6: prefer the S43_* naming convention used by every other constant in
+# this module, but fall back to the legacy SENTINEL_VERSION name for
+# backwards compatibility with existing deployments.
+RULES_VERSION = os.getenv("S43_RULES_VERSION", os.getenv("SENTINEL_VERSION", "0.1.0"))
+
+
+def _float_env(name: str, default: float) -> float:
+    """
+    Fix #5: WATCHTOWER_TIMEOUT used to be `float(os.getenv(...))`, an
+    unguarded cast performed at import time. An invalid value for the env
+    var would raise ValueError and crash the entire module on import.
+
+    This helper falls back to the provided default (and logs a warning) if
+    the env var is missing or not a valid float.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid value %r for %s, falling back to default %s", raw, name, default,
+        )
+        return default
+
+
+WATCHTOWER_TIMEOUT = _float_env("S43_WATCHTOWER_TIMEOUT", 2.0)
+
+# Fix #2: when registration with Watchtower fails, don't retry it on every
+# single rule evaluation -- that turns every run() call into a blocking
+# network round trip while Watchtower is down. Back off for this many
+# seconds between registration attempts instead.
+REGISTRATION_RETRY_SECONDS = _float_env("S43_RULES_REGISTRATION_RETRY_SECONDS", 30.0)
 
 
 def utc_now() -> str:
@@ -76,8 +112,25 @@ def _watchtower_request(
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     url = f"{WATCHTOWER_URL}{path}"
-    data = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {"Content-Type": "application/json"}
+
+    data = None
+    if payload is not None:
+        # Fix #1 (part 1): json.dumps() used to be called unguarded. A
+        # non-serializable value anywhere in `payload` raised an uncaught
+        # TypeError here that propagated all the way out of run() with no
+        # surrounding try/except, turning a successful rule evaluation
+        # into an unhandled exception.
+        #
+        # Serialization failures are now contained to this function and
+        # reported the same way as any other Watchtower-unreachable error.
+        try:
+            data = json.dumps(payload).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            return {
+                "error": "watchtower_payload_serialization_error",
+                "detail": str(exc),
+            }
 
     request = urllib.request.Request(
         url=url,
@@ -119,31 +172,42 @@ def _watchtower_request(
 
 
 def _report_rule_dependency(status: str, details: dict[str, Any]) -> dict[str, Any]:
-    payload = {
-        "name": RULES_MODULE_ID,
-        "status": status,
-        "version": RULES_VERSION,
-        "details": {
-            "timestamp": utc_now(),
-            **details,
-        },
-    }
-    return _watchtower_request("POST", "/watchtower/dependencies/report", payload)
-
-
-def _report_rule_event(status: str, details: dict[str, Any]) -> dict[str, Any]:
-    payload = {
-        "event": {
-            "kind": "runtime",
-            "source": RULES_MODULE_ID,
+    # Fix #1 (part 2): this is best-effort telemetry. It must never raise
+    # into its callers (run(), thresholds_for()), or a telemetry hiccup
+    # (network blip, serialization issue) gets misreported as a failure of
+    # the actual rule/threshold logic, or crashes it outright.
+    try:
+        payload = {
+            "name": RULES_MODULE_ID,
             "status": status,
+            "version": RULES_VERSION,
             "details": {
                 "timestamp": utc_now(),
                 **details,
             },
         }
-    }
-    return _watchtower_request("POST", "/watchtower/analyze", payload)
+        return _watchtower_request("POST", "/watchtower/dependencies/report", payload)
+    except Exception as exc:
+        return {"error": "telemetry_reporting_failed", "detail": str(exc)}
+
+
+def _report_rule_event(status: str, details: dict[str, Any]) -> dict[str, Any]:
+    # Fix #1 (part 2): see _report_rule_dependency -- must never raise.
+    try:
+        payload = {
+            "event": {
+                "kind": "runtime",
+                "source": RULES_MODULE_ID,
+                "status": status,
+                "details": {
+                    "timestamp": utc_now(),
+                    **details,
+                },
+            }
+        }
+        return _watchtower_request("POST", "/watchtower/analyze", payload)
+    except Exception as exc:
+        return {"error": "telemetry_reporting_failed", "detail": str(exc)}
 
 
 class ThresholdProfile(str, Enum):
@@ -180,6 +244,8 @@ def thresholds_for(profile: ThresholdProfile | str = ThresholdProfile.DEV) -> Th
         elif isinstance(profile, ThresholdProfile):
             clean_profile = profile
     except ValueError:
+        # Fix #1: _report_rule_dependency can no longer raise, so this
+        # telemetry call can't mask/replace the ValueError handling here.
         _report_rule_dependency(
             status="degraded",
             details={
@@ -220,9 +286,25 @@ class RuleRegistry:
         self._rules: dict[str, RuleCallable] = {}
         self._registered_with_watchtower = False
 
+        # Fix #2: backoff timestamp for registration retries.
+        self._next_registration_attempt = 0.0
+
+        # Fix #4: `_rules`, `_registered_with_watchtower`, and
+        # `_next_registration_attempt` are mutated from register(),
+        # unregister(), and run(), any of which may be called concurrently
+        # on the shared module-level `registry` singleton.
+        self._lock = threading.Lock()
+
     def _register_with_watchtower_if_needed(self) -> None:
-        if self._registered_with_watchtower:
-            return
+        with self._lock:
+            if self._registered_with_watchtower:
+                return
+
+            now = time.monotonic()
+            if now < self._next_registration_attempt:
+                # Still within backoff window from a previous failed
+                # registration attempt -- skip the network call entirely.
+                return
 
         payload = {
             "module_id": RULES_MODULE_ID,
@@ -240,11 +322,14 @@ class RuleRegistry:
         }
 
         result = _watchtower_request("POST", "/watchtower/modules/register", payload)
-        if "error" in result:
-            logger.warning("Watchtower module registration failed: %s", result)
-            return
 
-        self._registered_with_watchtower = True
+        with self._lock:
+            if "error" in result:
+                logger.warning("Watchtower module registration failed: %s", result)
+                self._registered_with_watchtower = False
+                self._next_registration_attempt = time.monotonic() + REGISTRATION_RETRY_SECONDS
+            else:
+                self._registered_with_watchtower = True
 
     def register(self, name: str, rule: RuleCallable) -> None:
         if not isinstance(name, str) or not name.strip():
@@ -252,16 +337,20 @@ class RuleRegistry:
         if not callable(rule):
             raise TypeError("rule must be callable")
 
-        self._rules[name] = rule
+        with self._lock:
+            self._rules[name] = rule
 
     def unregister(self, name: str) -> None:
-        self._rules.pop(name, None)
+        with self._lock:
+            self._rules.pop(name, None)
 
     def get(self, name: str) -> RuleCallable | None:
-        return self._rules.get(name)
+        with self._lock:
+            return self._rules.get(name)
 
     def list_rules(self) -> list[str]:
-        return sorted(self._rules.keys())
+        with self._lock:
+            return sorted(self._rules.keys())
 
     def run(self, name: str, payload: dict[str, Any]) -> RuleResult:
         # Network side-effects safely deferred to actual evaluation cycles
@@ -311,6 +400,10 @@ class RuleRegistry:
                 severity="error", details={"result_type": type(result).__name__}
             )
 
+        # Fix #1: _report_rule_event can no longer raise (it catches and
+        # returns an error dict internally), so a telemetry/serialization
+        # issue here can never prevent `result` -- which was already
+        # computed successfully -- from being returned to the caller.
         _report_rule_event(
             status="passed" if result.passed else "failed",
             details={
@@ -324,7 +417,25 @@ class RuleRegistry:
 # Core Rule Logic Definitions
 def api_health_rule(payload: dict[str, Any]) -> RuleResult:
     thresholds = thresholds_for(payload.get("profile", ThresholdProfile.DEV))
-    error_rate = _safe_float(payload.get("error_rate"), 0.0)
+
+    # Fix #3: thresholds_for() defines error_rate_warn/error_rate_fail as
+    # FRACTIONS (e.g. 0.03 = 3%), but adapters.runtime_event() produces a
+    # field literally named `error_rate_percent` (a 0-100 percentage).
+    # If the caller only populated "error_rate_percent", `error_rate`
+    # would previously be silently treated as 0.0, masking real error-rate
+    # alerts. Fall back to "error_rate_percent" / 100.0 when "error_rate"
+    # isn't present, so both shapes of payload behave correctly.
+    #
+    # NOTE: please verify against the actual payload-construction code --
+    # if "error_rate" is always populated as a fraction by design, this
+    # fallback is harmless (it's only used when that key is absent).
+    if "error_rate" in payload:
+        error_rate = _safe_float(payload.get("error_rate"), 0.0)
+    elif "error_rate_percent" in payload:
+        error_rate = _safe_float(payload.get("error_rate_percent"), 0.0) / 100.0
+    else:
+        error_rate = 0.0
+
     latency_seconds = _safe_float(payload.get("latency_seconds"), 0.0)
 
     if error_rate >= thresholds.error_rate_fail:
