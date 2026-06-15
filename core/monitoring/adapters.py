@@ -32,12 +32,11 @@
 # Sentinel-43™
 # Original Work and Protected Intellectual Property.
 # =============================================================================
+#
 # Adapters file
-#============================================================================
+# =============================================================================
 
 from __future__ import annotations
-
-from typing import Any, Dict
 
 from .event_types import (
     RequestEvent,
@@ -81,7 +80,7 @@ def expectation_event(status: str, failed_checks: int = 0) -> ExpectationEvent:
 # Runtime Health Monitoring
 # ============================================================
 
-def runtime_event(error_rate_percent: int, crash_loop: bool = False) -> RuntimeEvent:
+def runtime_event(error_rate_percent: int | float, crash_loop: bool = False) -> RuntimeEvent:
     """
     Convert runtime health metrics into a monitoring event.
     """
@@ -109,7 +108,7 @@ def dependency_event(status: str, version_mismatch: bool = False) -> DependencyE
 # Resource Monitoring
 # ============================================================
 
-def resource_event(cpu: int, memory: int, disk: int) -> ResourceEvent:
+def resource_event(cpu: int | float, memory: int | float, disk: int | float) -> ResourceEvent:
     """
     Convert system resource metrics into a monitoring event.
     """
