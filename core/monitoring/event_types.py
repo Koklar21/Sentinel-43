@@ -36,22 +36,73 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import threading
 import urllib.request
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any, Dict
 import uuid
 
+logger = logging.getLogger("SentinelEventTypes")
 
 EVENT_TYPES_MODULE_ID = os.getenv("S43_EVENT_TYPES_MODULE_ID", "sentinel43-event-types")
-EVENT_TYPES_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
+
+# Fix #5: prefer the S43_* naming convention used elsewhere, fall back to
+# the legacy SENTINEL_VERSION name for backwards compatibility. Now also
+# actually used (see _report_event_type_issue) instead of being dead code.
+EVENT_TYPES_VERSION = os.getenv("S43_EVENT_TYPES_VERSION", os.getenv("SENTINEL_VERSION", "0.1.0"))
+
 WATCHTOWER_URL = os.getenv("S43_WATCHTOWER_URL", "http://s43-watchtower:9100").rstrip("/")
-WATCHTOWER_TIMEOUT = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
+
+
+def _float_env(name: str, default: float) -> float:
+    """
+    Fix #4: WATCHTOWER_TIMEOUT used to be `float(os.getenv(...))`, an
+    unguarded cast performed at import time. An invalid value for the env
+    var would raise ValueError and crash the entire module on import.
+
+    Falls back to the provided default (and logs a warning) if the env var
+    is missing or not a valid float.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid value %r for %s, falling back to default %s", raw, name, default,
+        )
+        return default
+
+
+WATCHTOWER_TIMEOUT = _float_env("S43_WATCHTOWER_TIMEOUT", 2.0)
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _send_watchtower_report(payload: dict[str, Any]) -> None:
+    """
+    Actually perform the Watchtower POST. Runs on a background thread (see
+    _report_event_type_issue) so it can never block event normalization.
+    """
+    try:
+        request = urllib.request.Request(
+            f"{WATCHTOWER_URL}/watchtower/analyze",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(request, timeout=WATCHTOWER_TIMEOUT)
+    except Exception as exc:
+        # Fix #6: log instead of silently swallowing -- this is the only
+        # visibility we have into normalization issues reaching Watchtower.
+        logger.debug("Failed to report event-type issue to Watchtower: %s", exc)
 
 
 def _report_event_type_issue(
@@ -63,6 +114,7 @@ def _report_event_type_issue(
         "event": {
             "kind": "runtime",
             "source": EVENT_TYPES_MODULE_ID,
+            "source_version": EVENT_TYPES_VERSION,
             "status": status,
             "details": {
                 "issue": issue,
@@ -72,16 +124,16 @@ def _report_event_type_issue(
         }
     }
 
+    # Fix #3: normalize_event() is on the event-ingestion hot path. The
+    # previous implementation made a blocking urlopen() call (up to
+    # WATCHTOWER_TIMEOUT) directly inline, so any unknown-kind or
+    # coercion-failure event added up to 2s of latency. Fire this off on a
+    # daemon thread instead -- it's best-effort telemetry and must never
+    # slow down (or fail) event normalization itself.
     try:
-        request = urllib.request.Request(
-            f"{WATCHTOWER_URL}/watchtower/analyze",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        urllib.request.urlopen(request, timeout=WATCHTOWER_TIMEOUT)
-    except Exception:
-        pass
+        threading.Thread(target=_send_watchtower_report, args=(payload,), daemon=True).start()
+    except Exception as exc:
+        logger.debug("Failed to spawn Watchtower reporting thread: %s", exc)
 
 
 @dataclass
@@ -162,6 +214,13 @@ _EVENT_TYPE_MAP = {
     "security": SecurityEvent,
 }
 
+# Cache of valid field names per event class, used to drop unrecognized
+# keys (Fix #2) without an exception-driven try/except.
+_EVENT_TYPE_FIELDS: dict[type, set[str]] = {
+    event_cls: {f.name for f in fields(event_cls)}
+    for event_cls in {BaseEvent, *_EVENT_TYPE_MAP.values()}
+}
+
 
 def normalize_event(event: Dict[str, Any]) -> BaseEvent:
     """
@@ -186,6 +245,15 @@ def normalize_event(event: Dict[str, Any]) -> BaseEvent:
     if "id" not in local_event or not local_event["id"]:
         local_event["id"] = str(uuid.uuid4())
 
+    # Fix #1: previously `local_event["kind"]` retained whatever raw value
+    # was supplied (e.g. mixed case / whitespace), while `kind` (the
+    # normalized value used for type dispatch) was discarded. That meant
+    # the constructed event's `.kind` attribute could differ from the
+    # normalized dispatch key, even though the fallback BaseEvent path
+    # below always used the normalized value. Normalize it consistently
+    # for both paths.
+    local_event["kind"] = kind
+
     if kind not in _EVENT_TYPE_MAP and kind != "base":
         _report_event_type_issue(
             status="degraded",
@@ -195,6 +263,32 @@ def normalize_event(event: Dict[str, Any]) -> BaseEvent:
                 "event_id": local_event["id"],
             },
         )
+
+    # Fix #2: previously, ANY key in `local_event` that wasn't a field on
+    # `event_cls` caused `event_cls(**local_event)` to raise TypeError,
+    # which discarded the entire event -- including otherwise-valid fields
+    # like status_code/latency_ms -- collapsing it to a bare BaseEvent.
+    #
+    # This is a forward-compatibility hazard: any new field a client (e.g.
+    # the mobile app) starts sending before the dataclasses are updated to
+    # include it would silently wipe out the whole event on every
+    # occurrence. Instead, drop only the unrecognized keys (reporting them
+    # for visibility) and construct the event from the fields it does
+    # recognize.
+    valid_fields = _EVENT_TYPE_FIELDS.get(event_cls, _EVENT_TYPE_FIELDS[BaseEvent])
+    unknown_keys = set(local_event) - valid_fields
+
+    if unknown_keys:
+        _report_event_type_issue(
+            status="degraded",
+            issue="unknown_event_fields_dropped",
+            details={
+                "kind": kind,
+                "event_id": local_event["id"],
+                "dropped_fields": sorted(unknown_keys),
+            },
+        )
+        local_event = {k: v for k, v in local_event.items() if k in valid_fields}
 
     try:
         return event_cls(**local_event)
