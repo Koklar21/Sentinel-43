@@ -45,32 +45,72 @@ do not create fake None objects in the package namespace.
 
 from __future__ import annotations
 
+import importlib
 import warnings
 from typing import Any
 
 
-from .watchtower import (
-    VERSION,
-    ThresholdProfile,
-    thresholds_for,
-    WatchtowerState,
-    TowerSlot,
-    TowerType,
-    AlertSeverity,
-    CoordinatorDecision,
-    ScanResult,
-    TowerConfig,
-    WatchtowerConfig,
-    WatchtowerSegment,
-    WatchtowerNode,
-    AnalyzeRequest,
-    ModuleRegisterRequest,
-    ModuleHeartbeatRequest,
-    DependencyReportRequest,
-    build_node,
-    create_watchtower_router,
-    create_api_app,
-)
+# Fix #3: wrap the core eager import so a broken/renamed name in
+# .watchtower fails with a clear, package-scoped error message instead of
+# a bare ImportError pointing at an internal module path.
+try:
+    from .watchtower import (
+        VERSION,
+        WatchtowerState,
+        TowerSlot,
+        TowerType,
+        AlertSeverity,
+        CoordinatorDecision,
+        ScanResult,
+        TowerConfig,
+        WatchtowerConfig,
+        WatchtowerSegment,
+        WatchtowerNode,
+        AnalyzeRequest,
+        ModuleRegisterRequest,
+        ModuleHeartbeatRequest,
+        DependencyReportRequest,
+        build_node,
+        create_watchtower_router,
+        create_api_app,
+    )
+except ImportError as exc:
+    raise ImportError(
+        f"sentinel43.monitoring: failed to load core Watchtower exports "
+        f"from .watchtower: {exc}"
+    ) from exc
+
+
+# Fix #1: ThresholdProfile / thresholds_for were previously imported
+# unconditionally from .watchtower alongside the names above. Per the
+# rules-engine review, these are actually defined in the rules module, not
+# watchtower -- if watchtower.py doesn't independently define/re-export
+# them, that import raises ImportError with NO fault isolation (unlike the
+# lazy legacy exports below), taking down the entire package.
+#
+# Resolve them with a fallback chain across the plausible locations so the
+# package stays importable regardless of which module turns out to be
+# canonical, and so we don't end up silently using two non-identical
+# ThresholdProfile enum types depending on import order.
+_threshold_import_errors: list[str] = []
+
+for _module_name in (".watchtower", ".rules_engine", ".rules"):
+    try:
+        _mod = importlib.import_module(_module_name, __name__)
+        ThresholdProfile = _mod.ThresholdProfile
+        thresholds_for = _mod.thresholds_for
+        break
+    except (ImportError, AttributeError) as _exc:
+        _threshold_import_errors.append(f"{_module_name}: {_exc}")
+else:
+    raise ImportError(
+        "sentinel43.monitoring: could not locate ThresholdProfile/"
+        "thresholds_for in .watchtower, .rules_engine, or .rules. Tried: "
+        + "; ".join(_threshold_import_errors)
+    )
+
+del _threshold_import_errors, _module_name, _mod, _exc
+
 
 from .event_types import (
     BaseEvent,
@@ -139,36 +179,58 @@ _LEGACY_EXPORTS = {
     "MonitoringManager",
 }
 
+# Fix #2: previously hardcoded to .rules / .manager. Try multiple plausible
+# module names so a filename mismatch degrades to the existing
+# ImportWarning + AttributeError behavior instead of a permanently silent
+# "module has no attribute" with no diagnostic of *why*.
+_RULES_MODULE_CANDIDATES = (".rules_engine", ".rules")
+_MANAGER_MODULE_CANDIDATES = (".monitoring_manager", ".manager")
+
 
 def __getattr__(name: str) -> Any:
     if name in {"RuleRegistry", "registry"}:
-        try:
-            from .rules import RuleRegistry, registry
-        except ImportError as exc:
-            warnings.warn(
-                f"sentinel43.monitoring: optional legacy export from '.rules' is unavailable: {exc}",
-                ImportWarning,
-                stacklevel=2,
-            )
-            raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+        errors: list[str] = []
+        for module_name in _RULES_MODULE_CANDIDATES:
+            try:
+                mod = importlib.import_module(module_name, __name__)
+                rule_registry_cls = mod.RuleRegistry
+                registry_obj = mod.registry
+            except (ImportError, AttributeError) as exc:
+                errors.append(f"{module_name}: {exc}")
+                continue
 
-        globals()["RuleRegistry"] = RuleRegistry
-        globals()["registry"] = registry
-        return globals()[name]
+            globals()["RuleRegistry"] = rule_registry_cls
+            globals()["registry"] = registry_obj
+            return globals()[name]
+
+        warnings.warn(
+            "sentinel43.monitoring: optional legacy export "
+            f"{name!r} is unavailable: " + "; ".join(errors),
+            ImportWarning,
+            stacklevel=2,
+        )
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
 
     if name == "MonitoringManager":
-        try:
-            from .manager import MonitoringManager
-        except ImportError as exc:
-            warnings.warn(
-                f"sentinel43.monitoring: optional legacy export '.manager.MonitoringManager' is unavailable: {exc}",
-                ImportWarning,
-                stacklevel=2,
-            )
-            raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+        errors = []
+        for module_name in _MANAGER_MODULE_CANDIDATES:
+            try:
+                mod = importlib.import_module(module_name, __name__)
+                manager_cls = mod.MonitoringManager
+            except (ImportError, AttributeError) as exc:
+                errors.append(f"{module_name}: {exc}")
+                continue
 
-        globals()["MonitoringManager"] = MonitoringManager
-        return MonitoringManager
+            globals()["MonitoringManager"] = manager_cls
+            return manager_cls
+
+        warnings.warn(
+            "sentinel43.monitoring: optional legacy export "
+            f"{name!r} is unavailable: " + "; ".join(errors),
+            ImportWarning,
+            stacklevel=2,
+        )
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
