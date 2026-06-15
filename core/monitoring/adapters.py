@@ -32,6 +32,8 @@
 # Sentinel-43™
 # Original Work and Protected Intellectual Property.
 # =============================================================================
+# Adapters file
+=============================================================================
 
 from __future__ import annotations
 
