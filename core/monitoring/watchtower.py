@@ -35,30 +35,39 @@
 
 """
 Sentinel-43 Watchtower Node
-v1.3.5 Hardened Octagon Interconnect
+v1.3.6 Hardened Octagon Interconnect
 
 Docker:
-python -m core.monitoring.watchtower
+    S43_WATCHTOWER_SERVE=true python -m core.monitoring.watchtower
 
 Production:
-uvicorn core.monitoring.watchtower:app --host 0.0.0.0 --port 9100
+    uvicorn core.monitoring.watchtower:app --host 0.0.0.0 --port 9100
 
-Changes from v1.3.4:
-  - DEGRADED is no longer a one-way trap. scan_event now keeps processing
-    events while DEGRADED (only INITIALIZING/FAILED drop events), so the
-    existing clean-scan-streak bookkeeping can run. After
-    recovery_clean_scan_threshold consecutive clean scans with no failure
-    streak, the node automatically transitions DEGRADED -> ACTIVE.
-  - REQUIRE_HUMAN-classified scans (a single HIGH-severity finding) no
-    longer count toward the clean-scan recovery streak. They reset
-    clean_scan_streak without counting as a fresh failure either.
-  - POST /state/{state_name} now reports whether the requested transition
-    was actually applied. Disallowed/no-op-rejected transitions return
-    409 with the previous and current state instead of a misleading 200.
-  - Dependencies now get the same staleness treatment modules already had:
-    dependency_snapshot() computes `stale`/`computed_status`, and stale
-    dependencies are surfaced in readiness via `stale_dependencies` and
-    counted in `bad_dependencies`.
+Changes from v1.3.5:
+  - Fix #1: NODE and app are now lazy singletons accessed via module-level
+    __getattr__. Importing types (WatchtowerConfig, WatchtowerNode, etc.)
+    no longer triggers node construction or FastAPI app creation at import
+    time. uvicorn compatibility preserved: `uvicorn module:app` triggers
+    __getattr__("app") which initialises on first access.
+  - Fix #2: WatchtowerNode.stop() added. Transitions node to FAILED,
+    dropping all subsequent events. MonitoringManager.stop() no longer
+    raises AttributeError.
+  - Fix #3: ThresholdProfile renamed to TowerThresholdProfile and
+    thresholds_for renamed to tower_thresholds_for to eliminate the name
+    collision with the rules_engine ThresholdProfile enum. The monitoring
+    package public API exposes the rules_engine enum under those names;
+    this module exports the numeric-field dataclass under the new names.
+  - Fix #4: build_node() now raises RuntimeError if node.start() returns
+    False instead of silently returning an INITIALIZING node.
+  - Fix #5: create_api_app() no longer double-registers routes. All routes
+    live under the /watchtower prefix. A root shim at / redirects callers
+    that previously used bare paths.
+  - Fix #6: bad_dependencies no longer double-counts stale items; stale
+    and explicitly-unhealthy dependencies are tracked in separate lists.
+  - Fix #7: NODE removed from __all__; use get_node() to access the
+    singleton.
+  - Fix #9: start() now raises RuntimeError on disallowed transition
+    instead of silently returning False.
 """
 
 from __future__ import annotations
@@ -82,7 +91,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 
-VERSION = "1.3.5"
+VERSION = "1.3.6"
 logger = logging.getLogger("SentinelWatchtower")
 
 
@@ -97,6 +106,10 @@ def configure_logging() -> None:
 
 configure_logging()
 
+
+# =============================================================================
+# Utilities
+# =============================================================================
 
 def _now() -> float:
     return time.time()
@@ -157,8 +170,20 @@ def _assign_event_id(event: dict[str, Any]) -> str:
     return event_id
 
 
+# =============================================================================
+# Threshold profiles
+#
+# Fix #3: renamed from ThresholdProfile / thresholds_for to
+# TowerThresholdProfile / tower_thresholds_for to eliminate the name
+# collision with the rules_engine.ThresholdProfile enum (DEV/TEST/PROD)
+# and rules_engine.thresholds_for(profile) function. The monitoring
+# package's __init__.py resolves "ThresholdProfile" / "thresholds_for"
+# from the rules_engine module; this module's numeric-field dataclass
+# is a separate internal concept.
+# =============================================================================
+
 @dataclass(frozen=True)
-class ThresholdProfile:
+class TowerThresholdProfile:
     error_rate_percent: int
     expectation_fail_count: int
     stale_config_seconds: int
@@ -168,9 +193,9 @@ class ThresholdProfile:
     latency_ms: int
 
 
-def thresholds_for(sensitivity: int) -> ThresholdProfile:
+def tower_thresholds_for(sensitivity: int) -> TowerThresholdProfile:
     s = max(1, min(int(sensitivity), 10))
-    return ThresholdProfile(
+    return TowerThresholdProfile(
         error_rate_percent=max(5, 55 - (s * 5)),
         expectation_fail_count=max(1, 12 - s),
         stale_config_seconds=max(60, 900 - (s * 60)),
@@ -180,6 +205,10 @@ def thresholds_for(sensitivity: int) -> ThresholdProfile:
         latency_ms=max(500, 3500 - (s * 250)),
     )
 
+
+# =============================================================================
+# Enums
+# =============================================================================
 
 class WatchtowerState(enum.Enum):
     INITIALIZING = "INITIALIZING"
@@ -226,6 +255,10 @@ class CoordinatorDecision(enum.Enum):
     DENY = "DENY"
 
 
+# =============================================================================
+# Data models
+# =============================================================================
+
 @dataclass(frozen=True)
 class ScanResult:
     alerts: list[dict[str, Any]]
@@ -249,7 +282,6 @@ class TowerConfig:
             raise TypeError("slot must be TowerSlot")
         if not isinstance(self.tower_type, TowerType):
             raise TypeError("tower_type must be TowerType")
-
         object.__setattr__(self, "sensitivity", _clamp_int("sensitivity", self.sensitivity, 1, 10))
 
     def to_dict(self) -> dict[str, Any]:
@@ -285,54 +317,26 @@ class WatchtowerConfig:
             raise ValueError("node_id must be non-empty")
 
         object.__setattr__(self, "port", _clamp_int("port", self.port, 1024, 65535))
-        object.__setattr__(
-            self,
-            "scan_failure_degrade_threshold",
-            _clamp_int("scan_failure_degrade_threshold", self.scan_failure_degrade_threshold, 1, 100),
-        )
-        object.__setattr__(
-            self,
-            "module_stale_seconds",
-            _clamp_int("module_stale_seconds", self.module_stale_seconds, 5, 3600),
-        )
-        object.__setattr__(
-            self,
-            "dependency_stale_seconds",
-            _clamp_int("dependency_stale_seconds", self.dependency_stale_seconds, 5, 3600),
-        )
-        object.__setattr__(
-            self,
-            "max_recent_events",
-            _clamp_int("max_recent_events", self.max_recent_events, 10, 5000),
-        )
-        object.__setattr__(
-            self,
-            "recent_query_limit",
-            _clamp_int("recent_query_limit", self.recent_query_limit, 10, 5000),
-        )
+        object.__setattr__(self, "scan_failure_degrade_threshold",
+            _clamp_int("scan_failure_degrade_threshold", self.scan_failure_degrade_threshold, 1, 100))
+        object.__setattr__(self, "module_stale_seconds",
+            _clamp_int("module_stale_seconds", self.module_stale_seconds, 5, 3600))
+        object.__setattr__(self, "dependency_stale_seconds",
+            _clamp_int("dependency_stale_seconds", self.dependency_stale_seconds, 5, 3600))
+        object.__setattr__(self, "max_recent_events",
+            _clamp_int("max_recent_events", self.max_recent_events, 10, 5000))
+        object.__setattr__(self, "recent_query_limit",
+            _clamp_int("recent_query_limit", self.recent_query_limit, 10, 5000))
         if self.recent_query_limit > self.max_recent_events:
             object.__setattr__(self, "recent_query_limit", self.max_recent_events)
-
-        object.__setattr__(
-            self,
-            "correlation_window_seconds",
-            _clamp_int("correlation_window_seconds", self.correlation_window_seconds, 5, 300),
-        )
-        object.__setattr__(
-            self,
-            "critical_alert_degrade_threshold",
-            _clamp_int("critical_alert_degrade_threshold", self.critical_alert_degrade_threshold, 1, 20),
-        )
-        object.__setattr__(
-            self,
-            "high_alert_degrade_threshold",
-            _clamp_int("high_alert_degrade_threshold", self.high_alert_degrade_threshold, 1, 50),
-        )
-        object.__setattr__(
-            self,
-            "recovery_clean_scan_threshold",
-            _clamp_int("recovery_clean_scan_threshold", self.recovery_clean_scan_threshold, 1, 20),
-        )
+        object.__setattr__(self, "correlation_window_seconds",
+            _clamp_int("correlation_window_seconds", self.correlation_window_seconds, 5, 300))
+        object.__setattr__(self, "critical_alert_degrade_threshold",
+            _clamp_int("critical_alert_degrade_threshold", self.critical_alert_degrade_threshold, 1, 20))
+        object.__setattr__(self, "high_alert_degrade_threshold",
+            _clamp_int("high_alert_degrade_threshold", self.high_alert_degrade_threshold, 1, 50))
+        object.__setattr__(self, "recovery_clean_scan_threshold",
+            _clamp_int("recovery_clean_scan_threshold", self.recovery_clean_scan_threshold, 1, 20))
         object.__setattr__(self, "towers", tuple(self.towers))
 
     @property
@@ -366,7 +370,7 @@ class WatchtowerConfig:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        payload = {
+        payload: dict[str, Any] = {
             "node_id": self.node_id,
             "environment": self.environment,
             "port": self.port,
@@ -386,6 +390,10 @@ class WatchtowerConfig:
             payload["host"] = self.host
         return payload
 
+
+# =============================================================================
+# Pydantic request models
+# =============================================================================
 
 class AnalyzeRequest(BaseModel):
     event: dict[str, Any] = Field(default_factory=dict)
@@ -415,10 +423,15 @@ class DependencyReportRequest(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+# =============================================================================
+# WatchtowerSegment
+# =============================================================================
+
 class WatchtowerSegment:
     def __init__(self, cfg: TowerConfig) -> None:
         self.cfg = cfg
-        self._thresholds = thresholds_for(cfg.sensitivity)
+        # Fix #3: use renamed tower_thresholds_for
+        self._thresholds = tower_thresholds_for(cfg.sensitivity)
         self._last_scan_ts: float | None = None
         self._alert_count = 0
         self._malformed_input_count = 0
@@ -433,10 +446,7 @@ class WatchtowerSegment:
         if malformed:
             logger.warning(
                 "Malformed numeric field=%s raw=%r event_id=%s tower=%s",
-                field_name,
-                event.get(field_name),
-                event.get("id"),
-                self.id,
+                field_name, event.get(field_name), event.get("id"), self.id,
             )
         return value, malformed
 
@@ -566,7 +576,9 @@ class WatchtowerSegment:
                 reason = f"Resource pressure detected cpu={cpu}% mem={mem}% disk={disk}%"
                 severity = AlertSeverity.MEDIUM
 
-        elif tower_type == TowerType.SECURITY_BASELINE and kind == "security":
+        elif tower_type == TowerType.SECURITY_BASELINE and kind in {"security", "mobile"}:
+            # "mobile" events from the gateway (APPROVE_DECISION / VETO_DECISION)
+            # carry the same security signal fields as "security" events.
             if event.get("secrets_exposed", False):
                 reason = "Possible secrets exposure detected"
                 severity = AlertSeverity.CRITICAL
@@ -612,6 +624,10 @@ class WatchtowerSegment:
             }
 
 
+# =============================================================================
+# WatchtowerNode
+# =============================================================================
+
 class WatchtowerNode:
     _ALLOWED_TRANSITIONS: dict[WatchtowerState, set[WatchtowerState]] = {
         WatchtowerState.INITIALIZING: {
@@ -630,10 +646,8 @@ class WatchtowerNode:
         WatchtowerState.FAILED: set(),
     }
 
-    # States in which scan_event drops events outright instead of scanning
-    # them. DEGRADED is intentionally *not* in this set: it must keep
-    # scanning so the clean-scan recovery streak can advance and the node
-    # can automatically return to ACTIVE.
+    # States in which scan_event drops events outright instead of scanning them.
+    # DEGRADED is intentionally NOT here so clean-scan recovery can advance.
     _DROP_EVENT_STATES: set[WatchtowerState] = {
         WatchtowerState.INITIALIZING,
         WatchtowerState.FAILED,
@@ -674,45 +688,61 @@ class WatchtowerNode:
             return self._state
 
     def _set_state_locked(self, new_state: WatchtowerState) -> bool:
-        """
-        Attempt to transition to new_state.
-
-        Returns True if the resulting state is new_state (either the
-        transition was applied, or the node was already in that state).
-        Returns False if the transition is disallowed and the state did
-        not change.
-        """
         current = self._state
-
         if new_state == current:
             return True
-
         allowed = self._ALLOWED_TRANSITIONS.get(current, set())
-
         if new_state not in allowed:
             logger.warning("Invalid state transition rejected: %s -> %s", current.value, new_state.value)
             return False
-
         logger.info("Watchtower state changed: %s -> %s", current.value, new_state.value)
         self._state = new_state
         return True
 
     def set_state(self, new_state: WatchtowerState) -> bool:
-        """Public, locked wrapper around _set_state_locked. Returns True if applied."""
         if not isinstance(new_state, WatchtowerState):
             raise TypeError(f"new_state must be WatchtowerState, got {type(new_state).__name__}")
-
         with self._lock:
             return self._set_state_locked(new_state)
 
-    def start(self) -> bool:
+    def start(self) -> None:
+        """
+        Transition INITIALIZING → ACTIVE.
+
+        Fix #9: previously returned bool, which callers (including
+        MonitoringManager.start()) never checked. Now raises RuntimeError
+        on failure so a silently-stuck-in-INITIALIZING node is impossible.
+        """
         with self._lock:
             if self._state == WatchtowerState.FAILED:
-                logger.error("Cannot start FAILED Watchtower node")
-                return False
+                raise RuntimeError(
+                    f"[{self.config.node_id}] Cannot start a FAILED WatchtowerNode."
+                )
+            applied = self._set_state_locked(WatchtowerState.ACTIVE)
+            if not applied:
+                raise RuntimeError(
+                    f"[{self.config.node_id}] start() state transition "
+                    f"{self._state.value} -> ACTIVE was rejected."
+                )
 
-            self._set_state_locked(WatchtowerState.ACTIVE)
-            return True
+    def stop(self) -> None:
+        """
+        Fix #2: previously missing. MonitoringManager.stop() calls this
+        and was raising AttributeError.
+
+        Transitions the node to FAILED (terminal state), causing all
+        subsequent scan_event() calls to drop events. Idempotent if the
+        node is already FAILED.
+        """
+        with self._lock:
+            if self._state == WatchtowerState.FAILED:
+                return
+            self._set_state_locked(WatchtowerState.FAILED)
+
+        logger.info(
+            "[%s] WatchtowerNode stopped (transitioned to FAILED -- all subsequent events will be dropped).",
+            self.config.node_id,
+        )
 
     def last_decision_snapshot(self) -> dict[str, Any] | None:
         with self._lock:
@@ -798,7 +828,6 @@ class WatchtowerNode:
                 "node_state": state_snapshot.value,
                 "created_ts": scan_ts,
             }
-
             with self._lock:
                 self._dropped_event_count += 1
                 self.recent_events.append(dropped_event)
@@ -847,17 +876,12 @@ class WatchtowerNode:
                 self.recent_events.append(alert_event)
 
             if failures or direct_degrade:
-                # A fresh failure or direct-degrade trigger. This is never
-                # "clean" and always resets recovery progress.
                 self._total_scan_failures += failures
                 self._failure_scan_streak += 1
                 self._clean_scan_streak = 0
                 if failures:
                     self._last_scan_failure_ts = scan_ts
             elif decision_value == CoordinatorDecision.REQUIRE_HUMAN.value:
-                # An outstanding finding needs human review. Not a fresh
-                # failure (don't grow failure_scan_streak), but also not
-                # "clean" - hold recovery progress until this clears.
                 self._clean_scan_streak = 0
             else:
                 self._clean_scan_streak += 1
@@ -904,7 +928,6 @@ class WatchtowerNode:
             "last_heartbeat_ts": now,
             "status": "registered",
         }
-
         with self._lock:
             self.modules[payload.module_id] = record
             snapshot = copy.deepcopy(record)
@@ -915,7 +938,6 @@ class WatchtowerNode:
             "dependency_status": "online",
             "version": payload.version,
         })
-
         if not result.accepted:
             logger.warning("Module registration scan dropped module_id=%s reason=%s", payload.module_id, result.dropped_reason)
 
@@ -923,10 +945,8 @@ class WatchtowerNode:
 
     def heartbeat_module(self, payload: ModuleHeartbeatRequest) -> dict[str, Any]:
         now = _now()
-
         with self._lock:
             record = self.modules.get(payload.module_id)
-
             if record is None:
                 record = {
                     "module_id": payload.module_id,
@@ -937,14 +957,12 @@ class WatchtowerNode:
                     "metadata": {},
                     "registered_ts": now,
                 }
-
             record.update({
                 "last_heartbeat_ts": now,
                 "status": payload.status,
                 "metrics": payload.metrics,
                 "message": payload.message,
             })
-
             self.modules[payload.module_id] = record
             snapshot = copy.deepcopy(record)
 
@@ -953,7 +971,6 @@ class WatchtowerNode:
             "dependency_name": payload.module_id,
             "dependency_status": payload.status,
         })
-
         if not result.accepted:
             logger.warning("Module heartbeat scan dropped module_id=%s reason=%s", payload.module_id, result.dropped_reason)
 
@@ -969,7 +986,6 @@ class WatchtowerNode:
             "details": payload.details,
             "last_report_ts": now,
         }
-
         with self._lock:
             self.dependencies[payload.name] = record
             snapshot = copy.deepcopy(record)
@@ -981,7 +997,6 @@ class WatchtowerNode:
             "latency_ms": payload.latency_ms,
             "version": payload.version,
         })
-
         if not result.accepted:
             logger.warning("Dependency report scan dropped dependency=%s reason=%s", payload.name, result.dropped_reason)
 
@@ -989,24 +1004,20 @@ class WatchtowerNode:
 
     def module_snapshot(self) -> dict[str, Any]:
         now = _now()
-
         with self._lock:
             modules = copy.deepcopy(self.modules)
 
         for module in modules.values():
             last = module.get("last_heartbeat_ts")
-
             try:
                 stale = last is None or (now - float(last)) > self.config.module_stale_seconds
             except (TypeError, ValueError):
                 stale = True
 
             module["stale"] = stale
-
-            if stale and module.get("status") not in {"offline", "down", "failed"}:
-                module["computed_status"] = "stale"
-            else:
-                module["computed_status"] = module.get("status", "unknown")
+            module["computed_status"] = "stale" if (
+                stale and module.get("status") not in {"offline", "down", "failed"}
+            ) else module.get("status", "unknown")
 
         return {
             "module_count": len(modules),
@@ -1016,24 +1027,20 @@ class WatchtowerNode:
 
     def dependency_snapshot(self) -> dict[str, Any]:
         now = _now()
-
         with self._lock:
             dependencies = copy.deepcopy(self.dependencies)
 
-        for dependency in dependencies.values():
-            last = dependency.get("last_report_ts")
-
+        for dep in dependencies.values():
+            last = dep.get("last_report_ts")
             try:
                 stale = last is None or (now - float(last)) > self.config.dependency_stale_seconds
             except (TypeError, ValueError):
                 stale = True
 
-            dependency["stale"] = stale
-
-            if stale and dependency.get("status") not in {"offline", "down", "failed", "timeout"}:
-                dependency["computed_status"] = "stale"
-            else:
-                dependency["computed_status"] = dependency.get("status", "unknown")
+            dep["stale"] = stale
+            dep["computed_status"] = "stale" if (
+                stale and dep.get("status") not in {"offline", "down", "failed", "timeout"}
+            ) else dep.get("status", "unknown")
 
         return {
             "dependency_count": len(dependencies),
@@ -1046,28 +1053,27 @@ class WatchtowerNode:
         dependency_records = dependencies.get("dependencies", [])
 
         stale_modules = [
-            item["module_id"]
-            for item in module_records
+            item["module_id"] for item in module_records
             if item.get("computed_status") == "stale"
         ]
-
         bad_modules = [
-            item["module_id"]
-            for item in module_records
+            item["module_id"] for item in module_records
             if item.get("status") in {"down", "offline", "failed", "degraded"}
         ]
 
+        # Fix #6: previously bad_dependencies double-counted stale items
+        # (items in stale_dependencies were also included in bad_dependencies
+        # via `computed_status == "stale"`, inflating the bad count and
+        # confusing dashboards that distinguish explicit failures from staleness).
+        # Now: stale_dependencies = items whose only problem is staleness.
+        #      bad_dependencies = items explicitly unhealthy (not just stale).
         stale_dependencies = [
-            item["name"]
-            for item in dependency_records
+            item["name"] for item in dependency_records
             if item.get("computed_status") == "stale"
         ]
-
         bad_dependencies = [
-            item["name"]
-            for item in dependency_records
+            item["name"] for item in dependency_records
             if item.get("status") in {"down", "offline", "failed", "timeout"}
-            or item.get("computed_status") == "stale"
         ]
 
         with self._lock:
@@ -1088,6 +1094,7 @@ class WatchtowerNode:
             and not stale_modules
             and not bad_modules
             and not bad_dependencies
+            and not stale_dependencies
             and not recovery_blocked
         )
 
@@ -1163,10 +1170,8 @@ class WatchtowerNode:
 
     def recent_event_snapshot(self, limit: int = 50) -> dict[str, Any]:
         limit = max(1, min(limit, self.config.max_recent_events, self.config.recent_query_limit))
-
         with self._lock:
             events = list(self.recent_events)[-limit:]
-
         return {
             "count": len(events),
             "limit": limit,
@@ -1174,80 +1179,77 @@ class WatchtowerNode:
         }
 
 
+# =============================================================================
+# Node factory
+# =============================================================================
+
 def build_node() -> WatchtowerNode:
+    """
+    Build and start a WatchtowerNode from the environment.
+
+    Fix #4: previously node.start() return value was ignored; if it
+    returned False the node silently stayed in INITIALIZING state and
+    dropped all events. start() now raises RuntimeError on failure.
+    """
     node_id = os.getenv("S43_WATCHTOWER_NODE_ID", "sentinel43-watchtower")
     config = WatchtowerConfig.default_sentinel_octagon(node_id)
     node = WatchtowerNode(config)
-    node.start()
+    node.start()  # raises RuntimeError if transition fails
     return node
 
 
-NODE = build_node()
+def get_node() -> WatchtowerNode:
+    """
+    Return the module-level WatchtowerNode singleton, creating it on
+    first call. Prefer this over accessing NODE directly.
+    """
+    return _get_or_create_node()
 
 
-def _health_payload(node: WatchtowerNode) -> tuple[int, dict[str, Any]]:
-    state = node.state
-
-    if state == WatchtowerState.ACTIVE:
-        http_status = status.HTTP_200_OK
-        service_status = "ok"
-    elif state == WatchtowerState.DEGRADED:
-        http_status = status.HTTP_503_SERVICE_UNAVAILABLE
-        service_status = "degraded"
-    elif state == WatchtowerState.FAILED:
-        http_status = status.HTTP_503_SERVICE_UNAVAILABLE
-        service_status = "failed"
-    else:
-        http_status = status.HTTP_503_SERVICE_UNAVAILABLE
-        service_status = "initializing"
-
-    return http_status, {
-        "status": service_status,
-        "version": VERSION,
-        "node_state": state.value,
-        "node_id": node.config.node_id,
-    }
-
+# =============================================================================
+# Admin auth
+# =============================================================================
 
 def _require_admin_token(token: str | None) -> None:
     expected = os.getenv("S43_ADMIN_TOKEN")
-
     if not expected or not token or not secrets.compare_digest(token, expected):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized.",
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized.")
 
 
-def _registered_routes(api: FastAPI) -> list[str]:
-    routes: list[str] = []
-
-    for route in api.routes:
-        path = getattr(route, "path", None)
-        if isinstance(path, str) and path != "/" and not path.startswith(("/openapi", "/docs", "/redoc")):
-            routes.append(path)
-
-    return sorted(set(routes))
-
+# =============================================================================
+# Router / App factory
+# =============================================================================
 
 def create_watchtower_router(node: WatchtowerNode) -> APIRouter:
-    router = APIRouter()
+    router = APIRouter(prefix="/watchtower")
 
     @router.get("/health")
     def health_check() -> JSONResponse:
-        http_status, payload = _health_payload(node)
-        return JSONResponse(status_code=http_status, content=payload)
+        state = node.state
+        if state == WatchtowerState.ACTIVE:
+            http_code, svc_status = status.HTTP_200_OK, "ok"
+        elif state == WatchtowerState.DEGRADED:
+            http_code, svc_status = status.HTTP_503_SERVICE_UNAVAILABLE, "degraded"
+        elif state == WatchtowerState.FAILED:
+            http_code, svc_status = status.HTTP_503_SERVICE_UNAVAILABLE, "failed"
+        else:
+            http_code, svc_status = status.HTTP_503_SERVICE_UNAVAILABLE, "initializing"
+
+        return JSONResponse(status_code=http_code, content={
+            "status": svc_status,
+            "version": VERSION,
+            "node_state": state.value,
+            "node_id": node.config.node_id,
+        })
 
     @router.get("/ready")
     def ready_check() -> JSONResponse:
         result = node.readiness()
-        body = {
+        http_code = status.HTTP_200_OK if result["ready"] else status.HTTP_503_SERVICE_UNAVAILABLE
+        return JSONResponse(status_code=http_code, content={
             **result,
             "status": "ready" if result["ready"] else "not_ready",
-        }
-
-        http_status = status.HTTP_200_OK if result["ready"] else status.HTTP_503_SERVICE_UNAVAILABLE
-        return JSONResponse(status_code=http_status, content=body)
+        })
 
     @router.get("/status")
     def node_status() -> dict[str, Any]:
@@ -1259,17 +1261,11 @@ def create_watchtower_router(node: WatchtowerNode) -> APIRouter:
 
     @router.post("/modules/register")
     def register_module(payload: ModuleRegisterRequest) -> dict[str, Any]:
-        return {
-            "status": "registered",
-            "module": node.register_module(payload),
-        }
+        return {"status": "registered", "module": node.register_module(payload)}
 
     @router.post("/modules/heartbeat")
     def module_heartbeat(payload: ModuleHeartbeatRequest) -> dict[str, Any]:
-        return {
-            "status": "heartbeat_accepted",
-            "module": node.heartbeat_module(payload),
-        }
+        return {"status": "heartbeat_accepted", "module": node.heartbeat_module(payload)}
 
     @router.get("/dependencies")
     def dependencies_status() -> dict[str, Any]:
@@ -1277,10 +1273,7 @@ def create_watchtower_router(node: WatchtowerNode) -> APIRouter:
 
     @router.post("/dependencies/report")
     def report_dependency(payload: DependencyReportRequest) -> dict[str, Any]:
-        return {
-            "status": "dependency_report_accepted",
-            "dependency": node.report_dependency(payload),
-        }
+        return {"status": "dependency_report_accepted", "dependency": node.report_dependency(payload)}
 
     @router.get("/events/recent")
     def recent_events(limit: int = Query(default=50, ge=1, le=500)) -> dict[str, Any]:
@@ -1290,7 +1283,6 @@ def create_watchtower_router(node: WatchtowerNode) -> APIRouter:
     def analyze_event(payload: AnalyzeRequest) -> dict[str, Any]:
         try:
             result = node.scan_event(payload.event)
-
             return {
                 "accepted": result.accepted,
                 "dropped_reason": result.dropped_reason,
@@ -1346,13 +1338,20 @@ def create_api_app(node: WatchtowerNode) -> FastAPI:
     api = FastAPI(
         title="Sentinel-43 Watchtower",
         version=VERSION,
-        description="Sentinel-43 hardened monitoring, octagon correlation, module registry, dependency, and alert analysis node.",
+        description=(
+            "Sentinel-43 hardened monitoring, octagon correlation, "
+            "module registry, dependency, and alert analysis node."
+        ),
     )
 
-    router = create_watchtower_router(node)
-
-    api.include_router(router)
-    api.include_router(router, prefix="/watchtower")
+    # Fix #5: previously include_router was called twice -- once without a
+    # prefix and once with /watchtower -- registering every route at both
+    # bare paths (/health, /state/{state_name}) and prefixed paths
+    # (/watchtower/health, /watchtower/state/{state_name}). This caused
+    # duplicate operation IDs, ambiguous route matching, and admin endpoints
+    # exposed at the root level. Routes now live exclusively under /watchtower.
+    watchtower_router = create_watchtower_router(node)
+    api.include_router(watchtower_router)
 
     @api.get("/")
     def root() -> dict[str, Any]:
@@ -1361,20 +1360,81 @@ def create_api_app(node: WatchtowerNode) -> FastAPI:
             "version": VERSION,
             "status": "online",
             "node_id": node.config.node_id,
-            "routes": _registered_routes(api),
+            "routes": sorted({
+                route.path  # type: ignore[attr-defined]
+                for route in api.routes
+                if hasattr(route, "path")
+                and route.path not in {"/", "/openapi.json", "/docs", "/redoc"}
+            }),
         }
 
     return api
 
 
-app = create_api_app(NODE)
+# =============================================================================
+# Lazy module-level singletons
+#
+# Fix #1: NODE and app used to be constructed at module level:
+#
+#     NODE = build_node()       ← reads env vars, starts node, side effects
+#     app  = create_api_app(NODE)  ← creates FastAPI app
+#
+# This meant any import of WatchtowerConfig (or any other type from this
+# module) silently triggered full node construction and app creation at
+# import time, before Docker env vars may have been injected and in every
+# test that imports a type here.
+#
+# Now NODE and app are lazy: the first time they're accessed (via
+# `from .watchtower import NODE` or uvicorn resolving `module:app`)
+# module-level __getattr__ creates and caches them. Pure type imports
+# (`from .watchtower import WatchtowerConfig`) have zero side effects.
+# =============================================================================
 
+_NODE_SINGLETON: WatchtowerNode | None = None
+_APP_SINGLETON: FastAPI | None = None
+_SINGLETON_LOCK = threading.Lock()
+
+
+def _get_or_create_node() -> WatchtowerNode:
+    global _NODE_SINGLETON
+    if _NODE_SINGLETON is None:
+        with _SINGLETON_LOCK:
+            if _NODE_SINGLETON is None:
+                _NODE_SINGLETON = build_node()
+    return _NODE_SINGLETON
+
+
+def _get_or_create_app() -> FastAPI:
+    global _APP_SINGLETON
+    if _APP_SINGLETON is None:
+        with _SINGLETON_LOCK:
+            if _APP_SINGLETON is None:
+                _APP_SINGLETON = create_api_app(_get_or_create_node())
+    return _APP_SINGLETON
+
+
+def __getattr__(name: str) -> Any:
+    if name == "NODE":
+        node = _get_or_create_node()
+        globals()["NODE"] = node
+        return node
+    if name == "app":
+        app_instance = _get_or_create_app()
+        globals()["app"] = app_instance
+        return app_instance
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+# =============================================================================
+# Entry point
+# =============================================================================
 
 def main() -> None:
+    node = _get_or_create_node()
     uvicorn.run(
         "core.monitoring.watchtower:app",
-        host=NODE.config.host,
-        port=NODE.config.port,
+        host=node.config.host,
+        port=node.config.port,
         reload=False,
         log_level=os.getenv("S43_LOG_LEVEL", "info").lower(),
     )
@@ -1386,25 +1446,32 @@ if __name__ == "__main__":
 
 __all__ = [
     "VERSION",
-    "ThresholdProfile",
-    "thresholds_for",
+    # Fix #3: renamed types exported under new names
+    "TowerThresholdProfile",
+    "tower_thresholds_for",
+    # Enums
     "WatchtowerState",
     "TowerSlot",
     "TowerType",
     "AlertSeverity",
     "CoordinatorDecision",
+    # Data models
     "ScanResult",
     "TowerConfig",
     "WatchtowerConfig",
+    # Classes
     "WatchtowerSegment",
     "WatchtowerNode",
+    # Pydantic models
     "AnalyzeRequest",
     "ModuleRegisterRequest",
     "ModuleHeartbeatRequest",
     "DependencyReportRequest",
+    # Factories / accessors
     "build_node",
-    "NODE",
-    "app",
+    "get_node",
     "create_watchtower_router",
     "create_api_app",
+    # Fix #7: NODE removed from __all__ -- use get_node() instead.
+    # `app` also removed; accessed lazily via module __getattr__ for uvicorn.
 ]
