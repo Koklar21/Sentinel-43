@@ -36,6 +36,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
@@ -43,30 +44,20 @@ import traceback
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, Union
+from typing import Any, Dict, Optional, Union
 
-from .event_types import BaseEvent, normalize_event
+from .event_types import BaseEvent, MobileEvent, normalize_event, to_event_context
 from .watchtower import WatchtowerConfig, WatchtowerNode
 
 
+logger = logging.getLogger("SentinelMonitoringManager")
+
 WATCHTOWER_URL = os.getenv("S43_WATCHTOWER_URL", "http://s43-watchtower:9100").rstrip("/")
 MANAGER_MODULE_ID = os.getenv("S43_MONITORING_MANAGER_ID", "sentinel43-monitoring-manager")
-
-# Fix #6: prefer the S43_* naming convention used by every other constant in
-# this module, but fall back to the legacy SENTINEL_VERSION name for
-# backwards compatibility with existing deployments.
 MANAGER_VERSION = os.getenv("S43_MANAGER_VERSION", os.getenv("SENTINEL_VERSION", "0.1.0"))
 
 
 def _float_env(name: str, default: float) -> float:
-    """
-    Fix #5: previously WATCHTOWER_TIMEOUT = float(os.getenv(...)) was an
-    unguarded cast performed at import time. An invalid value for the env
-    var would raise ValueError and crash the entire module on import.
-
-    This helper falls back to the provided default (and logs a warning to
-    stderr) if the env var is missing or not a valid float.
-    """
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -74,19 +65,14 @@ def _float_env(name: str, default: float) -> float:
     try:
         return float(raw)
     except ValueError:
-        print(
-            f"[monitoring_manager] WARNING: invalid value {raw!r} for {name}, "
-            f"falling back to default {default}",
+        logger.warning(
+            "[monitoring_manager] invalid value %r for %s, falling back to %s",
+            raw, name, default,
         )
         return default
 
 
 WATCHTOWER_TIMEOUT = _float_env("S43_WATCHTOWER_TIMEOUT", 2.0)
-
-# Fix #3: when registration with Watchtower fails, don't retry it on every
-# single analyze_event() call -- that turns every monitored event into a
-# blocking network round trip while Watchtower is down. Instead, back off
-# for this many seconds between registration attempts.
 REGISTRATION_RETRY_SECONDS = _float_env("S43_REGISTRATION_RETRY_SECONDS", 30.0)
 
 
@@ -104,16 +90,6 @@ def _watchtower_request(
     headers = {"Content-Type": "application/json"}
 
     if payload is not None:
-        # Fix #1 (part 1): json.dumps() used to be called outside of any
-        # try/except. A non-serializable value anywhere in `payload`
-        # (e.g. a datetime object nested inside node status/alerts) raised
-        # an uncaught TypeError here that propagated all the way up into
-        # start() / analyze_event(), where it was caught by their broad
-        # `except Exception` blocks and misreported as a start/scan
-        # failure -- discarding real results in the process.
-        #
-        # Serialization failures are now contained to this function and
-        # reported the same way as any other Watchtower-unreachable error.
         try:
             data = json.dumps(payload).encode("utf-8")
         except (TypeError, ValueError) as exc:
@@ -166,26 +142,66 @@ class MonitoringManager:
     High-level orchestration layer for Sentinel monitoring.
     Keeps the rest of the system from depending on Watchtower internals.
     Reports manager lifecycle, scan failures, and degraded states to the primary Watchtower.
+
+    Window store / threat detector integration
+    ------------------------------------------
+    If a SentinelWindowStore and threat_detector are supplied, analyze_event()
+    will:
+      1. Convert the normalized event to an EventContext via to_event_context()
+      2. Add it to the window store's rolling buffer for (identity, ip)
+      3. Build a SequenceWindow snapshot for the threat detector
+      4. Score the window and include the result in the returned dict
+
+    source_ip is required for window store population and must be supplied by
+    the gateway / request handler -- it is never read from the event payload
+    itself, to avoid trusting client-supplied IPs. For MobileEvent, source_ip
+    is already on the event (set at the gateway before construction) so the
+    kwarg may be omitted, but supplying it explicitly is also fine.
     """
 
-    def __init__(self, config: WatchtowerConfig):
+    def __init__(
+        self,
+        config: WatchtowerConfig,
+        *,
+        window_store: Optional[Any] = None,
+        threat_detector: Optional[Any] = None,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        config:
+            WatchtowerConfig for the embedded WatchtowerNode.
+        window_store:
+            Optional SentinelWindowStore instance. When supplied, every
+            successfully normalized event is added to the rolling window
+            buffer so that temporal threat patterns accumulate over time.
+            Type: SentinelWindowStore (from sentinel_43_ai or local package).
+        threat_detector:
+            Optional threat detector with a .score(window: SequenceWindow)
+            method. Requires window_store to be set -- if window_store is
+            None this parameter is ignored.
+            Type: whatever the sentinel_43_ai detector exposes.
+        """
         self.node = WatchtowerNode(config)
+
+        # Window store + threat detector are optional; the manager degrades
+        # gracefully to pure Watchtower-only monitoring if they're absent.
+        self._window_store = window_store
+        self._threat_detector = threat_detector
+
+        if threat_detector is not None and window_store is None:
+            logger.warning(
+                "MonitoringManager: threat_detector supplied without a "
+                "window_store -- threat scoring will be skipped. Pass a "
+                "SentinelWindowStore instance to enable it."
+            )
+
         self._registered = False
         self._last_error: dict[str, Any] | None = None
         self._scan_count = 0
         self._alert_count = 0
         self._failure_count = 0
-
-        # Fix #3: tracks when we're allowed to retry registration again
-        # after a failure, to avoid hammering Watchtower (and blocking the
-        # scan hot path) on every single call while it's unreachable.
         self._next_registration_attempt = 0.0
-
-        # Fix #4: counters and registration/error state are mutated from
-        # analyze_event(), start(), stop(), and the various _report_*
-        # helpers, any of which may be invoked concurrently (e.g. from
-        # multiple FastAPI request handlers sharing one MonitoringManager
-        # instance). Guard all mutations/reads of shared state with a lock.
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -199,25 +215,32 @@ class MonitoringManager:
 
             now = time.monotonic()
             if now < self._next_registration_attempt:
-                # Still within backoff window from a previous failed
-                # registration attempt -- skip the network call entirely.
                 return
+
+        capabilities = [
+            "watchtower_orchestration",
+            "event_normalization",
+            "event_analysis",
+            "alert_counting",
+            "scan_failure_reporting",
+            "manager_status_reporting",
+        ]
+
+        if self._window_store is not None:
+            capabilities.append("rolling_window_store")
+        if self._threat_detector is not None:
+            capabilities.append("threat_scoring")
 
         payload = {
             "module_id": MANAGER_MODULE_ID,
             "module_type": "monitoring-manager",
             "version": MANAGER_VERSION,
             "endpoint": None,
-            "capabilities": [
-                "watchtower_orchestration",
-                "event_normalization",
-                "event_analysis",
-                "alert_counting",
-                "scan_failure_reporting",
-                "manager_status_reporting",
-            ],
+            "capabilities": capabilities,
             "metadata": {
                 "timestamp": utc_now(),
+                "window_store_enabled": self._window_store is not None,
+                "threat_detector_enabled": self._threat_detector is not None,
             },
         }
 
@@ -236,10 +259,6 @@ class MonitoringManager:
         event: str,
         details: dict[str, Any] | None = None,
     ) -> None:
-        # Fix #1 (part 2): _report_* helpers are best-effort telemetry.
-        # They must never raise into start()/analyze_event(), or a
-        # telemetry hiccup (network blip, serialization issue, etc.) gets
-        # misreported as a failure of the actual operation being performed.
         try:
             self._register_if_needed()
 
@@ -280,7 +299,6 @@ class MonitoringManager:
         status: str,
         details: dict[str, Any] | None = None,
     ) -> None:
-        # Fix #1 (part 2): see _report_dependency -- this must never raise.
         try:
             self._register_if_needed()
 
@@ -317,6 +335,69 @@ class MonitoringManager:
                 }
 
     # ------------------------------------------------------------------
+    # Window store helpers
+    # ------------------------------------------------------------------
+
+    def _populate_window(
+        self,
+        normalized: BaseEvent,
+        source_ip: Optional[str],
+    ) -> Optional[Any]:
+        """
+        Add the normalized event to the rolling window store and return the
+        resulting SequenceWindow for threat scoring. Returns None if the
+        window store is not configured, source_ip is unavailable, or
+        population fails for any reason.
+
+        This is best-effort -- any exception is logged and suppressed so
+        that window store errors never fail or slow down the scan path.
+        """
+        if self._window_store is None:
+            return None
+
+        # For MobileEvent, source_ip is already on the event (set at the
+        # gateway before construction). For all other event types the caller
+        # must supply it explicitly.
+        effective_ip: Optional[str] = (
+            getattr(normalized, "source_ip", None) or source_ip
+        )
+
+        if not effective_ip:
+            logger.debug(
+                "Window store skipped for event id=%s kind=%s: "
+                "source_ip not available. Supply it via analyze_event(source_ip=...)",
+                normalized.id, normalized.kind,
+            )
+            return None
+
+        try:
+            ctx = to_event_context(normalized, source_ip=effective_ip)
+            self._window_store.add_event(ctx)
+            return self._window_store.build_window(ctx.source_identity, effective_ip)
+
+        except Exception as exc:
+            logger.warning(
+                "Window store population failed for event id=%s kind=%s: %s",
+                normalized.id, normalized.kind, exc,
+            )
+            return None
+
+    def _score_window(self, window: Optional[Any]) -> Optional[float]:
+        """
+        Run the threat detector over the SequenceWindow and return a score.
+        Returns None if no detector is configured or scoring fails.
+        Best-effort -- never raises.
+        """
+        if self._threat_detector is None or window is None:
+            return None
+
+        try:
+            return float(self._threat_detector.score(window))
+        except Exception as exc:
+            logger.warning("Threat detector scoring failed: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
@@ -341,27 +422,64 @@ class MonitoringManager:
 
             raise
 
-        # Reporting success is best-effort telemetry and must not affect
-        # the outcome of start() itself -- node.start() already succeeded
-        # by this point regardless of whether this report goes through.
         self._report_dependency(
             status="online",
             event="monitoring_manager_started",
             details={
                 "node_status": self.node.get_status(),
+                "window_store_enabled": self._window_store is not None,
+                "threat_detector_enabled": self._threat_detector is not None,
             },
         )
 
-    def analyze_event(self, event: Union[Dict[str, Any], BaseEvent]) -> Dict[str, Any]:
+    def analyze_event(
+        self,
+        event: Union[Dict[str, Any], BaseEvent],
+        *,
+        source_ip: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Normalize, scan, and optionally score an event.
+
+        Parameters
+        ----------
+        event:
+            A raw event dict or a typed BaseEvent subclass.
+        source_ip:
+            The client IP address, extracted from the request by the gateway
+            layer (e.g. X-Forwarded-For header). Required for window store
+            population for non-MobileEvent types. For MobileEvent, the IP is
+            already on the event and this kwarg may be omitted.
+
+        Returns
+        -------
+        {
+            "alerts":       list of alert dicts from the Watchtower scan,
+            "alert_count":  int,
+            "threat_score": float | None,  -- None if window store / detector
+                                              not configured or unavailable
+        }
+        """
         self._register_if_needed()
 
         try:
+            # Normalize to a typed BaseEvent first so both the window store
+            # (which needs the object) and the Watchtower scan (which needs
+            # the dict) can share the same normalization pass.
             if isinstance(event, BaseEvent):
-                payload = event.to_dict()
+                normalized = event
             else:
-                payload = normalize_event(event).to_dict()
+                normalized = normalize_event(event)
 
-            alerts = self.node.scan_event(payload)
+            scan_payload = normalized.to_dict()
+
+            # Window population + threat scoring are best-effort and must
+            # not affect the outcome of the Watchtower scan below.
+            window = self._populate_window(normalized, source_ip)
+            threat_score = self._score_window(window)
+
+            alerts = self.node.scan_event(scan_payload)
+
         except Exception as exc:
             with self._lock:
                 self._failure_count += 1
@@ -382,9 +500,6 @@ class MonitoringManager:
             self._scan_count += 1
             self._alert_count += len(alerts)
 
-        # Reporting alerts to Watchtower is best-effort telemetry and must
-        # not prevent the caller from receiving the (already-successful)
-        # scan results.
         if alerts:
             self._report_event(
                 kind="runtime",
@@ -393,12 +508,14 @@ class MonitoringManager:
                     "event": "monitoring_alerts_generated",
                     "alert_count": len(alerts),
                     "alerts": alerts,
+                    "threat_score": threat_score,
                 },
             )
 
         return {
             "alerts": alerts,
             "alert_count": len(alerts),
+            "threat_score": threat_score,
         }
 
     def get_status(self) -> Dict[str, Any]:
@@ -421,6 +538,8 @@ class MonitoringManager:
                 "failure_count": failure_count,
                 "last_error": last_error,
                 "timestamp": utc_now(),
+                "window_store_enabled": self._window_store is not None,
+                "threat_detector_enabled": self._threat_detector is not None,
             },
             "watchtower_node": status,
         }
@@ -431,9 +550,6 @@ class MonitoringManager:
             final_alert_count = self._alert_count
             final_failure_count = self._failure_count
 
-        # Fix #2: previously stop() only sent a "going offline" telemetry
-        # report and never actually stopped the underlying WatchtowerNode,
-        # leaving it running after the manager reported itself offline.
         node_stop_error: str | None = None
         try:
             self.node.stop()
