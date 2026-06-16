@@ -186,7 +186,7 @@ let refreshPromise   = null;
 let pollTimer        = null;
 let kbToastTimer     = null;
 let injectInFlight   = false;
-let wsConnected      = false; // updated by sentinel:ws:* events from websocket.js
+let wsConnected      = false; // set true only after server sends "connected" (post-auth)
 let isLight          = false;
 
 // =============================================================================
@@ -1234,16 +1234,18 @@ function startPollingFallback() {
 // WebSocket Event Listeners  (driven by websocket.js via sentinel:ws:* events)
 // =============================================================================
 
+// Socket is open but NOT yet authenticated. Do not promote to Live or set
+// wsConnected here — the server will send auth_required first, and the
+// sentinel:ws:message "connected" case promotes to Live after auth succeeds.
 window.addEventListener("sentinel:ws:open", () => {
-    wsConnected = true;
-    setStatus("Live");
-    log("WebSocket connected. Live queue updates enabled.", "ok");
+    setStatus("Authenticating");
+    log("WebSocket connected. Awaiting auth handshake.", "info");
 });
 
 window.addEventListener("sentinel:ws:close", () => {
     wsConnected = false;
     setStatus("Reconnecting");
-    log("WebSocket disconnected. HTTP polling remains active.", "warn");
+    log("WebSocket disconnected. Polling fallback remains active.", "warn");
 });
 
 window.addEventListener("sentinel:ws:reconnecting", event => {
@@ -1282,8 +1284,12 @@ window.addEventListener("sentinel:ws:message", event => {
     const {type, payload} = event.detail;
 
     switch (type) {
+        // Server has completed the auth handshake and the session is live.
+        // This is the correct place to promote status — not on socket open.
         case "connected":
-            log("WebSocket server acknowledged connection.", "ok");
+            wsConnected = true;
+            setStatus("Live");
+            log("WebSocket authenticated. Live queue updates enabled.", "ok");
             break;
 
         case "subscribed":
@@ -1328,7 +1334,20 @@ window.addEventListener("sentinel:ws:message", event => {
             log(`WebSocket server error: ${normalizeString(payload.error, "unknown")}`, "err");
             break;
 
-        case "auth_required":
+        // Server is requesting an auth frame as the first message. Send the
+        // token via websocket.js. If no token is available, disconnect
+        // immediately rather than looping — the server will close anyway.
+        case "auth_required": {
+            const token = getDevToken();
+            if (token) {
+                window.SentinelWS?.sendAuth?.(token);
+            } else {
+                log("WebSocket auth required but no JWT token is available. Disconnecting.", "err");
+                window.SentinelWS?.disconnect?.();
+            }
+            break;
+        }
+
         case "pong":
         case "unsubscribed":
             // Handled by websocket.js internally — nothing to do here.
