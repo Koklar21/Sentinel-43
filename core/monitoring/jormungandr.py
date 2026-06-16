@@ -34,7 +34,7 @@
 # =============================================================================
 
 """
-Sentinel-43 Jormungandr v2.3 — Cryptographic Security Node
+Sentinel-43 Jormungandr v2.4 — Cryptographic Security Node
 
 AEAD encrypted audit storage with:
 
@@ -72,7 +72,7 @@ import threading
 import uuid
 from collections import deque
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -121,6 +121,17 @@ class JormungandrCryptoError(JormungandrError):
 
 class JormungandrConfigError(JormungandrError):
     """Raised for invalid configuration."""
+
+
+# =============================================================================
+# Monitoring manager interface
+# =============================================================================
+
+@runtime_checkable
+class MonitoringManagerProtocol(Protocol):
+    """Structural interface expected of any monitoring_manager passed to JormungandrNode."""
+
+    def analyze_event(self, event: dict[str, Any]) -> None: ...
 
 
 # =============================================================================
@@ -365,7 +376,7 @@ class JormungandrNode:
         config: JormungandrConfig | None = None,
         *,
         root_key: bytes | None = None,
-        monitoring_manager: Any | None = None,
+        monitoring_manager: MonitoringManagerProtocol | None = None,
     ) -> None:
         self._config = config or JormungandrConfig()
         self._monitoring_manager = monitoring_manager
@@ -548,6 +559,7 @@ class JormungandrNode:
                 "severity": rec.severity,
                 "posture": rec.posture,
                 "epoch": rec.epoch,
+                "node_uuid": rec.node_uuid,
                 "payload": rec.payload,
                 "prev_hash": prev_hash,
             },
@@ -665,7 +677,10 @@ class JormungandrNode:
             message = f"Source: {source} | {description}"
             encrypt = False
         else:
-            message = "Source: [REDACTED] | " + description
+            # Source and description are both preserved inside the ciphertext so
+            # FORENSIC-mode decryption can recover the full record.  Console
+            # output is separately redacted by _console_log.
+            message = f"Source: {source} | {description}"
             encrypt = True
 
         self._record("THREAT", message, severity, encrypt)
@@ -878,12 +893,15 @@ class JormungandrNode:
                 for record in self._threat_log
             ]
             status_snapshot = dict(self.system_status)
+            # Call get_summary() while still holding _lock (RLock allows re-entry)
+            # so the counts it reports are consistent with the lists above.
+            summary = self.get_summary()
 
         return {
             "events": events,
             "threats": threats,
             "system_status": status_snapshot,
-            "summary": self.get_summary(),
+            "summary": summary,
         }
 
     def verify_chain(self, log: str = "events", mode: str = "window") -> dict[str, Any]:
@@ -953,6 +971,8 @@ class JormungandrNode:
             except queue.Full:
                 pass
             worker.join(timeout=2.0)
+            if worker.is_alive():
+                logger.warning("JormungandrNode: monitoring worker did not stop within 2 s.")
 
     def __enter__(self) -> "JormungandrNode":
         return self
@@ -968,7 +988,7 @@ class JormungandrNode:
 def build_jormungandr(
     *,
     root_key: bytes | None = None,
-    monitoring_manager: Any | None = None,
+    monitoring_manager: MonitoringManagerProtocol | None = None,
 ) -> JormungandrNode:
     config = JormungandrConfig.from_env()
     return JormungandrNode(
@@ -986,6 +1006,7 @@ __all__ = [
     "JormungandrError",
     "JormungandrNode",
     "Mode",
+    "MonitoringManagerProtocol",
     "Posture",
     "aead_decrypt",
     "aead_encrypt",
@@ -1006,7 +1027,7 @@ if __name__ == "__main__":
 
     node = JormungandrNode(JormungandrConfig(mode=Mode.FORENSIC, retain_epochs=6))
     try:
-        print("--- INITIALIZING JORMUNGANDR v2.3 ---")
+        print("--- INITIALIZING JORMUNGANDR v2.4 ---")
         print(json.dumps(node.get_summary(), indent=2))
 
         print("\n--- SIMULATING LOW/MED THREATS ---")
