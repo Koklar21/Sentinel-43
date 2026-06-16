@@ -34,64 +34,98 @@
 # =============================================================================
 
 """
-Sentinel-43 Application-Layer Middleware Package
+Sentinel-43 API Middleware Package
 
-This package exposes the FastAPI/Starlette middleware components that sit
-in front of every route in the S43 API layer.
+This package exposes FastAPI/Starlette middleware components used by the
+Sentinel-43 API layer.
 
-Exports
--------
+Physical layout
+---------------
+    core/api/middleware/__init__.py
+    core/api/middleware/sentinel_firewall_middleware.py
+    core/api/middleware/request_context.py
+
+Primary exports
+---------------
 SentinelFirewall
-    Application-layer firewall middleware. Enforces IP allowlist/blocklist,
-    per-IP rate limiting, request size limits, and path blocking. Routes
-    blocked-request events to MonitoringManager for Watchtower alerting and
-    SentinelWindowStore threat scoring.
+    Application-layer ASGI firewall middleware.
 
 FirewallConfig
-    Immutable frozen-dataclass configuration for SentinelFirewall.
-    Build from environment variables via FirewallConfig.from_env()
-    (reads S43_FIREWALL_* vars) or construct directly.
+    Configuration object for SentinelFirewall.
 
 BlockReason
-    String constants for firewall block reason codes used in monitoring
-    events and HTTP error responses:
-        ip_blocked, ip_not_in_allowlist, rate_limited,
-        payload_too_large, path_blocked.
+    Firewall block reason enum/string constants.
+
+create_request_context_middleware
+    Request context middleware factory. Adds/echoes X-Request-ID and attaches
+    request.state.request_id.
 
 Typical usage in core/api/main.py
-----------------------------------
-    from core.middleware import SentinelFirewall, FirewallConfig
+---------------------------------
+    from core.api.middleware import (
+        FirewallConfig,
+        SentinelFirewall,
+        create_request_context_middleware,
+    )
+
+    app.add_middleware(create_request_context_middleware())
 
     app.add_middleware(
         SentinelFirewall,
-        config=FirewallConfig.from_env(),
-        monitoring_manager=_monitoring_manager,   # optional
+        config=FirewallConfig(),
+        monitoring_manager=monitoring_manager,
     )
 
-Note on other security components
-----------------------------------
-SpartaCore (file-integrity watchdog) and JormungandrNode (cryptographic
-audit node) live in their own packages and are exported from
-core.monitoring, not here:
+Compatibility note
+------------------
+The firewall module was intentionally named:
 
-    from core.monitoring import SpartaCore, IntegrityConfig, create_node_router
-    from core.monitoring import JormungandrNode, JormungandrConfig, build_jormungandr
+    sentinel_firewall_middleware.py
 
-Keeping middleware separate from monitoring avoids duplicate module loads
-(which would cause isinstance checks to fail across import paths) and
-matches the physical file layout:
+instead of:
 
-    core/middleware/sentinel_firewall.py   ← this package
-    core/monitoring/sparta_core.py         ← core.monitoring
-    core/audit/jormungandr.py              ← core.monitoring (lazy export)
+    sentinel_firewall.py
+
+so Pylance does not get clever and start chewing the furniture. The exported
+public names stay clean:
+
+    SentinelFirewall
+    FirewallConfig
+    BlockReason
 """
 
 from __future__ import annotations
 
-from .sentinel_firewall import BlockReason, FirewallConfig, SentinelFirewall
+try:
+    from .sentinel_firewall_middleware import (
+        BlockReason,
+        FirewallConfig,
+        SentinelFirewall,
+    )
+except ImportError as exc:  # pragma: no cover
+    raise ImportError(
+        "core.api.middleware: failed to import SentinelFirewall from "
+        "core.api.middleware.sentinel_firewall_middleware. Ensure the file "
+        "exists and defines BlockReason, FirewallConfig, and SentinelFirewall."
+    ) from exc
+
+
+try:
+    from .request_context import (
+        X_REQUEST_ID,
+        create_request_context_middleware,
+    )
+except ImportError:
+    # Request context middleware is useful but should not prevent firewall import
+    # during early beta wiring.
+    X_REQUEST_ID = "X-Request-ID"  # type: ignore[assignment]
+    create_request_context_middleware = None  # type: ignore[assignment]
+
 
 __all__ = [
-    "SentinelFirewall",
-    "FirewallConfig",
     "BlockReason",
+    "FirewallConfig",
+    "SentinelFirewall",
+    "X_REQUEST_ID",
+    "create_request_context_middleware",
 ]
