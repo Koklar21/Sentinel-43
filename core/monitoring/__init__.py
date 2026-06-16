@@ -38,12 +38,25 @@ Sentinel-43 Monitoring Package
 
 Safe public exports for the monitoring layer.
 
-Core Watchtower and event-type exports are loaded eagerly.
-Optional/heavyweight exports (rules registry, MonitoringManager, window
-store, remote gateway wiring) are loaded lazily through __getattr__ so
-failed imports from optional packages (e.g. sentinel_43_ai) do not create
-fake None objects in the package namespace or break the whole monitoring
-package for callers that don't need those features.
+Eager exports (always available on import):
+  - Watchtower core: WatchtowerNode, WatchtowerConfig, ScanResult, etc.
+  - ThresholdProfile / thresholds_for (resolved via fallback chain)
+  - Event types: BaseEvent, MobileEvent, to_event_context, normalize_event, etc.
+  - Exceptions: MonitoringError, EventNormalizationError, etc.
+
+Lazy exports (loaded on first access, optional dependencies gracefully absent):
+  - RuleRegistry, registry         (.rules_engine / .rules)
+  - MonitoringManager              (.monitoring_manager / .manager)
+  - SentinelWindowStore,           (.window_store /
+    SentinelWindowConfig            sentinel_43_ai.detection.window_store)
+  - set_monitoring_manager         (.remote_gateway)
+  - SpartaCore, IntegrityConfig,   (.sparta_core)
+    create_node_router
+  - SentinelFirewall, FirewallConfig  (..middleware.sentinel_firewall)
+
+Lazy exports degrade to ImportWarning + AttributeError when their source
+module or an optional dependency (sentinel_43_ai, starlette) is unavailable,
+rather than crashing the entire monitoring package at import time.
 """
 
 from __future__ import annotations
@@ -86,17 +99,19 @@ except ImportError as exc:
 
 
 # =============================================================================
-# ThresholdProfile / thresholds_for -- fallback resolution
+# ThresholdProfile / thresholds_for — fallback resolution
 #
-# These were previously imported unconditionally from .watchtower, but per
-# the rules-engine review they are actually defined there -- if watchtower.py
-# doesn't independently re-export them that import takes down the whole
-# package with no fault isolation.
+# Two separate ThresholdProfile types exist in the codebase:
+#   - watchtower.TowerThresholdProfile  (numeric dataclass, internal)
+#   - rules_engine.ThresholdProfile     (DEV/TEST/PROD enum, public API)
 #
-# Also fixed: the original loop used `del _exc` after the loop body, which
-# raises NameError if the first candidate succeeds (no exception is ever
-# caught, so _exc is never assigned). Resolved by scoping the loop inside a
-# helper function so no temporaries leak into the module namespace at all.
+# The public monitoring API exposes the rules_engine enum under these names.
+# The fallback chain tries each candidate in order; the first that exposes
+# both names wins and both are cached together.
+#
+# del _resolve_threshold_imports avoids a NameError that would occur if the
+# original inline loop pattern was used (del _exc raises NameError when the
+# first candidate succeeds and no exception was ever caught).
 # =============================================================================
 
 def _resolve_threshold_imports() -> tuple[Any, Any]:
@@ -120,9 +135,7 @@ del _resolve_threshold_imports
 
 
 # =============================================================================
-# Event type exports -- eager
-# MobileEvent and to_event_context are new; they bridge BaseEvent subclasses
-# into EventContext for SentinelWindowStore ingestion.
+# Event type exports — eager
 # =============================================================================
 
 try:
@@ -136,9 +149,9 @@ try:
         DependencyEvent,
         ResourceEvent,
         SecurityEvent,
-        MobileEvent,
+        MobileEvent,        # mobile companion app / HUMAN_GATED approve/veto
         normalize_event,
-        to_event_context,
+        to_event_context,   # BaseEvent -> EventContext bridge for SentinelWindowStore
     )
 except ImportError as exc:
     raise ImportError(
@@ -148,7 +161,7 @@ except ImportError as exc:
 
 
 # =============================================================================
-# Exception exports -- eager
+# Exception exports — eager
 # =============================================================================
 
 try:
@@ -167,7 +180,7 @@ except ImportError as exc:
 
 
 # =============================================================================
-# Public API
+# Public API — eager names
 # =============================================================================
 
 __all__ = [
@@ -202,9 +215,9 @@ __all__ = [
     "DependencyEvent",
     "ResourceEvent",
     "SecurityEvent",
-    "MobileEvent",           # mobile companion app event type
+    "MobileEvent",
     "normalize_event",
-    "to_event_context",      # BaseEvent → EventContext bridge for SentinelWindowStore
+    "to_event_context",
     # Exceptions
     "MonitoringError",
     "MonitoringConfigError",
@@ -215,53 +228,51 @@ __all__ = [
 
 
 # =============================================================================
-# Lazy exports
+# Lazy export registry
 #
-# These are loaded on first access so that:
-#   - optional packages (sentinel_43_ai) don't need to be installed for the
-#     core monitoring package to import cleanly
-#   - failed imports produce a clear AttributeError + ImportWarning rather
-#     than a silent None in the namespace
+# All optional / heavyweight names live here. __getattr__ resolves each group
+# on first access and caches the result in globals() so subsequent accesses
+# bypass __getattr__ entirely.
 #
-# Candidates are tried in order; the first that succeeds wins. The resolved
-# name is cached in globals() so subsequent accesses skip __getattr__.
+# Candidate lists are tried in order; the first module that exposes all
+# required names in a group wins. Absolute imports use anchor=None;
+# relative imports use anchor=__name__ ("core.monitoring").
+#
+# Relative import path note for SentinelFirewall:
+#   sentinel_firewall.py lives in core/middleware/, one package above and
+#   across from core/monitoring/. From core.monitoring, the relative path is
+#   "..middleware.sentinel_firewall" (.. = up to core, then into middleware).
 # =============================================================================
 
-# Rules engine
-_RULES_MODULE_CANDIDATES = (".rules_engine", ".rules")
-
-# MonitoringManager
-_MANAGER_MODULE_CANDIDATES = (".monitoring_manager", ".manager")
-
-# SentinelWindowStore / SentinelWindowConfig
-# Tries the local package first (if the store module is bundled here),
-# then falls back to the sentinel_43_ai detection subpackage.
-_WINDOW_STORE_CANDIDATES = (
-    ".window_store",
-    "sentinel_43_ai.detection.window_store",
-)
-
-# Gateway wiring: set_monitoring_manager() wires a MonitoringManager into
-# the Remote Gateway so security events (auth failures, rate-limit hits,
-# role mismatches) route through the monitoring pipeline rather than being
-# siloed in a separate raw httpx POST to Watchtower.
-_GATEWAY_MODULE_CANDIDATES = (".remote_gateway",)
+_RULES_MODULE_CANDIDATES       = (".rules_engine", ".rules")
+_MANAGER_MODULE_CANDIDATES     = (".monitoring_manager", ".manager")
+_WINDOW_STORE_CANDIDATES       = (".window_store", "sentinel_43_ai.detection.window_store")
+_GATEWAY_MODULE_CANDIDATES     = (".remote_gateway",)
+_SPARTA_MODULE_CANDIDATES      = (".sparta_core",)
+_FIREWALL_MODULE_CANDIDATES    = ("..middleware.sentinel_firewall",)
 
 _LAZY_EXPORTS: set[str] = {
-    # Rules
+    # Rules engine
     "RuleRegistry",
     "registry",
-    # Manager
+    # Monitoring orchestration
     "MonitoringManager",
-    # Window store
+    # Threat-detection window store (requires sentinel_43_ai)
     "SentinelWindowStore",
     "SentinelWindowConfig",
-    # Gateway wiring
+    # Remote gateway wiring
     "set_monitoring_manager",
+    # File integrity watchdog  (core/monitoring/sparta_core.py)
+    "SpartaCore",
+    "IntegrityConfig",
+    "create_node_router",
+    # Application-layer firewall  (core/middleware/sentinel_firewall.py)
+    "SentinelFirewall",
+    "FirewallConfig",
 }
 
 
-def __getattr__(name: str) -> Any:
+def __getattr__(name: str) -> Any:  # noqa: C901
 
     # ------------------------------------------------------------------ rules
     if name in {"RuleRegistry", "registry"}:
@@ -302,11 +313,10 @@ def __getattr__(name: str) -> Any:
         )
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
 
-    # ------------------------------------------------------- SentinelWindowStore
+    # ----------------------------------------------- SentinelWindowStore / Config
     if name in {"SentinelWindowStore", "SentinelWindowConfig"}:
         errors = []
         for module_name in _WINDOW_STORE_CANDIDATES:
-            # Absolute imports (sentinel_43_ai.*) use None as the anchor.
             anchor = __name__ if module_name.startswith(".") else None
             try:
                 mod = importlib.import_module(module_name, anchor)
@@ -337,6 +347,52 @@ def __getattr__(name: str) -> Any:
 
         warnings.warn(
             f"sentinel43.monitoring: optional export {name!r} is unavailable: "
+            + "; ".join(errors),
+            ImportWarning,
+            stacklevel=2,
+        )
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+
+    # --------------------------------- SpartaCore / IntegrityConfig / create_node_router
+    if name in {"SpartaCore", "IntegrityConfig", "create_node_router"}:
+        errors = []
+        for module_name in _SPARTA_MODULE_CANDIDATES:
+            try:
+                mod = importlib.import_module(module_name, __name__)
+                globals()["SpartaCore"] = mod.SpartaCore
+                globals()["IntegrityConfig"] = mod.IntegrityConfig
+                globals()["create_node_router"] = mod.create_node_router
+                return globals()[name]
+            except (ImportError, AttributeError) as exc:
+                errors.append(f"{module_name}: {exc}")
+
+        warnings.warn(
+            f"sentinel43.monitoring: optional export {name!r} is unavailable: "
+            + "; ".join(errors),
+            ImportWarning,
+            stacklevel=2,
+        )
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+
+    # ----------------------------------------- SentinelFirewall / FirewallConfig
+    if name in {"SentinelFirewall", "FirewallConfig"}:
+        errors = []
+        for module_name in _FIREWALL_MODULE_CANDIDATES:
+            # "..middleware.sentinel_firewall" is relative: anchor must be
+            # the current package (core.monitoring) so importlib can resolve
+            # the ".." back up to "core" and across to "core.middleware".
+            anchor = __name__ if module_name.startswith(".") else None
+            try:
+                mod = importlib.import_module(module_name, anchor)
+                globals()["SentinelFirewall"] = mod.SentinelFirewall
+                globals()["FirewallConfig"] = mod.FirewallConfig
+                return globals()[name]
+            except (ImportError, AttributeError) as exc:
+                errors.append(f"{module_name}: {exc}")
+
+        warnings.warn(
+            f"sentinel43.monitoring: optional export {name!r} is unavailable "
+            "(ensure core/middleware/sentinel_firewall.py is present): "
             + "; ".join(errors),
             ImportWarning,
             stacklevel=2,
