@@ -107,6 +107,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_any_bool(names: tuple[str, ...], default: bool = False) -> bool:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is not None:
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
+
 def _env_frozenset(name: str, default: str = "") -> frozenset[str]:
     raw = os.getenv(name, default)
     return frozenset(o.strip() for o in raw.split(",") if o.strip())
@@ -184,6 +192,11 @@ _orchestrator: Any | None = None
 # Task handle stored so we can stop it on shutdown.
 _sparta_instance: Any | None = None
 _sparta_task:     asyncio.Task | None = None  # type: ignore[type-arg]
+
+# Fenrir — optional local-only monitoring node.
+# Runs as an in-process background task when S43_FENRIR_ENABLED=true.
+_fenrir_instance: Any | None = None
+_fenrir_task:     asyncio.Task | None = None  # type: ignore[type-arg]
 
 
 # =============================================================================
@@ -472,6 +485,8 @@ def register_api_with_watchtower() -> dict[str, Any]:
         capabilities.append("sparta_integrity_watchdog")
     if _env_bool("S43_JORM_ENABLED"):
         capabilities.append("jormungandr_audit")
+    if _fenrir_instance is not None or _env_any_bool(("S43_FENRIR_ENABLED", "SENTINEL_FENRIR_ENABLED", "FENRIR_ENABLED")):
+        capabilities.append("fenrir_local_monitoring")
     try:
         from core.middleware import SentinelFirewall  # noqa: F401
         capabilities.append("sentinel_firewall")
@@ -580,6 +595,7 @@ async def _async_heartbeat_loop() -> None:
 async def lifespan(api: FastAPI):
     global _stop_heartbeat_event, _heartbeat_task
     global _orchestrator, _sparta_instance, _sparta_task
+    global _fenrir_instance, _fenrir_task
 
     bootstrap_expectations()
 
@@ -631,6 +647,25 @@ async def lifespan(api: FastAPI):
                 )
         except Exception as exc:
             logger.error("SpartaCore failed to start: %s", exc)
+
+    # --- Optional: Fenrir local-only monitoring node ---
+    if _env_any_bool(("S43_FENRIR_ENABLED", "SENTINEL_FENRIR_ENABLED", "FENRIR_ENABLED")):
+        try:
+            from core.monitoring import FenrirConfig, FenrirNode
+
+            fenrir_cfg = FenrirConfig.from_environment()
+            _fenrir_instance = FenrirNode(fenrir_cfg)
+            _fenrir_task = asyncio.create_task(
+                _fenrir_instance.main(), name="sentinel43-fenrir-node"
+            )
+            logger.info(
+                "Fenrir node task started (node_id=%s mode=%s scope=%s)",
+                fenrir_cfg.node_id,
+                fenrir_cfg.mode.value,
+                fenrir_cfg.deployment_scope,
+            )
+        except Exception as exc:
+            logger.error("Fenrir failed to start: %s", exc)
 
     # --- Optional: SystemOrchestrator (governance) ---
     if _env_bool("S43_GOVERNANCE_ENABLED"):
@@ -687,6 +722,19 @@ async def lifespan(api: FastAPI):
             await asyncio.wait_for(_heartbeat_task, timeout=5.0)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             _heartbeat_task.cancel()
+
+    if _fenrir_instance is not None:
+        try:
+            await _fenrir_instance.shutdown()
+        except Exception as exc:
+            logger.warning("Fenrir shutdown error: %s", exc)
+    if _fenrir_task is not None:
+        try:
+            await asyncio.wait_for(_fenrir_task, timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            _fenrir_task.cancel()
+        except Exception as exc:
+            logger.warning("Fenrir task ended with error: %s", exc)
 
     if _sparta_instance is not None:
         _sparta_instance.stop()
@@ -1152,6 +1200,7 @@ def system_status() -> dict[str, Any]:
             "rules": "loaded", "config": "loaded",
             "monitoring_manager": "active" if _monitoring_manager else "disabled",
             "sparta": "active" if _sparta_instance else "disabled",
+            "fenrir": "active" if _fenrir_instance else "disabled",
             "governance": "active" if _orchestrator else "disabled",
             "redis": "unknown", "postgres": "unknown",
         },
@@ -1178,6 +1227,63 @@ def intercom_status() -> dict[str, Any]:
         "watchtower": "online" if wt_health["reachable"] else "unreachable",
         "watchtower_url": WATCHTOWER_URL,
         "modules": wt_modules, "timestamp": utc_now(),
+    }
+
+
+
+# =============================================================================
+# Fenrir local monitoring router
+# =============================================================================
+
+fenrir_router = APIRouter(prefix="/fenrir", tags=["fenrir"])
+
+def _fenrir_snapshot() -> dict[str, Any]:
+    if _fenrir_instance is None:
+        return {
+            "enabled": _env_any_bool(("S43_FENRIR_ENABLED", "SENTINEL_FENRIR_ENABLED", "FENRIR_ENABLED")),
+            "status": "disabled",
+            "timestamp": utc_now(),
+        }
+
+    return {
+        "enabled": True,
+        "status": getattr(getattr(_fenrir_instance, "state", None), "value", "unknown"),
+        "node_id": getattr(getattr(_fenrir_instance, "config", None), "node_id", "unknown"),
+        "mode": getattr(getattr(getattr(_fenrir_instance, "config", None), "mode", None), "value", "unknown"),
+        "deployment_scope": getattr(getattr(_fenrir_instance, "config", None), "deployment_scope", "unknown"),
+        "metrics": (
+            _fenrir_instance.metrics.as_dict()
+            if getattr(_fenrir_instance, "metrics", None) is not None
+            else {}
+        ),
+        "task_done": bool(_fenrir_task.done()) if _fenrir_task is not None else None,
+        "timestamp": utc_now(),
+    }
+
+
+@fenrir_router.get("/status")
+def fenrir_status(request: Request) -> dict[str, Any]:
+    _get_operator(request)
+    return _fenrir_snapshot()
+
+
+@fenrir_router.get("/health")
+def fenrir_health(request: Request) -> dict[str, Any]:
+    _get_operator(request)
+    snapshot = _fenrir_snapshot()
+    return {"service": "fenrir", **snapshot}
+
+
+@fenrir_router.get("/metrics")
+def fenrir_metrics(request: Request) -> dict[str, Any]:
+    _get_operator(request)
+    snapshot = _fenrir_snapshot()
+    return {
+        "service": "fenrir",
+        "enabled": snapshot.get("enabled", False),
+        "status": snapshot.get("status", "disabled"),
+        "metrics": snapshot.get("metrics", {}),
+        "timestamp": utc_now(),
     }
 
 
@@ -1273,6 +1379,7 @@ app.include_router(rules_router)
 app.include_router(config_router)
 app.include_router(dependencies_router)
 app.include_router(system_router)
+app.include_router(fenrir_router)
 app.include_router(api_router)
 app.include_router(audit_router)
 
