@@ -34,117 +34,64 @@
 # =============================================================================
 
 """
-Sentinel-43 middleware/security package.
+Sentinel-43 Application-Layer Middleware Package
 
-This package exposes the primary middleware and security-node components used by
-the S43 API layer:
+This package exposes the FastAPI/Starlette middleware components that sit
+in front of every route in the S43 API layer.
 
-    - SentinelFirewall:
-        FastAPI / Starlette application-layer firewall middleware.
+Exports
+-------
+SentinelFirewall
+    Application-layer firewall middleware. Enforces IP allowlist/blocklist,
+    per-IP rate limiting, request size limits, and path blocking. Routes
+    blocked-request events to MonitoringManager for Watchtower alerting and
+    SentinelWindowStore threat scoring.
 
-    - SpartaCore:
-        File-integrity watchdog and hardened node API router.
+FirewallConfig
+    Immutable frozen-dataclass configuration for SentinelFirewall.
+    Build from environment variables via FirewallConfig.from_env()
+    (reads S43_FIREWALL_* vars) or construct directly.
 
-    - JormungandrNode:
-        Cryptographic audit/security node for tamper-resistant governance logs.
+BlockReason
+    String constants for firewall block reason codes used in monitoring
+    events and HTTP error responses:
+        ip_blocked, ip_not_in_allowlist, rate_limited,
+        payload_too_large, path_blocked.
 
-Preferred imports:
-
+Typical usage in core/api/main.py
+----------------------------------
     from core.middleware import SentinelFirewall, FirewallConfig
-    from core.middleware import SpartaCore, IntegrityConfig, create_node_router
-    from core.middleware import JormungandrNode, JormungandrConfig, build_jormungandr
+
+    app.add_middleware(
+        SentinelFirewall,
+        config=FirewallConfig.from_env(),
+        monitoring_manager=_monitoring_manager,   # optional
+    )
+
+Note on other security components
+----------------------------------
+SpartaCore (file-integrity watchdog) and JormungandrNode (cryptographic
+audit node) live in their own packages and are exported from
+core.monitoring, not here:
+
+    from core.monitoring import SpartaCore, IntegrityConfig, create_node_router
+    from core.monitoring import JormungandrNode, JormungandrConfig, build_jormungandr
+
+Keeping middleware separate from monitoring avoids duplicate module loads
+(which would cause isinstance checks to fail across import paths) and
+matches the physical file layout:
+
+    core/middleware/sentinel_firewall.py   ← this package
+    core/monitoring/sparta_core.py         ← core.monitoring
+    core/audit/jormungandr.py              ← core.monitoring (lazy export)
 """
 
 from __future__ import annotations
 
-try:
-    from .sentinel_firewall import (
-        BlockReason,
-        FirewallConfig,
-        SentinelFirewall,
-    )
-except ImportError:  # pragma: no cover
-    BlockReason = None  # type: ignore[assignment]
-    FirewallConfig = None  # type: ignore[assignment]
-    SentinelFirewall = None  # type: ignore[assignment]
-
-try:
-    from .sparta_core import (
-        IntegrityConfig,
-        IntegrityEvent,
-        NodeAuthRequest,
-        NodeHeartbeatRequest,
-        NodeRegisterRequest,
-        SpartaCore,
-        SpartaState,
-        build_sparta_core,
-        create_node_router,
-        setup_signal_handlers,
-    )
-except ImportError:  # pragma: no cover
-    IntegrityConfig = None  # type: ignore[assignment]
-    IntegrityEvent = None  # type: ignore[assignment]
-    NodeAuthRequest = None  # type: ignore[assignment]
-    NodeHeartbeatRequest = None  # type: ignore[assignment]
-    NodeRegisterRequest = None  # type: ignore[assignment]
-    SpartaCore = None  # type: ignore[assignment]
-    SpartaState = None  # type: ignore[assignment]
-    build_sparta_core = None  # type: ignore[assignment]
-    create_node_router = None  # type: ignore[assignment]
-    setup_signal_handlers = None  # type: ignore[assignment]
-
-try:
-    from .jormungandr import (
-        AuditRecord,
-        JormungandrConfig,
-        JormungandrConfigError,
-        JormungandrCryptoError,
-        JormungandrError,
-        JormungandrNode,
-        Mode,
-        Posture,
-        build_jormungandr,
-    )
-except ImportError:  # pragma: no cover
-    AuditRecord = None  # type: ignore[assignment]
-    JormungandrConfig = None  # type: ignore[assignment]
-    JormungandrConfigError = None  # type: ignore[assignment]
-    JormungandrCryptoError = None  # type: ignore[assignment]
-    JormungandrError = None  # type: ignore[assignment]
-    JormungandrNode = None  # type: ignore[assignment]
-    Mode = None  # type: ignore[assignment]
-    Posture = None  # type: ignore[assignment]
-    build_jormungandr = None  # type: ignore[assignment]
-
+from .sentinel_firewall import BlockReason, FirewallConfig, SentinelFirewall
 
 __all__ = [
-    # Firewall
-    "BlockReason",
-    "FirewallConfig",
     "SentinelFirewall",
-
-    # SpartaCore
-    "IntegrityConfig",
-    "IntegrityEvent",
-    "NodeAuthRequest",
-    "NodeHeartbeatRequest",
-    "NodeRegisterRequest",
-    "SpartaCore",
-    "SpartaState",
-    "build_sparta_core",
-    "create_node_router",
-    "setup_signal_handlers",
-
-    # Jormungandr
-    "AuditRecord",
-    "JormungandrConfig",
-    "JormungandrConfigError",
-    "JormungandrCryptoError",
-    "JormungandrError",
-    "JormungandrNode",
-    "Mode",
-    "Posture",
-    "build_jormungandr",
+    "FirewallConfig",
+    "BlockReason",
 ]
-```
-
