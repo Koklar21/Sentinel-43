@@ -45,18 +45,20 @@ Eager exports (always available on import):
   - Exceptions: MonitoringError, EventNormalizationError, etc.
 
 Lazy exports (loaded on first access, optional dependencies gracefully absent):
-  - RuleRegistry, registry         (.rules_engine / .rules)
-  - MonitoringManager              (.monitoring_manager / .manager)
-  - SentinelWindowStore,           (.window_store /
-    SentinelWindowConfig            sentinel_43_ai.detection.window_store)
-  - set_monitoring_manager         (.remote_gateway)
-  - SpartaCore, IntegrityConfig,   (.sparta_core)
+  - RuleRegistry, registry            (.rules_engine / .rules)
+  - MonitoringManager                 (.monitoring_manager / .manager)
+  - SentinelWindowStore,              (.window_store /
+    SentinelWindowConfig               sentinel_43_ai.detection.window_store)
+  - set_monitoring_manager            (.remote_gateway)
+  - SpartaCore, IntegrityConfig,      (.sparta_core)
     create_node_router
   - SentinelFirewall, FirewallConfig  (..middleware.sentinel_firewall)
+  - JormungandrNode, JormungandrConfig,  (..audit.jormungandr)
+    build_jormungandr
 
 Lazy exports degrade to ImportWarning + AttributeError when their source
-module or an optional dependency (sentinel_43_ai, starlette) is unavailable,
-rather than crashing the entire monitoring package at import time.
+module or an optional dependency (sentinel_43_ai, starlette, cryptography)
+is unavailable, rather than crashing the entire monitoring package.
 """
 
 from __future__ import annotations
@@ -100,18 +102,6 @@ except ImportError as exc:
 
 # =============================================================================
 # ThresholdProfile / thresholds_for — fallback resolution
-#
-# Two separate ThresholdProfile types exist in the codebase:
-#   - watchtower.TowerThresholdProfile  (numeric dataclass, internal)
-#   - rules_engine.ThresholdProfile     (DEV/TEST/PROD enum, public API)
-#
-# The public monitoring API exposes the rules_engine enum under these names.
-# The fallback chain tries each candidate in order; the first that exposes
-# both names wins and both are cached together.
-#
-# del _resolve_threshold_imports avoids a NameError that would occur if the
-# original inline loop pattern was used (del _exc raises NameError when the
-# first candidate succeeds and no exception was ever caught).
 # =============================================================================
 
 def _resolve_threshold_imports() -> tuple[Any, Any]:
@@ -149,9 +139,9 @@ try:
         DependencyEvent,
         ResourceEvent,
         SecurityEvent,
-        MobileEvent,        # mobile companion app / HUMAN_GATED approve/veto
+        MobileEvent,
         normalize_event,
-        to_event_context,   # BaseEvent -> EventContext bridge for SentinelWindowStore
+        to_event_context,
     )
 except ImportError as exc:
     raise ImportError(
@@ -229,27 +219,15 @@ __all__ = [
 
 # =============================================================================
 # Lazy export registry
-#
-# All optional / heavyweight names live here. __getattr__ resolves each group
-# on first access and caches the result in globals() so subsequent accesses
-# bypass __getattr__ entirely.
-#
-# Candidate lists are tried in order; the first module that exposes all
-# required names in a group wins. Absolute imports use anchor=None;
-# relative imports use anchor=__name__ ("core.monitoring").
-#
-# Relative import path note for SentinelFirewall:
-#   sentinel_firewall.py lives in core/middleware/, one package above and
-#   across from core/monitoring/. From core.monitoring, the relative path is
-#   "..middleware.sentinel_firewall" (.. = up to core, then into middleware).
 # =============================================================================
 
-_RULES_MODULE_CANDIDATES       = (".rules_engine", ".rules")
-_MANAGER_MODULE_CANDIDATES     = (".monitoring_manager", ".manager")
-_WINDOW_STORE_CANDIDATES       = (".window_store", "sentinel_43_ai.detection.window_store")
-_GATEWAY_MODULE_CANDIDATES     = (".remote_gateway",)
-_SPARTA_MODULE_CANDIDATES      = (".sparta_core",)
-_FIREWALL_MODULE_CANDIDATES    = ("..middleware.sentinel_firewall",)
+_RULES_MODULE_CANDIDATES    = (".rules_engine", ".rules")
+_MANAGER_MODULE_CANDIDATES  = (".monitoring_manager", ".manager")
+_WINDOW_STORE_CANDIDATES    = (".window_store", "sentinel_43_ai.detection.window_store")
+_GATEWAY_MODULE_CANDIDATES  = (".remote_gateway",)
+_SPARTA_MODULE_CANDIDATES   = (".sparta_core",)
+_FIREWALL_MODULE_CANDIDATES = ("..middleware.sentinel_firewall",)
+_JORM_MODULE_CANDIDATES     = ("..audit.jormungandr",)
 
 _LAZY_EXPORTS: set[str] = {
     # Rules engine
@@ -269,6 +247,10 @@ _LAZY_EXPORTS: set[str] = {
     # Application-layer firewall  (core/middleware/sentinel_firewall.py)
     "SentinelFirewall",
     "FirewallConfig",
+    # Cryptographic audit node  (core/audit/jormungandr.py)
+    "JormungandrNode",
+    "JormungandrConfig",
+    "build_jormungandr",
 }
 
 
@@ -285,12 +267,10 @@ def __getattr__(name: str) -> Any:  # noqa: C901
                 return globals()[name]
             except (ImportError, AttributeError) as exc:
                 errors.append(f"{module_name}: {exc}")
-
         warnings.warn(
             f"sentinel43.monitoring: optional export {name!r} is unavailable: "
             + "; ".join(errors),
-            ImportWarning,
-            stacklevel=2,
+            ImportWarning, stacklevel=2,
         )
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
 
@@ -304,12 +284,10 @@ def __getattr__(name: str) -> Any:  # noqa: C901
                 return globals()["MonitoringManager"]
             except (ImportError, AttributeError) as exc:
                 errors.append(f"{module_name}: {exc}")
-
         warnings.warn(
             f"sentinel43.monitoring: optional export {name!r} is unavailable: "
             + "; ".join(errors),
-            ImportWarning,
-            stacklevel=2,
+            ImportWarning, stacklevel=2,
         )
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
 
@@ -325,12 +303,10 @@ def __getattr__(name: str) -> Any:  # noqa: C901
                 return globals()[name]
             except (ImportError, AttributeError) as exc:
                 errors.append(f"{module_name}: {exc}")
-
         warnings.warn(
             f"sentinel43.monitoring: optional export {name!r} is unavailable "
             "(sentinel_43_ai may not be installed): " + "; ".join(errors),
-            ImportWarning,
-            stacklevel=2,
+            ImportWarning, stacklevel=2,
         )
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
 
@@ -344,16 +320,14 @@ def __getattr__(name: str) -> Any:  # noqa: C901
                 return globals()["set_monitoring_manager"]
             except (ImportError, AttributeError) as exc:
                 errors.append(f"{module_name}: {exc}")
-
         warnings.warn(
             f"sentinel43.monitoring: optional export {name!r} is unavailable: "
             + "; ".join(errors),
-            ImportWarning,
-            stacklevel=2,
+            ImportWarning, stacklevel=2,
         )
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
 
-    # --------------------------------- SpartaCore / IntegrityConfig / create_node_router
+    # ----------------------------- SpartaCore / IntegrityConfig / create_node_router
     if name in {"SpartaCore", "IntegrityConfig", "create_node_router"}:
         errors = []
         for module_name in _SPARTA_MODULE_CANDIDATES:
@@ -365,12 +339,10 @@ def __getattr__(name: str) -> Any:  # noqa: C901
                 return globals()[name]
             except (ImportError, AttributeError) as exc:
                 errors.append(f"{module_name}: {exc}")
-
         warnings.warn(
             f"sentinel43.monitoring: optional export {name!r} is unavailable: "
             + "; ".join(errors),
-            ImportWarning,
-            stacklevel=2,
+            ImportWarning, stacklevel=2,
         )
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
 
@@ -378,9 +350,6 @@ def __getattr__(name: str) -> Any:  # noqa: C901
     if name in {"SentinelFirewall", "FirewallConfig"}:
         errors = []
         for module_name in _FIREWALL_MODULE_CANDIDATES:
-            # "..middleware.sentinel_firewall" is relative: anchor must be
-            # the current package (core.monitoring) so importlib can resolve
-            # the ".." back up to "core" and across to "core.middleware".
             anchor = __name__ if module_name.startswith(".") else None
             try:
                 mod = importlib.import_module(module_name, anchor)
@@ -389,13 +358,34 @@ def __getattr__(name: str) -> Any:  # noqa: C901
                 return globals()[name]
             except (ImportError, AttributeError) as exc:
                 errors.append(f"{module_name}: {exc}")
-
         warnings.warn(
             f"sentinel43.monitoring: optional export {name!r} is unavailable "
             "(ensure core/middleware/sentinel_firewall.py is present): "
             + "; ".join(errors),
-            ImportWarning,
-            stacklevel=2,
+            ImportWarning, stacklevel=2,
+        )
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+
+    # ----------------------------- JormungandrNode / JormungandrConfig / build_jormungandr
+    if name in {"JormungandrNode", "JormungandrConfig", "build_jormungandr"}:
+        errors = []
+        for module_name in _JORM_MODULE_CANDIDATES:
+            # "..audit.jormungandr" is relative: anchor = core.monitoring so
+            # importlib resolves ".." up to "core", then into "core.audit".
+            anchor = __name__ if module_name.startswith(".") else None
+            try:
+                mod = importlib.import_module(module_name, anchor)
+                globals()["JormungandrNode"]   = mod.JormungandrNode
+                globals()["JormungandrConfig"] = mod.JormungandrConfig
+                globals()["build_jormungandr"] = mod.build_jormungandr
+                return globals()[name]
+            except (ImportError, AttributeError) as exc:
+                errors.append(f"{module_name}: {exc}")
+        warnings.warn(
+            f"sentinel43.monitoring: optional export {name!r} is unavailable "
+            "(ensure core/audit/jormungandr.py is present and "
+            "the cryptography package is installed): " + "; ".join(errors),
+            ImportWarning, stacklevel=2,
         )
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
 
