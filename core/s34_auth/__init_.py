@@ -29,6 +29,23 @@ from .globals import configure_auth, get_auth_manager, is_auth_configured
 from .manager import AuthManager
 from .models import AuthContext, AuthResult
 
+# Fenrir auth integration
+try:
+    from .fenrir_auth import (
+        FenrirAuthConfig,
+        FenrirAuthManager,
+        configure_fenrir_auth,
+        get_fenrir_auth_manager,
+        is_fenrir_auth_configured,
+    )
+except ImportError:
+    FenrirAuthConfig = None
+    FenrirAuthManager = None
+    configure_fenrir_auth = None
+    get_fenrir_auth_manager = None
+    is_fenrir_auth_configured = None
+
+
 __all__ = [
     # Manager
     "AuthManager",
@@ -41,6 +58,13 @@ __all__ = [
     "configure_auth",
     "get_auth_manager",
     "is_auth_configured",
+
+    # Fenrir
+    "FenrirAuthConfig",
+    "FenrirAuthManager",
+    "configure_fenrir_auth",
+    "get_fenrir_auth_manager",
+    "is_fenrir_auth_configured",
 
     # Exceptions
     "SentinelSecurityError",
