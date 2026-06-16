@@ -1,30 +1,37 @@
+# =============================================================================
 # Sentinel-43
-# Copyright (c) 2026 Justin
 #
-# This file is part of the Sentinel-43 project.
+# Copyright (c) 2026 Justin Armstrong
+# All Rights Reserved.
 #
-# Licensed under one of the following:
+# This file is part of the Sentinel-43 platform and constitutes original
+# intellectual property of the copyright holder.
 #
-# 1. GNU Affero General Public License v3.0 (AGPL-3.0)
-#    This program is free software: you can redistribute it and/or modify
-#    it under the terms of the GNU Affero General Public License as
-#    published by the Free Software Foundation, version 3 of the License.
+# Sentinel-43 is distributed under a dual-license model:
 #
-#    This program is distributed in the hope that it will be useful,
-#    but WITHOUT ANY WARRANTY; without even the implied warranty of
-#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
-#    See the GNU Affero General Public License for more details.
-#
-#    You should have received a copy of the GNU Affero General Public License
-#    along with this program. If not, see https://www.gnu.org/licenses/.
+# 1. GNU Affero General Public License (AGPL v3.0)
+# for open-source use, modification, and distribution.
 #
 # 2. Commercial License
-#    This software is also available under a commercial license that permits
-#    use, modification, and distribution without the obligations of the AGPL.
-#    For commercial licensing terms, contact the project owner.
+# for proprietary, enterprise, government, or other commercial use
+# not permitted under the AGPL v3.0.
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
-
+# Use, modification, redistribution, and commercial use are governed by
+# the terms of the applicable license. Any use outside those terms is
+# prohibited.
+#
+# By accessing, modifying, distributing, or using this software, you agree
+# to comply with the terms of the applicable license.
+#
+# License Information:
+# AGPL v3.0: https://www.gnu.org/licenses/agpl-3.0.en.html
+#
+# Commercial Licensing:
+# Contact the copyright holder for commercial licensing terms.
+#
+# Sentinel-43™
+# Original Work and Protected Intellectual Property.
+# =============================================================================
 from .contracts import (
     ExpectationCategory,
     ExpectationContract,
