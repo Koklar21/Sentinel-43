@@ -1,3 +1,4 @@
+```python
 # =============================================================================
 # Sentinel-43
 #
@@ -35,34 +36,21 @@
 
 """
 Sentinel-43 SpartaCore
-v1.0.0 — File Integrity Watchdog + Node API Router
+v1.1.0 — File Integrity Watchdog + Hardened Node API Router
 
-Replaces the original two-file concatenation with a single, coherent S43
-module. Changes from the original:
+Security improvements in this recode:
 
-  - Fix: JormState / SparState NameErrors -- both typos eliminated.
-    SpartaState is the one enum, used consistently throughout.
-  - Fix: hash comparison now uses secrets.compare_digest() to eliminate
-    timing side-channel vulnerability.
-  - Fix: calculate_sha256() wrapped in exception handling; existence check
-    and file open are combined (TOCTOU protection).
-  - Fix: event_log is a bounded deque(maxlen=...) rather than an unbounded
-    list.
-  - Fix: watchdog_loop no longer unconditionally resets state to OPERATIONAL
-    at start; graceful LOCKDOWN -> OPERATIONAL recovery path added.
-  - Fix: signal handling uses loop.add_signal_handler() (asyncio-safe)
-    instead of sys.exit() inside a sync signal.signal() handler.
-  - Fix: os.system() shell call removed from initiate_lockdown().
-  - Fix: authenticate() now performs real HMAC-SHA256 token validation
-    against S43_SPARTA_NODE_TOKEN instead of returning a placeholder string.
-  - Fix: aiohttp API server replaced with a FastAPI APIRouter factory
-    (create_node_router()) so it mounts cleanly on the existing S43 app
-    and shares its auth, logging, and monitoring infrastructure.
-  - Fix: datetime.utcnow() replaced with datetime.now(timezone.utc).
-  - Fix: asyncio.get_event_loop() replaced with asyncio.run() at entry point.
-  - Added: optional MonitoringManager integration -- integrity violations
-    generate SecurityEvent / LogEvent objects that flow through the
-    Watchtower scan pipeline and accumulate in SentinelWindowStore.
+  - Thread-safe event recording via SpartaCore._record().
+  - Startup no longer forces LOCKDOWN/COMPROMISED back to OPERATIONAL.
+  - Route-level authentication failure tracking.
+  - Temporary client blocking after repeated auth failures.
+  - Request-aware auth guards for /status, /events, /auth, /register, /heartbeat.
+  - JSON payload size guards for node registration and heartbeat metadata.
+  - Safer MonitoringManager dispatch using wrapped daemon-thread calls.
+  - Public /health endpoint no longer leaks node_signature or exact internal state
+    unless explicitly enabled.
+  - Maintains fail-closed node API token behavior.
+  - Maintains bounded in-memory event log via deque(maxlen=...).
 """
 
 from __future__ import annotations
@@ -75,11 +63,9 @@ import logging
 import os
 import secrets
 import signal
-import subprocess
-import sys
 import threading
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -93,7 +79,7 @@ logger = logging.getLogger("SentinelSpartaCore")
 
 
 # =============================================================================
-# Utilities (consistent with S43 conventions)
+# Utilities
 # =============================================================================
 
 def utc_now() -> str:
@@ -104,29 +90,71 @@ def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+
+    logger.warning("Invalid bool for %s=%r, using default %s", name, raw, default)
+    return default
+
+
 def _env_int(name: str, default: int, lo: int, hi: int) -> int:
     raw = os.getenv(name)
     if raw is None:
         return default
+
     try:
-        v = int(raw.strip())
-        if not lo <= v <= hi:
+        value = int(raw.strip())
+        if not lo <= value <= hi:
             raise ValueError(f"out of [{lo},{hi}]")
-        return v
+        return value
     except ValueError:
         logger.warning("Invalid int for %s=%r, using default %s", name, raw, default)
         return default
 
 
-def _env_float(name: str, default: float) -> float:
+def _env_float(name: str, default: float, lo: float | None = None, hi: float | None = None) -> float:
     raw = os.getenv(name)
     if raw is None:
         return default
+
     try:
-        return float(raw.strip())
+        value = float(raw.strip())
+        if lo is not None and value < lo:
+            raise ValueError(f"below minimum {lo}")
+        if hi is not None and value > hi:
+            raise ValueError(f"above maximum {hi}")
+        return value
     except ValueError:
         logger.warning("Invalid float for %s=%r, using default %s", name, raw, default)
         return default
+
+
+def _json_size_bytes(obj: Any) -> int:
+    return len(json.dumps(obj, default=str, sort_keys=True).encode("utf-8"))
+
+
+def _json_size_guard(obj: Any, max_bytes: int) -> None:
+    try:
+        size = _json_size_bytes(obj)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid JSON payload.",
+        ) from exc
+
+    if size > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Node payload too large.",
+        )
 
 
 # =============================================================================
@@ -134,16 +162,11 @@ def _env_float(name: str, default: float) -> float:
 # =============================================================================
 
 class SpartaState(Enum):
-    """
-    Fix: the original file defined SpartaState but referenced JormState and
-    SparState (two different typos), causing NameError on every instantiation
-    and every shutdown call. One enum, used consistently throughout.
-    """
     INITIALIZING = "INITIALIZING"
-    OPERATIONAL  = "OPERATIONAL"
-    LOCKDOWN     = "LOCKDOWN"
-    COMPROMISED  = "COMPROMISED"
-    SHUTDOWN     = "SHUTDOWN"
+    OPERATIONAL = "OPERATIONAL"
+    LOCKDOWN = "LOCKDOWN"
+    COMPROMISED = "COMPROMISED"
+    SHUTDOWN = "SHUTDOWN"
 
 
 # =============================================================================
@@ -153,39 +176,61 @@ class SpartaState(Enum):
 @dataclass(frozen=True)
 class IntegrityConfig:
     """
-    Immutable configuration for SpartaCore. Matches S43's frozen-dataclass
-    config pattern used in WatchtowerConfig, RemoteGatewayConfig, etc.
-    """
-    # path -> expected SHA-256 hex digest
-    watched_files: MappingProxyType
+    Immutable configuration for SpartaCore.
 
-    # Unique identifier for this watchdog instance
+    Required in production:
+      - S43_SPARTA_TOKEN_SECRET
+      - S43_SPARTA_NODE_TOKEN
+
+    S43_ENV=dev allows an insecure dev signing secret, but the node API still
+    fails closed if S43_SPARTA_NODE_TOKEN is missing.
+    """
+
+    watched_files: MappingProxyType
     node_signature: str
 
-    # How often to run the integrity check (seconds)
     check_interval_seconds: float = 30.0
-
-    # Upper bound on in-memory event log entries
     max_event_log_entries: int = 1_000
 
-    # Bearer token for the node API endpoints (S43_SPARTA_NODE_TOKEN)
     node_api_token: str = ""
-
-    # HMAC secret used to sign session tokens issued by /node/auth
-    # (S43_SPARTA_TOKEN_SECRET). Must be set in non-dev deployments.
     token_secret: str = ""
-
-    # Session token validity window (seconds)
     token_ttl_seconds: float = 3_600.0
 
+    max_auth_failures_per_window: int = 8
+    auth_failure_window_seconds: float = 300.0
+    auth_block_seconds: float = 900.0
+
+    max_node_payload_bytes: int = 8_192
+    public_health_detail: bool = False
+
     def __post_init__(self) -> None:
-        # Ensure watched_files is always an immutable MappingProxyType
         if not isinstance(self.watched_files, MappingProxyType):
             object.__setattr__(
-                self, "watched_files", MappingProxyType(dict(self.watched_files))
+                self,
+                "watched_files",
+                MappingProxyType(dict(self.watched_files)),
             )
+
         if not self.node_signature.strip():
             raise ValueError("IntegrityConfig.node_signature must not be empty")
+
+        if self.check_interval_seconds <= 0:
+            raise ValueError("check_interval_seconds must be > 0")
+
+        if self.max_event_log_entries < 1:
+            raise ValueError("max_event_log_entries must be >= 1")
+
+        if self.max_auth_failures_per_window < 1:
+            raise ValueError("max_auth_failures_per_window must be >= 1")
+
+        if self.auth_failure_window_seconds <= 0:
+            raise ValueError("auth_failure_window_seconds must be > 0")
+
+        if self.auth_block_seconds <= 0:
+            raise ValueError("auth_block_seconds must be > 0")
+
+        if self.max_node_payload_bytes < 1:
+            raise ValueError("max_node_payload_bytes must be >= 1")
 
     @classmethod
     def from_env(cls, watched_files: dict[str, str]) -> "IntegrityConfig":
@@ -197,6 +242,7 @@ class IntegrityConfig:
                     "S43_SPARTA_TOKEN_SECRET is required for tamper-resistant "
                     "session tokens outside of S43_ENV=dev."
                 )
+
             token_secret = "dev-only-change-me"
             logger.warning(
                 "S43_SPARTA_TOKEN_SECRET not set; using insecure dev default. "
@@ -205,12 +251,55 @@ class IntegrityConfig:
 
         return cls(
             watched_files=MappingProxyType(watched_files),
-            node_signature=_env("S43_SPARTA_NODE_SIGNATURE", "SPARTA-CORE-SIG-v1.0"),
-            check_interval_seconds=_env_float("S43_SPARTA_CHECK_INTERVAL", 30.0),
-            max_event_log_entries=_env_int("S43_SPARTA_MAX_EVENT_LOG", 1_000, 100, 100_000),
+            node_signature=_env("S43_SPARTA_NODE_SIGNATURE", "SPARTA-CORE-SIG-v1.1"),
+            check_interval_seconds=_env_float(
+                "S43_SPARTA_CHECK_INTERVAL",
+                30.0,
+                lo=0.1,
+                hi=86_400.0,
+            ),
+            max_event_log_entries=_env_int(
+                "S43_SPARTA_MAX_EVENT_LOG",
+                1_000,
+                100,
+                100_000,
+            ),
             node_api_token=_env("S43_SPARTA_NODE_TOKEN"),
             token_secret=token_secret,
-            token_ttl_seconds=_env_float("S43_SPARTA_TOKEN_TTL", 3_600.0),
+            token_ttl_seconds=_env_float(
+                "S43_SPARTA_TOKEN_TTL",
+                3_600.0,
+                lo=30.0,
+                hi=86_400.0,
+            ),
+            max_auth_failures_per_window=_env_int(
+                "S43_SPARTA_MAX_AUTH_FAILURES",
+                8,
+                1,
+                10_000,
+            ),
+            auth_failure_window_seconds=_env_float(
+                "S43_SPARTA_AUTH_FAILURE_WINDOW",
+                300.0,
+                lo=1.0,
+                hi=86_400.0,
+            ),
+            auth_block_seconds=_env_float(
+                "S43_SPARTA_AUTH_BLOCK_SECONDS",
+                900.0,
+                lo=1.0,
+                hi=86_400.0,
+            ),
+            max_node_payload_bytes=_env_int(
+                "S43_SPARTA_MAX_NODE_PAYLOAD_BYTES",
+                8_192,
+                512,
+                1_048_576,
+            ),
+            public_health_detail=_env_bool(
+                "S43_SPARTA_PUBLIC_HEALTH_DETAIL",
+                False,
+            ),
         )
 
 
@@ -239,25 +328,20 @@ class IntegrityEvent:
 
 
 # =============================================================================
-# SpartaCore — file integrity watchdog
+# SpartaCore
 # =============================================================================
 
 class SpartaCore:
     """
-    Hardened file integrity watchdog.
+    Hardened file integrity watchdog and local node API security anchor.
 
-    On each cycle it hashes every watched file and compares the digest
-    against the configured expected value using secrets.compare_digest()
-    (constant-time). Any mismatch or missing file transitions the watchdog
-    to LOCKDOWN and emits events to the S43 monitoring pipeline.
-
-    LOCKDOWN is not a trap: once all files pass integrity checks the node
-    automatically recovers to OPERATIONAL.
-
-    Optional MonitoringManager integration: when a manager is supplied,
-    integrity violations are routed through analyze_event() as SecurityEvent
-    / LogEvent payloads so they surface in Watchtower alerts and accumulate
-    in SentinelWindowStore for threat scoring.
+    Responsibilities:
+      - Watch configured files by SHA-256 digest.
+      - Transition to LOCKDOWN on missing/unreadable/tampered files.
+      - Recover LOCKDOWN -> OPERATIONAL only after clean integrity checks.
+      - Record bounded integrity/auth events.
+      - Notify MonitoringManager on important security events.
+      - Track bad node API clients and temporarily block repeated failures.
     """
 
     def __init__(
@@ -268,12 +352,144 @@ class SpartaCore:
     ) -> None:
         self._config = config
         self._monitoring_manager = monitoring_manager
+
         self._state = SpartaState.INITIALIZING
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._event_log: deque[dict[str, Any]] = deque(maxlen=config.max_event_log_entries)
+
         self._tamper_count = 0
         self._total_checks = 0
         self._stop_requested = threading.Event()
+
+        self._auth_guard_lock = threading.Lock()
+        self._auth_failures: dict[str, deque[float]] = defaultdict(deque)
+        self._blocked_clients: dict[str, float] = {}
+
+    # ------------------------------------------------------------------
+    # Client/auth guard helpers
+    # ------------------------------------------------------------------
+
+    def _client_id(self, request: Request | None) -> str:
+        """
+        Prefer the firewall-resolved client IP if SentinelFirewall injected it.
+        Fall back to Starlette's immediate peer address.
+        """
+        if request is None:
+            return "unknown"
+
+        state_ip = getattr(request.state, "s43_client_ip", None)
+        if isinstance(state_ip, str) and state_ip.strip():
+            return state_ip.strip()
+
+        if request.client is None:
+            return "unknown"
+
+        return request.client.host or "unknown"
+
+    def _is_client_blocked(self, client_id: str) -> bool:
+        now = time.monotonic()
+
+        with self._auth_guard_lock:
+            until = self._blocked_clients.get(client_id)
+            if until is None:
+                return False
+
+            if now >= until:
+                self._blocked_clients.pop(client_id, None)
+                return False
+
+            return True
+
+    def _record_auth_failure(self, client_id: str, reason: str) -> None:
+        now = time.monotonic()
+        cutoff = now - self._config.auth_failure_window_seconds
+        blocked_until: float | None = None
+
+        with self._auth_guard_lock:
+            failures = self._auth_failures[client_id]
+
+            while failures and failures[0] < cutoff:
+                failures.popleft()
+
+            failures.append(now)
+
+            if len(failures) >= self._config.max_auth_failures_per_window:
+                blocked_until = now + self._config.auth_block_seconds
+                self._blocked_clients[client_id] = blocked_until
+
+            self._gc_auth_guard_locked(now)
+
+        details: dict[str, Any] = {
+            "client_id": client_id,
+            "reason": reason,
+        }
+        if blocked_until is not None:
+            details["blocked_until_monotonic"] = blocked_until
+            details["block_seconds"] = self._config.auth_block_seconds
+
+        event = IntegrityEvent(
+            event_type="AuthFailure",
+            source="NodeAPI",
+            file_path="",
+            details=details,
+            state_at_event=self.get_status()["state"],
+        )
+        self._record(event)
+        self._emit_to_monitoring("AuthFailure", client_id)
+
+    def _gc_auth_guard_locked(self, now: float) -> None:
+        """
+        Called under _auth_guard_lock. Prevents unbounded growth if many unique
+        troll IPs each hit once and disappear into the internet swamp.
+        """
+        cutoff = now - self._config.auth_failure_window_seconds
+
+        stale_failure_clients = [
+            client_id
+            for client_id, failures in self._auth_failures.items()
+            if not failures or failures[-1] < cutoff
+        ]
+        for client_id in stale_failure_clients:
+            self._auth_failures.pop(client_id, None)
+
+        expired_blocks = [
+            client_id
+            for client_id, until in self._blocked_clients.items()
+            if now >= until
+        ]
+        for client_id in expired_blocks:
+            self._blocked_clients.pop(client_id, None)
+
+    def require_node_auth(
+        self,
+        request: Request,
+        authorization: str | None,
+    ) -> None:
+        """
+        Route-level guard for node API endpoints.
+
+        This wraps _require_node_token() with:
+          - client identification
+          - temporary client blocking
+          - auth failure event logging
+          - monitoring notification
+        """
+        client_id = self._client_id(request)
+
+        if self._is_client_blocked(client_id):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many failed authentication attempts.",
+            )
+
+        try:
+            _require_node_token(authorization, self._config)
+        except HTTPException as exc:
+            reason = "missing_or_invalid_bearer"
+            if exc.status_code == status.HTTP_503_SERVICE_UNAVAILABLE:
+                reason = "node_api_token_not_configured"
+            self._record_auth_failure(client_id, reason)
+            raise
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -281,9 +497,8 @@ class SpartaCore:
 
     def _calculate_sha256(self, file_path: str) -> str | None:
         """
-        Fix: the original separated os.path.exists() from open(), creating a
-        TOCTOU race (file deleted between check and open). Fix: attempt open
-        directly and handle OSError. Returns None on any read error.
+        Hash a file without a separate exists() check, avoiding a TOCTOU window.
+        Returns None on any read failure.
         """
         try:
             sha256 = hashlib.sha256()
@@ -293,52 +508,101 @@ class SpartaCore:
             return sha256.hexdigest()
         except OSError as exc:
             logger.warning(
-                "Integrity check: cannot read file path=%s error=%s", file_path, exc
+                "Integrity check: cannot read file path=%s error=%s",
+                file_path,
+                exc,
             )
             return None
 
     def _record(self, event: IntegrityEvent) -> None:
-        self._event_log.append(event.to_dict())
+        """
+        Thread-safe bounded event record.
+        """
+        event_dict = event.to_dict()
+
+        with self._lock:
+            self._event_log.append(event_dict)
+
         logger.warning(
             "INTEGRITY EVENT type=%s file=%s state=%s",
-            event.event_type, event.file_path, event.state_at_event,
+            event.event_type,
+            event.file_path,
+            event.state_at_event,
         )
 
-    def _emit_to_monitoring(self, event_type: str, file_path: str) -> None:
+    def _safe_monitoring_dispatch(self, payload: dict[str, Any]) -> None:
         """
-        Route integrity violations to MonitoringManager so they surface in
-        Watchtower alerts and the SentinelWindowStore threat-detection buffer.
-        Best-effort: never raises.
+        Notify MonitoringManager without blocking the caller.
+
+        The try/except must live inside the worker thread, not merely around
+        Thread.start(), because exceptions raised inside the thread are not
+        caught by the outer call site. Yes, Python made that a little foot-gun.
         """
         if self._monitoring_manager is None:
             return
 
-        # Map integrity violation type to S43 event kind
+        def _worker() -> None:
+            try:
+                self._monitoring_manager.analyze_event(payload)
+            except Exception as exc:
+                logger.debug("MonitoringManager notification failed: %s", exc)
+
+        try:
+            threading.Thread(target=_worker, daemon=True).start()
+        except Exception as exc:
+            logger.debug("MonitoringManager thread start failed: %s", exc)
+
+    def _emit_to_monitoring(self, event_type: str, subject: str) -> None:
+        """
+        Route security-relevant events to MonitoringManager.
+
+        event_type:
+          - TamperDetected
+          - FileMissing
+          - AuthFailure
+          - LockdownTriggered
+        """
+        if self._monitoring_manager is None:
+            return
+
         if event_type == "TamperDetected":
             payload: dict[str, Any] = {
                 "kind": "log",
                 "integrity_status": "tampered",
                 "audit_write_failed": False,
-                "file_path": file_path,
+                "file_path": subject,
                 "source": "SpartaCore",
+                "event_category": "tamper_detected",
+                "timestamp": utc_now(),
             }
-        else:  # FileMissing / Unreadable
+        elif event_type == "AuthFailure":
+            payload = {
+                "kind": "security",
+                "auth_failure": True,
+                "source_ip": subject,
+                "source": "SpartaCore",
+                "event_category": "node_api_auth_failure",
+                "timestamp": utc_now(),
+            }
+        elif event_type == "LockdownTriggered":
+            payload = {
+                "kind": "security",
+                "secrets_exposed": True,
+                "source": "SpartaCore",
+                "event_category": "lockdown_triggered",
+                "timestamp": utc_now(),
+            }
+        else:
             payload = {
                 "kind": "security",
                 "unsigned_artifact": True,
-                "file_path": file_path,
+                "file_path": subject,
                 "source": "SpartaCore",
                 "event_category": "file_missing",
+                "timestamp": utc_now(),
             }
 
-        try:
-            threading.Thread(
-                target=self._monitoring_manager.analyze_event,
-                args=(payload,),
-                daemon=True,
-            ).start()
-        except Exception as exc:
-            logger.debug("MonitoringManager notification failed: %s", exc)
+        self._safe_monitoring_dispatch(payload)
 
     # ------------------------------------------------------------------
     # Integrity check
@@ -347,7 +611,9 @@ class SpartaCore:
     def check_integrity(self) -> bool:
         """
         Hash every watched file. Returns True if all pass.
-        Records events and updates state for any failures.
+
+        Records events and updates state for any failures. File hashing happens
+        outside the lock so slow disk reads do not freeze status calls.
         """
         with self._lock:
             current_state = self._state
@@ -359,7 +625,6 @@ class SpartaCore:
             actual_hash = self._calculate_sha256(file_path)
 
             if actual_hash is None:
-                # File missing or unreadable
                 event = IntegrityEvent(
                     event_type="FileMissing",
                     source="IntegrityCheck",
@@ -372,11 +637,9 @@ class SpartaCore:
                 all_ok = False
                 continue
 
-            # Fix: constant-time comparison eliminates timing side-channel.
-            # The original used `!=` (Python string equality short-circuits
-            # on the first differing byte, leaking information about how many
-            # leading characters match).
-            if not secrets.compare_digest(actual_hash, expected_hash.lower()):
+            expected_normalized = expected_hash.strip().lower()
+
+            if not secrets.compare_digest(actual_hash, expected_normalized):
                 event = IntegrityEvent(
                     event_type="TamperDetected",
                     source="IntegrityCheck",
@@ -403,34 +666,43 @@ class SpartaCore:
             if old != new_state:
                 logger.info(
                     "SpartaCore state transition: %s -> %s",
-                    old.value, new_state.value,
+                    old.value,
+                    new_state.value,
                 )
                 self._state = new_state
 
+    def _mark_operational_if_initializing(self) -> None:
+        """
+        Startup-safe transition.
+
+        Does not turn LOCKDOWN/COMPROMISED back into OPERATIONAL just because
+        run() started. Security state should not be erased by a coroutine entry.
+        That would be stupid, and yet disturbingly common.
+        """
+        with self._lock:
+            if self._state == SpartaState.INITIALIZING:
+                logger.info(
+                    "SpartaCore state transition: %s -> %s",
+                    self._state.value,
+                    SpartaState.OPERATIONAL.value,
+                )
+                self._state = SpartaState.OPERATIONAL
+
     def _initiate_lockdown(self) -> None:
-        """
-        Fix: the original called os.system("killall -STOP suspicious_processes")
-        which is a shell-injection surface and does nothing in a container.
-        Lockdown now:
-          - Logs a CRITICAL entry
-          - Emits a SecurityEvent to the monitoring pipeline
-          - Invokes an optional lockdown_hook (operator-supplied callback)
-          so real response logic can be injected without touching this module.
-        """
         logger.critical(
             "SPARTA LOCKDOWN: integrity violation detected. "
             "Monitoring pipeline notified. Awaiting recovery or operator action."
         )
-        if self._monitoring_manager is not None:
-            try:
-                threading.Thread(
-                    target=self._monitoring_manager.analyze_event,
-                    args=({"kind": "security", "secrets_exposed": True,
-                           "source": "SpartaCore", "event_category": "lockdown_triggered"},),
-                    daemon=True,
-                ).start()
-            except Exception as exc:
-                logger.debug("MonitoringManager lockdown notification failed: %s", exc)
+
+        event = IntegrityEvent(
+            event_type="LockdownTriggered",
+            source="SpartaCore",
+            file_path="",
+            details={"reason": "integrity_violation"},
+            state_at_event=self.get_status()["state"],
+        )
+        self._record(event)
+        self._emit_to_monitoring("LockdownTriggered", "SpartaCore")
 
     # ------------------------------------------------------------------
     # Main watchdog loop
@@ -438,14 +710,14 @@ class SpartaCore:
 
     async def run(self) -> None:
         """
-        Fix: the original reset state to OPERATIONAL unconditionally at the
-        top of the loop (wiping any LOCKDOWN that may have been set before
-        the loop was re-entered). Now:
-          - INITIALIZING -> OPERATIONAL only on first entry
-          - LOCKDOWN -> OPERATIONAL only after a clean check
-          - SHUTDOWN exits the loop cleanly
+        Main watchdog loop.
+
+        Behavior:
+          - INITIALIZING -> OPERATIONAL only on first entry.
+          - LOCKDOWN -> OPERATIONAL only after a clean check.
+          - SHUTDOWN exits cleanly.
         """
-        self._transition(SpartaState.OPERATIONAL)
+        self._mark_operational_if_initializing()
         interval = self._config.check_interval_seconds
 
         while not self._stop_requested.is_set():
@@ -455,16 +727,17 @@ class SpartaCore:
                 current = self._state
 
             if not ok and current == SpartaState.OPERATIONAL:
-                self._tamper_count += 1
+                with self._lock:
+                    self._tamper_count += 1
                 self._transition(SpartaState.LOCKDOWN)
                 self._initiate_lockdown()
+
             elif ok and current == SpartaState.LOCKDOWN:
                 logger.info(
                     "All integrity checks passed -- transitioning LOCKDOWN -> OPERATIONAL"
                 )
                 self._transition(SpartaState.OPERATIONAL)
 
-            # Sleep in short increments so stop_requested is checked promptly
             deadline = time.monotonic() + interval
             while not self._stop_requested.is_set() and time.monotonic() < deadline:
                 await asyncio.sleep(min(1.0, deadline - time.monotonic()))
@@ -482,29 +755,63 @@ class SpartaCore:
 
     def get_status(self) -> dict[str, Any]:
         with self._lock:
+            state = self._state.value
+            watched_file_count = len(self._config.watched_files)
+            total_checks = self._total_checks
+            tamper_count = self._tamper_count
+            event_log_entries = len(self._event_log)
+
+        with self._auth_guard_lock:
+            blocked_clients = len(self._blocked_clients)
+            tracked_auth_clients = len(self._auth_failures)
+
+        return {
+            "state": state,
+            "node_signature": self._config.node_signature,
+            "watched_file_count": watched_file_count,
+            "total_checks": total_checks,
+            "tamper_count": tamper_count,
+            "event_log_entries": event_log_entries,
+            "blocked_clients": blocked_clients,
+            "tracked_auth_clients": tracked_auth_clients,
+            "timestamp": utc_now(),
+        }
+
+    def get_public_health(self) -> dict[str, Any]:
+        status_obj = self.get_status()
+        state_value = status_obj["state"]
+
+        ok = state_value == SpartaState.OPERATIONAL.value
+
+        if self._config.public_health_detail:
             return {
-                "state": self._state.value,
+                "status": "ok" if ok else state_value.lower(),
+                "state": state_value,
                 "node_signature": self._config.node_signature,
-                "watched_file_count": len(self._config.watched_files),
-                "total_checks": self._total_checks,
-                "tamper_count": self._tamper_count,
-                "event_log_entries": len(self._event_log),
                 "timestamp": utc_now(),
             }
 
+        return {
+            "status": "ok" if ok else "degraded",
+            "timestamp": utc_now(),
+        }
+
     def get_event_log(self, limit: int = 50) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 500))
         with self._lock:
             return list(self._event_log)[-limit:]
 
 
 # =============================================================================
-# Session token helpers (HMAC-SHA256, no external JWT library required)
+# Session token helpers
 # =============================================================================
 
 def _sign_token(node_id: str, secret: str, ttl: float) -> str:
     """
     Generate a time-limited HMAC-SHA256 session token.
-    Format: <node_id>:<expiry_unix>:<hex_signature>
+
+    Format:
+      <node_id>:<expiry_unix>:<hex_signature>
     """
     expiry = int(time.time() + ttl)
     payload = f"{node_id}:{expiry}"
@@ -515,20 +822,24 @@ def _sign_token(node_id: str, secret: str, ttl: float) -> str:
 def _verify_token(token: str, secret: str) -> str | None:
     """
     Verify a session token. Returns node_id on success, None on failure.
-    Uses secrets.compare_digest for constant-time comparison.
     """
     try:
         parts = token.split(":")
         if len(parts) != 3:
             return None
+
         node_id, expiry_str, provided_sig = parts
         expiry = int(expiry_str)
+
         if time.time() > expiry:
             return None
+
         payload = f"{node_id}:{expiry_str}"
         expected_sig = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
         if not secrets.compare_digest(provided_sig, expected_sig):
             return None
+
         return node_id
     except Exception:
         return None
@@ -536,8 +847,12 @@ def _verify_token(token: str, secret: str) -> str | None:
 
 def _require_node_token(authorization: str | None, config: IntegrityConfig) -> None:
     """
-    Validate the bearer token against the configured node API token.
-    Fails CLOSED: if no token is configured, every request is rejected.
+    Validate bearer token against S43_SPARTA_NODE_TOKEN.
+
+    Fails closed:
+      - no configured token = 503
+      - missing/malformed header = 401
+      - wrong token = 401
     """
     if not config.node_api_token:
         raise HTTPException(
@@ -547,12 +862,21 @@ def _require_node_token(authorization: str | None, config: IntegrityConfig) -> N
                 "Set S43_SPARTA_NODE_TOKEN to enable authenticated node endpoints."
             ),
         )
+
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or malformed Authorization header.",
         )
-    token = authorization.removeprefix("Bearer ")
+
+    token = authorization.removeprefix("Bearer ").strip()
+
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing bearer token.",
+        )
+
     if not secrets.compare_digest(token, config.node_api_token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -566,20 +890,20 @@ def _require_node_token(authorization: str | None, config: IntegrityConfig) -> N
 
 class NodeAuthRequest(BaseModel):
     node_id: str = Field(..., min_length=2, max_length=120)
-    credential: str = Field(..., min_length=8)
+    credential: str = Field(..., min_length=8, max_length=512)
 
 
 class NodeRegisterRequest(BaseModel):
     node_id: str = Field(..., min_length=2, max_length=120)
-    node_type: str = Field(default="generic")
-    version: str = Field(default="unknown")
-    capabilities: list[str] = Field(default_factory=list)
+    node_type: str = Field(default="generic", min_length=1, max_length=80)
+    version: str = Field(default="unknown", min_length=1, max_length=80)
+    capabilities: list[str] = Field(default_factory=list, max_length=32)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class NodeHeartbeatRequest(BaseModel):
     node_id: str = Field(..., min_length=2, max_length=120)
-    status_value: str = Field(default="online", alias="status")
+    status_value: str = Field(default="online", alias="status", min_length=1, max_length=80)
     metrics: dict[str, Any] = Field(default_factory=dict)
 
     class Config:
@@ -588,14 +912,6 @@ class NodeHeartbeatRequest(BaseModel):
 
 # =============================================================================
 # FastAPI node API router
-#
-# Fix: the original used aiohttp (a different framework from the rest of S43).
-# Converted to a FastAPI APIRouter factory so it mounts cleanly on the
-# existing S43 app with shared auth, logging, and middleware.
-#
-# The original /register_node, /update_status, /status routes map to
-# WatchtowerNode's existing module/dependency infrastructure; this router
-# provides a lightweight shim that also feeds events into SpartaCore.
 # =============================================================================
 
 def create_node_router(
@@ -612,57 +928,66 @@ def create_node_router(
     router = APIRouter(prefix=prefix, tags=["node"])
     cfg = sparta._config
 
+    def _require_route_auth(request: Request, authorization: str | None) -> None:
+        sparta.require_node_auth(request, authorization)
+
     @router.get("/health")
     def node_health() -> dict[str, Any]:
-        """Node health check -- no auth required."""
-        status_obj = sparta.get_status()
-        ok = status_obj["state"] == SpartaState.OPERATIONAL.value
-        return {
-            "status": "ok" if ok else status_obj["state"].lower(),
-            "node_signature": cfg.node_signature,
-            "state": status_obj["state"],
-            "timestamp": utc_now(),
-        }
+        """
+        Public health check.
+
+        By default, intentionally does not expose node_signature or exact state.
+        Set S43_SPARTA_PUBLIC_HEALTH_DETAIL=true only for trusted/private
+        deployments.
+        """
+        return sparta.get_public_health()
 
     @router.get("/status")
     def node_status(
+        request: Request,
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         """Full node status. Requires bearer token."""
-        _require_node_token(authorization, cfg)
+        _require_route_auth(request, authorization)
         return sparta.get_status()
 
     @router.get("/events")
     def node_events(
+        request: Request,
         authorization: str | None = Header(default=None),
         limit: int = 50,
     ) -> dict[str, Any]:
-        """Recent integrity events. Requires bearer token."""
-        _require_node_token(authorization, cfg)
+        """Recent integrity/security events. Requires bearer token."""
+        _require_route_auth(request, authorization)
         limit = max(1, min(limit, 500))
         events = sparta.get_event_log(limit)
-        return {"count": len(events), "limit": limit, "events": events}
+        return {
+            "count": len(events),
+            "limit": limit,
+            "events": events,
+        }
 
     @router.post("/auth", status_code=status.HTTP_200_OK)
     def authenticate(
+        request: Request,
         body: NodeAuthRequest,
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         """
         Authenticate a node and issue a time-limited HMAC session token.
 
-        Fix: the original returned the hardcoded string "example_jwt_token_here"
-        regardless of credentials -- an open auth bypass. Now:
-          - The bearer token is validated against S43_SPARTA_NODE_TOKEN
-          - The node_id in the body is validated against the credential
-            (credential must be a constant-time match against node_api_token)
-          - A real HMAC-SHA256 session token is issued with configurable TTL
-        """
-        _require_node_token(authorization, cfg)
+        Requires:
+          - valid Authorization: Bearer <S43_SPARTA_NODE_TOKEN>
+          - body.credential matching S43_SPARTA_NODE_TOKEN
 
-        # Validate the credential field as well (defense-in-depth for callers
-        # that send both headers and body credentials)
+        Repeated failures are locally tracked and temporarily blocked.
+        """
+        _require_route_auth(request, authorization)
+
+        client_id = sparta._client_id(request)
+
         if not secrets.compare_digest(body.credential, cfg.node_api_token):
+            sparta._record_auth_failure(client_id, "invalid_body_credential")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid node credential.",
@@ -674,7 +999,11 @@ def create_node_router(
                 detail="Token signing not configured on this node.",
             )
 
-        session_token = _sign_token(body.node_id, cfg.token_secret, cfg.token_ttl_seconds)
+        session_token = _sign_token(
+            body.node_id,
+            cfg.token_secret,
+            cfg.token_ttl_seconds,
+        )
 
         return {
             "message": "Authentication successful.",
@@ -686,16 +1015,21 @@ def create_node_router(
 
     @router.post("/register", status_code=status.HTTP_201_CREATED)
     def register_node(
+        request: Request,
         body: NodeRegisterRequest,
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
         """
         Register a node. Requires bearer token.
 
-        In a full S43 deployment this delegates to WatchtowerNode.register_module().
-        The SpartaCore watchdog records the registration as an integrity event.
+        In a full S43 deployment this can delegate into WatchtowerNode or
+        governance. Here SpartaCore records the registration as an integrity
+        event and applies payload-size guards.
         """
-        _require_node_token(authorization, cfg)
+        _require_route_auth(request, authorization)
+
+        _json_size_guard(body.capabilities, cfg.max_node_payload_bytes)
+        _json_size_guard(body.metadata, cfg.max_node_payload_bytes)
 
         event = IntegrityEvent(
             event_type="NodeRegistered",
@@ -706,7 +1040,9 @@ def create_node_router(
                 "node_type": body.node_type,
                 "version": body.version,
                 "capabilities": body.capabilities,
+                "metadata_size_bytes": _json_size_bytes(body.metadata),
             },
+            state_at_event=sparta.get_status()["state"],
         )
         sparta._record(event)
 
@@ -720,11 +1056,30 @@ def create_node_router(
 
     @router.post("/heartbeat")
     def node_heartbeat(
+        request: Request,
         body: NodeHeartbeatRequest,
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        """Node heartbeat / status update. Requires bearer token."""
-        _require_node_token(authorization, cfg)
+        """
+        Node heartbeat / status update. Requires bearer token.
+
+        Metrics are accepted only within configured JSON size limits.
+        """
+        _require_route_auth(request, authorization)
+        _json_size_guard(body.metrics, cfg.max_node_payload_bytes)
+
+        event = IntegrityEvent(
+            event_type="NodeHeartbeat",
+            source="NodeAPI",
+            file_path="",
+            details={
+                "node_id": body.node_id,
+                "status": body.status_value,
+                "metrics_size_bytes": _json_size_bytes(body.metrics),
+            },
+            state_at_event=sparta.get_status()["state"],
+        )
+        sparta._record(event)
 
         return {
             "status": "acknowledged",
@@ -742,10 +1097,10 @@ def create_node_router(
 
 def setup_signal_handlers(sparta: SpartaCore, loop: asyncio.AbstractEventLoop) -> None:
     """
-    Fix: the original used signal.signal() with sys.exit() inside the handler,
-    which raises SystemExit mid-event-loop, leaving coroutines and async
-    resources unclean. loop.add_signal_handler() is the correct asyncio
-    pattern -- the callback runs inside the event loop's next iteration.
+    Register graceful shutdown handlers.
+
+    Uses loop.add_signal_handler where supported, with a Windows-compatible
+    fallback.
     """
     def _handle() -> None:
         logger.warning("Shutdown signal received -- stopping SpartaCore watchdog.")
@@ -756,13 +1111,24 @@ def setup_signal_handlers(sparta: SpartaCore, loop: asyncio.AbstractEventLoop) -
         try:
             loop.add_signal_handler(sig, _handle)
         except (NotImplementedError, RuntimeError):
-            # Windows / environments where add_signal_handler isn't supported
-            signal.signal(sig, lambda s, f: _handle())
+            signal.signal(sig, lambda _s, _f: _handle())
 
 
 # =============================================================================
-# Entry point
+# Factory / Entry point
 # =============================================================================
+
+def build_sparta_core(
+    watched_files: dict[str, str],
+    *,
+    monitoring_manager: Optional[Any] = None,
+) -> SpartaCore:
+    """
+    Build SpartaCore from S43_SPARTA_* environment configuration.
+    """
+    config = IntegrityConfig.from_env(watched_files)
+    return SpartaCore(config, monitoring_manager=monitoring_manager)
+
 
 if __name__ == "__main__":
     WATCHED_FILES = {
@@ -770,13 +1136,12 @@ if __name__ == "__main__":
         "security_layer.py": os.getenv("S43_SPARTA_HASH_SECURITY_LAYER", "PLACEHOLDER_HASH"),
     }
 
-    config = IntegrityConfig.from_env(WATCHED_FILES)
-    sparta = SpartaCore(config)
+    sparta = build_sparta_core(WATCHED_FILES)
 
-    # Fix: asyncio.run() replaces the deprecated asyncio.get_event_loop()
     async def _main() -> None:
         loop = asyncio.get_running_loop()
         setup_signal_handlers(sparta, loop)
         await sparta.run()
 
     asyncio.run(_main())
+```
