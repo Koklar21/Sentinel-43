@@ -35,19 +35,23 @@
 
 """
 Sentinel-43 SpartaCore
-v1.1.0 — File Integrity Watchdog + Hardened Node API Router
+v1.2.0 — File Integrity Watchdog + Hardened Node API Router
 
-Security improvements in this recode:
+Security / architecture improvements in this recode:
 
   - Thread-safe event recording via SpartaCore._record().
   - Startup no longer forces LOCKDOWN/COMPROMISED back to OPERATIONAL.
+  - Optional sticky LOCKDOWN behavior via S43_SPARTA_AUTO_RECOVER_LOCKDOWN.
+  - Async watchdog loop offloads blocking file I/O through asyncio.to_thread().
   - Route-level authentication failure tracking.
   - Temporary client blocking after repeated auth failures.
   - Request-aware auth guards for /status, /events, /auth, /register, /heartbeat.
   - JSON payload size guards for node registration and heartbeat metadata.
-  - Safer MonitoringManager dispatch using wrapped daemon-thread calls.
-  - Public /health endpoint no longer leaks node_signature or exact internal state
-    unless explicitly enabled.
+  - MonitoringManager dispatch uses a bounded ThreadPoolExecutor instead of
+    unbounded daemon-thread creation.
+  - Public /health endpoint no longer leaks node_signature or exact internal
+    state unless explicitly enabled.
+  - Pydantic v2 ConfigDict support with a v1-compatible fallback.
   - Maintains fail-closed node API token behavior.
   - Maintains bounded in-memory event log via deque(maxlen=...).
 """
@@ -65,6 +69,7 @@ import signal
 import threading
 import time
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -73,6 +78,12 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
+
+try:  # Pydantic v2
+    from pydantic import ConfigDict
+except ImportError:  # pragma: no cover - Pydantic v1 fallback
+    ConfigDict = None  # type: ignore[assignment]
+
 
 logger = logging.getLogger("SentinelSpartaCore")
 
@@ -119,7 +130,12 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
         return default
 
 
-def _env_float(name: str, default: float, lo: float | None = None, hi: float | None = None) -> float:
+def _env_float(
+    name: str,
+    default: float,
+    lo: float | None = None,
+    hi: float | None = None,
+) -> float:
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -202,6 +218,12 @@ class IntegrityConfig:
     max_node_payload_bytes: int = 8_192
     public_health_detail: bool = False
 
+    # If False, LOCKDOWN is sticky and must be cleared by operator action.
+    auto_recover_lockdown: bool = False
+
+    # Bounded monitoring dispatch; prevents thread explosions under attack.
+    monitoring_workers: int = 2
+
     def __post_init__(self) -> None:
         if not isinstance(self.watched_files, MappingProxyType):
             object.__setattr__(
@@ -231,6 +253,9 @@ class IntegrityConfig:
         if self.max_node_payload_bytes < 1:
             raise ValueError("max_node_payload_bytes must be >= 1")
 
+        if self.monitoring_workers < 1:
+            raise ValueError("monitoring_workers must be >= 1")
+
     @classmethod
     def from_env(cls, watched_files: dict[str, str]) -> "IntegrityConfig":
         token_secret = _env("S43_SPARTA_TOKEN_SECRET")
@@ -250,7 +275,7 @@ class IntegrityConfig:
 
         return cls(
             watched_files=MappingProxyType(watched_files),
-            node_signature=_env("S43_SPARTA_NODE_SIGNATURE", "SPARTA-CORE-SIG-v1.1"),
+            node_signature=_env("S43_SPARTA_NODE_SIGNATURE", "SPARTA-CORE-SIG-v1.2"),
             check_interval_seconds=_env_float(
                 "S43_SPARTA_CHECK_INTERVAL",
                 30.0,
@@ -299,6 +324,16 @@ class IntegrityConfig:
                 "S43_SPARTA_PUBLIC_HEALTH_DETAIL",
                 False,
             ),
+            auto_recover_lockdown=_env_bool(
+                "S43_SPARTA_AUTO_RECOVER_LOCKDOWN",
+                False,
+            ),
+            monitoring_workers=_env_int(
+                "S43_SPARTA_MONITORING_WORKERS",
+                2,
+                1,
+                32,
+            ),
         )
 
 
@@ -337,7 +372,7 @@ class SpartaCore:
     Responsibilities:
       - Watch configured files by SHA-256 digest.
       - Transition to LOCKDOWN on missing/unreadable/tampered files.
-      - Recover LOCKDOWN -> OPERATIONAL only after clean integrity checks.
+      - Optionally recover LOCKDOWN -> OPERATIONAL after clean integrity checks.
       - Record bounded integrity/auth events.
       - Notify MonitoringManager on important security events.
       - Track bad node API clients and temporarily block repeated failures.
@@ -363,6 +398,12 @@ class SpartaCore:
         self._auth_guard_lock = threading.Lock()
         self._auth_failures: dict[str, deque[float]] = defaultdict(deque)
         self._blocked_clients: dict[str, float] = {}
+
+        self._monitoring_executor = ThreadPoolExecutor(
+            max_workers=config.monitoring_workers,
+            thread_name_prefix="s43-sparta-monitor",
+        )
+        self._monitoring_shutdown = False
 
     # ------------------------------------------------------------------
     # Client/auth guard helpers
@@ -533,23 +574,27 @@ class SpartaCore:
         """
         Notify MonitoringManager without blocking the caller.
 
-        The try/except must live inside the worker thread, not merely around
-        Thread.start(), because exceptions raised inside the thread are not
-        caught by the outer call site. Yes, Python made that a little foot-gun.
+        Uses a bounded ThreadPoolExecutor rather than spawning one OS thread per
+        security event. This prevents auth-failure floods from turning monitoring
+        dispatch into its own denial-of-service mechanism. Humanity remains
+        committed to inventing new ways to trip over logging.
         """
-        if self._monitoring_manager is None:
+        manager = self._monitoring_manager
+        if manager is None or self._monitoring_shutdown:
             return
 
         def _worker() -> None:
             try:
-                self._monitoring_manager.analyze_event(payload)
+                manager.analyze_event(payload)
             except Exception as exc:
                 logger.debug("MonitoringManager notification failed: %s", exc)
 
         try:
-            threading.Thread(target=_worker, daemon=True).start()
+            self._monitoring_executor.submit(_worker)
+        except RuntimeError as exc:
+            logger.debug("MonitoringManager executor unavailable: %s", exc)
         except Exception as exc:
-            logger.debug("MonitoringManager thread start failed: %s", exc)
+            logger.debug("MonitoringManager executor submit failed: %s", exc)
 
     def _emit_to_monitoring(self, event_type: str, subject: str) -> None:
         """
@@ -560,6 +605,7 @@ class SpartaCore:
           - FileMissing
           - AuthFailure
           - LockdownTriggered
+          - OperatorUnlock
         """
         if self._monitoring_manager is None:
             return
@@ -589,6 +635,14 @@ class SpartaCore:
                 "secrets_exposed": True,
                 "source": "SpartaCore",
                 "event_category": "lockdown_triggered",
+                "timestamp": utc_now(),
+            }
+        elif event_type == "OperatorUnlock":
+            payload = {
+                "kind": "security",
+                "operator_action": True,
+                "source": "SpartaCore",
+                "event_category": "operator_unlock",
                 "timestamp": utc_now(),
             }
         else:
@@ -656,7 +710,7 @@ class SpartaCore:
         return all_ok
 
     # ------------------------------------------------------------------
-    # State transitions
+    # State transitions / operator controls
     # ------------------------------------------------------------------
 
     def _transition(self, new_state: SpartaState) -> None:
@@ -676,7 +730,6 @@ class SpartaCore:
 
         Does not turn LOCKDOWN/COMPROMISED back into OPERATIONAL just because
         run() started. Security state should not be erased by a coroutine entry.
-        That would be stupid, and yet disturbingly common.
         """
         with self._lock:
             if self._state == SpartaState.INITIALIZING:
@@ -703,6 +756,30 @@ class SpartaCore:
         self._record(event)
         self._emit_to_monitoring("LockdownTriggered", "SpartaCore")
 
+    def unlock_lockdown(self, *, operator: str = "unknown", reason: str = "manual") -> bool:
+        """
+        Explicit operator unlock path for sticky LOCKDOWN deployments.
+
+        Returns True when LOCKDOWN was cleared, False when no unlock was needed.
+        Does not clear COMPROMISED or SHUTDOWN. Those require higher-level
+        recovery because pretending everything is fine is not a recovery plan.
+        """
+        with self._lock:
+            if self._state != SpartaState.LOCKDOWN:
+                return False
+            self._state = SpartaState.OPERATIONAL
+
+        event = IntegrityEvent(
+            event_type="OperatorUnlock",
+            source="NodeAPI",
+            file_path="",
+            details={"operator": operator, "reason": reason},
+            state_at_event=SpartaState.OPERATIONAL.value,
+        )
+        self._record(event)
+        self._emit_to_monitoring("OperatorUnlock", operator)
+        return True
+
     # ------------------------------------------------------------------
     # Main watchdog loop
     # ------------------------------------------------------------------
@@ -713,14 +790,16 @@ class SpartaCore:
 
         Behavior:
           - INITIALIZING -> OPERATIONAL only on first entry.
-          - LOCKDOWN -> OPERATIONAL only after a clean check.
+          - File hashing is offloaded through asyncio.to_thread().
+          - LOCKDOWN -> OPERATIONAL only after a clean check when
+            auto_recover_lockdown is enabled.
           - SHUTDOWN exits cleanly.
         """
         self._mark_operational_if_initializing()
         interval = self._config.check_interval_seconds
 
         while not self._stop_requested.is_set():
-            ok = self.check_integrity()
+            ok = await asyncio.to_thread(self.check_integrity)
 
             with self._lock:
                 current = self._state
@@ -731,11 +810,21 @@ class SpartaCore:
                 self._transition(SpartaState.LOCKDOWN)
                 self._initiate_lockdown()
 
-            elif ok and current == SpartaState.LOCKDOWN:
+            elif (
+                ok
+                and current == SpartaState.LOCKDOWN
+                and self._config.auto_recover_lockdown
+            ):
                 logger.info(
                     "All integrity checks passed -- transitioning LOCKDOWN -> OPERATIONAL"
                 )
                 self._transition(SpartaState.OPERATIONAL)
+
+            elif ok and current == SpartaState.LOCKDOWN:
+                logger.info(
+                    "All integrity checks passed, but LOCKDOWN remains sticky "
+                    "because S43_SPARTA_AUTO_RECOVER_LOCKDOWN=false."
+                )
 
             deadline = time.monotonic() + interval
             while not self._stop_requested.is_set() and time.monotonic() < deadline:
@@ -747,6 +836,13 @@ class SpartaCore:
     def stop(self) -> None:
         """Request watchdog shutdown. Safe to call from any thread."""
         self._stop_requested.set()
+
+    def close(self) -> None:
+        """
+        Shutdown monitoring executor. Call during application shutdown.
+        """
+        self._monitoring_shutdown = True
+        self._monitoring_executor.shutdown(wait=False, cancel_futures=True)
 
     # ------------------------------------------------------------------
     # Status
@@ -773,6 +869,7 @@ class SpartaCore:
             "event_log_entries": event_log_entries,
             "blocked_clients": blocked_clients,
             "tracked_auth_clients": tracked_auth_clients,
+            "auto_recover_lockdown": self._config.auto_recover_lockdown,
             "timestamp": utc_now(),
         }
 
@@ -900,13 +997,26 @@ class NodeRegisterRequest(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class NodeHeartbeatRequest(BaseModel):
-    node_id: str = Field(..., min_length=2, max_length=120)
-    status_value: str = Field(default="online", alias="status", min_length=1, max_length=80)
-    metrics: dict[str, Any] = Field(default_factory=dict)
+if ConfigDict is not None:
+    class NodeHeartbeatRequest(BaseModel):
+        model_config = ConfigDict(populate_by_name=True)
 
-    class Config:
-        populate_by_name = True
+        node_id: str = Field(..., min_length=2, max_length=120)
+        status_value: str = Field(default="online", alias="status", min_length=1, max_length=80)
+        metrics: dict[str, Any] = Field(default_factory=dict)
+else:
+    class NodeHeartbeatRequest(BaseModel):
+        node_id: str = Field(..., min_length=2, max_length=120)
+        status_value: str = Field(default="online", alias="status", min_length=1, max_length=80)
+        metrics: dict[str, Any] = Field(default_factory=dict)
+
+        class Config:
+            allow_population_by_field_name = True
+
+
+class NodeUnlockRequest(BaseModel):
+    operator: str = Field(default="unknown", min_length=1, max_length=120)
+    reason: str = Field(default="manual", min_length=1, max_length=512)
 
 
 # =============================================================================
@@ -1087,6 +1197,31 @@ def create_node_router(
             "timestamp": utc_now(),
         }
 
+    @router.post("/unlock")
+    def unlock_node(
+        request: Request,
+        body: NodeUnlockRequest,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        """
+        Explicit operator unlock for sticky LOCKDOWN deployments.
+
+        Requires bearer token. This only clears LOCKDOWN, not COMPROMISED or
+        SHUTDOWN. Keep this behind the same firewall/auth stack as the rest of
+        the node API unless you enjoy debugging self-inflicted breaches.
+        """
+        _require_route_auth(request, authorization)
+        _json_size_guard(body.reason, cfg.max_node_payload_bytes)
+
+        changed = sparta.unlock_lockdown(operator=body.operator, reason=body.reason)
+
+        return {
+            "status": "unlocked" if changed else "no_change",
+            "state": sparta.get_status()["state"],
+            "operator": body.operator,
+            "timestamp": utc_now(),
+        }
+
     return router
 
 
@@ -1104,6 +1239,7 @@ def setup_signal_handlers(sparta: SpartaCore, loop: asyncio.AbstractEventLoop) -
     def _handle() -> None:
         logger.warning("Shutdown signal received -- stopping SpartaCore watchdog.")
         sparta.stop()
+        sparta.close()
         loop.stop()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -1129,6 +1265,21 @@ def build_sparta_core(
     return SpartaCore(config, monitoring_manager=monitoring_manager)
 
 
+__all__ = [
+    "IntegrityConfig",
+    "IntegrityEvent",
+    "NodeAuthRequest",
+    "NodeHeartbeatRequest",
+    "NodeRegisterRequest",
+    "NodeUnlockRequest",
+    "SpartaCore",
+    "SpartaState",
+    "build_sparta_core",
+    "create_node_router",
+    "setup_signal_handlers",
+]
+
+
 if __name__ == "__main__":
     WATCHED_FILES = {
         "sparta_core.py": os.getenv("S43_SPARTA_HASH_SPARTA_CORE", "PLACEHOLDER_HASH"),
@@ -1140,7 +1291,9 @@ if __name__ == "__main__":
     async def _main() -> None:
         loop = asyncio.get_running_loop()
         setup_signal_handlers(sparta, loop)
-        await sparta.run()
+        try:
+            await sparta.run()
+        finally:
+            sparta.close()
 
     asyncio.run(_main())
-```
