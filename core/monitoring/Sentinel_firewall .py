@@ -35,20 +35,21 @@
 
 """
 Sentinel-43 Application-Layer Firewall
-v1.1.0
+v1.2.0 — Pure ASGI Firewall + Hardened Reporting Path
 
-FastAPI / Starlette middleware that sits in front of every route and enforces:
+FastAPI / Starlette middleware that sits in front of every HTTP route and enforces:
 
-  - IP allowlist / blocklist with exact IP and CIDR support.
+  - Pure ASGI request handling, avoiding BaseHTTPMiddleware overhead.
+  - Exact IP and CIDR allowlist/blocklist with startup pre-compilation.
   - Trusted-proxy-only X-Forwarded-For handling.
   - Per-IP sliding-window rate limiting.
   - Request Content-Length limits before body read.
   - Optional rejection of body methods that omit Content-Length.
-  - Header budget checks.
+  - Header budget checks using raw ASGI header bytes.
   - Path length, exact path, and prefix path blocking.
-  - Request state injection for downstream handlers.
+  - Request scope state injection for downstream handlers.
   - Optional response header injection.
-  - Best-effort MonitoringManager security events.
+  - Bounded monitoring queue with a single worker thread.
   - Thread-safe operational counters.
 
 Mounting on an existing S43 FastAPI app:
@@ -67,21 +68,20 @@ The middleware runs before routing, so blocked requests never reach handlers.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import logging
 import os
+import queue
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Iterable, MutableMapping, Optional, Sequence
 
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import Response
-from starlette.types import ASGIApp
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 logger = logging.getLogger("SentinelFirewall")
 
@@ -128,7 +128,12 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
         return default
 
 
-def _env_float(name: str, default: float, lo: float | None = None, hi: float | None = None) -> float:
+def _env_float(
+    name: str,
+    default: float,
+    lo: float | None = None,
+    hi: float | None = None,
+) -> float:
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -164,34 +169,76 @@ def _safe_ip_address(value: str) -> ipaddress._BaseAddress | None:
         return None
 
 
-def _entry_matches_ip(entry: str, ip_value: str) -> bool:
+def _compile_ip_entries(
+    entries: Iterable[str],
+    *,
+    label: str,
+) -> tuple[frozenset[ipaddress._BaseAddress], tuple[ipaddress._BaseNetwork, ...]]:
     """
-    Match an IP against either:
-      - exact IP string
-      - CIDR network string
+    Compile exact IPs and CIDR ranges once at startup.
 
-    Invalid entries do not match. This avoids DNS lookups and other nonsense
-    humans eventually regret.
+    Exact IPs become a frozenset for O(1) lookup. CIDRs become a tuple of
+    network objects. We still scan CIDRs linearly because Python stdlib has no
+    built-in prefix trie, and pulling one in for beta would be very on-brand for
+    overengineering a toaster.
     """
-    entry = entry.strip()
-    if not entry:
-        return False
+    exact: set[ipaddress._BaseAddress] = set()
+    networks: list[ipaddress._BaseNetwork] = []
 
+    for raw_entry in entries:
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+
+        try:
+            if "/" in entry:
+                networks.append(ipaddress.ip_network(entry, strict=False))
+            else:
+                exact.add(ipaddress.ip_address(entry))
+        except ValueError:
+            logger.warning("Invalid %s IP/CIDR entry ignored: %r", label, entry)
+
+    return frozenset(exact), tuple(networks)
+
+
+def _ip_matches_compiled(
+    ip_value: str,
+    exact_ips: frozenset[ipaddress._BaseAddress],
+    networks: Sequence[ipaddress._BaseNetwork],
+) -> bool:
     ip_obj = _safe_ip_address(ip_value)
     if ip_obj is None:
         return False
 
-    try:
-        if "/" in entry:
-            return ip_obj in ipaddress.ip_network(entry, strict=False)
-        return ip_obj == ipaddress.ip_address(entry)
-    except ValueError:
-        logger.warning("Invalid firewall IP/CIDR entry ignored: %r", entry)
-        return False
+    if ip_obj in exact_ips:
+        return True
+
+    return any(ip_obj in network for network in networks)
 
 
-def _any_entry_matches(entries: frozenset[str], ip_value: str) -> bool:
-    return any(_entry_matches_ip(entry, ip_value) for entry in entries)
+def _get_header(headers: Sequence[tuple[bytes, bytes]], name: bytes) -> str:
+    """
+    Return the first matching HTTP header decoded as latin-1.
+
+    ASGI headers are lowercase-preserving bytes. We compare lowercased bytes and
+    decode only the one we need. This avoids building Starlette Request objects
+    just to ask them the same question while pretending allocations are free.
+    """
+    wanted = name.lower()
+    for key, value in headers:
+        if key.lower() == wanted:
+            return value.decode("latin-1", errors="ignore").strip()
+    return ""
+
+
+def _append_response_headers(message: Message, extra_headers: list[tuple[bytes, bytes]]) -> Message:
+    if message.get("type") != "http.response.start":
+        return message
+
+    headers = list(message.get("headers", []))
+    headers.extend(extra_headers)
+    message["headers"] = headers
+    return message
 
 
 # =============================================================================
@@ -249,6 +296,11 @@ class FirewallConfig:
       trusted_proxies:
         Exact IPs/CIDRs allowed to supply X-Forwarded-For.
 
+    Monitoring:
+      monitoring_queue_size:
+        Max queued block reports. When full, reports are dropped instead of
+        blocking request handling.
+
     Response:
       inject_response_headers:
         Adds S43 firewall metadata to successful downstream responses.
@@ -274,7 +326,16 @@ class FirewallConfig:
     trusted_proxies: frozenset[str] = field(default_factory=frozenset)
 
     gc_every_n_requests: int = 500
+    monitoring_queue_size: int = 1_000
     inject_response_headers: bool = False
+
+    # Compiled fields are derived in __post_init__.
+    _allowed_exact_ips: frozenset[ipaddress._BaseAddress] = field(init=False, repr=False)
+    _allowed_networks: tuple[ipaddress._BaseNetwork, ...] = field(init=False, repr=False)
+    _blocked_exact_ips: frozenset[ipaddress._BaseAddress] = field(init=False, repr=False)
+    _blocked_networks: tuple[ipaddress._BaseNetwork, ...] = field(init=False, repr=False)
+    _trusted_proxy_exact_ips: frozenset[ipaddress._BaseAddress] = field(init=False, repr=False)
+    _trusted_proxy_networks: tuple[ipaddress._BaseNetwork, ...] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.allowed_ips is not None:
@@ -306,6 +367,29 @@ class FirewallConfig:
 
         if self.gc_every_n_requests < 1:
             raise ValueError("gc_every_n_requests must be >= 1")
+
+        if self.monitoring_queue_size < 1:
+            raise ValueError("monitoring_queue_size must be >= 1")
+
+        allowed_exact, allowed_networks = _compile_ip_entries(
+            self.allowed_ips or frozenset(),
+            label="allowed_ips",
+        )
+        blocked_exact, blocked_networks = _compile_ip_entries(
+            self.blocked_ips,
+            label="blocked_ips",
+        )
+        trusted_exact, trusted_networks = _compile_ip_entries(
+            self.trusted_proxies,
+            label="trusted_proxies",
+        )
+
+        object.__setattr__(self, "_allowed_exact_ips", allowed_exact)
+        object.__setattr__(self, "_allowed_networks", allowed_networks)
+        object.__setattr__(self, "_blocked_exact_ips", blocked_exact)
+        object.__setattr__(self, "_blocked_networks", blocked_networks)
+        object.__setattr__(self, "_trusted_proxy_exact_ips", trusted_exact)
+        object.__setattr__(self, "_trusted_proxy_networks", trusted_networks)
 
     @classmethod
     def from_env(cls) -> "FirewallConfig":
@@ -351,6 +435,9 @@ class FirewallConfig:
         S43_FIREWALL_GC_EVERY
             Rate-limit GC interval. Default: 500.
 
+        S43_FIREWALL_MONITORING_QUEUE_SIZE
+            Max queued block reports. Default: 1000.
+
         S43_FIREWALL_INJECT_RESPONSE_HEADERS
             Adds S43 response headers on allowed requests. Default: false.
         """
@@ -370,6 +457,7 @@ class FirewallConfig:
             max_path_length=_env_int("S43_FIREWALL_MAX_PATH_LENGTH", 2_048, 128, 32_768),
             trusted_proxies=_env_set("S43_FIREWALL_TRUSTED_PROXIES"),
             gc_every_n_requests=_env_int("S43_FIREWALL_GC_EVERY", 500, 10, 100_000),
+            monitoring_queue_size=_env_int("S43_FIREWALL_MONITORING_QUEUE_SIZE", 1_000, 1, 100_000),
             inject_response_headers=_env_bool("S43_FIREWALL_INJECT_RESPONSE_HEADERS", False),
         )
 
@@ -391,12 +479,16 @@ class BlockReason:
 
 
 # =============================================================================
-# SentinelFirewall middleware
+# SentinelFirewall ASGI middleware
 # =============================================================================
 
-class SentinelFirewall(BaseHTTPMiddleware):
+class SentinelFirewall:
     """
-    Application-layer firewall middleware for Sentinel-43.
+    Pure ASGI application-layer firewall for Sentinel-43.
+
+    This intentionally avoids BaseHTTPMiddleware. It reads only the ASGI scope
+    and headers before deciding whether to drop a request, so blocked requests
+    never construct a Starlette Request and never hit route handlers.
     """
 
     def __init__(
@@ -406,8 +498,7 @@ class SentinelFirewall(BaseHTTPMiddleware):
         *,
         monitoring_manager: Optional[Any] = None,
     ) -> None:
-        super().__init__(app)
-
+        self.app = app
         self._config = config
         self._monitoring_manager = monitoring_manager
 
@@ -418,10 +509,27 @@ class SentinelFirewall(BaseHTTPMiddleware):
         self._total_requests = 0
         self._blocked_count = 0
         self._gc_counter = 0
+        self._dropped_report_count = 0
+        self._reported_block_count = 0
+
+        self._report_queue: queue.Queue[dict[str, Any] | None] = queue.Queue(
+            maxsize=config.monitoring_queue_size
+        )
+        self._reporter_stop = threading.Event()
+        self._reporter_thread: threading.Thread | None = None
+
+        if monitoring_manager is not None:
+            self._reporter_thread = threading.Thread(
+                target=self._report_worker,
+                name="s43-firewall-reporter",
+                daemon=True,
+            )
+            self._reporter_thread.start()
 
         logger.info(
             "SentinelFirewall initialized: rate_limit=%d/%ss max_bytes=%d "
-            "allowed_ips=%s blocked_ips=%d blocked_paths=%d trusted_proxies=%d",
+            "allowed_ips=%s blocked_ips=%d blocked_paths=%d trusted_proxies=%d "
+            "monitoring_queue=%d pure_asgi=true",
             config.rate_limit_per_window,
             config.rate_window_seconds,
             config.max_request_bytes,
@@ -429,7 +537,29 @@ class SentinelFirewall(BaseHTTPMiddleware):
             len(config.blocked_ips),
             len(config.blocked_paths) + len(config.blocked_prefixes),
             len(config.trusted_proxies),
+            config.monitoring_queue_size,
         )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def close(self) -> None:
+        """
+        Stop the reporting worker.
+
+        Starlette does not automatically call middleware close hooks, so call
+        this from app shutdown if you want a tidy local dev teardown. Daemon
+        worker still exits with the process if humans forget, as tradition
+        demands.
+        """
+        self._reporter_stop.set()
+        if self._reporter_thread is not None:
+            try:
+                self._report_queue.put_nowait(None)
+            except queue.Full:
+                pass
+            self._reporter_thread.join(timeout=2.0)
 
     # ------------------------------------------------------------------
     # Stats helpers
@@ -443,35 +573,54 @@ class SentinelFirewall(BaseHTTPMiddleware):
         with self._stats_lock:
             self._blocked_count += 1
 
+    def _inc_dropped_report(self) -> None:
+        with self._stats_lock:
+            self._dropped_report_count += 1
+
+    def _inc_reported_block(self) -> None:
+        with self._stats_lock:
+            self._reported_block_count += 1
+
     # ------------------------------------------------------------------
     # IP extraction
     # ------------------------------------------------------------------
 
-    def _extract_client_ip(self, request: Request) -> str:
-        """
-        Extract the client IP.
-
-        X-Forwarded-For is trusted only when the immediate upstream peer is in
-        trusted_proxies. If the proxy is not trusted, forwarded headers are
-        ignored. Because apparently anyone on the internet can type headers,
-        which is shocking only if you just woke up from 1996.
-        """
-        if request.client is None:
+    def _peer_ip(self, scope: Scope) -> str:
+        client = scope.get("client")
+        if not client:
             return "unknown"
 
-        immediate_ip = request.client.host or "unknown"
-        forwarded_for = request.headers.get("X-Forwarded-For", "").strip()
+        try:
+            return str(client[0] or "unknown")
+        except Exception:
+            return "unknown"
+
+    def _is_trusted_proxy(self, immediate_ip: str) -> bool:
+        return _ip_matches_compiled(
+            immediate_ip,
+            self._config._trusted_proxy_exact_ips,
+            self._config._trusted_proxy_networks,
+        )
+
+    def _extract_client_ip(self, scope: Scope, headers: Sequence[tuple[bytes, bytes]]) -> str:
+        """
+        Extract the client IP from ASGI scope.
+
+        X-Forwarded-For is trusted only when the immediate upstream peer is in
+        trusted_proxies. Untrusted callers can type fake XFF headers all day.
+        The firewall remains unimpressed.
+        """
+        immediate_ip = self._peer_ip(scope)
+        forwarded_for = _get_header(headers, b"x-forwarded-for")
 
         if not forwarded_for:
             return immediate_ip
 
-        if not _any_entry_matches(self._config.trusted_proxies, immediate_ip):
+        if not self._is_trusted_proxy(immediate_ip):
             return immediate_ip
 
-        # RFC-style chain: first entry is original client.
         first = forwarded_for.split(",")[0].strip()
 
-        # Reject garbage by falling back to immediate IP.
         if _safe_ip_address(first) is None:
             logger.warning(
                 "Firewall: invalid X-Forwarded-For from trusted proxy=%s value=%r",
@@ -486,19 +635,30 @@ class SentinelFirewall(BaseHTTPMiddleware):
     # IP filtering
     # ------------------------------------------------------------------
 
-    def _is_ip_allowed(self, ip_value: str) -> bool:
+    def _is_blocked_ip(self, ip_value: str) -> bool:
+        return _ip_matches_compiled(
+            ip_value,
+            self._config._blocked_exact_ips,
+            self._config._blocked_networks,
+        )
+
+    def _is_allowed_ip(self, ip_value: str) -> bool:
         config = self._config
 
-        if _any_entry_matches(config.blocked_ips, ip_value):
+        if self._is_blocked_ip(ip_value):
             return False
 
-        if config.allowed_ips is not None and not _any_entry_matches(config.allowed_ips, ip_value):
-            return False
+        if config.allowed_ips is None:
+            return True
 
-        return True
+        return _ip_matches_compiled(
+            ip_value,
+            config._allowed_exact_ips,
+            config._allowed_networks,
+        )
 
     def _ip_block_reason(self, ip_value: str) -> str:
-        if _any_entry_matches(self._config.blocked_ips, ip_value):
+        if self._is_blocked_ip(ip_value):
             return BlockReason.IP_BLOCKED
         return BlockReason.IP_NOT_ALLOWED
 
@@ -562,36 +722,38 @@ class SentinelFirewall(BaseHTTPMiddleware):
     # Header / payload checks
     # ------------------------------------------------------------------
 
-    def _headers_too_large(self, request: Request) -> bool:
+    def _headers_too_large(self, headers: Sequence[tuple[bytes, bytes]]) -> bool:
         if self._config.max_header_bytes <= 0:
             return False
 
         total = 0
-        for key, value in request.headers.items():
-            total += len(key.encode("utf-8", errors="ignore"))
-            total += len(value.encode("utf-8", errors="ignore"))
-
+        for key, value in headers:
+            total += len(key) + len(value)
             if total > self._config.max_header_bytes:
                 return True
 
         return False
 
-    def _payload_block_reason(self, request: Request) -> str | None:
+    def _payload_block_reason(
+        self,
+        method: str,
+        headers: Sequence[tuple[bytes, bytes]],
+    ) -> str | None:
         """
         Return a BlockReason if the payload should be blocked, else None.
 
-        This uses Content-Length only. If you allow chunked uploads directly to
-        the app, enforce streaming body limits upstream or replace this with a
-        lower-level ASGI receive wrapper. Pretending chunked bodies do not exist
-        is how people accidentally host a landfill.
+        This uses Content-Length only. If chunked uploads are allowed directly to
+        the app, enforce streaming body limits upstream. This middleware rejects
+        body methods without Content-Length by default because letting unknown
+        body sizes wander in is not security, it is hope with a badge.
         """
         config = self._config
 
         if config.max_request_bytes <= 0 and not config.require_content_length_for_body:
             return None
 
-        method = request.method.upper()
-        raw = request.headers.get("content-length", "").strip()
+        method = method.upper()
+        raw = _get_header(headers, b"content-length")
 
         if not raw:
             if config.require_content_length_for_body and method in config.body_methods:
@@ -615,6 +777,29 @@ class SentinelFirewall(BaseHTTPMiddleware):
     # Monitoring integration
     # ------------------------------------------------------------------
 
+    def _report_worker(self) -> None:
+        manager = self._monitoring_manager
+        if manager is None:
+            return
+
+        while not self._reporter_stop.is_set():
+            try:
+                event = self._report_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            if event is None:
+                self._report_queue.task_done()
+                return
+
+            try:
+                manager.analyze_event(event)
+                self._inc_reported_block()
+            except Exception as exc:
+                logger.debug("Firewall: MonitoringManager notification failed: %s", exc)
+            finally:
+                self._report_queue.task_done()
+
     def _report_block(
         self,
         reason: str,
@@ -622,11 +807,11 @@ class SentinelFirewall(BaseHTTPMiddleware):
         path: str,
     ) -> None:
         """
-        Route a firewall block event to the monitoring pipeline.
+        Queue a firewall block event for the monitoring pipeline.
 
-        The try/except is inside the worker thread, not just around start(),
-        because exceptions raised inside daemon threads do not get caught by the
-        parent. Yes, another tiny Python bear trap.
+        This never blocks the request path. If the queue is full, the event is
+        dropped and counted. The firewall protects the application first; it is
+        not here to lovingly journal every troll with a loop and a dream.
         """
         if self._monitoring_manager is None:
             return
@@ -641,76 +826,97 @@ class SentinelFirewall(BaseHTTPMiddleware):
             "timestamp": utc_now(),
         }
 
-        def _worker() -> None:
-            try:
-                self._monitoring_manager.analyze_event(event)
-            except Exception as exc:
-                logger.debug("Firewall: MonitoringManager notification failed: %s", exc)
-
         try:
-            threading.Thread(target=_worker, daemon=True).start()
-        except Exception as exc:
-            logger.debug("Firewall: MonitoringManager thread start failed: %s", exc)
+            self._report_queue.put_nowait(event)
+        except queue.Full:
+            self._inc_dropped_report()
+            logger.debug(
+                "Firewall: monitoring report queue full; dropped block report reason=%s ip=%s path=%s",
+                reason,
+                client_ip,
+                path,
+            )
 
     # ------------------------------------------------------------------
-    # Block response factory
+    # ASGI response helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _block_response(
+    async def _send_block_response(
+        send: Send,
         http_status: int,
         reason: str,
         code: str,
         *,
         retry_after: int | None = None,
-    ) -> Response:
-        headers = {
-            "Cache-Control": "no-store",
-            "X-S43-Firewall": "blocked",
-            "X-S43-Block-Code": code,
-        }
+    ) -> None:
+        body = json.dumps({"error": reason, "code": code}).encode("utf-8")
+
+        headers = [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode("ascii")),
+            (b"cache-control", b"no-store"),
+            (b"x-s43-firewall", b"blocked"),
+            (b"x-s43-block-code", code.encode("ascii", errors="ignore")),
+        ]
 
         if retry_after is not None:
-            headers["Retry-After"] = str(max(1, retry_after))
+            headers.append((b"retry-after", str(max(1, retry_after)).encode("ascii")))
 
-        return Response(
-            content=json.dumps(
-                {
-                    "error": reason,
-                    "code": code,
-                }
-            ),
-            status_code=http_status,
-            media_type="application/json",
-            headers=headers,
+        await send(
+            {
+                "type": "http.response.start",
+                "status": http_status,
+                "headers": headers,
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": body,
+                "more_body": False,
+            }
         )
 
     # ------------------------------------------------------------------
-    # Middleware dispatch
+    # Middleware entrypoint
     # ------------------------------------------------------------------
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
         self._inc_total()
 
-        client_ip = self._extract_client_ip(request)
-        path = request.url.path
+        headers: Sequence[tuple[bytes, bytes]] = scope.get("headers", [])
+        method = str(scope.get("method", "GET")).upper()
+        path = str(scope.get("path", "/"))
+        client_ip = self._extract_client_ip(scope, headers)
 
         # ---- Path length check ----
         if self._is_path_too_long(path):
             self._inc_blocked()
             logger.warning("Firewall: path too long ip=%s path_len=%d", client_ip, len(path))
             self._report_block(BlockReason.PATH_TOO_LONG, client_ip, path)
-            return self._block_response(414, "URI Too Long", "PATH_TOO_LONG")
+            await self._send_block_response(send, 414, "URI Too Long", "PATH_TOO_LONG")
+            return
 
         # ---- Header budget check ----
-        if self._headers_too_large(request):
+        if self._headers_too_large(headers):
             self._inc_blocked()
             logger.warning("Firewall: headers too large ip=%s path=%s", client_ip, path)
             self._report_block(BlockReason.HEADERS_TOO_LARGE, client_ip, path)
-            return self._block_response(431, "Request Header Fields Too Large", "HEADERS_TOO_LARGE")
+            await self._send_block_response(
+                send,
+                431,
+                "Request Header Fields Too Large",
+                "HEADERS_TOO_LARGE",
+            )
+            return
 
         # ---- IP check ----
-        if not self._is_ip_allowed(client_ip):
+        if not self._is_allowed_ip(client_ip):
             self._inc_blocked()
             reason = self._ip_block_reason(client_ip)
             logger.warning(
@@ -720,17 +926,19 @@ class SentinelFirewall(BaseHTTPMiddleware):
                 reason,
             )
             self._report_block(reason, client_ip, path)
-            return self._block_response(403, "Forbidden", reason.upper())
+            await self._send_block_response(send, 403, "Forbidden", reason.upper())
+            return
 
         # ---- Path block check ----
         if self._is_path_blocked(path):
             self._inc_blocked()
             logger.warning("Firewall: path blocked ip=%s path=%s", client_ip, path)
             self._report_block(BlockReason.PATH_BLOCKED, client_ip, path)
-            return self._block_response(403, "Forbidden", "PATH_BLOCKED")
+            await self._send_block_response(send, 403, "Forbidden", "PATH_BLOCKED")
+            return
 
         # ---- Payload check ----
-        payload_reason = self._payload_block_reason(request)
+        payload_reason = self._payload_block_reason(method, headers)
         if payload_reason is not None:
             self._inc_blocked()
 
@@ -749,11 +957,12 @@ class SentinelFirewall(BaseHTTPMiddleware):
                 client_ip,
                 path,
                 payload_reason,
-                request.headers.get("content-length"),
+                _get_header(headers, b"content-length"),
             )
 
             self._report_block(payload_reason, client_ip, path)
-            return self._block_response(status_code, error, payload_reason.upper())
+            await self._send_block_response(send, status_code, error, payload_reason.upper())
+            return
 
         # ---- Rate limit ----
         if not self._check_rate_limit(client_ip):
@@ -761,24 +970,37 @@ class SentinelFirewall(BaseHTTPMiddleware):
             retry_after = int(max(1.0, self._config.rate_window_seconds))
             logger.warning("Firewall: rate limited ip=%s path=%s", client_ip, path)
             self._report_block(BlockReason.RATE_LIMITED, client_ip, path)
-            return self._block_response(
+            await self._send_block_response(
+                send,
                 429,
                 "Too Many Requests",
                 "RATE_LIMITED",
                 retry_after=retry_after,
             )
+            return
 
-        # ---- Downstream request state injection ----
-        request.state.s43_client_ip = client_ip
-        request.state.s43_firewall_passed = True
+        # ---- Downstream state injection ----
+        # Starlette Request.state is backed by scope["state"], so this remains
+        # compatible with downstream handlers reading request.state.s43_client_ip.
+        state = scope.setdefault("state", {})
+        if isinstance(state, MutableMapping):
+            state["s43_client_ip"] = client_ip
+            state["s43_firewall_passed"] = True
 
-        response = await call_next(request)
+        # ---- Optional response header injection ----
+        if not self._config.inject_response_headers:
+            await self.app(scope, receive, send)
+            return
 
-        if self._config.inject_response_headers:
-            response.headers["X-S43-Firewall"] = "passed"
-            response.headers["X-S43-Client-IP"] = client_ip
+        extra_headers = [
+            (b"x-s43-firewall", b"passed"),
+            (b"x-s43-client-ip", client_ip.encode("latin-1", errors="ignore")),
+        ]
 
-        return response
+        async def send_with_headers(message: Message) -> None:
+            await send(_append_response_headers(message, extra_headers))
+
+        await self.app(scope, receive, send_with_headers)
 
     # ------------------------------------------------------------------
     # Stats
@@ -791,6 +1013,8 @@ class SentinelFirewall(BaseHTTPMiddleware):
         with self._stats_lock:
             total_requests = self._total_requests
             blocked_count = self._blocked_count
+            dropped_report_count = self._dropped_report_count
+            reported_block_count = self._reported_block_count
 
         return {
             "total_requests": total_requests,
@@ -800,6 +1024,9 @@ class SentinelFirewall(BaseHTTPMiddleware):
                 2,
             ),
             "tracked_ips": tracked_ips,
+            "reported_block_count": reported_block_count,
+            "dropped_report_count": dropped_report_count,
+            "monitoring_queue_size": self._report_queue.qsize(),
             "config": {
                 "rate_limit_per_window": self._config.rate_limit_per_window,
                 "rate_window_seconds": self._config.rate_window_seconds,
@@ -819,7 +1046,9 @@ class SentinelFirewall(BaseHTTPMiddleware):
                     + len(self._config.blocked_prefixes)
                 ),
                 "trusted_proxies_count": len(self._config.trusted_proxies),
+                "monitoring_queue_capacity": self._config.monitoring_queue_size,
                 "inject_response_headers": self._config.inject_response_headers,
+                "pure_asgi": True,
             },
             "timestamp": utc_now(),
         }
@@ -830,4 +1059,3 @@ __all__ = [
     "FirewallConfig",
     "SentinelFirewall",
 ]
-```
