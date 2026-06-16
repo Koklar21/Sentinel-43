@@ -37,25 +37,17 @@
 Sentinel-43 Authentication Module.
 Unified authentication interface.
 
-Eager exports (always available):
-  AuthManager, AuthContext, AuthResult, all exceptions and constants.
+All exports are eager and required.
 
-Lazy exports (loaded on first access):
-  FenrirAuthConfig, FenrirAuthManager, configure_fenrir_auth,
-  get_fenrir_auth_manager, is_fenrir_auth_configured.
-
-  These require .fenrir_auth to be importable (i.e. the fenrir sub-package
-  and its dependencies must be installed). If the import fails, accessing any
-  of these names raises AttributeError with an ImportWarning — not TypeError
-  from a None value, and not a silent null in the caller's namespace.
+Fenrir is an active security hunting component. Its auth layer
+(FenrirAuthConfig, FenrirAuthManager, etc.) is a hard dependency —
+if .fenrir_auth cannot be imported, this package raises ImportError
+at load time. Fenrir must not fail silently.
 """
 
 from __future__ import annotations
 
-import importlib
 import logging
-import warnings
-from typing import Any
 
 from .constants import (
     ALLOWED_ALGORITHMS,
@@ -114,81 +106,49 @@ __all__ = [
     "DEFAULT_ALGORITHM",
     "ALLOWED_ALGORITHMS",
     "is_allowed_algorithm",
-]
-
-
-# =============================================================================
-# Lazy exports — optional Fenrir auth integration
-#
-# Why __getattr__ instead of try/except + None:
-#
-#   The original code set FenrirAuthConfig = None on ImportError, then listed
-#   it in __all__. This caused two problems:
-#
-#     1. `from core.security.auth import *` exported None values into the
-#        caller's namespace. Calling configure_fenrir_auth(...) then raised
-#        TypeError: 'NoneType' is not callable — a confusing error with no
-#        indication that Fenrir auth is unavailable.
-#
-#     2. The failure was completely silent (no warning, no log). A developer
-#        expecting Fenrir auth to work would not discover the import failure
-#        until the first auth call failed at runtime.
-#
-#   The __getattr__ pattern raises AttributeError (which Python converts to
-#   "cannot import name X from core.security.auth") with an ImportWarning
-#   that names the exact module and error. Callers get a clear failure at
-#   import time rather than a silent null that explodes later.
-# =============================================================================
-
-_FENRIR_LAZY_NAMES: frozenset[str] = frozenset({
+    # Fenrir — active security hunting auth (hard dependency)
     "FenrirAuthConfig",
     "FenrirAuthManager",
     "configure_fenrir_auth",
     "get_fenrir_auth_manager",
     "is_fenrir_auth_configured",
-})
-
-_LAZY_EXPORTS: set[str] = set(_FENRIR_LAZY_NAMES)
+]
 
 
-def __getattr__(name: str) -> Any:
-    if name in _FENRIR_LAZY_NAMES:
-        try:
-            mod = importlib.import_module(".fenrir_auth", __name__)
-        except ImportError as exc:
-            _logger.debug(
-                "sentinel43.security.auth: Fenrir auth unavailable: %s", exc
-            )
-            warnings.warn(
-                f"sentinel43.security.auth: optional Fenrir auth export {name!r} "
-                f"is unavailable (.fenrir_auth could not be imported: {exc}). "
-                "Ensure the Fenrir sub-package and its dependencies are installed.",
-                ImportWarning,
-                stacklevel=2,
-            )
-            raise AttributeError(
-                f"module {__name__!r} has no attribute {name!r}"
-            ) from None
+# =============================================================================
+# Fenrir auth — EAGER hard import
+#
+# Fenrir is an active security hunting component, not a passive observer.
+# Its auth integration is NOT optional: if fenrir_auth cannot be imported,
+# Sentinel-43 cannot perform active security hunting and must not start
+# silently in a degraded state.
+#
+# Fail loud at package import time so the problem surfaces immediately
+# rather than at the first hunt cycle.
+#
+# If you are running a deployment that intentionally excludes Fenrir
+# (e.g. a stripped-down audit-only instance), create a stub fenrir_auth
+# module that exports the same names rather than relying on silent fallback.
+# =============================================================================
 
-        # Cache all available Fenrir names in one go
-        found: list[str] = []
-        for attr_name in _FENRIR_LAZY_NAMES:
-            val = getattr(mod, attr_name, None)
-            if val is not None:
-                globals()[attr_name] = val
-                found.append(attr_name)
-
-        if name in globals():
-            return globals()[name]
-
-        raise AttributeError(
-            f"module {__name__!r} has no attribute {name!r} "
-            f"(fenrir_auth loaded but {name!r} not found; "
-            f"available: {found})"
-        )
-
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+try:
+    from .fenrir_auth import (
+        FenrirAuthConfig,
+        FenrirAuthManager,
+        configure_fenrir_auth,
+        get_fenrir_auth_manager,
+        is_fenrir_auth_configured,
+    )
+except ImportError as _fenrir_exc:
+    raise ImportError(
+        "sentinel43.security.auth: Fenrir auth module failed to import. "
+        "Fenrir is an active security hunting component — its auth layer is "
+        "required for S43 to function. "
+        f"Underlying error: {_fenrir_exc}. "
+        "Ensure core/security/fenrir_auth.py and all its dependencies "
+        "(pyjwt, aiohttp, etc.) are installed in this environment."
+    ) from _fenrir_exc
 
 
 def __dir__() -> list[str]:
-    return sorted([*__all__, *_LAZY_EXPORTS])
+    return sorted(__all__)
