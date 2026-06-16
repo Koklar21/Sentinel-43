@@ -1064,9 +1064,3 @@ def _write_audit_record(
     )
 
     return audit_id
-SENTINEL_EOF
-echo "Written OK"
-Done
-
-You are out of free messages until 12:10 AM
-Claude Fable 5 is currently unavailable.
