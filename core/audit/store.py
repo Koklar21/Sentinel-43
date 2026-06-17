@@ -1,163 +1,232 @@
+# =============================================================================
+# Sentinel-43
+#
+# Copyright (c) 2026 Justin Armstrong
+# All Rights Reserved.
+#
+# This file is part of the Sentinel-43 platform and constitutes original
+# intellectual property of the copyright holder.
+#
+# Sentinel-43 is distributed under a dual-license model:
+#
+#   1. GNU Affero General Public License (AGPL v3.0)
+#      for open-source use, modification, and distribution.
+#
+#   2. Commercial License
+#      for proprietary, enterprise, government, or other commercial use
+#      not permitted under the AGPL v3.0.
+#
+# Unauthorized copying, redistribution, relicensing, reverse engineering,
+# or commercial exploitation outside the terms of the applicable license
+# is strictly prohibited.
+#
+# By accessing, modifying, distributing, or using this software, you agree
+# to comply with the terms of the applicable license.
+#
+# License Information:
+# AGPL v3.0: https://www.gnu.org/licenses/agpl-3.0.en.html
+#
+# Commercial Licensing:
+# Contact the copyright holder for commercial licensing terms.
+#
+# Sentinel-43™
+# Original Work and Protected Intellectual Property.
+# =============================================================================
+
 from __future__ import annotations
 
-import hmac
-import hashlib
-import json
-import os
-import sqlite3
+import logging
 import threading
+from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from decimal import Decimal
-from pathlib import Path
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Deque
 
-
-class AuditEncoder(json.JSONEncoder):
-    def default(self, obj: Any) -> Any:
-        if isinstance(obj, Decimal):
-            return str(obj)
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-        return super().default(obj)
-
-
-def constant_time_compare(a: str, b: str) -> bool:
-    return hmac.compare_digest(a, b)
-
-
-def _secret_from_str(raw: str) -> bytes:
-    """
-    Accept hex or raw text. Return bytes.
-    """
-    raw = (raw or "").strip()
-    if not raw:
-        raise RuntimeError("Audit signing key is missing.")
-    try:
-        if all(c in "0123456789abcdefABCDEF" for c in raw) and len(raw) >= 64 and len(raw) % 2 == 0:
-            return bytes.fromhex(raw)
-    except Exception:
-        pass
-    return raw.encode("utf-8")
+_logger = logging.getLogger("sentinel43.velocity")
 
 
 @dataclass(frozen=True)
-class AuditConfig:
-    sqlite_path: Path
-    jsonl_path: Optional[Path]
-    signing_key: str  # required in non-dev strict mode (enforced by caller)
-
-
-class AuditStore:
+class VelocityConfig:
     """
-    Tamper-resistant append-only audit chain.
+    Configuration for VelocityGuard.
 
-    - SQLite WAL + FULL synchronous
-    - Anchor row stores current head hash (fork prevention)
-    - Each payload hash is HMAC(secret, payload_json + prev_hash)
-    - Optional JSONL sink is best-effort (non-fatal)
+    window_seconds:       sliding window duration
+    limit:                max events allowed within the window
+    gc_interval_seconds:  how often stale user entries are purged
+    max_entries_per_user: hard memory cap per user deque
+    max_user_id_length:   input validation cap on user_id strings
+    max_tracked_users:    global cap on tracked user count
+
+    Invariants enforced by __post_init__:
+      - All integer fields must be >= 1.
+      - max_entries_per_user must be >= limit so the memory cap is never
+        reached before the rate limit, avoiding confusing VELOCITY_CAP_EXCEEDED
+        responses under normal load.
     """
 
-    def __init__(self, cfg: AuditConfig) -> None:
+    window_seconds:       int = 60
+    limit:                int = 10
+    gc_interval_seconds:  int = 300
+    max_entries_per_user: int = 1_000
+    max_user_id_length:   int = 128
+    max_tracked_users:    int = 10_000
+
+    def __post_init__(self) -> None:
+        # Fix (MEDIUM): validate all fields so misconfigured guards fail loudly
+        # at construction time rather than silently producing wrong behaviour.
+        for name, value in [
+            ("window_seconds",       self.window_seconds),
+            ("limit",                self.limit),
+            ("gc_interval_seconds",  self.gc_interval_seconds),
+            ("max_entries_per_user", self.max_entries_per_user),
+            ("max_user_id_length",   self.max_user_id_length),
+            ("max_tracked_users",    self.max_tracked_users),
+        ]:
+            if not isinstance(value, int) or value < 1:
+                raise ValueError(
+                    f"VelocityConfig.{name} must be a positive integer, got {value!r}."
+                )
+
+        if self.max_entries_per_user < self.limit:
+            raise ValueError(
+                f"VelocityConfig.max_entries_per_user ({self.max_entries_per_user}) "
+                f"must be >= limit ({self.limit}). "
+                "Otherwise the memory cap is hit before the rate limit."
+            )
+
+
+class VelocityGuard:
+    """
+    DoS / memory-hardened sliding-window velocity guard.
+
+      - Per-user sliding window with configurable limit and window duration.
+      - Periodic GC purges stale user entries to reclaim memory.
+      - Hard per-user deque cap prevents memory exhaustion on individual users.
+      - Global tracked-user cap prevents unbounded growth across all users.
+    """
+
+    def __init__(self, cfg: VelocityConfig) -> None:
         self.cfg = cfg
         self._lock = threading.Lock()
-        self._key = _secret_from_str(cfg.signing_key)
-        self._ensure_schema()
+        self._last_gc = datetime.now(timezone.utc)
+        self._events: dict[str, Deque[datetime]] = {}
 
-    def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(str(self.cfg.sqlite_path), timeout=5.0)
-        con.execute("PRAGMA journal_mode=WAL;")
-        con.execute("PRAGMA synchronous=FULL;")
-        return con
+    def _validate_now(self, now: datetime) -> datetime:
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("VelocityGuard requires a timezone-aware datetime.")
+        return now.astimezone(timezone.utc)
 
-    def _ensure_schema(self) -> None:
-        self.cfg.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-        con = self._connect()
-        try:
-            con.execute(
-                """
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    decision_time TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    payload_hmac TEXT NOT NULL,
-                    prev_hash TEXT NOT NULL
-                )
-                """
-            )
-            con.execute(
-                """
-                CREATE TABLE IF NOT EXISTS audit_anchor (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
-                    prev_hash TEXT NOT NULL
-                )
-                """
-            )
-            row = con.execute("SELECT prev_hash FROM audit_anchor WHERE id=1").fetchone()
-            if row is None:
-                con.execute("INSERT INTO audit_anchor (id, prev_hash) VALUES (1, ?)", ("GENESIS",))
-            con.commit()
-        finally:
-            con.close()
+    def _normalize_user_id(self, user_id: str) -> str:
+        if not isinstance(user_id, str):
+            raise TypeError("user_id must be a string.")
+        user_id = user_id.strip()
+        if not user_id:
+            raise ValueError("user_id must not be empty.")
+        if len(user_id) > self.cfg.max_user_id_length:
+            raise ValueError("user_id exceeds maximum allowed length.")
 
-    def get_prev_hash(self) -> str:
-        con = self._connect()
-        try:
-            (prev_hash,) = con.execute("SELECT prev_hash FROM audit_anchor WHERE id=1").fetchone()
-            return str(prev_hash)
-        finally:
-            con.close()
+        # Strip control characters and non-printable chars to prevent log
+        # injection and junk IDs. isprintable() already excludes \r, \n, \t —
+        # the explicit exclude list in the original was redundant; removed.
+        user_id = "".join(ch for ch in user_id if ch.isprintable())
+        if not user_id:
+            raise ValueError("user_id became empty after normalization.")
+        return user_id
 
-    def compute_payload_hmac(self, payload: Dict[str, Any], prev_hash: str) -> str:
-        payload_json = json.dumps(payload, cls=AuditEncoder, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        msg = payload_json + prev_hash.encode("utf-8")
-        return hmac.new(self._key, msg, hashlib.sha256).hexdigest()
+    def _gc(self, now: datetime) -> None:
+        """Purge stale user entries. Must be called under self._lock."""
+        # Recover from backward clock movement or test time-skew.
+        if now < self._last_gc:
+            self._last_gc = now
 
-    def append(self, payload: Dict[str, Any]) -> str:
+        if (now - self._last_gc).total_seconds() < self.cfg.gc_interval_seconds:
+            return
+
+        # Set at the start of the sweep so a slow GC doesn't trigger
+        # immediate re-entry on the next allow() call.
+        self._last_gc = now
+
+        cutoff = now - timedelta(seconds=self.cfg.window_seconds)
+        dead: list[str] = []
+
+        for user_id, dq in self._events.items():
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+            if not dq:
+                dead.append(user_id)
+
+        for user_id in dead:
+            self._events.pop(user_id, None)
+
+    def allow(self, user_id: str, now: datetime | None = None) -> tuple[bool, str]:
         """
-        Atomic append:
-        - BEGIN IMMEDIATE for write lock
-        - Verify anchor head
-        - Insert row + update anchor
-        Returns the new head hash.
+        Check whether this user_id is within the configured velocity limit.
+
+        Returns (allowed: bool, reason_code: str).
+
+        Reason codes:
+          CLEARED                   -> request is allowed
+          VELOCITY_LIMIT            -> rate limit exceeded in current window
+          VELOCITY_CAP_EXCEEDED     -> per-user memory cap exceeded
+          VELOCITY_GLOBAL_CAP_EXCEEDED -> global tracked-user cap exceeded
         """
+        now = self._validate_now(now or datetime.now(timezone.utc))
+        user_id = self._normalize_user_id(user_id)
+
         with self._lock:
-            con = self._connect()
-            try:
-                con.execute("BEGIN IMMEDIATE")
-                (current_head,) = con.execute("SELECT prev_hash FROM audit_anchor WHERE id=1").fetchone()
-                current_head = str(current_head)
+            self._gc(now)
 
-                decision_time = payload.get("decision_time") or datetime.now(timezone.utc).isoformat()
-                payload["decision_time"] = decision_time
+            dq = self._events.get(user_id)
+            if dq is None:
+                if len(self._events) >= self.cfg.max_tracked_users:
+                    _logger.warning(
+                        "Velocity tracked-user cap exceeded users=%s",
+                        len(self._events),
+                    )
+                    return (False, "VELOCITY_GLOBAL_CAP_EXCEEDED")
+                dq = deque()
+                self._events[user_id] = dq
 
-                payload_json = json.dumps(payload, cls=AuditEncoder, sort_keys=True, separators=(",", ":"))
-                payload_hmac = self.compute_payload_hmac(payload, current_head)
+            # Evict events outside the current window.
+            cutoff = now - timedelta(seconds=self.cfg.window_seconds)
+            while dq and dq[0] < cutoff:
+                dq.popleft()
 
-                con.execute(
-                    "INSERT INTO audit_log (decision_time, payload_json, payload_hmac, prev_hash) VALUES (?, ?, ?, ?)",
-                    (decision_time, payload_json, payload_hmac, current_head),
+            # Rate limit check (fast path — checked before memory cap).
+            if len(dq) >= self.cfg.limit:
+                return (False, "VELOCITY_LIMIT")
+
+            # Memory cap check (guards against misconfiguration or extremely
+            # long windows causing deque growth beyond expected bounds).
+            if len(dq) >= self.cfg.max_entries_per_user:
+                _logger.warning(
+                    "Velocity per-user cap exceeded user=%s entries=%s",
+                    user_id,
+                    len(dq),
                 )
-                con.execute("UPDATE audit_anchor SET prev_hash=? WHERE id=1", (payload_hmac,))
-                con.commit()
-            except Exception:
-                con.rollback()
-                raise
-            finally:
-                con.close()
+                return (False, "VELOCITY_CAP_EXCEEDED")
 
-        # Best-effort JSONL sink (non-fatal)
-        if self.cfg.jsonl_path:
-            try:
-                p = self.cfg.jsonl_path
-                p.parent.mkdir(parents=True, exist_ok=True)
-                line = json.dumps({"payload": payload, "hash": payload_hmac}, cls=AuditEncoder) + "\n"
-                with open(p, "a", encoding="utf-8") as f:
-                    f.write(line)
-                    f.flush()
-                    os.fsync(f.fileno())
-            except Exception:
-                # swallow: audit DB is the source of truth
-                pass
+            dq.append(now)
+            return (True, "CLEARED")
 
-        return payload_hmac
+    def reset_user(self, user_id: str) -> bool:
+        """
+        Clear all velocity events for a specific user.
+        Returns True if the user was tracked, False if not found.
+        Useful for tests and manual operator intervention.
+        """
+        try:
+            user_id = self._normalize_user_id(user_id)
+        except (TypeError, ValueError):
+            return False
+
+        with self._lock:
+            if user_id in self._events:
+                del self._events[user_id]
+                return True
+            return False
+
+    def tracked_user_count(self) -> int:
+        """Return the current number of tracked users."""
+        with self._lock:
+            return len(self._events)
