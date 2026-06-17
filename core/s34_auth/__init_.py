@@ -34,20 +34,35 @@
 # =============================================================================
 
 """
-Sentinel-43 Authentication Module.
-Unified authentication interface.
+Sentinel-43 S34 Authentication Package.
 
-All exports are eager and required.
+Unified authentication interface for S34.
+
+This package exposes:
+    - constants
+    - exceptions
+    - auth models
+    - AuthManager
+    - token extraction helper
+    - runtime auth globals
+    - Fenrir auth integration
 
 Fenrir is an active security hunting component. Its auth layer
-(FenrirAuthConfig, FenrirAuthManager, etc.) is a hard dependency —
-if .fenrir_auth cannot be imported, this package raises ImportError
-at load time. Fenrir must not fail silently.
+(FenrirAuthConfig, FenrirAuthManager, etc.) is a hard dependency.
+
+If .fenrir_auth cannot be imported, this package raises ImportError at
+load time. Fenrir must not fail silently, because silent auth failure is how
+software turns into a haunted vending machine.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Any, Optional
+
+# =============================================================================
+# Constants
+# =============================================================================
 
 from .constants import (
     ALLOWED_ALGORITHMS,
@@ -57,6 +72,11 @@ from .constants import (
     DEFAULT_ALGORITHM,
     is_allowed_algorithm,
 )
+
+# =============================================================================
+# Exceptions
+# =============================================================================
+
 from .exceptions import (
     AuthenticationError,
     AuthorizationError,
@@ -68,51 +88,71 @@ from .exceptions import (
     ReplayAttackError,
     SentinelSecurityError,
 )
-from .globals import configure_auth, get_auth_manager, is_auth_configured
+
+# =============================================================================
+# Models / manager
+# =============================================================================
+
 from .manager import AuthManager
 from .models import AuthContext, AuthResult
+
+# =============================================================================
+# New S34 support files
+# =============================================================================
+
+from .extract_token import (
+    AUTHORIZATION_HEADER,
+    BEARER_SCHEME as EXTRACT_BEARER_SCHEME,
+    extract_token,
+)
+
+from .globals import (
+    AuthGlobalsSnapshot,
+    auth_globals_ready,
+    clear_auth_globals,
+    clear_auth_manager,
+    clear_jwt_service,
+    clear_policy_engine,
+    clear_token_verifier,
+    clear_user_resolver,
+    get_auth_globals_snapshot,
+    get_auth_manager,
+    get_jwt_service,
+    get_policy_engine,
+    get_token_verifier,
+    get_user_resolver,
+    set_auth_manager,
+    set_jwt_service,
+    set_policy_engine,
+    set_token_verifier,
+    set_user_resolver,
+)
+
 
 _logger = logging.getLogger("sentinel43.security.auth")
 
 
 # =============================================================================
-# Stable public API — always available
+# Backward-compatible auth global helpers
 # =============================================================================
 
-__all__ = [
-    # Manager
-    "AuthManager",
-    # Models
-    "AuthContext",
-    "AuthResult",
-    # Globals
-    "configure_auth",
-    "get_auth_manager",
-    "is_auth_configured",
-    # Exceptions
-    "SentinelSecurityError",
-    "AuthenticationError",
-    "AuthorizationError",
-    "ExpiredTokenError",
-    "InvalidSignatureError",
-    "InvalidTokenError",
-    "MFARequiredError",
-    "PermissionDeniedError",
-    "ReplayAttackError",
-    # Constants
-    "AUTH_HEADER",
-    "BEARER_SCHEME",
-    "BEARER_PREFIX",
-    "DEFAULT_ALGORITHM",
-    "ALLOWED_ALGORITHMS",
-    "is_allowed_algorithm",
-    # Fenrir — active security hunting auth (hard dependency)
-    "FenrirAuthConfig",
-    "FenrirAuthManager",
-    "configure_fenrir_auth",
-    "get_fenrir_auth_manager",
-    "is_fenrir_auth_configured",
-]
+def configure_auth(manager: AuthManager) -> None:
+    """
+    Register the active AuthManager.
+
+    Backward-compatible wrapper around globals.set_auth_manager().
+    """
+    set_auth_manager(manager)
+
+
+def is_auth_configured() -> bool:
+    """
+    Return True when the S34 auth layer has a useful runtime auth component.
+
+    This remains compatible with older code that only checked for AuthManager,
+    while also allowing the newer token verifier / JWT service globals.
+    """
+    return get_auth_manager() is not None or auth_globals_ready()
 
 
 # =============================================================================
@@ -123,12 +163,10 @@ __all__ = [
 # Sentinel-43 cannot perform active security hunting and must not start
 # silently in a degraded state.
 #
-# Fail loud at package import time so the problem surfaces immediately
-# rather than at the first hunt cycle.
-#
 # If you are running a deployment that intentionally excludes Fenrir
-# (e.g. a stripped-down audit-only instance), create a stub fenrir_auth
-# module that exports the same names rather than relying on silent fallback.
+# (for example, a stripped-down audit-only instance), create a stub
+# fenrir_auth module that exports the same names instead of relying on
+# silent fallback.
 # =============================================================================
 
 try:
@@ -142,12 +180,82 @@ try:
 except ImportError as _fenrir_exc:
     raise ImportError(
         "sentinel43.security.auth: Fenrir auth module failed to import. "
-        "Fenrir is an active security hunting component — its auth layer is "
+        "Fenrir is an active security hunting component, so its auth layer is "
         "required for S43 to function. "
         f"Underlying error: {_fenrir_exc}. "
-        "Ensure core/security/fenrir_auth.py and all its dependencies "
-        "(pyjwt, aiohttp, etc.) are installed in this environment."
+        "Ensure core/s34_auth/fenrir_auth.py and all required dependencies "
+        "are installed in this environment."
     ) from _fenrir_exc
+
+
+# =============================================================================
+# Stable public API
+# =============================================================================
+
+__all__ = [
+    # Manager
+    "AuthManager",
+
+    # Models
+    "AuthContext",
+    "AuthResult",
+
+    # Token extraction
+    "AUTHORIZATION_HEADER",
+    "EXTRACT_BEARER_SCHEME",
+    "extract_token",
+
+    # Globals / runtime registry
+    "AuthGlobalsSnapshot",
+    "set_auth_manager",
+    "get_auth_manager",
+    "clear_auth_manager",
+    "set_token_verifier",
+    "get_token_verifier",
+    "clear_token_verifier",
+    "set_jwt_service",
+    "get_jwt_service",
+    "clear_jwt_service",
+    "set_user_resolver",
+    "get_user_resolver",
+    "clear_user_resolver",
+    "set_policy_engine",
+    "get_policy_engine",
+    "clear_policy_engine",
+    "clear_auth_globals",
+    "get_auth_globals_snapshot",
+    "auth_globals_ready",
+
+    # Backward-compatible globals
+    "configure_auth",
+    "is_auth_configured",
+
+    # Exceptions
+    "SentinelSecurityError",
+    "AuthenticationError",
+    "AuthorizationError",
+    "ExpiredTokenError",
+    "InvalidSignatureError",
+    "InvalidTokenError",
+    "MFARequiredError",
+    "PermissionDeniedError",
+    "ReplayAttackError",
+
+    # Constants
+    "AUTH_HEADER",
+    "BEARER_SCHEME",
+    "BEARER_PREFIX",
+    "DEFAULT_ALGORITHM",
+    "ALLOWED_ALGORITHMS",
+    "is_allowed_algorithm",
+
+    # Fenrir active security hunting auth
+    "FenrirAuthConfig",
+    "FenrirAuthManager",
+    "configure_fenrir_auth",
+    "get_fenrir_auth_manager",
+    "is_fenrir_auth_configured",
+]
 
 
 def __dir__() -> list[str]:
