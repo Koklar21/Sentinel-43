@@ -47,6 +47,13 @@ Responsibilities:
 No I/O.
 No networking.
 No logging.
+
+Important normalization rule:
+    PolicyContext normalizes action and mode at construction time.
+    evaluate() must use context.action and context.mode directly.
+
+This prevents PolicyContext.action and PolicyDecision.action from diverging
+and prevents invalid policy modes from silently becoming AUTONOMOUS_VETO.
 """
 
 from __future__ import annotations
@@ -74,6 +81,30 @@ STATUS_REQUIRES_HUMAN = "REQUIRES_HUMAN"
 STATUS_UNKNOWN_ACTION = "UNKNOWN_ACTION"
 
 
+def _normalize_action(action: str) -> str:
+    """
+    Normalize action names for governance lookups.
+
+    Current governance compatibility:
+        The previous policy gate normalized actions with .lower() before
+        calling governance.py. We keep that behavior, but move it into
+        PolicyContext so context.action and decision.action match.
+
+    If governance.py is later changed to uppercase action keys, change this
+    single helper to `.strip().upper()` instead of scattering casing logic.
+    """
+    return action.strip().lower()
+
+
+def _normalize_mode(mode: str) -> str:
+    """
+    Normalize operational mode names.
+
+    Governance mode constants are uppercase, so modes normalize to uppercase.
+    """
+    return mode.strip().upper()
+
+
 @dataclass(frozen=True)
 class PolicyContext:
     """
@@ -81,6 +112,10 @@ class PolicyContext:
 
     Keep this small and stable. Extra caller-provided information belongs
     in metadata and should not be treated as authoritative.
+
+    action and mode are normalized during construction:
+        - action: stripped and lowercased for governance lookup consistency
+        - mode: stripped and uppercased, then validated against ALLOWED_MODES
     """
 
     action: str
@@ -110,6 +145,31 @@ class PolicyContext:
         if not isinstance(self.mode, str):
             raise TypeError("mode must be a string")
 
+        if self.request_id is not None and not isinstance(self.request_id, str):
+            raise TypeError("request_id must be a string or None")
+
+        if self.correlation_id is not None and not isinstance(self.correlation_id, str):
+            raise TypeError("correlation_id must be a string or None")
+
+        normalized_action = _normalize_action(self.action)
+        if not normalized_action:
+            raise ValueError("action must not be empty")
+
+        normalized_mode = _normalize_mode(self.mode)
+        if not normalized_mode:
+            raise ValueError("mode must not be empty")
+
+        if normalized_mode not in ALLOWED_MODES:
+            raise ValueError(
+                f"invalid policy mode {self.mode!r}; "
+                f"allowed modes: {sorted(ALLOWED_MODES)}"
+            )
+
+        object.__setattr__(self, "action", normalized_action)
+        object.__setattr__(self, "mode", normalized_mode)
+        object.__setattr__(self, "actor_id", self.actor_id.strip() or "unknown")
+        object.__setattr__(self, "tenant_id", self.tenant_id.strip() or "default")
+        object.__setattr__(self, "resource", self.resource.strip() or "unknown")
         object.__setattr__(
             self,
             "metadata",
@@ -182,8 +242,6 @@ def _decision(
     context: PolicyContext,
     allowed: bool,
     status: str,
-    mode: str,
-    action: str,
     reasons: list[str],
     tags: list[str],
     evaluated_at: str,
@@ -192,8 +250,8 @@ def _decision(
     return PolicyDecision(
         allowed=allowed,
         status=status,
-        mode=mode,
-        action=action,
+        mode=context.mode,
+        action=context.action,
         actor_id=context.actor_id,
         tenant_id=context.tenant_id,
         resource=context.resource,
@@ -212,6 +270,9 @@ def evaluate(context: PolicyContext) -> PolicyDecision:
 
     This function is deterministic except for evaluated_at timestamp capture.
     It performs no I/O and has no side effects.
+
+    PolicyContext is responsible for normalizing and validating action/mode.
+    evaluate() must not silently change mode or re-normalize action.
     """
 
     if not isinstance(context, PolicyContext):
@@ -221,46 +282,11 @@ def evaluate(context: PolicyContext) -> PolicyDecision:
 
     evaluated_at = _utc_now_iso()
 
-    action = context.action.strip().lower()
-    mode = context.mode.strip().upper() or MODE_SHADOW
+    action = context.action
+    mode = context.mode
 
     reasons: list[str] = []
     tags: list[str] = []
-
-    if not action:
-        tags.append("empty_action")
-        reasons.append("Action is empty.")
-
-        if mode == MODE_SHADOW:
-            return _decision(
-                context=context,
-                allowed=True,
-                status=STATUS_UNKNOWN_ACTION,
-                mode=mode,
-                action=action,
-                reasons=reasons,
-                tags=tags,
-                shadow_would_status=STATUS_DENY,
-                evaluated_at=evaluated_at,
-            )
-
-        return _decision(
-            context=context,
-            allowed=False,
-            status=STATUS_UNKNOWN_ACTION,
-            mode=mode,
-            action=action,
-            reasons=reasons + ["Deny-by-default for empty action."],
-            tags=tags + ["deny_by_default"],
-            evaluated_at=evaluated_at,
-        )
-
-    if mode not in ALLOWED_MODES:
-        tags.append("invalid_mode")
-        reasons.append(
-            f"Invalid mode '{mode}', defaulting to AUTONOMOUS_VETO behavior."
-        )
-        mode = MODE_AUTONOMOUS_VETO
 
     if not is_action_known(action):
         tags.append("unknown_action")
@@ -271,8 +297,6 @@ def evaluate(context: PolicyContext) -> PolicyDecision:
                 context=context,
                 allowed=True,
                 status=STATUS_UNKNOWN_ACTION,
-                mode=mode,
-                action=action,
                 reasons=reasons,
                 tags=tags,
                 shadow_would_status=STATUS_DENY,
@@ -283,8 +307,6 @@ def evaluate(context: PolicyContext) -> PolicyDecision:
             context=context,
             allowed=False,
             status=STATUS_UNKNOWN_ACTION,
-            mode=mode,
-            action=action,
             reasons=reasons
             + ["Deny-by-default for unknown actions in non-shadow modes."],
             tags=tags + ["deny_by_default"],
@@ -300,8 +322,6 @@ def evaluate(context: PolicyContext) -> PolicyDecision:
                 context=context,
                 allowed=True,
                 status=STATUS_ALLOW,
-                mode=mode,
-                action=action,
                 reasons=reasons,
                 tags=tags,
                 shadow_would_status=STATUS_DENY,
@@ -312,8 +332,6 @@ def evaluate(context: PolicyContext) -> PolicyDecision:
             context=context,
             allowed=False,
             status=STATUS_DENY,
-            mode=mode,
-            action=action,
             reasons=reasons,
             tags=tags,
             evaluated_at=evaluated_at,
@@ -328,8 +346,6 @@ def evaluate(context: PolicyContext) -> PolicyDecision:
                 context=context,
                 allowed=True,
                 status=STATUS_ALLOW,
-                mode=mode,
-                action=action,
                 reasons=reasons,
                 tags=tags,
                 shadow_would_status=STATUS_DENY,
@@ -340,8 +356,6 @@ def evaluate(context: PolicyContext) -> PolicyDecision:
             context=context,
             allowed=False,
             status=STATUS_DENY,
-            mode=mode,
-            action=action,
             reasons=reasons,
             tags=tags,
             evaluated_at=evaluated_at,
@@ -356,8 +370,6 @@ def evaluate(context: PolicyContext) -> PolicyDecision:
                 context=context,
                 allowed=True,
                 status=STATUS_ALLOW,
-                mode=mode,
-                action=action,
                 reasons=reasons,
                 tags=tags,
                 shadow_would_status=STATUS_REQUIRES_HUMAN,
@@ -369,8 +381,6 @@ def evaluate(context: PolicyContext) -> PolicyDecision:
                 context=context,
                 allowed=False,
                 status=STATUS_REQUIRES_HUMAN,
-                mode=mode,
-                action=action,
                 reasons=reasons,
                 tags=tags,
                 evaluated_at=evaluated_at,
@@ -381,20 +391,20 @@ def evaluate(context: PolicyContext) -> PolicyDecision:
                 context=context,
                 allowed=False,
                 status=STATUS_DENY,
-                mode=mode,
-                action=action,
                 reasons=reasons
                 + ["AUTONOMOUS_VETO blocks human-required actions."],
                 tags=tags + ["autonomous_veto"],
                 evaluated_at=evaluated_at,
             )
 
+        raise RuntimeError(
+            f"unhandled valid policy mode {mode!r} for human-required action {action!r}"
+        )
+
     return _decision(
         context=context,
         allowed=True,
         status=STATUS_ALLOW,
-        mode=mode,
-        action=action,
         reasons=reasons,
         tags=tags,
         evaluated_at=evaluated_at,
@@ -436,3 +446,9 @@ __all__ = [
     "STATUS_REQUIRES_HUMAN",
     "STATUS_UNKNOWN_ACTION",
 ]
+'''
+
+path = Path("/mnt/data/policy_gate.py")
+path.write_text(content, encoding="utf-8")
+print(f"created {path}")
+print(path.stat().st_size)
