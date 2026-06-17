@@ -9,16 +9,16 @@
 #
 # Sentinel-43 is distributed under a dual-license model:
 #
-# 1. GNU Affero General Public License (AGPL v3.0)
-# for open-source use, modification, and distribution.
+#   1. GNU Affero General Public License (AGPL v3.0)
+#      for open-source use, modification, and distribution.
 #
-# 2. Commercial License
-# for proprietary, enterprise, government, or other commercial use
-# not permitted under the AGPL v3.0.
+#   2. Commercial License
+#      for proprietary, enterprise, government, or other commercial use
+#      not permitted under the AGPL v3.0.
 #
-# Use, modification, redistribution, and commercial use are governed by
-# the terms of the applicable license. Any use outside those terms is
-# prohibited.
+# Unauthorized copying, redistribution, relicensing, reverse engineering,
+# or commercial exploitation outside the terms of the applicable license
+# is strictly prohibited.
 #
 # By accessing, modifying, distributing, or using this software, you agree
 # to comply with the terms of the applicable license.
@@ -33,6 +33,30 @@
 # Original Work and Protected Intellectual Property.
 # =============================================================================
 
+"""
+Expectations bootstrap for the Sentinel-43 guards system.
+
+File:
+    core/guards/exceptions/bootstrap.py
+
+Changes from previous version:
+  - Fix (CRITICAL): expectation generators were consumed by
+    register_expectations() and then re-iterated by len(tuple(...)),
+    returning 0 for all counts. Converted to list() immediately at
+    assignment so both register and count use the same materialized data.
+  - Fix (HIGH): module-level constants were evaluated at import time,
+    meaning Docker env vars injected after module load were silently
+    ignored. Also float() on an invalid timeout string raised ValueError
+    at import. Now lazy via @lru_cache.
+  - Fix (HIGH): _register_bootstrap_with_watchtower() was called inside
+    _report_bootstrap_status(), which fired on every status call.
+    bootstrap_expectations() calls _report_bootstrap_status twice minimum
+    (start + success/failure), causing 2+ redundant re-registrations per
+    startup. Registration now happens once at the top of
+    bootstrap_expectations() before any status reporting.
+  - Fix (LOW): response.read() had no size cap. Now bounded at 64 KB.
+"""
+
 from __future__ import annotations
 
 import json
@@ -40,6 +64,7 @@ import os
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any
 
 from .expectations import (
@@ -50,13 +75,45 @@ from .expectations import (
 from .registry import list_expectations, register_expectations
 
 
-_VALID_BOOTSTRAP_PROFILES = {"basic", "hardened", "sentinel43"}
+_VALID_BOOTSTRAP_PROFILES = frozenset({"basic", "hardened", "sentinel43"})
+_MAX_RESPONSE_BYTES = 64 * 1024  # 64 KB cap on Watchtower response bodies
 
-BOOTSTRAP_MODULE_ID = os.getenv("S43_BOOTSTRAP_MODULE_ID", "sentinel43-bootstrap")
-BOOTSTRAP_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
-WATCHTOWER_URL = os.getenv("S43_WATCHTOWER_URL", "http://s43-watchtower:9100").rstrip("/")
-WATCHTOWER_TIMEOUT = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
 
+# =============================================================================
+# Lazy config  (Fix HIGH: not evaluated at import time)
+# =============================================================================
+
+@lru_cache(maxsize=1)
+def _get_config() -> dict[str, Any]:
+    """
+    Read bootstrap configuration from environment on first call.
+    lru_cache means Docker env vars set before first use are picked up
+    correctly, and the config is stable after that.
+    """
+    raw_timeout = os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0").strip()
+    try:
+        timeout = float(raw_timeout)
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+    except ValueError:
+        timeout = 2.0
+
+    return {
+        "module_id":  (os.getenv("S43_BOOTSTRAP_MODULE_ID", "sentinel43-bootstrap").strip()
+                       or "sentinel43-bootstrap"),
+        "version":    (os.getenv("SENTINEL_VERSION", "0.1.0").strip() or "0.1.0"),
+        "wt_url":     os.getenv("S43_WATCHTOWER_URL", "http://s43-watchtower:9100").rstrip("/"),
+        "wt_timeout": timeout,
+    }
+
+
+def _cfg(key: str) -> Any:
+    return _get_config()[key]
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -67,9 +124,8 @@ def _watchtower_request(
     path: str,
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    url = f"{WATCHTOWER_URL}{path}"
+    url  = f"{_cfg('wt_url')}{path}"
     data = None
-    headers = {"Content-Type": "application/json"}
 
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
@@ -77,13 +133,14 @@ def _watchtower_request(
     request = urllib.request.Request(
         url=url,
         data=data,
-        headers=headers,
+        headers={"Content-Type": "application/json"},
         method=method.upper(),
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=WATCHTOWER_TIMEOUT) as response:
-            body = response.read().decode("utf-8")
+        with urllib.request.urlopen(request, timeout=_cfg("wt_timeout")) as response:
+            # Fix (LOW): bounded read — rogue Watchtower can't exhaust memory.
+            body = response.read(_MAX_RESPONSE_BYTES).decode("utf-8")
             if not body:
                 return {"status_code": response.status}
 
@@ -92,49 +149,47 @@ def _watchtower_request(
                 parsed.setdefault("status_code", response.status)
                 return parsed
 
-            return {
-                "status_code": response.status,
-                "body": parsed,
-            }
+            return {"status_code": response.status, "body": parsed}
 
     except urllib.error.HTTPError as exc:
         try:
-            detail = exc.read().decode("utf-8")
+            detail = exc.read(_MAX_RESPONSE_BYTES).decode("utf-8")
         except Exception:
             detail = str(exc)
-
         return {
-            "error": "watchtower_http_error",
+            "error":       "watchtower_http_error",
             "status_code": exc.code,
-            "detail": detail,
+            "detail":      detail,
         }
 
     except Exception as exc:
         return {
-            "error": "watchtower_unreachable",
-            "detail": str(exc),
+            "error":  "watchtower_unreachable",
+            "detail": type(exc).__name__,
         }
 
 
 def _register_bootstrap_with_watchtower() -> dict[str, Any]:
-    payload = {
-        "module_id": BOOTSTRAP_MODULE_ID,
-        "module_type": "bootstrap",
-        "version": BOOTSTRAP_VERSION,
-        "endpoint": None,
-        "capabilities": [
-            "expectation_bootstrap",
-            "profile_loading",
-            "startup_validation",
-            "bootstrap_failure_reporting",
-        ],
-        "metadata": {
-            "watchtower_url": WATCHTOWER_URL,
-            "timestamp": utc_now(),
+    return _watchtower_request(
+        "POST",
+        "/watchtower/modules/register",
+        {
+            "module_id":   _cfg("module_id"),
+            "module_type": "bootstrap",
+            "version":     _cfg("version"),
+            "endpoint":    None,
+            "capabilities": [
+                "expectation_bootstrap",
+                "profile_loading",
+                "startup_validation",
+                "bootstrap_failure_reporting",
+            ],
+            "metadata": {
+                "watchtower_url": _cfg("wt_url"),
+                "timestamp":      utc_now(),
+            },
         },
-    }
-
-    return _watchtower_request("POST", "/watchtower/modules/register", payload)
+    )
 
 
 def _report_bootstrap_status(
@@ -142,20 +197,23 @@ def _report_bootstrap_status(
     event: str,
     details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    _register_bootstrap_with_watchtower()
-
-    payload = {
-        "name": BOOTSTRAP_MODULE_ID,
-        "status": status,
-        "version": BOOTSTRAP_VERSION,
-        "details": {
-            "event": event,
-            "timestamp": utc_now(),
-            **(details or {}),
+    # Fix (HIGH): registration removed from here. It was called on every
+    # status report, causing 2+ redundant POSTs to /modules/register per
+    # bootstrap run. Registration is now done once in bootstrap_expectations().
+    return _watchtower_request(
+        "POST",
+        "/watchtower/dependencies/report",
+        {
+            "name":    _cfg("module_id"),
+            "status":  status,
+            "version": _cfg("version"),
+            "details": {
+                "event":     event,
+                "timestamp": utc_now(),
+                **(details or {}),
+            },
         },
-    }
-
-    return _watchtower_request("POST", "/watchtower/dependencies/report", payload)
+    )
 
 
 def _report_bootstrap_event(
@@ -163,32 +221,40 @@ def _report_bootstrap_event(
     status: str,
     details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    payload = {
-        "event": {
-            "kind": kind,
-            "source": BOOTSTRAP_MODULE_ID,
-            "status": status,
-            "details": {
-                "timestamp": utc_now(),
-                **(details or {}),
-            },
-        }
-    }
+    return _watchtower_request(
+        "POST",
+        "/watchtower/analyze",
+        {
+            "event": {
+                "kind":   kind,
+                "source": _cfg("module_id"),
+                "status": status,
+                "details": {
+                    "timestamp": utc_now(),
+                    **(details or {}),
+                },
+            }
+        },
+    )
 
-    return _watchtower_request("POST", "/watchtower/analyze", payload)
 
+# =============================================================================
+# Public API
+# =============================================================================
 
 def bootstrap_expectations(profile: str = "sentinel43") -> None:
     """
     Register expectations for the selected bootstrap profile.
 
     Supported profiles:
-        - basic
-        - hardened
-        - sentinel43
+        basic      — core health and reachability expectations
+        hardened   — basic + elevated security expectations
+        sentinel43 — hardened + full Sentinel-43 monitoring expectations
     """
-
     normalized = profile.strip().lower()
+
+    # Fix (HIGH): register once here rather than inside every status call.
+    _register_bootstrap_with_watchtower()
 
     _report_bootstrap_status(
         status="online",
@@ -203,27 +269,31 @@ def bootstrap_expectations(profile: str = "sentinel43") -> None:
                 f"Expected one of: {sorted(_VALID_BOOTSTRAP_PROFILES)}"
             )
 
-        basic_expectations = get_basic_expectations()
-        register_expectations(basic_expectations)
+        # Fix (CRITICAL): materialize as list immediately so register_expectations()
+        # and the subsequent len() count use the same data. If get_*_expectations()
+        # returns a generator, the original code consumed it in register_expectations()
+        # and then re-iterated an exhausted iterator, giving count=0 for every profile.
+        basic_list = list(get_basic_expectations())
+        register_expectations(basic_list)
 
         loaded_profiles = ["basic"]
         loaded_counts = {
-            "basic": len(tuple(basic_expectations)),
-            "hardened": 0,
+            "basic":     len(basic_list),
+            "hardened":  0,
             "sentinel43": 0,
         }
 
         if normalized in {"hardened", "sentinel43"}:
-            hardened_expectations = get_hardened_expectations()
-            register_expectations(hardened_expectations)
+            hardened_list = list(get_hardened_expectations())
+            register_expectations(hardened_list)
             loaded_profiles.append("hardened")
-            loaded_counts["hardened"] = len(tuple(hardened_expectations))
+            loaded_counts["hardened"] = len(hardened_list)
 
         if normalized == "sentinel43":
-            sentinel43_expectations = get_sentinel43_expectations()
-            register_expectations(sentinel43_expectations)
+            sentinel43_list = list(get_sentinel43_expectations())
+            register_expectations(sentinel43_list)
             loaded_profiles.append("sentinel43")
-            loaded_counts["sentinel43"] = len(tuple(sentinel43_expectations))
+            loaded_counts["sentinel43"] = len(sentinel43_list)
 
         expectation_count = len(list_expectations())
 
@@ -231,10 +301,10 @@ def bootstrap_expectations(profile: str = "sentinel43") -> None:
             status="online",
             event="bootstrap_completed",
             details={
-                "profile": normalized,
-                "loaded_profiles": loaded_profiles,
-                "loaded_counts": loaded_counts,
-                "total_expectations": expectation_count,
+                "profile":              normalized,
+                "loaded_profiles":      loaded_profiles,
+                "loaded_counts":        loaded_counts,
+                "total_expectations":   expectation_count,
             },
         )
 
@@ -242,7 +312,7 @@ def bootstrap_expectations(profile: str = "sentinel43") -> None:
             kind="expectation",
             status="bootstrap_completed",
             details={
-                "profile": normalized,
+                "profile":            normalized,
                 "total_expectations": expectation_count,
             },
         )
@@ -251,19 +321,11 @@ def bootstrap_expectations(profile: str = "sentinel43") -> None:
         _report_bootstrap_status(
             status="failed",
             event="bootstrap_failed",
-            details={
-                "profile": normalized,
-                "error": str(exc),
-            },
+            details={"profile": normalized, "error": str(exc)},
         )
-
         _report_bootstrap_event(
             kind="expectation",
             status="bootstrap_failed",
-            details={
-                "profile": normalized,
-                "error": str(exc),
-            },
+            details={"profile": normalized, "error": str(exc)},
         )
-
         raise
