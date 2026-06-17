@@ -73,7 +73,15 @@ import uuid
 from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol, runtime_checkable
+from types import MappingProxyType
+from typing import Any, Protocol, runtime_checkable
 
+_THREAT_SCORE_MAP: MappingProxyType = MappingProxyType({
+    "Low": 1,
+    "Medium": 5,
+    "High": 15,
+    "Critical": 50,
+  
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -100,10 +108,7 @@ class Mode:
 VALID_SEVERITIES: frozenset[str] = frozenset({"Low", "Medium", "High", "Critical"})
 
 _THREAT_SCORE_MAP: dict[str, int] = {
-    "Low": 1,
-    "Medium": 5,
-    "High": 15,
-    "Critical": 50,
+    "Low": 1, "Medium": 5, "High": 15, "Critical": 50,
 }
 
 
@@ -796,7 +801,7 @@ class JormungandrNode:
             logger.warning("JormungandrNode.append: payload serialization failed: %s", exc)
             message = repr(payload)
 
-        payload_size = len(message.encode("utf-8", errors="ignore"))
+        payload_size = len(message.encode("utf-8"))
         if payload_size > self._config.max_append_payload_bytes:
             raise JormungandrConfigError(
                 "append payload exceeds S43_JORM_MAX_APPEND_BYTES "
@@ -959,7 +964,10 @@ class JormungandrNode:
         }
 
     def close(self) -> None:
-        self._monitoring_stop.set()
+        self._monitoring_queue.put_nowait(None)
+except queue.Full:
+    pass
+worker.join(timeout=2.0))
 
         worker = self._monitoring_worker
         if worker is None:
