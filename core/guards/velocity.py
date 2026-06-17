@@ -9,16 +9,16 @@
 #
 # Sentinel-43 is distributed under a dual-license model:
 #
-# 1. GNU Affero General Public License (AGPL v3.0)
-# for open-source use, modification, and distribution.
+#   1. GNU Affero General Public License (AGPL v3.0)
+#      for open-source use, modification, and distribution.
 #
-# 2. Commercial License
-# for proprietary, enterprise, government, or other commercial use
-# not permitted under the AGPL v3.0.
+#   2. Commercial License
+#      for proprietary, enterprise, government, or other commercial use
+#      not permitted under the AGPL v3.0.
 #
-# Use, modification, redistribution, and commercial use are governed by
-# the terms of the applicable license. Any use outside those terms is
-# prohibited.
+# Unauthorized copying, redistribution, relicensing, reverse engineering,
+# or commercial exploitation outside the terms of the applicable license
+# is strictly prohibited.
 #
 # By accessing, modifying, distributing, or using this software, you agree
 # to comply with the terms of the applicable license.
@@ -47,22 +47,62 @@ _logger = logging.getLogger("sentinel43.velocity")
 
 @dataclass(frozen=True)
 class VelocityConfig:
-    window_seconds: int = 60
-    limit: int = 10
-    gc_interval_seconds: int = 300
-    max_entries_per_user: int = 1000
-    max_user_id_length: int = 128
-    max_tracked_users: int = 10000
+    """
+    Configuration for VelocityGuard.
+
+    window_seconds:       sliding window duration
+    limit:                max events allowed within the window
+    gc_interval_seconds:  how often stale user entries are purged
+    max_entries_per_user: hard memory cap per user deque
+    max_user_id_length:   input validation cap on user_id strings
+    max_tracked_users:    global cap on tracked user count
+
+    Invariants enforced by __post_init__:
+      - All integer fields must be >= 1.
+      - max_entries_per_user must be >= limit so the memory cap is never
+        reached before the rate limit, avoiding confusing VELOCITY_CAP_EXCEEDED
+        responses under normal load.
+    """
+
+    window_seconds:       int = 60
+    limit:                int = 10
+    gc_interval_seconds:  int = 300
+    max_entries_per_user: int = 1_000
+    max_user_id_length:   int = 128
+    max_tracked_users:    int = 10_000
+
+    def __post_init__(self) -> None:
+        # Fix (MEDIUM): validate all fields so misconfigured guards fail loudly
+        # at construction time rather than silently producing wrong behaviour.
+        for name, value in [
+            ("window_seconds",       self.window_seconds),
+            ("limit",                self.limit),
+            ("gc_interval_seconds",  self.gc_interval_seconds),
+            ("max_entries_per_user", self.max_entries_per_user),
+            ("max_user_id_length",   self.max_user_id_length),
+            ("max_tracked_users",    self.max_tracked_users),
+        ]:
+            if not isinstance(value, int) or value < 1:
+                raise ValueError(
+                    f"VelocityConfig.{name} must be a positive integer, got {value!r}."
+                )
+
+        if self.max_entries_per_user < self.limit:
+            raise ValueError(
+                f"VelocityConfig.max_entries_per_user ({self.max_entries_per_user}) "
+                f"must be >= limit ({self.limit}). "
+                "Otherwise the memory cap is hit before the rate limit."
+            )
 
 
 class VelocityGuard:
     """
-    DoS/memory-hardened velocity guard.
+    DoS / memory-hardened sliding-window velocity guard.
 
-    - Sliding window per user
-    - Periodic GC of old timestamps
-    - Hard cap per user to prevent memory exhaustion
-    - Global tracked-user cap
+      - Per-user sliding window with configurable limit and window duration.
+      - Periodic GC purges stale user entries to reclaim memory.
+      - Hard per-user deque cap prevents memory exhaustion on individual users.
+      - Global tracked-user cap prevents unbounded growth across all users.
     """
 
     def __init__(self, cfg: VelocityConfig) -> None:
@@ -85,21 +125,25 @@ class VelocityGuard:
         if len(user_id) > self.cfg.max_user_id_length:
             raise ValueError("user_id exceeds maximum allowed length.")
 
-        # Strip control chars to reduce log injection / junk IDs
-        user_id = "".join(ch for ch in user_id if ch.isprintable() and ch not in "\r\n\t")
+        # Strip control characters and non-printable chars to prevent log
+        # injection and junk IDs. isprintable() already excludes \r, \n, \t —
+        # the explicit exclude list in the original was redundant; removed.
+        user_id = "".join(ch for ch in user_id if ch.isprintable())
         if not user_id:
             raise ValueError("user_id became empty after normalization.")
         return user_id
 
     def _gc(self, now: datetime) -> None:
-        # Recover from backward clock movement or test skew
+        """Purge stale user entries. Must be called under self._lock."""
+        # Recover from backward clock movement or test time-skew.
         if now < self._last_gc:
             self._last_gc = now
 
         if (now - self._last_gc).total_seconds() < self.cfg.gc_interval_seconds:
             return
 
-        # Set at start to avoid redundant immediate reruns after a long sweep
+        # Set at the start of the sweep so a slow GC doesn't trigger
+        # immediate re-entry on the next allow() call.
         self._last_gc = now
 
         cutoff = now - timedelta(seconds=self.cfg.window_seconds)
@@ -116,7 +160,15 @@ class VelocityGuard:
 
     def allow(self, user_id: str, now: datetime | None = None) -> tuple[bool, str]:
         """
-        Returns (allowed, reason_code).
+        Check whether this user_id is within the configured velocity limit.
+
+        Returns (allowed: bool, reason_code: str).
+
+        Reason codes:
+          CLEARED                   -> request is allowed
+          VELOCITY_LIMIT            -> rate limit exceeded in current window
+          VELOCITY_CAP_EXCEEDED     -> per-user memory cap exceeded
+          VELOCITY_GLOBAL_CAP_EXCEEDED -> global tracked-user cap exceeded
         """
         now = self._validate_now(now or datetime.now(timezone.utc))
         user_id = self._normalize_user_id(user_id)
@@ -127,18 +179,25 @@ class VelocityGuard:
             dq = self._events.get(user_id)
             if dq is None:
                 if len(self._events) >= self.cfg.max_tracked_users:
-                    _logger.warning("Velocity tracked-user cap exceeded users=%s", len(self._events))
+                    _logger.warning(
+                        "Velocity tracked-user cap exceeded users=%s",
+                        len(self._events),
+                    )
                     return (False, "VELOCITY_GLOBAL_CAP_EXCEEDED")
                 dq = deque()
                 self._events[user_id] = dq
 
+            # Evict events outside the current window.
             cutoff = now - timedelta(seconds=self.cfg.window_seconds)
             while dq and dq[0] < cutoff:
                 dq.popleft()
 
+            # Rate limit check (fast path — checked before memory cap).
             if len(dq) >= self.cfg.limit:
                 return (False, "VELOCITY_LIMIT")
 
+            # Memory cap check (guards against misconfiguration or extremely
+            # long windows causing deque growth beyond expected bounds).
             if len(dq) >= self.cfg.max_entries_per_user:
                 _logger.warning(
                     "Velocity per-user cap exceeded user=%s entries=%s",
@@ -149,3 +208,25 @@ class VelocityGuard:
 
             dq.append(now)
             return (True, "CLEARED")
+
+    def reset_user(self, user_id: str) -> bool:
+        """
+        Clear all velocity events for a specific user.
+        Returns True if the user was tracked, False if not found.
+        Useful for tests and manual operator intervention.
+        """
+        try:
+            user_id = self._normalize_user_id(user_id)
+        except (TypeError, ValueError):
+            return False
+
+        with self._lock:
+            if user_id in self._events:
+                del self._events[user_id]
+                return True
+            return False
+
+    def tracked_user_count(self) -> int:
+        """Return the current number of tracked users."""
+        with self._lock:
+            return len(self._events)
