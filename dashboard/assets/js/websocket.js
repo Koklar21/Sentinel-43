@@ -1,7 +1,30 @@
 /* =============================================================================
    Sentinel-43 Dashboard
    websocket.js — Hardened WebSocket bridge
-   v1.4.0
+   v1.5.0
+
+   Changes from v1.4.0:
+     - Fix: no longer reconnects on close code 1008 (auth failure) or 1003
+       (unsupported data). These codes mean the server rejected the client;
+       reconnecting just repeats the same failure. The client now stops and
+       dispatches sentinel:ws:auth_failed so the UI can prompt for re-login.
+     - Fix: page-hide no longer disconnects. For an active security hunting
+       platform, the operator must receive alerts even when the dashboard is
+       in a background tab. Disable RECONNECT_WHEN_VISIBLE if you want the
+       old aggressive-disconnect behaviour.
+     - Fix: outgoing frame size cap added to _sendRaw(). The server enforces
+       64 KB on incoming frames; the client now mirrors that guard before send.
+     - Fix: incoming message rate limiter. Server floods (or misbehaving
+       connections) no longer exhaust the event loop. MAX_MSGS_PER_SECOND
+       frames pass; excess frames are counted and a throttle event dispatched.
+     - Fix: _getDevToken() called only once per connection open — token is
+       captured in a local variable rather than read from sessionStorage twice.
+     - Added: governance, watchtower, dependencies channels to CHANNELS so the
+       dashboard receives HUMAN_GATED decision queues, Watchtower state
+       transitions, and dependency health events produced by the recoded main.py.
+     - Added: explicit handlers for governance_pending_snapshot,
+       watchtower_state, and dependency_state message types.
+     - Minor: raw.length fast-path in _validateFrame labelled with a comment.
 
    Protocol:
      - Backend may send: auth_required
@@ -34,21 +57,47 @@ const WS_CONFIG = Object.freeze({
         ?? "ws://localhost:8000/ws"
     ),
 
-    RECONNECT_MS: 1_000,
+    RECONNECT_MS:     1_000,
     RECONNECT_MAX_MS: 30_000,
 
     HEARTBEAT_MS: 25_000,
 
+    // Shared 64 KB limit with the server (main.py MAX_WS_FRAME_BYTES).
     MAX_FRAME_BYTES: 64 * 1_024,
 
     // Dev token is only read from sessionStorage and only on local hostnames.
     ALLOW_DEV_TOKEN: _locationIsLocal,
 
-    // If true, client may send auth immediately on open when a token exists.
-    // This guarantees the first outbound frame is auth.
+    // If true, client sends auth immediately on open when a token exists.
     AUTH_FIRST_WHEN_TOKEN_PRESENT: true,
 
-    CHANNELS: Object.freeze(["actions", "vault"]),
+    // Fix: active hunting context — keep the connection alive in background
+    // tabs so operators receive alerts even when the dashboard is not focused.
+    // Set to true to restore v1.4.0 behaviour (disconnect on page hide).
+    DISCONNECT_ON_PAGE_HIDE: false,
+
+    // Fix: close codes that must NOT trigger a reconnect attempt. 1008 is
+    // what main.py sends on auth failure; reconnecting just repeats the same
+    // rejected-token cycle indefinitely until the 30s cap is hit every time.
+    NO_RECONNECT_CODES: Object.freeze(new Set([
+        1008,   // Policy violation (auth failure)
+        1003,   // Unsupported data (server rejects message type)
+        1011,   // Server error — reconnecting won't fix a server-side crash
+    ])),
+
+    // Fix: incoming rate limiter. Excess messages are dropped and a throttle
+    // event is dispatched so the UI can display a warning.
+    MAX_MSGS_PER_SECOND: 30,
+
+    // Full channel set matching main.py subscriptions including governance
+    // (HUMAN_GATED decision queue) and Fenrir hunting event channels.
+    CHANNELS: Object.freeze([
+        "actions",
+        "vault",
+        "governance",
+        "watchtower",
+        "dependencies",
+    ]),
 });
 
 /* =============================================================================
@@ -59,16 +108,20 @@ const _WS_TEXT_ENCODER = new TextEncoder();
 
 let _ws = null;
 
-let _socketOpen = false;
+let _socketOpen   = false;
 let _authenticated = false;
-let _connected = false;
-let _subscribed = false;
+let _connected    = false;
+let _subscribed   = false;
 
-let _manuallyClosed = false;
+let _manuallyClosed   = false;
 let _reconnectAttempts = 0;
-let _reconnectTimer = null;
-let _heartbeatTimer = null;
-let _lastMessageAt = 0;
+let _reconnectTimer   = null;
+let _heartbeatTimer   = null;
+let _lastMessageAt    = 0;
+
+// Fix: incoming rate limiter state.
+let _msgCountThisSecond = 0;
+let _msgRateTick = null;
 
 /* =============================================================================
    Helpers
@@ -89,7 +142,6 @@ function _dispatchMessage(parsed) {
 
 function _getDevToken() {
     if (!WS_CONFIG.ALLOW_DEV_TOKEN) return null;
-
     try {
         return sessionStorage.getItem("SENTINEL_JWT") || null;
     } catch {
@@ -119,11 +171,44 @@ function _safeWsUrl() {
 }
 
 function _resetConnectionState() {
-    _socketOpen = false;
+    _socketOpen    = false;
     _authenticated = false;
-    _connected = false;
-    _subscribed = false;
+    _connected     = false;
+    _subscribed    = false;
     _lastMessageAt = 0;
+}
+
+/* =============================================================================
+   Incoming Rate Limiter (Fix)
+   ============================================================================= */
+
+function _startRateLimitTick() {
+    if (_msgRateTick) return;
+    _msgCountThisSecond = 0;
+    _msgRateTick = setInterval(() => {
+        _msgCountThisSecond = 0;
+    }, 1_000);
+}
+
+function _stopRateLimitTick() {
+    if (_msgRateTick) {
+        clearInterval(_msgRateTick);
+        _msgRateTick = null;
+    }
+    _msgCountThisSecond = 0;
+}
+
+function _isRateLimited() {
+    _msgCountThisSecond += 1;
+    if (_msgCountThisSecond > WS_CONFIG.MAX_MSGS_PER_SECOND) {
+        _dispatch("sentinel:ws:throttled", {
+            count: _msgCountThisSecond,
+            limit: WS_CONFIG.MAX_MSGS_PER_SECOND,
+            timestamp: _nowIso(),
+        });
+        return true;
+    }
+    return false;
 }
 
 /* =============================================================================
@@ -135,10 +220,16 @@ function _validateFrame(raw) {
         throw new Error("WebSocket frame must be a text message");
     }
 
-    if (
-        raw.length > WS_CONFIG.MAX_FRAME_BYTES ||
-        _WS_TEXT_ENCODER.encode(raw).length > WS_CONFIG.MAX_FRAME_BYTES
-    ) {
+    // Fast-path: if the JS string length already exceeds the byte cap, we know
+    // the UTF-8 byte count will too (UTF-8 bytes >= UTF-16 code units always).
+    // This avoids the encode() call for obviously-oversized frames.
+    if (raw.length > WS_CONFIG.MAX_FRAME_BYTES) {
+        throw new Error(`WebSocket frame exceeds ${WS_CONFIG.MAX_FRAME_BYTES} bytes`);
+    }
+
+    // Accurate byte check for frames that might have multi-byte characters
+    // within the code-unit budget but exceed the byte budget.
+    if (_WS_TEXT_ENCODER.encode(raw).length > WS_CONFIG.MAX_FRAME_BYTES) {
         throw new Error(`WebSocket frame exceeds ${WS_CONFIG.MAX_FRAME_BYTES} bytes`);
     }
 
@@ -189,8 +280,28 @@ function _canSend() {
 function _sendRaw(type, payload = {}) {
     if (!_canSend()) return false;
 
+    let serialized;
     try {
-        _ws.send(JSON.stringify({ type, payload }));
+        serialized = JSON.stringify({ type, payload });
+    } catch (err) {
+        _dispatch("sentinel:ws:error", {
+            error: `Frame serialization failed: ${err.message}`,
+            timestamp: _nowIso(),
+        });
+        return false;
+    }
+
+    // Fix: enforce outgoing frame size limit matching the server's incoming cap.
+    if (serialized.length > WS_CONFIG.MAX_FRAME_BYTES) {
+        _dispatch("sentinel:ws:error", {
+            error: `Outgoing frame for '${type}' exceeds ${WS_CONFIG.MAX_FRAME_BYTES} bytes and was not sent`,
+            timestamp: _nowIso(),
+        });
+        return false;
+    }
+
+    try {
+        _ws.send(serialized);
         return true;
     } catch (err) {
         _dispatch("sentinel:ws:error", {
@@ -201,30 +312,24 @@ function _sendRaw(type, payload = {}) {
     }
 }
 
-function _sendAuthFrame() {
-    const token = _getDevToken();
-
+function _sendAuthFrame(token) {
+    // Fix: token is passed in rather than read from sessionStorage a second
+    // time. The caller already read it once to decide whether to call this.
     if (!token) {
         _dispatch("sentinel:ws:auth_failed", {
-            error: "WebSocket authentication required, but no JWT was found in sessionStorage.",
+            error: "WebSocket authentication required, but no JWT was found.",
             timestamp: _nowIso(),
         });
-
         if (_ws) {
             try { _ws.close(); } catch {}
         }
-
         return false;
     }
 
     const ok = _sendRaw("auth", { token });
-
     if (ok) {
-        _dispatch("sentinel:ws:auth_sent", {
-            timestamp: _nowIso(),
-        });
+        _dispatch("sentinel:ws:auth_sent", { timestamp: _nowIso() });
     }
-
     return ok;
 }
 
@@ -256,24 +361,18 @@ function _startHeartbeat() {
     _lastMessageAt = Date.now();
 
     _heartbeatTimer = setInterval(() => {
-        if (!_canSend()) return;
-
-        // Do not ping before backend connection/auth handshake is accepted.
-        if (!_connected) return;
+        if (!_canSend() || !_connected) return;
 
         if (Date.now() - _lastMessageAt > WS_CONFIG.HEARTBEAT_MS * 2) {
             _dispatch("sentinel:ws:stale", {
                 silentMs: Date.now() - _lastMessageAt,
                 timestamp: _nowIso(),
             });
-
             try { _ws.close(); } catch {}
             return;
         }
 
-        _sendRaw("ping", {
-            timestamp: _nowIso(),
-        });
+        _sendRaw("ping", { timestamp: _nowIso() });
     }, WS_CONFIG.HEARTBEAT_MS);
 }
 
@@ -300,12 +399,12 @@ function _reconnectDelay() {
         WS_CONFIG.RECONNECT_MAX_MS,
         WS_CONFIG.RECONNECT_MS * Math.pow(2, _reconnectAttempts)
     );
-
     return Math.floor(base + base * 0.2 * Math.random());
 }
 
 function _scheduleReconnect() {
-    if (_manuallyClosed || document.hidden || _reconnectTimer) return;
+    if (_manuallyClosed || _reconnectTimer) return;
+    if (WS_CONFIG.DISCONNECT_ON_PAGE_HIDE && document.hidden) return;
 
     const delay = _reconnectDelay();
     _reconnectAttempts += 1;
@@ -318,10 +417,7 @@ function _scheduleReconnect() {
 
     _reconnectTimer = setTimeout(() => {
         _reconnectTimer = null;
-
-        if (!_manuallyClosed && !document.hidden) {
-            connect();
-        }
+        if (!_manuallyClosed) connect();
     }, delay);
 }
 
@@ -330,26 +426,27 @@ function _scheduleReconnect() {
    ============================================================================= */
 
 function _handleAuthRequired() {
-    _dispatch("sentinel:ws:auth_required", {
-        timestamp: _nowIso(),
-    });
-
-    _sendAuthFrame();
+    _dispatch("sentinel:ws:auth_required", { timestamp: _nowIso() });
+    // Read the token once here; pass it into _sendAuthFrame so sessionStorage
+    // is not accessed again inside the auth send path.
+    _sendAuthFrame(_getDevToken());
 }
 
 function _markConnected(parsed) {
     _authenticated = true;
-    _connected = true;
+    _connected     = true;
     _lastMessageAt = Date.now();
 
     _startHeartbeat();
     _subscribeConfiguredChannels();
-
     _dispatchMessage(parsed);
 }
 
 function _handleMessage(event) {
     _lastMessageAt = Date.now();
+
+    // Fix: rate limiter — drop excess frames before any parsing work.
+    if (_isRateLimited()) return;
 
     let parsed;
     try {
@@ -363,6 +460,7 @@ function _handleMessage(event) {
     }
 
     switch (parsed.type) {
+
         case "auth_required":
             _handleAuthRequired();
             return;
@@ -386,6 +484,37 @@ function _handleMessage(event) {
             _dispatchMessage(parsed);
             return;
 
+        // Governance: HUMAN_GATED pending decision queue snapshot.
+        // Received immediately after subscribing to the governance channel
+        // and whenever the queue changes.
+        case "governance_pending_snapshot":
+            _dispatch("sentinel:ws:governance_pending", {
+                pending: parsed.payload?.pending ?? [],
+                timestamp: _nowIso(),
+            });
+            _dispatchMessage(parsed);
+            return;
+
+        // Watchtower state transition (reachable / unreachable).
+        case "watchtower_state":
+            _dispatch("sentinel:ws:watchtower_state", {
+                reachable: parsed.payload?.reachable ?? false,
+                url: parsed.payload?.url ?? "",
+                timestamp: _nowIso(),
+            });
+            _dispatchMessage(parsed);
+            return;
+
+        // Dependency health update (core, redis, postgres, etc.).
+        case "dependency_state":
+            _dispatch("sentinel:ws:dependency_state", {
+                name: parsed.payload?.name ?? "unknown",
+                status: parsed.payload?.status ?? "unknown",
+                timestamp: _nowIso(),
+            });
+            _dispatchMessage(parsed);
+            return;
+
         default:
             _dispatchMessage(parsed);
             return;
@@ -397,7 +526,9 @@ function _handleMessage(event) {
    ============================================================================= */
 
 function connect() {
-    if (document.hidden) return;
+    // Fix: only skip connect when page is hidden if DISCONNECT_ON_PAGE_HIDE is
+    // enabled. Default is false — active hunting alerts must arrive in background.
+    if (WS_CONFIG.DISCONNECT_ON_PAGE_HIDE && document.hidden) return;
 
     if (_ws && [WebSocket.OPEN, WebSocket.CONNECTING].includes(_ws.readyState)) {
         return;
@@ -406,6 +537,7 @@ function connect() {
     _clearReconnectTimer();
     _manuallyClosed = false;
     _resetConnectionState();
+    _startRateLimitTick();
 
     let url;
     try {
@@ -418,10 +550,7 @@ function connect() {
         return;
     }
 
-    _dispatch("sentinel:ws:connecting", {
-        url,
-        timestamp: _nowIso(),
-    });
+    _dispatch("sentinel:ws:connecting", { url, timestamp: _nowIso() });
 
     try {
         _ws = new WebSocket(url);
@@ -435,41 +564,54 @@ function connect() {
     }
 
     _ws.addEventListener("open", () => {
-        _socketOpen = true;
+        _socketOpen        = true;
         _reconnectAttempts = 0;
-        _lastMessageAt = Date.now();
+        _lastMessageAt     = Date.now();
 
-        _dispatch("sentinel:ws:open", {
-            timestamp: _nowIso(),
-        });
+        _dispatch("sentinel:ws:open", { timestamp: _nowIso() });
 
-        /*
-           Critical rule:
-           If we send anything immediately after open, it must be auth.
-           No subscribe. No ping. No dashboard hello. No vibes.
-        */
-        if (WS_CONFIG.AUTH_FIRST_WHEN_TOKEN_PRESENT && _getDevToken()) {
-            _sendAuthFrame();
+        // Fix: read token once and pass into _sendAuthFrame so sessionStorage
+        // is not read twice (once for the existence check, once inside the send).
+        if (WS_CONFIG.AUTH_FIRST_WHEN_TOKEN_PRESENT) {
+            const token = _getDevToken();
+            if (token) {
+                _sendAuthFrame(token);
+            }
         }
     });
 
     _ws.addEventListener("message", _handleMessage);
 
     _ws.addEventListener("close", event => {
-        const wasManual = _manuallyClosed;
+        const wasManual  = _manuallyClosed;
+        const closeCode  = event.code;
 
         _stopHeartbeat();
+        _stopRateLimitTick();
         _resetConnectionState();
         _ws = null;
 
         _dispatch("sentinel:ws:close", {
-            code: event.code,
+            code:   closeCode,
             reason: event.reason || "",
-            clean: event.wasClean,
+            clean:  event.wasClean,
             timestamp: _nowIso(),
         });
 
-        if (!wasManual && !document.hidden) {
+        // Fix: do not reconnect on auth-failure or server-rejection codes.
+        // Reconnecting on 1008 just repeats the rejected-token cycle; the
+        // operator needs to re-authenticate, not retry the same credentials.
+        if (WS_CONFIG.NO_RECONNECT_CODES.has(closeCode)) {
+            _dispatch("sentinel:ws:auth_failed", {
+                code:    closeCode,
+                reason:  event.reason || "Connection rejected by server",
+                message: "Re-authentication required. The server rejected this connection.",
+                timestamp: _nowIso(),
+            });
+            return;
+        }
+
+        if (!wasManual) {
             _scheduleReconnect();
         }
     });
@@ -486,6 +628,7 @@ function disconnect() {
     _manuallyClosed = true;
     _clearReconnectTimer();
     _stopHeartbeat();
+    _stopRateLimitTick();
 
     if (_ws) {
         try { _ws.close(); } catch {}
@@ -493,10 +636,7 @@ function disconnect() {
     }
 
     _resetConnectionState();
-
-    _dispatch("sentinel:ws:disconnected", {
-        timestamp: _nowIso(),
-    });
+    _dispatch("sentinel:ws:disconnected", { timestamp: _nowIso() });
 }
 
 /* =============================================================================
@@ -529,12 +669,19 @@ function send(type, payload = {}) {
 
 document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
-        disconnect();
+        // Fix: only disconnect on hide if explicitly configured.
+        // Default: keep the connection alive so background alerts are received.
+        if (WS_CONFIG.DISCONNECT_ON_PAGE_HIDE) {
+            disconnect();
+        }
         return;
     }
 
-    _manuallyClosed = false;
-    connect();
+    // Tab visible again: ensure we're connected.
+    if (!_ws || _ws.readyState === WebSocket.CLOSED) {
+        _manuallyClosed = false;
+        connect();
+    }
 });
 
 /* =============================================================================
@@ -557,7 +704,7 @@ window.SentinelWS = Object.freeze({
     },
 
     auth() {
-        return _sendAuthFrame();
+        return _sendAuthFrame(_getDevToken());
     },
 
     get socketOpen() {
