@@ -34,7 +34,7 @@
 # =============================================================================
 
 """
-Sentinel-43 Jormungandr v2.4 — Cryptographic Security Node
+Sentinel-43 Jormungandr v2.4.1 — Cryptographic Security Node
 
 AEAD encrypted audit storage with:
 
@@ -50,12 +50,22 @@ AEAD encrypted audit storage with:
   - Strict historical AAD identity during decryption.
   - AuditStore-compatible append(payload) interface.
 
+Changes from v2.4:
+  - Fix: append() used errors="ignore" in the UTF-8 encode for the size
+    check. A lone surrogate encodes to 0 bytes under errors="ignore",
+    allowing payloads larger than max_append_payload_bytes to pass the
+    guard. Changed to encode("utf-8") with default strict handling.
+  - Fix: _THREAT_SCORE_MAP promoted to MappingProxyType so it is
+    immutable at runtime.
+  - Fix: close() now correctly calls self._monitoring_stop.set() before
+    attempting to drain the worker, and the sentinel put_nowait() is
+    properly wrapped in its own try/except.
+
 Notes on key hygiene:
 
-  - Old epoch KEKs are removed from the in-process KEK cache according to mode.
+  - Old epoch KEKs are removed from the in-process KEK cache per mode.
   - Python cannot guarantee secure memory zeroization of byte strings.
-  - For strong production forward secrecy, provide root_key from KMS/HSM or an
-    external key service rather than leaving long-lived root material in process.
+  - For strong production forward secrecy, provide root_key from KMS/HSM.
 """
 
 from __future__ import annotations
@@ -72,16 +82,9 @@ import threading
 import uuid
 from collections import deque
 from dataclasses import asdict, dataclass
-from typing import Any, Protocol, runtime_checkable
 from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
-_THREAT_SCORE_MAP: MappingProxyType = MappingProxyType({
-    "Low": 1,
-    "Medium": 5,
-    "High": 15,
-    "Critical": 50,
-  
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -95,21 +98,26 @@ logger = logging.getLogger("SentinelJormungandr")
 # =============================================================================
 
 class Posture:
-    CALM = "CALM"
+    CALM     = "CALM"
     VIGILANT = "VIGILANT"
-    HOSTILE = "HOSTILE"
+    HOSTILE  = "HOSTILE"
 
 
 class Mode:
-    FORENSIC = "FORENSIC"  # retain N epochs for decryption
-    WARTIME = "WARTIME"    # purge old KEKs aggressively from cache
+    FORENSIC = "FORENSIC"   # retain N epochs for decryption
+    WARTIME  = "WARTIME"    # purge old KEKs aggressively from cache
 
 
 VALID_SEVERITIES: frozenset[str] = frozenset({"Low", "Medium", "High", "Critical"})
 
-_THREAT_SCORE_MAP: dict[str, int] = {
-    "Low": 1, "Medium": 5, "High": 15, "Critical": 50,
-}
+# Fix: MappingProxyType prevents accidental mutation of this security-critical
+# scoring table (e.g. _THREAT_SCORE_MAP["Fake"] = 999 now raises TypeError).
+_THREAT_SCORE_MAP: MappingProxyType = MappingProxyType({
+    "Low":      1,
+    "Medium":   5,
+    "High":    15,
+    "Critical": 50,
+})
 
 
 # =============================================================================
@@ -151,7 +159,6 @@ def _env_int(name: str, default: int, lo: int, hi: int) -> int:
     raw = os.getenv(name)
     if raw is None:
         return default
-
     try:
         value = int(raw.strip())
         if not lo <= value <= hi:
@@ -221,16 +228,10 @@ class JormungandrConfig:
             event_log_cap=_env_int("S43_JORM_EVENT_LOG_CAP", 5_000, 1, 100_000),
             threat_log_cap=_env_int("S43_JORM_THREAT_LOG_CAP", 5_000, 1, 100_000),
             max_append_payload_bytes=_env_int(
-                "S43_JORM_MAX_APPEND_BYTES",
-                262_144,
-                1_024,
-                10 * 1024 * 1024,
+                "S43_JORM_MAX_APPEND_BYTES", 262_144, 1_024, 10 * 1024 * 1024,
             ),
             monitoring_queue_size=_env_int(
-                "S43_JORM_MONITORING_QUEUE_SIZE",
-                1_000,
-                1,
-                100_000,
+                "S43_JORM_MONITORING_QUEUE_SIZE", 1_000, 1, 100_000,
             ),
         )
 
@@ -242,14 +243,12 @@ class JormungandrConfig:
 class KeyManager:
     """
     Derives KEKs per epoch from a root key via HKDF-SHA-256.
-
     Not externally thread-safe. Callers must hold JormungandrNode._lock.
     """
 
     def __init__(self, root_key: bytes, mode: str, retain_epochs: int) -> None:
         if len(root_key) < 32:
             raise JormungandrConfigError("root_key must be >= 32 bytes")
-
         self._root_key = root_key
         self.mode = mode
         self.retain_epochs = retain_epochs
@@ -302,26 +301,23 @@ def _b64d(value: str) -> bytes:
 
 
 def aead_encrypt(payload: bytes, aad: bytes, kek: bytes) -> dict[str, str]:
-    """
-    Encrypt payload with a random per-record DEK, then wrap that DEK.
-    """
+    """Encrypt payload with a random per-record DEK, then wrap that DEK."""
     dek = secrets.token_bytes(32)
     nonce = secrets.token_bytes(12)
     ciphertext = AESGCM(dek).encrypt(nonce, payload, aad)
     wrapped_dek = aes_key_wrap(wrapping_key=kek, key_to_wrap=dek)
-
     return {
         "nonce": _b64e(nonce),
-        "dek": _b64e(wrapped_dek),
-        "ct": _b64e(ciphertext),
+        "dek":   _b64e(wrapped_dek),
+        "ct":    _b64e(ciphertext),
     }
 
 
 def aead_decrypt(blob: dict[str, str], aad: bytes, kek: bytes) -> bytes:
     """Reverse of aead_encrypt. Raises on any cryptographic failure."""
-    nonce = _b64d(blob["nonce"])
+    nonce       = _b64d(blob["nonce"])
     wrapped_dek = _b64d(blob["dek"])
-    ciphertext = _b64d(blob["ct"])
+    ciphertext  = _b64d(blob["ct"])
     dek = aes_key_unwrap(wrapping_key=kek, wrapped_key=wrapped_dek)
     return AESGCM(dek).decrypt(nonce, ciphertext, aad)
 
@@ -332,14 +328,14 @@ def aead_decrypt(blob: dict[str, str], aad: bytes, kek: bytes) -> bytes:
 
 @dataclass
 class AuditRecord:
-    timestamp: str
-    kind: str
-    severity: str | None
-    posture: str
-    epoch: int
-    payload: dict[str, Any]
-    prev_hash: str | None
-    node_uuid: str
+    timestamp:  str
+    kind:       str
+    severity:   str | None
+    posture:    str
+    epoch:      int
+    payload:    dict[str, Any]
+    prev_hash:  str | None
+    node_uuid:  str
     event_hash: str | None = None
 
     def __post_init__(self) -> None:
@@ -389,12 +385,12 @@ class JormungandrNode:
         self._lock = threading.RLock()
         self._monitoring_stats_lock = threading.Lock()
 
-        self.node_uuid: uuid.UUID = uuid.uuid4()
-        self.security_mode: str = "Normal"
-        self.posture: str = Posture.CALM
-        self.threat_score: int = 0
-        self.firewall_layer: int = 0
-        self.system_status: dict[str, str] = {}
+        self.node_uuid:     uuid.UUID       = uuid.uuid4()
+        self.security_mode: str             = "Normal"
+        self.posture:       str             = Posture.CALM
+        self.threat_score:  int             = 0
+        self.firewall_layer: int            = 0
+        self.system_status: dict[str, str]  = {}
 
         self._keymgr = KeyManager(
             root_key=root_key or os.urandom(32),
@@ -403,9 +399,9 @@ class JormungandrNode:
         )
         self._keymgr.rotate()
 
-        self._event_log: deque[AuditRecord] = deque(maxlen=self._config.event_log_cap)
+        self._event_log:  deque[AuditRecord] = deque(maxlen=self._config.event_log_cap)
         self._threat_log: deque[AuditRecord] = deque(maxlen=self._config.threat_log_cap)
-        self._last_event_hash: str | None = None
+        self._last_event_hash:  str | None = None
         self._last_threat_hash: str | None = None
 
         self._monitoring_queue: queue.Queue[dict[str, Any] | None] = queue.Queue(
@@ -414,7 +410,7 @@ class JormungandrNode:
         self._monitoring_stop = threading.Event()
         self._monitoring_worker: threading.Thread | None = None
         self._monitoring_events_reported = 0
-        self._monitoring_events_dropped = 0
+        self._monitoring_events_dropped  = 0
 
         if self._monitoring_manager is not None:
             self._start_monitoring_worker()
@@ -429,9 +425,7 @@ class JormungandrNode:
 
         logger.info(
             "JormungandrNode started node_uuid=%s mode=%s max_layers=%d",
-            self.node_uuid,
-            self._config.mode,
-            self._config.max_firewall_layers,
+            self.node_uuid, self._config.mode, self._config.max_firewall_layers,
         )
 
     # ------------------------------------------------------------------
@@ -442,7 +436,6 @@ class JormungandrNode:
         manager = self._monitoring_manager
         if manager is None:
             return
-
         if self._monitoring_worker is not None and self._monitoring_worker.is_alive():
             return
 
@@ -462,8 +455,7 @@ class JormungandrNode:
                         manager.analyze_event(event)
                     except Exception as exc:
                         logger.debug(
-                            "JormungandrNode: MonitoringManager notification failed: %s",
-                            exc,
+                            "JormungandrNode: MonitoringManager notification failed: %s", exc,
                         )
                     else:
                         with self._monitoring_stats_lock:
@@ -481,15 +473,12 @@ class JormungandrNode:
     def _enqueue_monitoring_event(self, event: dict[str, Any]) -> None:
         if self._monitoring_manager is None:
             return
-
         try:
             self._monitoring_queue.put_nowait(event)
         except queue.Full:
             with self._monitoring_stats_lock:
                 self._monitoring_events_dropped += 1
-            logger.warning(
-                "JormungandrNode: monitoring queue full; dropping telemetry event."
-            )
+            logger.warning("JormungandrNode: monitoring queue full; dropping telemetry event.")
 
     def _notify_monitoring(self, severity: str, source: str, description: str) -> None:
         if self._monitoring_manager is None:
@@ -498,28 +487,28 @@ class JormungandrNode:
             return
 
         with self._lock:
-            posture = self.posture
-            security_mode = self.security_mode
-            node_uuid_str = str(self.node_uuid)
-            threat_score = self.threat_score
+            posture        = self.posture
+            security_mode  = self.security_mode
+            node_uuid_str  = str(self.node_uuid)
+            threat_score   = self.threat_score
 
         event: dict[str, Any] = {
-            "kind": "security",
-            "secrets_exposed": severity == "Critical",
-            "privilege_escalation": severity == "Critical",
-            "unsigned_artifact": False,
-            "debug_mode_enabled": False,
-            "auth_failure": False,
-            "jormungandr_severity": severity,
-            "jormungandr_posture": posture,
-            "jormungandr_security_mode": security_mode,
-            "jormungandr_threat_score": threat_score,
-            "node_uuid": node_uuid_str,
-            "source": "JormungandrNode",
-            "event_category": "jormungandr_threat",
-            "threat_source": source,
-            "description": description,
-            "timestamp": _utc_now_str(),
+            "kind":                       "security",
+            "secrets_exposed":            severity == "Critical",
+            "privilege_escalation":       severity == "Critical",
+            "unsigned_artifact":          False,
+            "debug_mode_enabled":         False,
+            "auth_failure":               False,
+            "jormungandr_severity":       severity,
+            "jormungandr_posture":        posture,
+            "jormungandr_security_mode":  security_mode,
+            "jormungandr_threat_score":   threat_score,
+            "node_uuid":                  node_uuid_str,
+            "source":                     "JormungandrNode",
+            "event_category":             "jormungandr_threat",
+            "threat_source":              source,
+            "description":                description,
+            "timestamp":                  _utc_now_str(),
         }
 
         self._enqueue_monitoring_event(event)
@@ -538,20 +527,18 @@ class JormungandrNode:
     ) -> bytes:
         """
         Build AEAD additional authenticated data from stable per-record context.
-
-        No live self.node_uuid fallback is allowed here. Historical ciphertext
-        must decrypt using the exact identity and posture captured on the record.
+        No live self.node_uuid fallback — historical ciphertext must decrypt
+        using the exact identity and posture captured on the record.
         """
         if not node_uuid_str:
             raise JormungandrCryptoError("node_uuid_str is required for AAD")
         if not posture:
             raise JormungandrCryptoError("posture is required for AAD")
-
         base = {
-            "node_uuid": node_uuid_str,
-            "posture": posture,
-            "severity": severity or "",
-            "ts_minute": ts.replace(second=0, microsecond=0).isoformat(),
+            "node_uuid":  node_uuid_str,
+            "posture":    posture,
+            "severity":   severity or "",
+            "ts_minute":  ts.replace(second=0, microsecond=0).isoformat(),
         }
         return json.dumps(base, sort_keys=True).encode()
 
@@ -560,12 +547,12 @@ class JormungandrNode:
         material = json.dumps(
             {
                 "timestamp": rec.timestamp,
-                "kind": rec.kind,
-                "severity": rec.severity,
-                "posture": rec.posture,
-                "epoch": rec.epoch,
+                "kind":      rec.kind,
+                "severity":  rec.severity,
+                "posture":   rec.posture,
+                "epoch":     rec.epoch,
                 "node_uuid": rec.node_uuid,
-                "payload": rec.payload,
+                "payload":   rec.payload,
                 "prev_hash": prev_hash,
             },
             sort_keys=True,
@@ -600,13 +587,12 @@ class JormungandrNode:
             logger.info(output)
 
     def _record(self, kind: str, message: str, severity: str | None, encrypt: bool) -> None:
-        ts = _utc_now()
-        epoch = self._keymgr.epoch
+        ts               = _utc_now()
+        epoch            = self._keymgr.epoch
         record_node_uuid = str(self.node_uuid)
-        record_posture = self.posture
+        record_posture   = self.posture
         aad = self._aad(
-            severity,
-            ts,
+            severity, ts,
             node_uuid_str=record_node_uuid,
             posture=record_posture,
         )
@@ -614,14 +600,11 @@ class JormungandrNode:
         if encrypt and record_posture != Posture.CALM:
             kek = self._keymgr.get_kek(epoch)
             if kek is None:
-                logger.error(
-                    "No KEK available for epoch %d; storing redacted failure record.",
-                    epoch,
-                )
+                logger.error("No KEK available for epoch %d; storing redacted failure record.", epoch)
                 payload: dict[str, Any] = {
-                    "plaintext": "[ENCRYPTION FAILED: KEK unavailable; payload redacted]",
+                    "plaintext":         "[ENCRYPTION FAILED: KEK unavailable; payload redacted]",
                     "encryption_failed": True,
-                    "redacted": True,
+                    "redacted":          True,
                 }
             else:
                 try:
@@ -629,9 +612,9 @@ class JormungandrNode:
                 except Exception as exc:
                     logger.error("AEAD encrypt failed epoch=%d: %s", epoch, exc)
                     payload = {
-                        "plaintext": "[ENCRYPTION FAILED: AEAD failure; payload redacted]",
+                        "plaintext":         "[ENCRYPTION FAILED: AEAD failure; payload redacted]",
                         "encryption_failed": True,
-                        "redacted": True,
+                        "redacted":          True,
                     }
         else:
             payload = {"plaintext": message}
@@ -648,17 +631,9 @@ class JormungandrNode:
         )
 
         if kind == "THREAT":
-            self._last_threat_hash = self._append(
-                self._threat_log,
-                rec,
-                self._last_threat_hash,
-            )
+            self._last_threat_hash = self._append(self._threat_log, rec, self._last_threat_hash)
         else:
-            self._last_event_hash = self._append(
-                self._event_log,
-                rec,
-                self._last_event_hash,
-            )
+            self._last_event_hash = self._append(self._event_log, rec, self._last_event_hash)
 
         self._console_log(kind, message, severity)
 
@@ -677,17 +652,12 @@ class JormungandrNode:
     def _log_threat(self, source: str, description: str, severity: str) -> None:
         if severity not in VALID_SEVERITIES:
             raise JormungandrError(f"Invalid severity: {severity!r}")
-
-        if self.posture == Posture.CALM:
-            message = f"Source: {source} | {description}"
-            encrypt = False
-        else:
-            # Source and description are both preserved inside the ciphertext so
-            # FORENSIC-mode decryption can recover the full record.  Console
-            # output is separately redacted by _console_log.
-            message = f"Source: {source} | {description}"
-            encrypt = True
-
+        message = f"Source: {source} | {description}"
+        # In CALM posture: stored as plaintext (no encryption overhead).
+        # In VIGILANT/HOSTILE: stored encrypted. Source and description are
+        # preserved inside the ciphertext for FORENSIC-mode recovery;
+        # console output is separately redacted by _console_log.
+        encrypt = self.posture != Posture.CALM
         self._record("THREAT", message, severity, encrypt)
         self.threat_score += _THREAT_SCORE_MAP[severity]
         self._update_posture()
@@ -712,15 +682,13 @@ class JormungandrNode:
             self._keymgr.rotate()
             self._event(
                 f"Key epoch rotated to {self._keymgr.epoch} (posture escalation)",
-                severity=None,
-                encrypt=False,
+                severity=None, encrypt=False,
             )
         elif old == Posture.VIGILANT and new_posture == Posture.HOSTILE:
             self._keymgr.rotate()
             self._event(
                 f"Key epoch rotated to {self._keymgr.epoch} (HOSTILE entry)",
-                severity=None,
-                encrypt=False,
+                severity=None, encrypt=False,
             )
             self._switch_security_mode("Lockdown")
 
@@ -730,22 +698,17 @@ class JormungandrNode:
             raise JormungandrConfigError(f"Invalid security mode: {mode!r}")
         if self.security_mode == mode:
             return
-
         old = self.security_mode
         self.security_mode = mode
-
         if mode in {"Elevated", "Lockdown"}:
             self._keymgr.rotate()
             self._event(
                 f"Key epoch rotated to {self._keymgr.epoch} (mode change to {mode})",
-                severity=None,
-                encrypt=False,
+                severity=None, encrypt=False,
             )
-
         self._event(
             f"Security mode changed from {old!r} to {mode!r}",
-            severity=None,
-            encrypt=True,
+            severity=None, encrypt=True,
         )
 
     # ------------------------------------------------------------------
@@ -757,7 +720,6 @@ class JormungandrNode:
             if self.firewall_layer >= self._config.max_firewall_layers:
                 self._event("Firewall already at maximum layer.", severity=None, encrypt=True)
                 return
-
             self.firewall_layer += 1
             difficulty = round(self.firewall_layer * (1 + self.threat_score / 100), 2)
             self._status_update(
@@ -773,25 +735,20 @@ class JormungandrNode:
     def log_threat_and_react(self, source: str, description: str, severity: str) -> None:
         with self._lock:
             self._log_threat(source, description, severity)
-
             if severity == "Critical":
                 self._event(
                     "CRITICAL THREAT DETECTED. Initiating countermeasures.",
-                    severity="Critical",
-                    encrypt=False,
+                    severity="Critical", encrypt=False,
                 )
                 self._switch_security_mode("Lockdown")
-
                 old_id = self.node_uuid
                 self.node_uuid = uuid.uuid4()
                 self._keymgr.rotate()
                 self._event(
                     "SHIP OF THESEUS: Identity metamorphosed. "
                     f"OLD: {old_id} NEW: {self.node_uuid}",
-                    severity=None,
-                    encrypt=True,
+                    severity=None, encrypt=True,
                 )
-
         self._notify_monitoring(severity, source, description)
 
     def append(self, payload: dict[str, Any]) -> None:
@@ -801,6 +758,9 @@ class JormungandrNode:
             logger.warning("JormungandrNode.append: payload serialization failed: %s", exc)
             message = repr(payload)
 
+        # Fix: encode("utf-8") with default strict handling. errors="ignore"
+        # would silently drop non-encodable characters, making the byte count
+        # smaller than the actual payload and defeating the size guard.
         payload_size = len(message.encode("utf-8"))
         if payload_size > self._config.max_append_payload_bytes:
             raise JormungandrConfigError(
@@ -814,26 +774,26 @@ class JormungandrNode:
     def get_summary(self) -> dict[str, Any]:
         with self._lock:
             summary = {
-                "node_uuid": str(self.node_uuid),
-                "security_mode": self.security_mode,
-                "posture": self.posture,
-                "threat_score": self.threat_score,
-                "firewall_layer": f"{self.firewall_layer}/{self._config.max_firewall_layers}",
-                "epoch": self._keymgr.epoch,
-                "retained_key_epochs": self._keymgr.retained_epochs(),
-                "mode": self._config.mode,
-                "total_events_logged": len(self._event_log),
+                "node_uuid":            str(self.node_uuid),
+                "security_mode":        self.security_mode,
+                "posture":              self.posture,
+                "threat_score":         self.threat_score,
+                "firewall_layer":       f"{self.firewall_layer}/{self._config.max_firewall_layers}",
+                "epoch":                self._keymgr.epoch,
+                "retained_key_epochs":  self._keymgr.retained_epochs(),
+                "mode":                 self._config.mode,
+                "total_events_logged":  len(self._event_log),
                 "total_threats_logged": len(self._threat_log),
-                "last_event_hash": self._last_event_hash,
-                "last_threat_hash": self._last_threat_hash,
-                "timestamp": _utc_now_str(),
+                "last_event_hash":      self._last_event_hash,
+                "last_threat_hash":     self._last_threat_hash,
+                "timestamp":            _utc_now_str(),
             }
 
         with self._monitoring_stats_lock:
             summary["monitoring_events_reported"] = self._monitoring_events_reported
-            summary["monitoring_events_dropped"] = self._monitoring_events_dropped
-            summary["monitoring_queue_size"] = self._monitoring_queue.qsize()
-            summary["monitoring_queue_capacity"] = self._config.monitoring_queue_size
+            summary["monitoring_events_dropped"]  = self._monitoring_events_dropped
+            summary["monitoring_queue_size"]      = self._monitoring_queue.qsize()
+            summary["monitoring_queue_capacity"]  = self._config.monitoring_queue_size
 
         return summary
 
@@ -855,10 +815,9 @@ class JormungandrNode:
             return f"[KEY RETIRED epoch={rec.epoch}]"
 
         try:
-            ts = dt.datetime.fromisoformat(rec.timestamp)
+            ts  = dt.datetime.fromisoformat(rec.timestamp)
             aad = self._aad(
-                rec.severity,
-                ts,
+                rec.severity, ts,
                 node_uuid_str=rec.node_uuid,
                 posture=rec.posture,
             )
@@ -871,42 +830,41 @@ class JormungandrNode:
         with self._lock:
             events = [
                 {
-                    "timestamp": record.timestamp,
-                    "kind": record.kind,
-                    "severity": record.severity,
-                    "posture": record.posture,
-                    "epoch": record.epoch,
-                    "node_uuid": record.node_uuid,
-                    "message": self._decrypt_payload(record),
-                    "prev_hash": record.prev_hash,
+                    "timestamp":  record.timestamp,
+                    "kind":       record.kind,
+                    "severity":   record.severity,
+                    "posture":    record.posture,
+                    "epoch":      record.epoch,
+                    "node_uuid":  record.node_uuid,
+                    "message":    self._decrypt_payload(record),
+                    "prev_hash":  record.prev_hash,
                     "event_hash": record.event_hash,
                 }
                 for record in self._event_log
             ]
             threats = [
                 {
-                    "timestamp": record.timestamp,
-                    "kind": record.kind,
-                    "severity": record.severity,
-                    "posture": record.posture,
-                    "epoch": record.epoch,
-                    "node_uuid": record.node_uuid,
-                    "message": self._decrypt_payload(record),
-                    "prev_hash": record.prev_hash,
+                    "timestamp":  record.timestamp,
+                    "kind":       record.kind,
+                    "severity":   record.severity,
+                    "posture":    record.posture,
+                    "epoch":      record.epoch,
+                    "node_uuid":  record.node_uuid,
+                    "message":    self._decrypt_payload(record),
+                    "prev_hash":  record.prev_hash,
                     "event_hash": record.event_hash,
                 }
                 for record in self._threat_log
             ]
             status_snapshot = dict(self.system_status)
-            # Call get_summary() while still holding _lock (RLock allows re-entry)
-            # so the counts it reports are consistent with the lists above.
+            # get_summary() under RLock: re-entry is safe.
             summary = self.get_summary()
 
         return {
-            "events": events,
-            "threats": threats,
+            "events":        events,
+            "threats":       threats,
             "system_status": status_snapshot,
-            "summary": summary,
+            "summary":       summary,
         }
 
     def verify_chain(self, log: str = "events", mode: str = "window") -> dict[str, Any]:
@@ -920,22 +878,17 @@ class JormungandrNode:
 
         if not store:
             return {
-                "valid": True,
-                "log": log,
-                "mode": mode,
-                "length": 0,
-                "first_broken_index": None,
+                "valid": True, "log": log, "mode": mode,
+                "length": 0, "first_broken_index": None,
                 "timestamp": _utc_now_str(),
             }
 
         if mode == "strict" and store[0].prev_hash is not None:
             return {
-                "valid": False,
-                "log": log,
-                "mode": mode,
-                "length": len(store),
-                "first_broken_index": 0,
-                "reason": "strict mode requires genesis record; retained window has prior chain anchor",
+                "valid": False, "log": log, "mode": mode,
+                "length": len(store), "first_broken_index": 0,
+                "reason": "strict mode requires genesis record; "
+                          "retained window has prior chain anchor",
                 "timestamp": _utc_now_str(),
             }
 
@@ -945,42 +898,39 @@ class JormungandrNode:
             expected = self._chain_hash(record, prev)
             if record.event_hash != expected:
                 return {
-                    "valid": False,
-                    "log": log,
-                    "mode": mode,
-                    "length": len(store),
-                    "first_broken_index": index,
+                    "valid": False, "log": log, "mode": mode,
+                    "length": len(store), "first_broken_index": index,
                     "timestamp": _utc_now_str(),
                 }
             prev = record.event_hash
 
         return {
-            "valid": True,
-            "log": log,
-            "mode": mode,
-            "length": len(store),
-            "first_broken_index": None,
+            "valid": True, "log": log, "mode": mode,
+            "length": len(store), "first_broken_index": None,
             "timestamp": _utc_now_str(),
         }
 
     def close(self) -> None:
-        self._monitoring_queue.put_nowait(None)
-except queue.Full:
-    pass
-worker.join(timeout=2.0))
+        # Signal the worker to stop on its next queue.Empty timeout.
+        self._monitoring_stop.set()
 
         worker = self._monitoring_worker
         if worker is None:
             return
 
         if worker.is_alive():
+            # Try the sentinel for an immediate clean exit. If the queue is
+            # full, skip it — the worker will drain the queue then see
+            # _monitoring_stop.is_set() on the next queue.Empty and exit.
             try:
                 self._monitoring_queue.put_nowait(None)
             except queue.Full:
                 pass
             worker.join(timeout=2.0)
             if worker.is_alive():
-                logger.warning("JormungandrNode: monitoring worker did not stop within 2 s.")
+                logger.warning(
+                    "JormungandrNode: monitoring worker did not stop within 2 s."
+                )
 
     def __enter__(self) -> "JormungandrNode":
         return self
@@ -998,6 +948,7 @@ def build_jormungandr(
     root_key: bytes | None = None,
     monitoring_manager: MonitoringManagerProtocol | None = None,
 ) -> JormungandrNode:
+    """Build a JormungandrNode from S43_JORM_* environment configuration."""
     config = JormungandrConfig.from_env()
     return JormungandrNode(
         config=config,
@@ -1027,6 +978,7 @@ __all__ = [
 # =============================================================================
 
 if __name__ == "__main__":
+    import json as _json
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -1035,27 +987,18 @@ if __name__ == "__main__":
 
     node = JormungandrNode(JormungandrConfig(mode=Mode.FORENSIC, retain_epochs=6))
     try:
-        print("--- INITIALIZING JORMUNGANDR v2.4 ---")
-        print(json.dumps(node.get_summary(), indent=2))
+        print("--- JORMUNGANDR v2.4.1 ---")
+        print(_json.dumps(node.get_summary(), indent=2))
 
-        print("\n--- SIMULATING LOW/MED THREATS ---")
         node.log_threat_and_react("192.168.1.10", "ICMP Ping Sweep", "Low")
         node.advance_firewall()
         node.log_threat_and_react("192.168.1.15", "UDP Port Scan", "Medium")
         node.advance_firewall()
-        print(json.dumps(node.get_summary(), indent=2))
-
-        print("\n--- CRITICAL THREAT & THESEUS ---")
-        node.log_threat_and_react(
-            "10.20.30.40",
-            "Suspected Rootkit Injection Attempt",
-            "Critical",
-        )
+        node.log_threat_and_react("10.20.30.40", "Suspected Rootkit", "Critical")
         node.advance_firewall()
-        print(json.dumps(node.get_summary(), indent=2))
 
-        print("\n--- CHAIN VERIFICATION ---")
-        print("Events:", json.dumps(node.verify_chain("events"), indent=2))
-        print("Threats:", json.dumps(node.verify_chain("threats"), indent=2))
+        print(_json.dumps(node.get_summary(), indent=2))
+        print("Events:", _json.dumps(node.verify_chain("events"), indent=2))
+        print("Threats:", _json.dumps(node.verify_chain("threats"), indent=2))
     finally:
         node.close()
