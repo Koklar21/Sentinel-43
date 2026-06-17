@@ -34,6 +34,15 @@
 // dashboard.js
 // UI logic module. WebSocket transport is handled by websocket.js which
 // dispatches sentinel:ws:* events consumed here.
+//
+// v1.5.1-authfix
+// Fixes:
+// - Uses a wider dev JWT lookup path matching websocket.js.
+// - Handles sentinel:ws:auth_required directly instead of depending only on
+//   sentinel:ws:message.
+// - Supports both SentinelWS.sendAuth(token) and SentinelWS.auth().
+// - Does not log raw JWTs.
+// - Treats authenticated/auth_ok/connected as successful live state.
 // =============================================================================
 
 "use strict";
@@ -87,6 +96,17 @@ const STATUS_CLASSES = Object.freeze({
     UNKNOWN:  "unknown",
 });
 
+const DEV_JWT_KEYS = Object.freeze([
+    "SENTINEL_JWT",
+    "S43_JWT",
+    "S43_TOKEN",
+    "s43_token",
+    "s43_dashboard_token",
+    "sentinel_token",
+    "jwt",
+    "token",
+]);
+
 // =============================================================================
 // Element References
 // =============================================================================
@@ -112,10 +132,10 @@ const el = {
     vaultCount:    $("vaultCount"),
 
     // Config panel
-    apiBaseText:  $("apiBaseText"),
+    apiBaseText:   $("apiBaseText"),
     authStateText: $("authStateText"),
-    pollText:     $("pollText"),
-    demoText:     $("demoText"),
+    pollText:      $("pollText"),
+    demoText:      $("demoText"),
 
     // Header buttons
     refreshBtn: $("refreshBtn"),
@@ -126,11 +146,11 @@ const el = {
     kbHelpBtn:  $("kbHelpBtn"),
 
     // Actions table
-    actionsBody: $("actionsBody"),
-    emptyState:  $("emptyState"),
-    searchInput: $("searchInput"),
+    actionsBody:    $("actionsBody"),
+    emptyState:     $("emptyState"),
+    searchInput:    $("searchInput"),
     clearSearchBtn: $("clearSearchBtn"),
-    selectAll:   $("selectAll"),
+    selectAll:      $("selectAll"),
 
     // Bulk bar
     bulkBar:        $("bulkBar"),
@@ -144,14 +164,14 @@ const el = {
     clearLogBtn: $("clearLogBtn"),
 
     // Reason modal
-    reasonModal:   $("reasonModal"),
-    modalTitle:    $("modalTitle"),
-    modalSubtitle: $("modalSubtitle"),
-    modalInput:    $("modalInput"),
-    modalError:    $("modalError"),
+    reasonModal:    $("reasonModal"),
+    modalTitle:     $("modalTitle"),
+    modalSubtitle:  $("modalSubtitle"),
+    modalInput:     $("modalInput"),
+    modalError:     $("modalError"),
     modalCharCount: $("modalCharCount"),
-    modalCancel:   $("modalCancel"),
-    modalConfirm:  $("modalConfirm"),
+    modalCancel:    $("modalCancel"),
+    modalConfirm:   $("modalConfirm"),
 
     // JWT modal
     jwtModal:   $("jwtModal"),
@@ -186,7 +206,7 @@ let refreshPromise   = null;
 let pollTimer        = null;
 let kbToastTimer     = null;
 let injectInFlight   = false;
-let wsConnected      = false; // set true only after server sends "connected" (post-auth)
+let wsConnected      = false; // true only after server confirms auth/session
 let isLight          = false;
 
 // =============================================================================
@@ -221,19 +241,19 @@ function log(message, type = "info") {
     const safeType = ["info", "ok", "warn", "err"].includes(type) ? type : "info";
 
     const line = document.createElement("div");
-    line.className  = `log-line ${safeType}`;
+    line.className = `log-line ${safeType}`;
     line.dataset.type = safeType;
 
-    const ts  = document.createElement("span");
-    ts.className   = "log-ts";
+    const ts = document.createElement("span");
+    ts.className = "log-ts";
     ts.textContent = nowStamp();
 
     const lvl = document.createElement("span");
-    lvl.className   = "log-lvl";
+    lvl.className = "log-lvl";
     lvl.textContent = safeType.toUpperCase();
 
     const msg = document.createElement("span");
-    msg.className   = "log-msg";
+    msg.className = "log-msg";
     msg.textContent = normalizeString(message, "Unknown dashboard event");
 
     line.append(ts, lvl, msg);
@@ -295,9 +315,44 @@ function dataIsStale() {
 // Auth / API Helpers
 // =============================================================================
 
+function _readStoredToken(storage, key) {
+    try {
+        const value = storage.getItem(key);
+        return value && value.trim() ? value.trim() : null;
+    } catch {
+        return null;
+    }
+}
+
 function getDevToken() {
     if (!CONFIG.ALLOW_DEV_JWT_STORAGE) return null;
-    try { return sessionStorage.getItem("SENTINEL_JWT"); } catch { return null; }
+
+    for (const key of DEV_JWT_KEYS) {
+        const token = _readStoredToken(sessionStorage, key);
+        if (token) return token;
+    }
+
+    for (const key of DEV_JWT_KEYS) {
+        const token = _readStoredToken(localStorage, key);
+        if (token) return token;
+    }
+
+    try {
+        if (typeof window.SENTINEL_JWT === "string" && window.SENTINEL_JWT.trim()) {
+            return window.SENTINEL_JWT.trim();
+        }
+
+        if (
+            typeof window.S43_DASHBOARD_TOKEN === "string" &&
+            window.S43_DASHBOARD_TOKEN.trim()
+        ) {
+            return window.S43_DASHBOARD_TOKEN.trim();
+        }
+    } catch {
+        return null;
+    }
+
+    return null;
 }
 
 function getAuthHeaders() {
@@ -308,10 +363,12 @@ function getAuthHeaders() {
 }
 
 function buildApiUrl(path) {
-    if (typeof path !== "string" || !path.startsWith("/"))
+    if (typeof path !== "string" || !path.startsWith("/")) {
         throw new Error("API path must be relative");
-    if (path.includes("\r") || path.includes("\n"))
+    }
+    if (path.includes("\r") || path.includes("\n")) {
         throw new Error("API path contains invalid characters");
+    }
     return new URL(`${CONFIG.API_BASE}${path}`, location.href);
 }
 
@@ -360,8 +417,7 @@ function unwrapData(value) {
 function extractActionList(value) {
     const u = unwrapData(value);
     if (Array.isArray(u)) return u;
-    if (u && typeof u === "object" && Array.isArray(u.actions)) return u.actions;
-    throw new Error("Action endpoint returned an invalid payload shape");
+    if (u && typeof u === "object" && Array.isArray(u.actions)) return u.actions;    throw new Error("Action endpoint returned an invalid payload shape");
 }
 
 function extractVaultRecords(value) {
@@ -370,7 +426,54 @@ function extractVaultRecords(value) {
 }
 
 // =============================================================================
-// Demo Backend  (?demo=1 only)
+// WebSocket Auth Bridge
+// =============================================================================
+
+function sendWebSocketAuthFrame() {
+    const token = getDevToken();
+
+    if (!token) {
+        log("WebSocket auth required but no JWT token is available. Disconnecting.", "err");
+        window.SentinelWS?.disconnect?.();
+        return false;
+    }
+
+    if (typeof window.SentinelWS?.sendAuth === "function") {
+        const ok = window.SentinelWS.sendAuth(token);
+        log(ok ? "WebSocket auth frame sent." : "WebSocket auth frame failed to send.", ok ? "info" : "err");
+        return Boolean(ok);
+    }
+
+    if (typeof window.SentinelWS?.auth === "function") {
+        const ok = window.SentinelWS.auth();
+        log(ok ? "WebSocket auth frame sent." : "WebSocket auth frame failed to send.", ok ? "info" : "err");
+        return Boolean(ok);
+    }
+
+    if (typeof window.SentinelWS?.send === "function") {
+        const ok = window.SentinelWS.send("auth", {token});
+        log(ok ? "WebSocket auth frame sent." : "WebSocket auth frame failed to send.", ok ? "info" : "err");
+        return Boolean(ok);
+    }
+
+    log("WebSocket auth required, but SentinelWS has no usable auth sender. Disconnecting.", "err");
+    window.SentinelWS?.disconnect?.();
+    return false;
+}
+
+function markWebSocketLive(type = "connected") {
+    wsConnected = true;
+    setStatus("Live");
+    log(
+        type === "authenticated" || type === "auth_ok"
+            ? "WebSocket authenticated. Awaiting live session confirmation."
+            : "WebSocket authenticated. Live queue updates enabled.",
+        "ok"
+    );
+}
+
+// =============================================================================
+// Demo Backend (?demo=1 only)
 // =============================================================================
 
 const demoBackend = (() => {
@@ -379,8 +482,9 @@ const demoBackend = (() => {
         `ACT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`.toUpperCase();
 
     function trimStore() {
-        while (store.size > CONFIG.MAX_DEMO_ACTIONS)
+        while (store.size > CONFIG.MAX_DEMO_ACTIONS) {
             store.delete(store.keys().next().value);
+        }
     }
 
     function make(opts = {}) {
@@ -402,18 +506,28 @@ const demoBackend = (() => {
         return item;
     }
 
-    make({threat: "SQL injection pattern",       ip: "198.51.100.22", status: "PENDING"});
-    make({threat: "Credential stuffing detected", ip: "203.0.113.77", status: "STAGED"});
-    make({threat: "High-rate port probe",         ip: "192.0.2.41",   status: "APPROVED",
-          decision_reason: "Confirmed scanner - allowlisted", operator: "ops@sentinel"});
+    make({threat: "SQL injection pattern",         ip: "198.51.100.22", status: "PENDING"});
+    make({threat: "Credential stuffing detected", ip: "203.0.113.77",  status: "STAGED"});
+    make({
+        threat: "High-rate port probe",
+        ip: "192.0.2.41",
+        status: "APPROVED",
+        decision_reason: "Confirmed scanner - allowlisted",
+        operator: "ops@sentinel",
+    });
     make({threat: "XSS payload in user-agent",    ip: "198.51.100.9", status: "PENDING"});
-    make({threat: "Tor exit-node connection",     ip: "10.0.0.7",     status: "VETOED",
-          decision_reason: "Internal test - false positive",  operator: "sec@sentinel"});
+    make({
+        threat: "Tor exit-node connection",
+        ip: "10.0.0.7",
+        status: "VETOED",
+        decision_reason: "Internal test - false positive",
+        operator: "sec@sentinel",
+    });
 
     return {
         listActions: async () =>
             Array.from(store.values())
-                 .sort((a, b) => new Date(b.created_at) - new Date(a.created_at)),
+                .sort((a, b) => new Date(b.created_at) - new Date(a.created_at)),
         approve: async (id, reason) => {
             const item = store.get(id);
             if (!item) throw new Error("Not found");
@@ -426,16 +540,20 @@ const demoBackend = (() => {
         veto: async (id, reason) => {
             const item = store.get(id);
             if (!item) throw new Error("Not found");
-            if (!["PENDING", "STAGED"].includes(item.status))
+            if (!["PENDING", "STAGED"].includes(item.status)) {
                 throw new Error("Only pending/staged actions can be vetoed");
+            }
             item.status = "VETOED";
             item.decision_reason = reason;
             item.operator = "operator";
             return {ok: true};
         },
         inject: async () => {
-            make({threat: "Injected test incident", ip: "203.0.113.88",
-                  status: Math.random() > 0.5 ? "PENDING" : "STAGED"});
+            make({
+                threat: "Injected test incident",
+                ip: "203.0.113.88",
+                status: Math.random() > 0.5 ? "PENDING" : "STAGED",
+            });
             return {ok: true};
         },
         vaultStats: async () => ({records: 12487}),
@@ -462,16 +580,16 @@ const api = {
             ? demoBackend.approve(id, reason)
             : fetchJson(`/actions/${encodeURIComponent(id)}/approve`, {
                 method: "POST",
-                body:   JSON.stringify({reason}),
-              }),
+                body: JSON.stringify({reason}),
+            }),
 
     veto: (id, reason) =>
         CONFIG.DEMO_MODE
             ? demoBackend.veto(id, reason)
             : fetchJson(`/actions/${encodeURIComponent(id)}/veto`, {
                 method: "POST",
-                body:   JSON.stringify({reason}),
-              }),
+                body: JSON.stringify({reason}),
+            }),
 
     inject: () =>
         CONFIG.DEMO_MODE
@@ -491,13 +609,15 @@ function normalizeAction(raw) {
             ? raw.payload
             : {};
 
-    const id         = normalizeString(raw?.id, "").trim();
+    const id = normalizeString(raw?.id, "").trim();
     const createdRaw = normalizeString(raw?.created_at, "");
-    const parsed     = Date.parse(createdRaw);
+    const parsed = Date.parse(createdRaw);
     const createdBad = !createdRaw || Number.isNaN(parsed);
 
-    if (!id)         log("Backend returned action without id.", "warn");
-    if (createdBad)  log(`Action ${id || "<missing-id>"} has missing or invalid created_at.`, "warn");
+    if (!id) log("Backend returned action without id.", "warn");
+    if (createdBad) {
+        log(`Action ${id || "<missing-id>"} has missing or invalid created_at.`, "warn");
+    }
 
     return {
         id,
@@ -523,8 +643,9 @@ function reconcileSelectedIds() {
     const validIds = new Set(allActions.map(a => a.id).filter(Boolean));
     const before = selectedIds.size;
     selectedIds = new Set([...selectedIds].filter(id => validIds.has(id)));
-    if (selectedIds.size !== before)
+    if (selectedIds.size !== before) {
         log("Removed stale selections no longer in the live queue.", "info");
+    }
 }
 
 function replaceActions(rawActions, source) {
@@ -570,11 +691,13 @@ function applyFilters(actions) {
         : actions.filter(a => a.status === currentFilter);
 
     const q = searchQuery.trim().toLowerCase();
-    if (q) out = out.filter(a =>
-        a.id.toLowerCase().includes(q) ||
-        a.threat.toLowerCase().includes(q) ||
-        a.source.toLowerCase().includes(q)
-    );
+    if (q) {
+        out = out.filter(a =>
+            a.id.toLowerCase().includes(q) ||
+            a.threat.toLowerCase().includes(q) ||
+            a.source.toLowerCase().includes(q)
+        );
+    }
 
     return out;
 }
@@ -588,22 +711,32 @@ function visibleActionIds() {
 // =============================================================================
 
 function updateStats() {
-    const pending  = allActions.filter(a => a.status === "PENDING").length;
-    const staged   = allActions.filter(a => a.status === "STAGED").length;
+    const pending = allActions.filter(a => a.status === "PENDING").length;
+    const staged = allActions.filter(a => a.status === "STAGED").length;
     const approved = allActions.filter(a =>
         ["APPROVED", "EXECUTED"].includes(a.status)).length;
-    const vetoed   = allActions.filter(a => a.status === "VETOED").length;
 
-    if (pending  !== prevCounts.pending)  { bumpStat(el.pendingCount);  el.pendingCount.textContent  = pending; }
-    if (staged   !== prevCounts.staged)   { bumpStat(el.stagedCount);   el.stagedCount.textContent   = staged; }
-    if (approved !== prevCounts.approved) { bumpStat(el.approvedCount); el.approvedCount.textContent = approved; }
+    if (pending !== prevCounts.pending && el.pendingCount) {
+        bumpStat(el.pendingCount);
+        el.pendingCount.textContent = pending;
+    }
+    if (staged !== prevCounts.staged && el.stagedCount) {
+        bumpStat(el.stagedCount);
+        el.stagedCount.textContent = staged;
+    }
+    if (approved !== prevCounts.approved && el.approvedCount) {
+        bumpStat(el.approvedCount);
+        el.approvedCount.textContent = approved;
+    }
+
     prevCounts = {pending, staged, approved};
 
-    if (el.queueCount) el.queueCount.textContent = pending + staged;
-
-    for (const [key, value] of Object.entries({
-        ALL: allActions.length, PENDING: pending,
-        STAGED: staged, APPROVED: approved, VETOED: vetoed,
+    if (el.queueCount) el.queueCount.textContent = pending + staged;    for (const [key, value] of Object.entries({
+        ALL: allActions.length,
+        PENDING: pending,
+        STAGED: staged,
+        APPROVED: approved,
+        VETOED: allActions.filter(a => a.status === "VETOED").length,
     })) {
         const target = $(`fc-${key}`);
         if (target) target.textContent = value > 0 ? ` (${value})` : "";
@@ -618,15 +751,15 @@ function updateSelectAllState() {
     const boxes = Array.from(document.querySelectorAll(".row-cb"));
     const checked = boxes.filter(b => b.checked).length;
     if (el.selectAll) {
-        el.selectAll.checked       = boxes.length > 0 && checked === boxes.length;
+        el.selectAll.checked = boxes.length > 0 && checked === boxes.length;
         el.selectAll.indeterminate = checked > 0 && checked < boxes.length;
     }
 }
 
 function updateBulkBar() {
-    const count     = selectedIds.size;
+    const count = selectedIds.size;
     const visibleIds = visibleActionIds();
-    const hidden    = [...selectedIds].filter(id => !visibleIds.has(id)).length;
+    const hidden = [...selectedIds].filter(id => !visibleIds.has(id)).length;
 
     el.bulkBar?.classList.toggle("visible", count > 0);
     if (el.bulkLabel) {
@@ -639,11 +772,13 @@ function updateBulkBar() {
         .map(id => allActions.find(a => a.id === id))
         .filter(Boolean);
 
-    if (el.bulkApproveBtn)
+    if (el.bulkApproveBtn) {
         el.bulkApproveBtn.disabled = !selected.some(a => a.status === "STAGED");
-    if (el.bulkVetoBtn)
+    }
+    if (el.bulkVetoBtn) {
         el.bulkVetoBtn.disabled = !selected.some(a =>
             ["PENDING", "STAGED"].includes(a.status));
+    }
 
     updateSelectAllState();
 }
@@ -655,7 +790,7 @@ function clearSelection() {
         b.closest("tr")?.classList.remove("selected");
     });
     if (el.selectAll) {
-        el.selectAll.checked       = false;
+        el.selectAll.checked = false;
         el.selectAll.indeterminate = false;
     }
     updateBulkBar();
@@ -678,7 +813,10 @@ function visibleRows() {
 function setFocusedRow(index) {
     const rows = visibleRows();
     rows.forEach(r => r.classList.remove("focused"));
-    if (!rows.length) { resetFocus(); return; }
+    if (!rows.length) {
+        resetFocus();
+        return;
+    }
     focusedRowIndex = Math.max(0, Math.min(index, rows.length - 1));
     const row = rows[focusedRowIndex];
     focusedActionId = row.dataset.id ?? null;
@@ -687,10 +825,16 @@ function setFocusedRow(index) {
 }
 
 function restoreFocus(previousId) {
-    if (!previousId) { resetFocus(); return; }
+    if (!previousId) {
+        resetFocus();
+        return;
+    }
     const rows = visibleRows();
-    const idx  = rows.findIndex(r => r.dataset.id === previousId);
-    if (idx < 0) { resetFocus(); return; }
+    const idx = rows.findIndex(r => r.dataset.id === previousId);
+    if (idx < 0) {
+        resetFocus();
+        return;
+    }
     setFocusedRow(idx);
 }
 
@@ -707,16 +851,20 @@ function renderActions() {
     el.actionsBody.innerHTML = "";
     el.emptyState.hidden = Boolean(actions.length);
 
-    if (!actions.length) { resetFocus(); updateBulkBar(); return; }
+    if (!actions.length) {
+        resetFocus();
+        updateBulkBar();
+        return;
+    }
 
     for (const [index, action] of actions.entries()) {
         const row = document.createElement("tr");
-        row.dataset.id  = action.id;
+        row.dataset.id = action.id;
         row.dataset.idx = String(index);
         if (selectedIds.has(action.id)) row.classList.add("selected");
 
         const statusClass = STATUS_CLASSES[action.status] ?? "unknown";
-        const created     = action.createdAt
+        const created = action.createdAt
             ? new Date(action.createdAt).toLocaleString([], {dateStyle: "short", timeStyle: "short"})
             : "MISSING";
         const createdStyle = action.createdBad
@@ -724,7 +872,7 @@ function renderActions() {
             : "color:var(--muted);font-size:10px;";
 
         const canApprove = action.status === "STAGED";
-        const canVeto    = ["PENDING", "STAGED"].includes(action.status);
+        const canVeto = ["PENDING", "STAGED"].includes(action.status);
 
         const controls = canApprove || canVeto
             ? `<div class="act-btns">` +
@@ -768,7 +916,7 @@ function renderActions() {
 
 function toggleExpand(actionId) {
     const existing = el.actionsBody?.querySelector(`.expand-row[data-for="${CSS.escape(actionId)}"]`);
-    const button   = el.actionsBody?.querySelector(`[data-expand="${CSS.escape(actionId)}"]`);
+    const button = el.actionsBody?.querySelector(`[data-expand="${CSS.escape(actionId)}"]`);
 
     if (existing) {
         existing.remove();
@@ -777,11 +925,11 @@ function toggleExpand(actionId) {
     }
 
     const action = allActions.find(a => a.id === actionId);
-    const row    = el.actionsBody?.querySelector(`tr[data-id="${CSS.escape(actionId)}"]`);
+    const row = el.actionsBody?.querySelector(`tr[data-id="${CSS.escape(actionId)}"]`);
     if (!action || !row) return;
 
     const expansion = document.createElement("tr");
-    expansion.className  = "expand-row";
+    expansion.className = "expand-row";
     expansion.dataset.for = actionId;
     expansion.innerHTML =
         `<td colspan="9"><div class="expand-inner">` +
@@ -812,16 +960,19 @@ function validateReason(value) {
 
 function openReasonModal({title, subtitle, confirmText, confirmClass = "green"}) {
     return new Promise(resolve => {
-        if (!el.reasonModal) { resolve(null); return; }
+        if (!el.reasonModal) {
+            resolve(null);
+            return;
+        }
 
-        el.modalTitle.textContent    = title;
+        el.modalTitle.textContent = title;
         el.modalSubtitle.textContent = subtitle;
-        el.modalInput.value          = "";
+        el.modalInput.value = "";
         el.modalCharCount.textContent = `0 / ${CONFIG.REASON_MAX}`;
-        el.modalError.textContent    = "";
-        el.modalConfirm.textContent  = confirmText;
-        el.modalConfirm.className    = `btn ${confirmClass}`;
-        el.reasonModal.hidden        = false;
+        el.modalError.textContent = "";
+        el.modalConfirm.textContent = confirmText;
+        el.modalConfirm.className = `btn ${confirmClass}`;
+        el.reasonModal.hidden = false;
         el.reasonModal.setAttribute("aria-hidden", "false");
         setTimeout(() => el.modalInput.focus(), 0);
 
@@ -833,39 +984,42 @@ function openReasonModal({title, subtitle, confirmText, confirmClass = "green"})
             resolve(result);
         };
 
-        const onInput    = () => {
+        const onInput = () => {
             el.modalCharCount.textContent = `${el.modalInput.value.length} / ${CONFIG.REASON_MAX}`;
             if (el.modalError.textContent) el.modalError.textContent = "";
         };
-        const onCancel   = () => close(null);
-        const onConfirm  = () => {
+        const onCancel = () => close(null);
+        const onConfirm = () => {
             const err = validateReason(el.modalInput.value);
-            if (err) { el.modalError.textContent = err; return; }
+            if (err) {
+                el.modalError.textContent = err;
+                return;
+            }
             close(el.modalInput.value.trim());
         };
-        const onBackdrop = e => { if (e.target.hasAttribute("data-close")) onCancel(); };
-        const onKey      = e => {
+        const onBackdrop = e => {
+            if (e.target.hasAttribute("data-close")) onCancel();
+        };
+        const onKey = e => {
             if (e.key === "Escape") onCancel();
             if ((e.ctrlKey || e.metaKey) && e.key === "Enter") onConfirm();
         };
 
         function cleanup() {
-            el.modalInput.removeEventListener("input",   onInput);
-            el.modalCancel.removeEventListener("click",  onCancel);
+            el.modalInput.removeEventListener("input", onInput);
+            el.modalCancel.removeEventListener("click", onCancel);
             el.modalConfirm.removeEventListener("click", onConfirm);
-            el.reasonModal.removeEventListener("click",  onBackdrop);
-            document.removeEventListener("keydown",      onKey);
+            el.reasonModal.removeEventListener("click", onBackdrop);
+            document.removeEventListener("keydown", onKey);
         }
 
-        el.modalInput.addEventListener("input",   onInput);
-        el.modalCancel.addEventListener("click",  onCancel);
+        el.modalInput.addEventListener("input", onInput);
+        el.modalCancel.addEventListener("click", onCancel);
         el.modalConfirm.addEventListener("click", onConfirm);
-        el.reasonModal.addEventListener("click",  onBackdrop);
-        document.addEventListener("keydown",      onKey);
+        el.reasonModal.addEventListener("click", onBackdrop);
+        document.addEventListener("keydown", onKey);
     });
-}
-
-// =============================================================================
+}// =============================================================================
 // Refresh / Data Sync
 // =============================================================================
 
@@ -880,13 +1034,15 @@ async function performRefresh(manual = false) {
         ]);
         replaceActions(rawActions, wsConnected ? "live-sync" : "poll-sync");
         const records = extractVaultRecords(vault);
-        if (el.vaultCount)
+        if (el.vaultCount) {
             el.vaultCount.textContent = typeof records === "number"
                 ? records.toLocaleString()
                 : "--";
+        }
         setStatus(wsConnected ? "Live" : "Online");
-        if (manual)
+        if (manual) {
             log(`Refresh complete — ${applyFilters(allActions).length} action(s) visible.`, "ok");
+        }
         return true;
     } catch (err) {
         setStatus(wsConnected ? "Degraded" : "Offline");
@@ -902,12 +1058,14 @@ async function refreshDashboard(manual = false, {force = false} = {}) {
         const prior = await refreshPromise;
         if (!force) return prior;
     }
-    refreshPromise = performRefresh(manual).finally(() => { refreshPromise = null; });
+    refreshPromise = performRefresh(manual).finally(() => {
+        refreshPromise = null;
+    });
     return refreshPromise;
 }
 
 // =============================================================================
-// Revalidation  (TOCTOU guard before approve/veto)
+// Revalidation (TOCTOU guard before approve/veto)
 // =============================================================================
 
 async function revalidateAction(actionId, expectedStatuses) {
@@ -915,8 +1073,9 @@ async function revalidateAction(actionId, expectedStatuses) {
     if (!refreshed) throw new Error("Unable to refresh live state before submit");
     const latest = allActions.find(a => a.id === actionId);
     if (!latest) throw new Error("Action disappeared before submit");
-    if (!expectedStatuses.includes(latest.status))
+    if (!expectedStatuses.includes(latest.status)) {
         throw new Error(`Action status changed to ${latest.status}`);
+    }
 }
 
 // =============================================================================
@@ -925,12 +1084,15 @@ async function revalidateAction(actionId, expectedStatuses) {
 
 async function doApprove(actionId, button) {
     const reason = await openReasonModal({
-        title:        `Approve ${actionId}`,
-        subtitle:     "Describe why this action should proceed.",
-        confirmText:  "Approve",
+        title: `Approve ${actionId}`,
+        subtitle: "Describe why this action should proceed.",
+        confirmText: "Approve",
         confirmClass: "green",
     });
-    if (!reason) { log(`Approve cancelled — ${actionId}`, "warn"); return false; }
+    if (!reason) {
+        log(`Approve cancelled — ${actionId}`, "warn");
+        return false;
+    }
     if (button) button.disabled = true;
     try {
         await revalidateAction(actionId, ["STAGED"]);
@@ -947,12 +1109,15 @@ async function doApprove(actionId, button) {
 
 async function doVeto(actionId, button) {
     const reason = await openReasonModal({
-        title:        `Veto ${actionId}`,
-        subtitle:     "Explain why this action is being blocked.",
-        confirmText:  "Veto",
+        title: `Veto ${actionId}`,
+        subtitle: "Explain why this action is being blocked.",
+        confirmText: "Veto",
         confirmClass: "red",
     });
-    if (!reason) { log(`Veto cancelled — ${actionId}`, "warn"); return false; }
+    if (!reason) {
+        log(`Veto cancelled — ${actionId}`, "warn");
+        return false;
+    }
     if (button) button.disabled = true;
     try {
         await revalidateAction(actionId, ["PENDING", "STAGED"]);
@@ -968,7 +1133,7 @@ async function doVeto(actionId, button) {
 }
 
 // =============================================================================
-// Bulk Actions  (single shared reason, applied to all eligible selections)
+// Bulk Actions
 // =============================================================================
 
 async function runBulkAction(kind) {
@@ -977,15 +1142,18 @@ async function runBulkAction(kind) {
     const isApprove = kind === "approve";
 
     const reason = await openReasonModal({
-        title:        `Bulk ${kind} ${requestedIds.length} action(s)`,
-        subtitle:     "Applies only to currently eligible selections after a fresh server check.",
-        confirmText:  isApprove ? "Approve All" : "Veto All",
+        title: `Bulk ${kind} ${requestedIds.length} action(s)`,
+        subtitle: "Applies only to currently eligible selections after a fresh server check.",
+        confirmText: isApprove ? "Approve All" : "Veto All",
         confirmClass: isApprove ? "green" : "red",
     });
     if (!reason) return;
 
     const refreshed = await refreshDashboard(false, {force: true});
-    if (!refreshed) { log(`Bulk ${kind} aborted: live state could not be refreshed.`, "err"); return; }
+    if (!refreshed) {
+        log(`Bulk ${kind} aborted: live state could not be refreshed.`, "err");
+        return;
+    }
 
     const expected = isApprove ? ["STAGED"] : ["PENDING", "STAGED"];
     const eligible = requestedIds.filter(id => {
@@ -993,9 +1161,13 @@ async function runBulkAction(kind) {
         return a && expected.includes(a.status);
     });
 
-    if (eligible.length !== requestedIds.length)
+    if (eligible.length !== requestedIds.length) {
         log(`Bulk ${kind}: skipped ${requestedIds.length - eligible.length} ineligible selection(s).`, "warn");
-    if (!eligible.length) { clearSelection(); return; }
+    }
+    if (!eligible.length) {
+        clearSelection();
+        return;
+    }
 
     const btn = isApprove ? el.bulkApproveBtn : el.bulkVetoBtn;
     if (btn) btn.disabled = true;
@@ -1005,14 +1177,16 @@ async function runBulkAction(kind) {
         for (const id of eligible) {
             try {
                 if (isApprove) await api.approve(id, reason);
-                else           await api.veto(id, reason);
+                else await api.veto(id, reason);
                 successes += 1;
             } catch (err) {
                 log(`Bulk ${kind} failed — ${id}: ${err.message ?? err}`, "err");
             }
         }
-        log(`Bulk ${kind} complete: ${successes}/${eligible.length} action(s).`,
-            isApprove ? "ok" : "warn");
+        log(
+            `Bulk ${kind} complete: ${successes}/${eligible.length} action(s).`,
+            isApprove ? "ok" : "warn"
+        );
     } finally {
         clearSelection();
         await refreshDashboard(true, {force: true});
@@ -1076,36 +1250,38 @@ el.injectConfirm?.addEventListener("click", async () => {
 
 function exportVisibleActions() {
     const source = applyFilters(allActions);
-    const stale  = dataIsStale();
+    const stale = dataIsStale();
     const payload = {
-        exported_at:  new Date().toISOString(),
-        data_as_of:   lastDataSyncAt?.toISOString() ?? null,
-        data_stale:   stale,
-        filter:       currentFilter,
+        exported_at: new Date().toISOString(),
+        data_as_of: lastDataSyncAt?.toISOString() ?? null,
+        data_stale: stale,
+        filter: currentFilter,
         search_query: searchQuery,
         action_count: source.length,
         actions: source.map(a => ({
-            id:              a.id,
-            threat:          a.threat,
-            source:          a.source,
-            status:          a.status,
-            created_at:      a.createdAt,
-            created_raw:     a.createdRaw,
+            id: a.id,
+            threat: a.threat,
+            source: a.source,
+            status: a.status,
+            created_at: a.createdAt,
+            created_raw: a.createdRaw,
             created_invalid: a.createdBad,
             decision_reason: a.decisionReason,
-            operator:        a.operator,
+            operator: a.operator,
         })),
     };
 
     const blob = new Blob([JSON.stringify(payload, null, 2)], {type: "application/json"});
-    const url  = URL.createObjectURL(blob);
+    const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
-    link.href     = url;
+    link.href = url;
     link.download = `sentinel43-export-${Date.now()}.json`;
     link.click();
     URL.revokeObjectURL(url);
-    log(`Exported ${source.length} action(s)${stale ? " with stale-data warning" : ""}.`,
-        stale ? "warn" : "ok");
+    log(
+        `Exported ${source.length} action(s)${stale ? " with stale-data warning" : ""}.`,
+        stale ? "warn" : "ok"
+    );
 }
 
 // =============================================================================
@@ -1114,8 +1290,8 @@ function exportVisibleActions() {
 
 function updateStaticConfig() {
     if (el.apiBaseText) el.apiBaseText.textContent = CONFIG.API_BASE;
-    if (el.pollText)    el.pollText.textContent     = `fallback ${CONFIG.FALLBACK_POLL_MS} ms`;
-    if (el.modeText)    el.modeText.textContent     = "HUMAN_GATED";
+    if (el.pollText) el.pollText.textContent = `fallback ${CONFIG.FALLBACK_POLL_MS} ms`;
+    if (el.modeText) el.modeText.textContent = "HUMAN_GATED";
 
     const demoActive = CONFIG.DEMO_MODE || CONFIG.LIVE_TEST_MODE;
     if (el.demoText) {
@@ -1127,8 +1303,8 @@ function updateStaticConfig() {
         el.demoText.style.color = demoActive ? "var(--amber)" : "var(--green)";
     }
 
-    if (el.demoBadge)  el.demoBadge.hidden  = !CONFIG.DEMO_MODE;
-    if (el.injectBtn)  el.injectBtn.disabled = (!demoActive) || injectInFlight;
+    if (el.demoBadge) el.demoBadge.hidden = !CONFIG.DEMO_MODE;
+    if (el.injectBtn) el.injectBtn.disabled = (!demoActive) || injectInFlight;
 
     const token = getDevToken();
     if (el.authStateText) {
@@ -1138,7 +1314,7 @@ function updateStaticConfig() {
         el.authStateText.style.color = token ? "var(--amber)" : "var(--green)";
     }
     if (el.jwtRiskBadge) el.jwtRiskBadge.hidden = !token;
-    if (el.authBtn)      el.authBtn.disabled    = !CONFIG.ALLOW_DEV_JWT_STORAGE;
+    if (el.authBtn) el.authBtn.disabled = !CONFIG.ALLOW_DEV_JWT_STORAGE;
 }
 
 // =============================================================================
@@ -1149,21 +1325,27 @@ function applyTheme(light) {
     isLight = light;
     document.documentElement.classList.toggle("light", light);
     if (el.themeBtn) el.themeBtn.textContent = light ? "☽ Dark" : "☀ Light";
-    try { localStorage.setItem("s43-theme", light ? "light" : "dark"); } catch {}
+    try {
+        localStorage.setItem("s43-theme", light ? "light" : "dark");
+    } catch {}
 }
 
 function initTheme() {
     try {
         const stored = localStorage.getItem("s43-theme");
-        if (stored === "light") { applyTheme(true);  return; }
-        if (stored === "dark")  { applyTheme(false); return; }
+        if (stored === "light") {
+            applyTheme(true);
+            return;
+        }
+        if (stored === "dark") {
+            applyTheme(false);
+            return;
+        }
     } catch {}
     applyTheme(
         window.matchMedia?.("(prefers-color-scheme: light)").matches ?? false
     );
-}
-
-// =============================================================================
+}// =============================================================================
 // JWT Modal
 // =============================================================================
 
@@ -1198,7 +1380,12 @@ el.jwtModal?.addEventListener("click", e => {
     if (e.target.hasAttribute("data-close-jwt")) closeJwtModal();
 });
 el.jwtClear?.addEventListener("click", async () => {
-    try { sessionStorage.removeItem("SENTINEL_JWT"); } catch {}
+    try {
+        for (const key of DEV_JWT_KEYS) {
+            sessionStorage.removeItem(key);
+            localStorage.removeItem(key);
+        }
+    } catch {}
     log("Development JWT cleared.", "warn");
     closeJwtModal();
     await handleAuthChanged();
@@ -1214,13 +1401,15 @@ el.jwtConfirm?.addEventListener("click", async () => {
             sessionStorage.removeItem("SENTINEL_JWT");
             log("Development JWT cleared.", "warn");
         }
-    } catch { log("Unable to update sessionStorage JWT.", "err"); }
+    } catch {
+        log("Unable to update sessionStorage JWT.", "err");
+    }
     closeJwtModal();
     await handleAuthChanged();
 });
 
 // =============================================================================
-// Polling Fallback  (only runs when WebSocket is down or data is stale)
+// Polling Fallback
 // =============================================================================
 
 function startPollingFallback() {
@@ -1231,15 +1420,25 @@ function startPollingFallback() {
 }
 
 // =============================================================================
-// WebSocket Event Listeners  (driven by websocket.js via sentinel:ws:* events)
+// WebSocket Event Listeners
 // =============================================================================
 
-// Socket is open but NOT yet authenticated. Do not promote to Live or set
-// wsConnected here — the server will send auth_required first, and the
-// sentinel:ws:message "connected" case promotes to Live after auth succeeds.
 window.addEventListener("sentinel:ws:open", () => {
     setStatus("Authenticating");
     log("WebSocket connected. Awaiting auth handshake.", "info");
+});
+
+window.addEventListener("sentinel:ws:auth_required", () => {
+    sendWebSocketAuthFrame();
+});
+
+window.addEventListener("sentinel:ws:auth_sent", () => {
+    log("WebSocket auth frame sent.", "info");
+});
+
+window.addEventListener("sentinel:ws:subscribed_all", event => {
+    const count = Array.isArray(event.detail?.channels) ? event.detail.channels.length : 0;
+    log(`WebSocket subscribed to ${count} channel(s).`, "ok");
 });
 
 window.addEventListener("sentinel:ws:close", () => {
@@ -1270,8 +1469,20 @@ window.addEventListener("sentinel:ws:frame_error", event => {
     log(`Rejected WebSocket frame: ${event.detail?.error ?? "unknown"}`, "warn");
 });
 
+window.addEventListener("sentinel:ws:server_error", event => {
+    log(`WebSocket server error: ${event.detail?.error ?? "unknown"}`, "err");
+});
+
 window.addEventListener("sentinel:ws:auth_failed", event => {
-    log(`WebSocket auth failed: ${event.detail?.error ?? "unknown"}`, "err");
+    log(
+        `WebSocket auth failed: ${
+            event.detail?.error ??
+            event.detail?.reason ??
+            event.detail?.message ??
+            "unknown"
+        }`,
+        "err"
+    );
 });
 
 window.addEventListener("sentinel:ws:stale", () => {
@@ -1284,12 +1495,14 @@ window.addEventListener("sentinel:ws:message", event => {
     const {type, payload} = event.detail;
 
     switch (type) {
-        // Server has completed the auth handshake and the session is live.
-        // This is the correct place to promote status — not on socket open.
+        case "auth_required":
+            sendWebSocketAuthFrame();
+            break;
+
+        case "authenticated":
+        case "auth_ok":
         case "connected":
-            wsConnected = true;
-            setStatus("Live");
-            log("WebSocket authenticated. Live queue updates enabled.", "ok");
+            markWebSocketLive(type);
             break;
 
         case "subscribed":
@@ -1314,43 +1527,38 @@ window.addEventListener("sentinel:ws:message", event => {
 
         case "vault_stats": {
             const records = extractVaultRecords(payload);
-            if (el.vaultCount)
+            if (el.vaultCount) {
                 el.vaultCount.textContent =
                     typeof records === "number" ? records.toLocaleString() : "--";
+            }
             markDataSync("ws-sync");
             break;
         }
 
+        case "governance_pending_snapshot":
+            log(`Governance pending queue: ${(payload.pending ?? []).length} item(s).`, "info");
+            break;
+
         case "watchtower_state":
-            log(`Watchtower ${payload.reachable ? "reachable" : "unreachable"}.`,
-                payload.reachable ? "ok" : "warn");
+            log(
+                `Watchtower ${payload.reachable ? "reachable" : "unreachable"}.`,
+                payload.reachable ? "ok" : "warn"
+            );
             break;
 
         case "dependency_state":
-            log(`Dependency ${normalizeString(payload.name, "unknown")}: ${normalizeString(payload.status, "unknown")}`, "info");
+            log(
+                `Dependency ${normalizeString(payload.name, "unknown")}: ${normalizeString(payload.status, "unknown")}`,
+                "info"
+            );
             break;
 
         case "error":
             log(`WebSocket server error: ${normalizeString(payload.error, "unknown")}`, "err");
             break;
 
-        // Server is requesting an auth frame as the first message. Send the
-        // token via websocket.js. If no token is available, disconnect
-        // immediately rather than looping — the server will close anyway.
-        case "auth_required": {
-            const token = getDevToken();
-            if (token) {
-                window.SentinelWS?.sendAuth?.(token);
-            } else {
-                log("WebSocket auth required but no JWT token is available. Disconnecting.", "err");
-                window.SentinelWS?.disconnect?.();
-            }
-            break;
-        }
-
         case "pong":
         case "unsubscribed":
-            // Handled by websocket.js internally — nothing to do here.
             break;
 
         default:
@@ -1387,8 +1595,13 @@ el.clearSearchBtn?.addEventListener("click", () => {
 el.selectAll?.addEventListener("change", () => {
     document.querySelectorAll(".row-cb").forEach(box => {
         box.checked = el.selectAll.checked;
-        if (box.checked) { selectedIds.add(box.dataset.id); box.closest("tr")?.classList.add("selected"); }
-        else             { selectedIds.delete(box.dataset.id); box.closest("tr")?.classList.remove("selected"); }
+        if (box.checked) {
+            selectedIds.add(box.dataset.id);
+            box.closest("tr")?.classList.add("selected");
+        } else {
+            selectedIds.delete(box.dataset.id);
+            box.closest("tr")?.classList.remove("selected");
+        }
     });
     updateBulkBar();
 });
@@ -1396,8 +1609,13 @@ el.selectAll?.addEventListener("change", () => {
 document.addEventListener("change", e => {
     const box = e.target.closest?.(".row-cb");
     if (!box) return;
-    if (box.checked) { selectedIds.add(box.dataset.id); box.closest("tr")?.classList.add("selected"); }
-    else             { selectedIds.delete(box.dataset.id); box.closest("tr")?.classList.remove("selected"); }
+    if (box.checked) {
+        selectedIds.add(box.dataset.id);
+        box.closest("tr")?.classList.add("selected");
+    } else {
+        selectedIds.delete(box.dataset.id);
+        box.closest("tr")?.classList.remove("selected");
+    }
     updateBulkBar();
 });
 
@@ -1429,7 +1647,10 @@ document.addEventListener("click", async e => {
     }
 
     const expandBtn = e.target.closest?.("[data-expand]");
-    if (expandBtn) { toggleExpand(expandBtn.dataset.expand); return; }
+    if (expandBtn) {
+        toggleExpand(expandBtn.dataset.expand);
+        return;
+    }
 
     const approveBtn = e.target.closest?.("[data-approve]");
     if (approveBtn) {
@@ -1456,20 +1677,36 @@ el.kbHelpBtn?.addEventListener("click", () => {
 });
 
 document.addEventListener("keydown", e => {
-    const tag    = document.activeElement?.tagName ?? "";
+    const tag = document.activeElement?.tagName ?? "";
     const inInput = ["INPUT", "TEXTAREA", "SELECT"].includes(tag);
 
     if (e.key === "Escape") {
-        if (!el.reasonModal?.hidden)  { el.modalCancel?.click(); return; }
-        if (!el.jwtModal?.hidden)     { closeJwtModal(); return; }
-        if (!el.injectModal?.hidden)  { closeInjectModal(); return; }
+        if (!el.reasonModal?.hidden) {
+            el.modalCancel?.click();
+            return;
+        }
+        if (!el.jwtModal?.hidden) {
+            closeJwtModal();
+            return;
+        }
+        if (!el.injectModal?.hidden) {
+            closeInjectModal();
+            return;
+        }
         el.kbToast?.classList.remove("show");
         if (selectedIds.size) clearSelection();
         return;
     }
 
-    if (e.key === "/" && !inInput) { e.preventDefault(); el.searchInput?.focus(); return; }
-    if (e.key.toLowerCase() === "r" && !inInput) { refreshDashboard(true, {force: true}); return; }
+    if (e.key === "/" && !inInput) {
+        e.preventDefault();
+        el.searchInput?.focus();
+        return;
+    }
+    if (e.key.toLowerCase() === "r" && !inInput) {
+        refreshDashboard(true, {force: true});
+        return;
+    }
     if (inInput) return;
 
     const rows = visibleRows();
@@ -1486,17 +1723,23 @@ document.addEventListener("keydown", e => {
         return;
     }
     if (e.key.toLowerCase() === "a" && focusedRowIndex >= 0 && focusedRowIndex < rows.length) {
-        const id     = rows[focusedRowIndex].dataset.id;
+        const id = rows[focusedRowIndex].dataset.id;
         const action = allActions.find(a => a.id === id);
-        if (action?.status === "STAGED")
-            doApprove(id).then(ok => { if (ok) refreshDashboard(true, {force: true}); });
+        if (action?.status === "STAGED") {
+            doApprove(id).then(ok => {
+                if (ok) refreshDashboard(true, {force: true});
+            });
+        }
         return;
     }
     if (e.key.toLowerCase() === "v" && focusedRowIndex >= 0 && focusedRowIndex < rows.length) {
-        const id     = rows[focusedRowIndex].dataset.id;
+        const id = rows[focusedRowIndex].dataset.id;
         const action = allActions.find(a => a.id === id);
-        if (action && ["PENDING", "STAGED"].includes(action.status))
-            doVeto(id).then(ok => { if (ok) refreshDashboard(true, {force: true}); });
+        if (action && ["PENDING", "STAGED"].includes(action.status)) {
+            doVeto(id).then(ok => {
+                if (ok) refreshDashboard(true, {force: true});
+            });
+        }
     }
 });
 
