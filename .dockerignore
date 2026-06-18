@@ -1,0 +1,121 @@
+# =============================================================================
+# Sentinel-43 Docker Ignore
+# Keeps Docker build context clean and prevents secrets/local junk from being
+# sent to the Docker daemon during docker compose build.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Version Control
+# -----------------------------------------------------------------------------
+.git/
+.gitignore
+.gitattributes
+
+# -----------------------------------------------------------------------------
+# Python Build, Cache, Test, and Virtual Environments
+# -----------------------------------------------------------------------------
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+*.py[cod]
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+coverage.xml
+htmlcov/
+
+*.egg-info/
+dist/
+build/
+
+venv/
+.venv/
+env/
+.env_virt/
+
+# -----------------------------------------------------------------------------
+# Test Files and Generated Test Output
+# -----------------------------------------------------------------------------
+tests/
+**/*.xml
+**/*.junit
+
+# -----------------------------------------------------------------------------
+# Logs, Load Testing, Runtime State, and Local Databases
+# -----------------------------------------------------------------------------
+logs/
+**/*.log
+gunicorn.log
+
+loadtest-results/
+load_test_results.csv
+sequential_marathon_results.log
+
+sentinel43_state/
+
+**/*.sqlite3
+**/*.db
+**/*.db-wal
+**/*.db-shm
+
+# -----------------------------------------------------------------------------
+# Secrets, Environment Files, Certificates, and Key Material
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+.secrets/
+secrets/
+
+**/*.key
+**/*.pem
+**/*.cert
+**/*.crt
+**/*.p12
+**/*.pfx
+**/*.enc
+**/*.gpg
+
+# -----------------------------------------------------------------------------
+# Frontend / Node Artifacts
+# -----------------------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.eslintcache
+.parcel-cache/
+.next/
+
+# -----------------------------------------------------------------------------
+# OS, Editor, and Hidden Backup Files
+# -----------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+
+.vscode/
+.idea/
+.fleet/
+.history/
+
+**/*.tmp
+**/*.bak
+**/*.swp
+**/.*.swp
+**/.*.swo
+*~
+
+# -----------------------------------------------------------------------------
+# Local Generated Archives
+# -----------------------------------------------------------------------------
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
