@@ -1,42 +1,23 @@
 // =============================================================================
-// Sentinel-43
-//
-// Copyright (c) 2026 Justin Armstrong
-// All Rights Reserved.
-//
-// This file is part of the Sentinel-43 platform and constitutes original
-// intellectual property of the copyright holder.
-//
-// Sentinel-43 is distributed under a dual-license model:
-//
-// 1. GNU Affero General Public License (AGPL v3.0)
-// for open-source use, modification, and distribution.
-//
-// 2. Commercial License
-// for proprietary, enterprise, government, or other commercial use
-// not permitted under the AGPL v3.0.
-//
-// Use, modification, redistribution, and commercial use are governed by
-// the terms of the applicable license. Any use outside those terms is prohibited.
-//
-// By accessing, modifying, distributing, or using this software, you agree
-// to comply with the terms of the applicable license.
-//
-// License Information:
-// AGPL v3.0: https://www.gnu.org/licenses/agpl-3.0.en.html
-//
-// Commercial Licensing:
-// Contact the copyright holder for commercial licensing terms.
-//
-// Sentinel-43™ Original Work and Protected Intellectual Property.
-// =============================================================================
 // Sentinel-43 Dashboard
 // dashboard.js
 // UI logic module. WebSocket transport is handled by websocket.js which
 // dispatches sentinel:ws:* events consumed here.
 //
-// v1.5.1-authfix
+// v1.5.2
 // Fixes:
+// - Removed sendWebSocketAuthFrame(). websocket.js owns the auth exchange
+//   entirely: it proactively sends auth on open and responds to auth_required
+//   internally before dispatching sentinel:ws:auth_required as a notification.
+//   dashboard.js previously called sendWebSocketAuthFrame() from the
+//   sentinel:ws:auth_required listener AND from the sentinel:ws:message
+//   auth_required case, causing a double auth frame race on every challenge.
+// - sentinel:ws:auth_required listener now logs only — no auth send.
+// - auth_required removed from sentinel:ws:message switch (dead code: websocket.js
+//   handles auth_required internally and returns early, never dispatching it
+//   as a general sentinel:ws:message event).
+//
+// v1.5.1-authfix (prior):
 // - Uses a wider dev JWT lookup path matching websocket.js.
 // - Handles sentinel:ws:auth_required directly instead of depending only on
 //   sentinel:ws:message.
@@ -96,6 +77,7 @@ const STATUS_CLASSES = Object.freeze({
     UNKNOWN:  "unknown",
 });
 
+// Must stay in sync with websocket.js _DEV_JWT_KEYS.
 const DEV_JWT_KEYS = Object.freeze([
     "SENTINEL_JWT",
     "S43_JWT",
@@ -417,7 +399,8 @@ function unwrapData(value) {
 function extractActionList(value) {
     const u = unwrapData(value);
     if (Array.isArray(u)) return u;
-    if (u && typeof u === "object" && Array.isArray(u.actions)) return u.actions;    throw new Error("Action endpoint returned an invalid payload shape");
+    if (u && typeof u === "object" && Array.isArray(u.actions)) return u.actions;
+    throw new Error("Action endpoint returned an invalid payload shape");
 }
 
 function extractVaultRecords(value) {
@@ -426,50 +409,16 @@ function extractVaultRecords(value) {
 }
 
 // =============================================================================
-// WebSocket Auth Bridge
+// WebSocket Live State
 // =============================================================================
 
-function sendWebSocketAuthFrame() {
-    const token = getDevToken();
-
-    if (!token) {
-        log("WebSocket auth required but no JWT token is available. Disconnecting.", "err");
-        window.SentinelWS?.disconnect?.();
-        return false;
-    }
-
-    if (typeof window.SentinelWS?.sendAuth === "function") {
-        const ok = window.SentinelWS.sendAuth(token);
-        log(ok ? "WebSocket auth frame sent." : "WebSocket auth frame failed to send.", ok ? "info" : "err");
-        return Boolean(ok);
-    }
-
-    if (typeof window.SentinelWS?.auth === "function") {
-        const ok = window.SentinelWS.auth();
-        log(ok ? "WebSocket auth frame sent." : "WebSocket auth frame failed to send.", ok ? "info" : "err");
-        return Boolean(ok);
-    }
-
-    if (typeof window.SentinelWS?.send === "function") {
-        const ok = window.SentinelWS.send("auth", {token});
-        log(ok ? "WebSocket auth frame sent." : "WebSocket auth frame failed to send.", ok ? "info" : "err");
-        return Boolean(ok);
-    }
-
-    log("WebSocket auth required, but SentinelWS has no usable auth sender. Disconnecting.", "err");
-    window.SentinelWS?.disconnect?.();
-    return false;
-}
-
+// Called when the server confirms auth accepted (authenticated/auth_ok/connected).
+// wsConnected is only ever set true here — never on socket open — so the
+// polling fallback is suppressed only when we're actually live.
 function markWebSocketLive(type = "connected") {
     wsConnected = true;
     setStatus("Live");
-    log(
-        type === "authenticated" || type === "auth_ok"
-            ? "WebSocket authenticated. Awaiting live session confirmation."
-            : "WebSocket authenticated. Live queue updates enabled.",
-        "ok"
-    );
+    log("WebSocket live. Queue updates active.", "ok");
 }
 
 // =============================================================================
@@ -711,8 +660,8 @@ function visibleActionIds() {
 // =============================================================================
 
 function updateStats() {
-    const pending = allActions.filter(a => a.status === "PENDING").length;
-    const staged = allActions.filter(a => a.status === "STAGED").length;
+    const pending  = allActions.filter(a => a.status === "PENDING").length;
+    const staged   = allActions.filter(a => a.status === "STAGED").length;
     const approved = allActions.filter(a =>
         ["APPROVED", "EXECUTED"].includes(a.status)).length;
 
@@ -731,12 +680,14 @@ function updateStats() {
 
     prevCounts = {pending, staged, approved};
 
-    if (el.queueCount) el.queueCount.textContent = pending + staged;    for (const [key, value] of Object.entries({
-        ALL: allActions.length,
-        PENDING: pending,
-        STAGED: staged,
+    if (el.queueCount) el.queueCount.textContent = pending + staged;
+
+    for (const [key, value] of Object.entries({
+        ALL:      allActions.length,
+        PENDING:  pending,
+        STAGED:   staged,
         APPROVED: approved,
-        VETOED: allActions.filter(a => a.status === "VETOED").length,
+        VETOED:   allActions.filter(a => a.status === "VETOED").length,
     })) {
         const target = $(`fc-${key}`);
         if (target) target.textContent = value > 0 ? ` (${value})` : "";
@@ -1019,7 +970,9 @@ function openReasonModal({title, subtitle, confirmText, confirmClass = "green"})
         el.reasonModal.addEventListener("click", onBackdrop);
         document.addEventListener("keydown", onKey);
     });
-}// =============================================================================
+}
+
+// =============================================================================
 // Refresh / Data Sync
 // =============================================================================
 
@@ -1345,7 +1298,9 @@ function initTheme() {
     applyTheme(
         window.matchMedia?.("(prefers-color-scheme: light)").matches ?? false
     );
-}// =============================================================================
+}
+
+// =============================================================================
 // JWT Modal
 // =============================================================================
 
@@ -1358,6 +1313,7 @@ function closeJwtModal() {
 async function handleAuthChanged() {
     updateStaticConfig();
     if (!CONFIG.DEMO_MODE) {
+        // Reconnect triggers websocket.js's full auth flow with the new token.
         window.SentinelWS?.disconnect();
         window.SentinelWS?.connect();
     }
@@ -1428,8 +1384,11 @@ window.addEventListener("sentinel:ws:open", () => {
     log("WebSocket connected. Awaiting auth handshake.", "info");
 });
 
+// Fix v1.5.2: auth_required is handled internally by websocket.js before this
+// event fires. Do not send a second auth frame here — that causes a double-auth
+// race. This listener exists solely for UI notification (log + status).
 window.addEventListener("sentinel:ws:auth_required", () => {
-    sendWebSocketAuthFrame();
+    log("WebSocket auth challenge received.", "info");
 });
 
 window.addEventListener("sentinel:ws:auth_sent", () => {
@@ -1495,9 +1454,13 @@ window.addEventListener("sentinel:ws:message", event => {
     const {type, payload} = event.detail;
 
     switch (type) {
-        case "auth_required":
-            sendWebSocketAuthFrame();
-            break;
+
+        // Fix v1.5.2: auth_required is handled internally by websocket.js and
+        // never re-dispatched to sentinel:ws:message. This case is dead code
+        // and is removed to avoid confusion. The auth flow is:
+        //   open → proactive auth (websocket.js)
+        //   OR server sends auth_required → websocket.js responds internally
+        //       → dispatches sentinel:ws:auth_required for UI notification only
 
         case "authenticated":
         case "auth_ok":
@@ -1758,8 +1721,7 @@ window.addEventListener("beforeunload", () => {
 log("Dashboard initializing…", "info");
 
 if (CONFIG.DEMO_MODE) {
-    // In demo mode, disconnect the WebSocket — all data comes from the in-memory
-    // demo backend. websocket.js auto-connects on load; we cut it immediately.
+    // websocket.js auto-connects on load; cut it immediately in demo mode.
     window.SentinelWS?.disconnect();
     log("Demo mode active. WebSocket disconnected. Use ?demo=1 for local testing only.", "warn");
 } else if (!CONFIG.LIVE_TEST_MODE) {
