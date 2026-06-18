@@ -1,9 +1,19 @@
 /* =============================================================================
    Sentinel-43 Dashboard
    websocket.js — Hardened WebSocket bridge
-   v1.5.0
+   v1.5.1
 
-   Changes from v1.4.0:
+   Changes from v1.5.0:
+     - Fix: _getDevToken() now searches the same key set as dashboard.js
+       (DEV_JWT_KEYS across sessionStorage, localStorage, and window globals).
+       Previously only sessionStorage["SENTINEL_JWT"] was checked; tokens
+       stored under any other key were invisible to the auth path, causing
+       websocket.js to fail the proactive auth-on-open and then re-dispatch
+       auth_required to dashboard.js which could also not find the token via
+       SentinelWS.auth(). Both sides now see the same token regardless of
+       which key or storage mechanism the operator used.
+
+   Changes from v1.4.0 (carried forward from v1.5.0):
      - Fix: no longer reconnects on close code 1008 (auth failure) or 1003
        (unsupported data). These codes mean the server rejected the client;
        reconnecting just repeats the same failure. The client now stops and
@@ -31,6 +41,14 @@
      - Client must answer first with: {"type":"auth","payload":{"token":"..."}}
      - Client must NOT subscribe before auth is accepted.
      - After authenticated/connected, subscribe to configured channels.
+
+   Auth ownership:
+     - websocket.js owns all auth mechanics. On open it proactively sends an
+       auth frame if a token is available (AUTH_FIRST_WHEN_TOKEN_PRESENT).
+       If the server still sends auth_required, it responds internally and
+       also dispatches sentinel:ws:auth_required as a notification so dashboard
+       layers can update their UI. dashboard.js must NOT send a second auth
+       frame in response to that event — doing so causes a double-auth race.
 
    This module exposes window.SentinelWS and dispatches sentinel:ws:* events.
    ============================================================================= */
@@ -65,7 +83,7 @@ const WS_CONFIG = Object.freeze({
     // Shared 64 KB limit with the server (main.py MAX_WS_FRAME_BYTES).
     MAX_FRAME_BYTES: 64 * 1_024,
 
-    // Dev token is only read from sessionStorage and only on local hostnames.
+    // Dev token is only read from storage on local hostnames.
     ALLOW_DEV_TOKEN: _locationIsLocal,
 
     // If true, client sends auth immediately on open when a token exists.
@@ -101,6 +119,24 @@ const WS_CONFIG = Object.freeze({
 });
 
 /* =============================================================================
+   Token Lookup
+   ============================================================================= */
+
+// Fix v1.5.1: key list must stay in sync with dashboard.js DEV_JWT_KEYS so
+// that any token the UI layer can find is also visible to the auth path here.
+// Tokens stored under any other key were previously invisible to this module.
+const _DEV_JWT_KEYS = Object.freeze([
+    "SENTINEL_JWT",
+    "S43_JWT",
+    "S43_TOKEN",
+    "s43_token",
+    "s43_dashboard_token",
+    "sentinel_token",
+    "jwt",
+    "token",
+]);
+
+/* =============================================================================
    Module State
    ============================================================================= */
 
@@ -108,16 +144,16 @@ const _WS_TEXT_ENCODER = new TextEncoder();
 
 let _ws = null;
 
-let _socketOpen   = false;
+let _socketOpen    = false;
 let _authenticated = false;
-let _connected    = false;
-let _subscribed   = false;
+let _connected     = false;
+let _subscribed    = false;
 
-let _manuallyClosed   = false;
+let _manuallyClosed    = false;
 let _reconnectAttempts = 0;
-let _reconnectTimer   = null;
-let _heartbeatTimer   = null;
-let _lastMessageAt    = 0;
+let _reconnectTimer    = null;
+let _heartbeatTimer    = null;
+let _lastMessageAt     = 0;
 
 // Fix: incoming rate limiter state.
 let _msgCountThisSecond = 0;
@@ -140,13 +176,34 @@ function _dispatchMessage(parsed) {
     _dispatch(`sentinel:ws:${parsed.type}`, parsed);
 }
 
+// Fix v1.5.1: expanded token lookup. Checks sessionStorage first (shorter-
+// lived, more appropriate for session tokens), then localStorage for tokens
+// persisted across sessions, then window globals set by server-rendered pages.
 function _getDevToken() {
     if (!WS_CONFIG.ALLOW_DEV_TOKEN) return null;
-    try {
-        return sessionStorage.getItem("SENTINEL_JWT") || null;
-    } catch {
-        return null;
+
+    for (const key of _DEV_JWT_KEYS) {
+        try {
+            const value = sessionStorage.getItem(key);
+            if (value && value.trim()) return value.trim();
+        } catch {}
     }
+
+    for (const key of _DEV_JWT_KEYS) {
+        try {
+            const value = localStorage.getItem(key);
+            if (value && value.trim()) return value.trim();
+        } catch {}
+    }
+
+    try {
+        if (typeof window.SENTINEL_JWT === "string" && window.SENTINEL_JWT.trim())
+            return window.SENTINEL_JWT.trim();
+        if (typeof window.S43_DASHBOARD_TOKEN === "string" && window.S43_DASHBOARD_TOKEN.trim())
+            return window.S43_DASHBOARD_TOKEN.trim();
+    } catch {}
+
+    return null;
 }
 
 function _safeWsUrl() {
@@ -313,8 +370,6 @@ function _sendRaw(type, payload = {}) {
 }
 
 function _sendAuthFrame(token) {
-    // Fix: token is passed in rather than read from sessionStorage a second
-    // time. The caller already read it once to decide whether to call this.
     if (!token) {
         _dispatch("sentinel:ws:auth_failed", {
             error: "WebSocket authentication required, but no JWT was found.",
@@ -336,6 +391,10 @@ function _sendAuthFrame(token) {
 function _subscribeConfiguredChannels() {
     if (!_canSend()) return false;
     if (_subscribed) return true;
+
+    // Guard: must be authenticated before subscribing. The server enforces
+    // this; subscribing before auth accepted produces an immediate rejection.
+    if (!_connected) return false;
 
     for (const channel of WS_CONFIG.CHANNELS) {
         const ok = _sendRaw("subscribe", { channel });
@@ -425,10 +484,12 @@ function _scheduleReconnect() {
    Message Handling
    ============================================================================= */
 
+// Auth ownership note: this module owns the auth exchange entirely.
+// It dispatches sentinel:ws:auth_required as a notification for UI layers
+// but also immediately handles it internally. Consumers must NOT send a
+// second auth frame in response — that causes a double-auth race.
 function _handleAuthRequired() {
     _dispatch("sentinel:ws:auth_required", { timestamp: _nowIso() });
-    // Read the token once here; pass it into _sendAuthFrame so sessionStorage
-    // is not accessed again inside the auth send path.
     _sendAuthFrame(_getDevToken());
 }
 
@@ -485,8 +546,6 @@ function _handleMessage(event) {
             return;
 
         // Governance: HUMAN_GATED pending decision queue snapshot.
-        // Received immediately after subscribing to the governance channel
-        // and whenever the queue changes.
         case "governance_pending_snapshot":
             _dispatch("sentinel:ws:governance_pending", {
                 pending: parsed.payload?.pending ?? [],
@@ -526,8 +585,6 @@ function _handleMessage(event) {
    ============================================================================= */
 
 function connect() {
-    // Fix: only skip connect when page is hidden if DISCONNECT_ON_PAGE_HIDE is
-    // enabled. Default is false — active hunting alerts must arrive in background.
     if (WS_CONFIG.DISCONNECT_ON_PAGE_HIDE && document.hidden) return;
 
     if (_ws && [WebSocket.OPEN, WebSocket.CONNECTING].includes(_ws.readyState)) {
@@ -570,8 +627,11 @@ function connect() {
 
         _dispatch("sentinel:ws:open", { timestamp: _nowIso() });
 
-        // Fix: read token once and pass into _sendAuthFrame so sessionStorage
-        // is not read twice (once for the existence check, once inside the send).
+        // Proactively send auth before the server asks for it. Reduces
+        // round-trip latency on connect. Token is read once here using the
+        // expanded _getDevToken() lookup (sessionStorage → localStorage →
+        // window globals). If not found, the server will send auth_required
+        // and _handleAuthRequired() will attempt the same lookup again.
         if (WS_CONFIG.AUTH_FIRST_WHEN_TOKEN_PRESENT) {
             const token = _getDevToken();
             if (token) {
@@ -583,8 +643,8 @@ function connect() {
     _ws.addEventListener("message", _handleMessage);
 
     _ws.addEventListener("close", event => {
-        const wasManual  = _manuallyClosed;
-        const closeCode  = event.code;
+        const wasManual = _manuallyClosed;
+        const closeCode = event.code;
 
         _stopHeartbeat();
         _stopRateLimitTick();
@@ -598,9 +658,6 @@ function connect() {
             timestamp: _nowIso(),
         });
 
-        // Fix: do not reconnect on auth-failure or server-rejection codes.
-        // Reconnecting on 1008 just repeats the rejected-token cycle; the
-        // operator needs to re-authenticate, not retry the same credentials.
         if (WS_CONFIG.NO_RECONNECT_CODES.has(closeCode)) {
             _dispatch("sentinel:ws:auth_failed", {
                 code:    closeCode,
@@ -669,15 +726,12 @@ function send(type, payload = {}) {
 
 document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
-        // Fix: only disconnect on hide if explicitly configured.
-        // Default: keep the connection alive so background alerts are received.
         if (WS_CONFIG.DISCONNECT_ON_PAGE_HIDE) {
             disconnect();
         }
         return;
     }
 
-    // Tab visible again: ensure we're connected.
     if (!_ws || _ws.readyState === WebSocket.CLOSED) {
         _manuallyClosed = false;
         connect();
