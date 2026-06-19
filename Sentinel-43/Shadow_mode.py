@@ -54,6 +54,45 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# Public-beta security scrub — changelog (this pass)
+# =============================================================================
+#   1. ActionStatus.EXECUTING added. mark_pending_executing() now claims a
+#      PENDING (auto-execute / ACTIVE-mode) action by transitioning it to
+#      EXECUTING instead of APPROVED. finalize_execution() now expects
+#      EXECUTING. APPROVED is reserved exclusively for the human-approval
+#      path (STAGED -> APPROVED via Sentinel43ResponseEngine.approve_action()).
+#      Previously APPROVED meant two different things depending on which
+#      code path set it, which made the action lifecycle ambiguous.
+#   2. cleanup_old_actions() no longer deletes APPROVED rows. APPROVED is a
+#      transient mid-flight state (human approved, about to execute
+#      synchronously); deleting it during routine retention cleanup could
+#      silently discard an action that crashed between approval and
+#      execution, with no audit trail of what happened to it.
+#   3. pending_actions gained a target_hash column (pseudonymized SHA-256,
+#      same scheme used in logs). target_value remains stored raw because
+#      execution needs the real IP/identity; target_hash lets dashboards
+#      and log views display/query without touching the raw value.
+#      Existing databases are migrated in place (ALTER TABLE) and backfilled
+#      on next startup.
+#   4. OversightEngine.schedule_action(): HUMAN_GATED actions are now staged
+#      durably into SQLite immediately (same path as ACTIVE), exactly like
+#      every other action. Previously they were held only in an in-memory
+#      dict (_gated_actions) with no persistence — a process restart
+#      silently discarded any action awaiting human approval. There is now
+#      exactly one source of truth for action state: the pending_actions
+#      table. approve_gated_action()/veto_gated_action() are deprecated
+#      stubs that log an error and point callers at
+#      Sentinel43ResponseEngine.approve_action()/veto_action() directly.
+#   5. Several logger.* calls previously logged raw IP/identity values
+#      (dedupe_key, target, source, ip_address) directly to the log stream,
+#      defeating the pseudonymize() scheme used everywhere else in this
+#      file. All of these now log pseudonymize()d hashes instead.
+#   6. LOG_SALT no longer defaults to a hardcoded "CHANGE_ME_IN_PROD"
+#      placeholder (prior pass). Production requires SENTINEL_LOG_SALT;
+#      dev environments get an ephemeral random salt. See _load_log_salt().
+# =============================================================================
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -93,6 +132,13 @@ def _load_log_salt() -> str:
     used as a fallback.
 
     Generate: python -c "import secrets; print(secrets.token_hex(32))"
+
+    Running this module directly (python Shadow_mode.py) imports this
+    function at module load time, before __main__ runs. Set SENTINEL_ENV
+    (and optionally SENTINEL_LOG_SALT) in the shell first, e.g. PowerShell:
+        $env:SENTINEL_ENV="development"
+        $env:SENTINEL_LOG_SALT="dev-only-local-salt-change-me"
+        python ./Shadow_mode.py
     """
     salt = os.getenv("SENTINEL_LOG_SALT", "").strip()
     if salt:
@@ -133,6 +179,11 @@ EXECUTOR_MAX_BATCH = int(_env("SENTINEL_EXECUTOR_MAX_BATCH", "25"))
 
 # oversight behavior
 OVERSIGHT_DEDUPE_TTL_SECONDS = int(_env("SENTINEL_OVERSIGHT_DEDUPE_TTL", "120"))
+# Reserved: HUMAN_GATED backpressure used to be enforced against an
+# in-memory queue length here. That queue no longer exists (see changelog
+# #4) — HUMAN_GATED actions stage durably and immediately. This value is
+# still read into OversightEngine._max_pending for backward-compatible
+# construction but is not currently enforced anywhere.
 OVERSIGHT_MAX_PENDING = int(_env("SENTINEL_OVERSIGHT_MAX_PENDING", "250"))
 OVERSIGHT_BUDGET_WINDOW_SECONDS = int(_env("SENTINEL_OVERSIGHT_BUDGET_WINDOW_SECONDS", "300"))
 OVERSIGHT_BUDGET_MAX_PER_TARGET = int(_env("SENTINEL_OVERSIGHT_BUDGET_MAX_PER_TARGET", "5"))
@@ -266,7 +317,13 @@ class ActionStatus(str, enum.Enum):
     STAGED = "STAGED"
     PENDING = "PENDING"
     VETOED = "VETOED"
-    APPROVED = "APPROVED"
+    APPROVED = "APPROVED"     # human approved (STAGED -> APPROVED), about to
+                               # execute synchronously. Reserved exclusively
+                               # for the human-approval path; never set by
+                               # the auto-execute executor (see EXECUTING).
+    EXECUTING = "EXECUTING"    # executor claimed a PENDING (ACTIVE-mode,
+                               # post-veto-window) action for auto-execution.
+                               # Distinct from APPROVED — see changelog #1.
     EXECUTED = "EXECUTED"
     FAILED = "FAILED"
     EXPIRED = "EXPIRED"
@@ -279,7 +336,7 @@ class PendingAction:
     execute_at_ms: Optional[int]
     status: ActionStatus
 
-    target_type: str
+    target_type: str     # "ip" | "identity"
     target_value: str
 
     primary_action: str
@@ -350,6 +407,7 @@ class IntegrationHub:
 
     @staticmethod
     def execute(action: PendingAction) -> bool:
+        # Stub: Only logs. Replace with real effects.
         logger.warning(
             "[INTEGRATION] EXECUTE action_id=%s target_type=%s target_hash=%s primary=%s severity=%s kind=%s reason=%s",
             action.action_id,
@@ -423,6 +481,7 @@ class SqliteActionStore:
                         status TEXT NOT NULL,
                         target_type TEXT NOT NULL,
                         target_value TEXT NOT NULL,
+                        target_hash TEXT,
                         primary_action TEXT NOT NULL,
                         actions_json TEXT NOT NULL,
                         severity TEXT NOT NULL,
@@ -439,6 +498,15 @@ class SqliteActionStore:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_actions_status_exec ON pending_actions(status, execute_at_ms)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_actions_created ON pending_actions(created_at_ms)")
 
+                # Fix (scrub #3): migrate databases created before target_hash
+                # existed. New installs already have it from CREATE TABLE
+                # above; this handles in-place upgrades of existing DBs.
+                existing_cols = {
+                    row[1] for row in conn.execute("PRAGMA table_info(pending_actions)").fetchall()
+                }
+                if "target_hash" not in existing_cols:
+                    conn.execute("ALTER TABLE pending_actions ADD COLUMN target_hash TEXT NULL")
+
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS action_dedupe (
@@ -454,6 +522,23 @@ class SqliteActionStore:
                 conn.execute("ROLLBACK;")
                 raise
 
+        # Fix (scrub #3): backfill target_hash for rows written before this
+        # column existed, so every row has one going forward. Best-effort —
+        # a failure here must not block startup.
+        try:
+            with _db_conn() as backfill_conn:
+                rows = backfill_conn.execute(
+                    "SELECT action_id, target_value FROM pending_actions WHERE target_hash IS NULL"
+                ).fetchall()
+                for action_id, target_value in rows:
+                    backfill_conn.execute(
+                        "UPDATE pending_actions SET target_hash=? WHERE action_id=?",
+                        (pseudonymize(target_value), action_id),
+                    )
+        except Exception as exc:
+            logger.warning("target_hash backfill skipped: %s", exc)
+
+        # best-effort cleanup
         try:
             self.cleanup_old_logs(DEFAULT_LOG_RETENTION_DAYS)
             self.cleanup_old_actions(DEFAULT_ACTION_RETENTION_DAYS)
@@ -502,13 +587,13 @@ class SqliteActionStore:
                     """
                     INSERT INTO pending_actions (
                         action_id, created_at_ms, execute_at_ms, status,
-                        target_type, target_value,
+                        target_type, target_value, target_hash,
                         primary_action, actions_json,
                         severity, kind, source_kind, score,
                         reason, system_id,
                         operator_id, operator_reason
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         pa.action_id,
@@ -517,6 +602,7 @@ class SqliteActionStore:
                         pa.status.value,
                         pa.target_type,
                         pa.target_value,
+                        pseudonymize(pa.target_value),
                         pa.primary_action,
                         pa.actions_json,
                         pa.severity,
@@ -608,9 +694,16 @@ class SqliteActionStore:
         return out
 
     def mark_pending_executing(self, action_id: str) -> bool:
+        # Fix (scrub #1): claims a PENDING (auto-execute / ACTIVE-mode)
+        # action by transitioning it to EXECUTING, not APPROVED. APPROVED is
+        # reserved for the human-approval lifecycle (STAGED -> APPROVED via
+        # Sentinel43ResponseEngine.approve_action()). Reusing APPROVED for
+        # both "a human approved this" and "the executor claimed this for
+        # auto-run" made the state machine ambiguous — a crashed claim could
+        # be misread as a human decision, or vice versa.
         return self.update_action_status(
             action_id,
-            ActionStatus.APPROVED,
+            ActionStatus.EXECUTING,
             operator_id="executor",
             operator_reason="claimed_for_execution",
             expected_status=ActionStatus.PENDING,
@@ -623,7 +716,7 @@ class SqliteActionStore:
             new_status,
             operator_id="executor",
             operator_reason=(operator_reason or "")[:300],
-            expected_status=ActionStatus.APPROVED,
+            expected_status=ActionStatus.EXECUTING,
         )
 
     def expire_overdue(self, *, now_ms: int) -> int:
@@ -653,19 +746,24 @@ class SqliteActionStore:
             return int(cur.rowcount or 0)
 
     def cleanup_old_actions(self, retention_days: int) -> int:
+        # Fix (scrub #2): APPROVED removed from the deletion list. APPROVED
+        # is a transient mid-flight state (human approved, about to execute
+        # synchronously inside the same call). Deleting it during routine
+        # retention cleanup could discard an action that crashed between
+        # approval and execution with zero audit trail of what happened.
+        # Only genuinely terminal states are eligible for cleanup.
         cutoff_ms = _now_ms() - int(retention_days) * 86400 * 1000
         with _db_conn() as conn:
             cur = conn.execute(
                 """
                 DELETE FROM pending_actions
                  WHERE created_at_ms < ?
-                   AND status IN (?, ?, ?, ?, ?)
+                   AND status IN (?, ?, ?, ?)
                 """,
                 (
                     cutoff_ms,
                     ActionStatus.VETOED.value,
                     ActionStatus.EXECUTED.value,
-                    ActionStatus.APPROVED.value,
                     ActionStatus.FAILED.value,
                     ActionStatus.EXPIRED.value,
                 ),
@@ -674,7 +772,7 @@ class SqliteActionStore:
 
 
 # ============================================================
-# RESPONSE ENGINE
+# RESPONSE ENGINE (detector-free)
 # ============================================================
 
 class Sentinel43ResponseEngine:
@@ -708,6 +806,9 @@ class Sentinel43ResponseEngine:
         self._executor_thread.join(timeout=5)
         self.store.log_event("INFO", "SYSTEM", "Shutdown complete.", {"system_id": SYSTEM_ID})
 
+    # ------------------------------
+    # OPERATOR CONTROLS (DB-backed)
+    # ------------------------------
     def approve_action(self, action_id: str, operator_id: str, reason: str = "") -> bool:
         op = (operator_id or "").strip()[:80]
         rsn = (reason or "").strip()[:300]
@@ -732,6 +833,7 @@ class Sentinel43ResponseEngine:
             {"action_id": action_id, "operator_id": op},
         )
 
+        # Execute immediately on HUMAN_GATED approval:
         if ok:
             self._execute_approved_now(action_id)
 
@@ -746,6 +848,7 @@ class Sentinel43ResponseEngine:
                                  {"action_id": action_id, "operator_id": op})
             return False
 
+        # allow veto of PENDING or STAGED
         ok = self.store.update_action_status(
             action_id,
             ActionStatus.VETOED,
@@ -770,6 +873,9 @@ class Sentinel43ResponseEngine:
         )
         return ok
 
+    # ------------------------------
+    # MAIN ENTRY
+    # ------------------------------
     def handle_assessment(self, mode: SentinelMode, assessment: ThreatAssessment) -> Optional[PendingAction]:
         directive = self.plan_response(assessment)
 
@@ -936,11 +1042,15 @@ class Sentinel43ResponseEngine:
         )
 
         if not self.store.dedupe_check_and_set(dedupe_key, self.dedupe_ttl_seconds):
+            # Fix (scrub #5): dedupe_key embeds the raw target value
+            # (f"{target_type}:{target_value}:..."). Logging it verbatim
+            # into the persisted event_logs table defeated pseudonymize()
+            # for every suppressed duplicate. Log the hash instead.
             self.store.log_event(
                 "INFO",
                 "RESPONSE",
                 "Duplicate directive suppressed (dedupe window)",
-                {"dedupe_key": dedupe_key, "ttl_seconds": self.dedupe_ttl_seconds},
+                {"dedupe_hash": pseudonymize(dedupe_key), "ttl_seconds": self.dedupe_ttl_seconds},
             )
             return None
 
@@ -971,7 +1081,7 @@ class Sentinel43ResponseEngine:
             execute_at_ms=execute_at_ms,
             status=status,
             target_type=target_type,
-            target_value=raw_target_value,
+            target_value=raw_target_value,  # raw stored for downstream execution
             primary_action=d.primary_action.name,
             actions_json=actions_json,
             severity=d.threat_severity.name,
@@ -1010,6 +1120,9 @@ class Sentinel43ResponseEngine:
     def _new_action_id(self) -> str:
         return f"ACT-{uuid.uuid4().hex}".upper()
 
+    # ------------------------------
+    # EXECUTOR LOOP (durable ACTIVE execution)
+    # ------------------------------
     def _executor_loop(self) -> None:
         self.store.log_event("INFO", "EXECUTOR", "Executor thread online.", {"poll_ms": EXECUTOR_POLL_MS})
         while not self._stop.is_set():
@@ -1055,6 +1168,7 @@ class Sentinel43ResponseEngine:
         self.store.log_event("INFO", "EXECUTOR", "Executor thread stopping.", {})
 
     def _execute_approved_now(self, action_id: str) -> None:
+        # HUMAN_GATED: operator APPROVED -> execute immediately
         try:
             with _db_conn() as conn:
                 row = conn.execute("SELECT * FROM pending_actions WHERE action_id=?", (action_id,)).fetchone()
@@ -1100,6 +1214,12 @@ class Sentinel43ResponseEngine:
 
 # ============================================================
 # OVERSIGHT ENGINE
+#
+# Pre-staging guardrails (dedupe, budget caps, corroboration). As of this
+# scrub pass, every mode (SHADOW / HUMAN_GATED / ACTIVE) that results in a
+# durable action stages it the same way, immediately, through
+# Sentinel43ResponseEngine — there is no separate in-memory queue or
+# approval path here anymore (see changelog #4).
 # ============================================================
 
 @dataclass(frozen=True)
@@ -1197,11 +1317,22 @@ class ActionRequest:
     reason: str
     evidence: dict
 
+    # Instead of direct payloads, we stage via a callback:
     stage_callable: Callable[[SentinelMode, dict], Optional[str]]
+    # Optional shadow callback:
     shadow_callable: Optional[Callable[[], None]] = None
 
 
 class OversightEngine:
+    """
+    Pre-staging guardrails: dedupe, per-target/per-source budgets, and
+    two-signal corroboration for HIGH severity. Every mode that results in
+    a durable action (HUMAN_GATED, ACTIVE) stages it immediately through
+    Sentinel43ResponseEngine via stage_callable — there is exactly one
+    source of truth for action state (the pending_actions table). SHADOW
+    mode is advisory-only and never persists a durable action.
+    """
+
     def __init__(
         self,
         mode_resolver: Callable[[], OpMode],
@@ -1220,7 +1351,6 @@ class OversightEngine:
         self._mode_resolver = mode_resolver
         self._lock = threading.RLock()
 
-        self._gated_actions: Dict[str, ActionRequest] = {}
         self._recent_dedupe: Dict[str, float] = {}
         self._budget_target: Dict[str, BudgetState] = {}
         self._budget_source: Dict[str, BudgetState] = {}
@@ -1232,6 +1362,9 @@ class OversightEngine:
         self._on_execution_failure = on_execution_failure
 
         self._dedupe_ttl_seconds = int(dedupe_ttl_seconds)
+        # Reserved; HUMAN_GATED backpressure is no longer enforced against
+        # an in-memory queue here (see changelog #4). Kept for backward
+        # compatible construction.
         self._max_pending = int(max_pending)
         self._budget_window_seconds = int(budget_window_seconds)
         self._budget_max_actions_per_target = int(budget_max_actions_per_target)
@@ -1293,6 +1426,7 @@ class OversightEngine:
         return True
 
     def _consume_budgets_atomic(self, *, target: str, source: str) -> bool:
+        # Must be called under lock
         target_ok = self._consume_budget(self._budget_target, target, self._budget_max_actions_per_target)
         source_ok = True
         if source:
@@ -1301,6 +1435,7 @@ class OversightEngine:
         if target_ok and source_ok:
             return True
 
+        # rollback target if needed
         if target_ok and not source_ok:
             st = self._budget_target.get(target)
             if st:
@@ -1330,22 +1465,31 @@ class OversightEngine:
             mode = self._mode_resolver()
             self._cleanup()
 
-            if len(self._gated_actions) >= self._max_pending:
-                logger.error("[OVERSIGHT] Back-pressure: too many gated actions. Dropping %s", req.action_id)
-                return None
-
             if self._is_duplicate(req.dedupe_key):
-                logger.info("[OVERSIGHT] Duplicate suppressed dedupe_key=%s", req.dedupe_key)
+                # Fix (scrub #5): dedupe_key embeds the raw target
+                # (e.g. f"{ip}|{ttype}|{sev}|{bucket}"). Logging it verbatim
+                # leaked raw IPs into the log stream on every suppressed
+                # duplicate.
+                logger.info("[OVERSIGHT] Duplicate suppressed dedupe_hash=%s", pseudonymize(req.dedupe_key))
                 return None
 
             if not self._consume_budgets_atomic(target=req.target, source=req.source):
-                logger.warning("[OVERSIGHT] Budget exceeded target=%s source=%s suppressing %s", req.target, req.source, req.action_id)
+                # Fix (scrub #5): target/source are raw IP/identity values.
+                logger.warning(
+                    "[OVERSIGHT] Budget exceeded target_hash=%s source_hash=%s suppressing %s",
+                    pseudonymize(req.target), pseudonymize(req.source), req.action_id,
+                )
                 return None
 
             if req.severity == "HIGH" and self._require_two_signals_for_high:
                 count = self._corroborate(target=req.target, reason=req.reason)
-                logger.info("[OVERSIGHT] Corroboration target=%s reason=%s -> %d", req.target, req.reason, count)
+                # Fix (scrub #5): target is a raw IP/identity value.
+                logger.info(
+                    "[OVERSIGHT] Corroboration target_hash=%s reason=%s -> %d",
+                    pseudonymize(req.target), req.reason, count,
+                )
                 if count < 2:
+                    # Shadow still allowed
                     if mode is OpMode.SHADOW and req.shadow_callable:
                         try:
                             req.shadow_callable()
@@ -1354,6 +1498,7 @@ class OversightEngine:
                             logger.error("[OVERSIGHT] Shadow callable failed action_id=%s err=%s", req.action_id, exc)
                     return None
 
+            # SHADOW: optional shadow callable, no durable action
             if mode is OpMode.SHADOW:
                 if req.shadow_callable:
                     try:
@@ -1364,11 +1509,22 @@ class OversightEngine:
                 logger.info("[OVERSIGHT] Advisory only. No execution.")
                 return None
 
-            if mode is OpMode.HUMAN_GATED:
-                self._gated_actions[req.action_id] = req
-                logger.warning("[OVERSIGHT] ACTION STAGED gated action_id=%s", req.action_id)
-                return req.action_id
-
+            # Fix (scrub #4): HUMAN_GATED and ACTIVE both stage durably into
+            # SQLite via the response engine, immediately. stage_callable ->
+            # Sentinel43ResponseEngine.handle_assessment() ->
+            # stage_directive(), which sets status STAGED (HUMAN_GATED,
+            # awaiting Sentinel43ResponseEngine.approve_action()/
+            # veto_action()) or PENDING with a veto-window execute_at_ms
+            # (ACTIVE). There is exactly one source of truth for action
+            # state: the pending_actions table.
+            #
+            # Previously HUMAN_GATED actions were held only in an in-memory
+            # dict (self._gated_actions) here and were lost on process
+            # restart with zero audit trail of an action awaiting human
+            # approval. That dict is gone; approve_gated_action() /
+            # veto_gated_action() below are deprecated stubs that point
+            # callers at the engine's durable approve_action()/veto_action()
+            # using the action_id returned here.
             try:
                 staged_action_id = req.stage_callable(
                     _map_mode(mode),
@@ -1378,6 +1534,11 @@ class OversightEngine:
                         "evidence": req.evidence,
                     },
                 )
+                if staged_action_id:
+                    logger.warning(
+                        "[OVERSIGHT] ACTION STAGED (durable) action_id=%s mode=%s",
+                        staged_action_id, mode.value,
+                    )
                 return staged_action_id
             except Exception as exc:
                 self._record_failure(req.action_id, exc)
@@ -1390,46 +1551,47 @@ class OversightEngine:
                 return None
 
     def approve_gated_action(self, action_id: str, *, operator_id: str = "unknown") -> bool:
-        operator_id = _safe_str(operator_id, max_len=80)
-        if self._operator_authenticator is not None and not self._operator_authenticator(operator_id):
-            logger.error("[OVERSIGHT] APPROVAL REJECTED operator not authenticated operator=%s", operator_id)
-            return False
+        """
+        Deprecated (scrub #4). HUMAN_GATED actions are staged durably into
+        SQLite by schedule_action() the moment they are created — they are
+        no longer held in an in-memory queue here. Approve the action
+        directly against the response engine instead:
 
-        with self._lock:
-            req = self._gated_actions.pop(action_id, None)
+            engine.approve_action(action_id, operator_id, reason)
 
-        if not req:
-            logger.warning("[OVERSIGHT] APPROVAL FAILED not staged action_id=%s", action_id)
-            return False
-
-        try:
-            _ = req.stage_callable(SentinelMode.HUMAN_GATED, {"description": req.description, "evidence": req.evidence})
-            return True
-        except Exception as exc:
-            with self._lock:
-                self._record_failure(action_id, exc)
-            logger.error("[OVERSIGHT] gated stage failed action_id=%s err=%s", action_id, exc)
-            return False
+        where `engine` is the Sentinel43ResponseEngine instance and
+        `action_id` is the id returned by schedule_action() /
+        SentinelNexus.handle_threat(). This method is kept only so existing
+        callers fail loudly instead of silently operating on a queue that
+        no longer exists.
+        """
+        logger.error(
+            "[OVERSIGHT] approve_gated_action() is deprecated and does nothing. "
+            "HUMAN_GATED actions are staged durably in SQLite -- call "
+            "Sentinel43ResponseEngine.approve_action(action_id=%r, operator_id=%r, "
+            "reason=...) directly instead.",
+            action_id, operator_id,
+        )
+        return False
 
     def veto_gated_action(self, action_id: str, reason: str, *, operator_id: str = "unknown") -> bool:
-        operator_id = _safe_str(operator_id, max_len=80)
-        if self._operator_authenticator is not None and not self._operator_authenticator(operator_id):
-            logger.error("[OVERSIGHT] VETO REJECTED operator not authenticated operator=%s", operator_id)
-            return False
+        """
+        Deprecated (scrub #4). See approve_gated_action(). Veto the action
+        directly against the response engine instead:
 
-        with self._lock:
-            existed = action_id in self._gated_actions
-            self._gated_actions.pop(action_id, None)
-        if existed:
-            logger.warning("[OVERSIGHT] GATED ACTION DROPPED action_id=%s operator=%s reason=%s", action_id, operator_id, _safe_str(reason, max_len=300))
-            return True
-
-        logger.warning("[OVERSIGHT] VETO FAILED not found action_id=%s", action_id)
+            engine.veto_action(action_id, operator_id, reason)
+        """
+        logger.error(
+            "[OVERSIGHT] veto_gated_action() is deprecated and does nothing. "
+            "HUMAN_GATED actions are staged durably in SQLite -- call "
+            "Sentinel43ResponseEngine.veto_action(action_id=%r, operator_id=%r, "
+            "reason=...) directly instead.",
+            action_id, operator_id,
+        )
         return False
 
     def shutdown(self) -> None:
         with self._lock:
-            self._gated_actions.clear()
             self._recent_dedupe.clear()
             self._corroboration.clear()
             self._budget_target.clear()
@@ -1438,7 +1600,7 @@ class OversightEngine:
 
 
 # ============================================================
-# SENTINEL NEXUS
+# SENTINEL NEXUS (Facade like your pasted file)
 # ============================================================
 
 class SentinelNexus:
@@ -1457,6 +1619,7 @@ class SentinelNexus:
             integration=IntegrationHub,
         )
 
+        # Oversight uses the same operator authenticator if provided
         self.oversight = OversightEngine(
             self.get_mode,
             operator_authenticator=operator_authenticator,
@@ -1486,7 +1649,12 @@ class SentinelNexus:
         ok, ip = _validate_ip(ip_address)
         if not ok:
             token = f"DROP-{uuid.uuid4().hex[:12]}"
-            logger.warning("[THREAT] Dropped invalid ip_address=%s token=%s", _safe_str(ip_address, max_len=120), token)
+            # Fix (scrub #5): ip_address is raw user/network-supplied input;
+            # logging it verbatim on a validation failure still leaks it.
+            logger.warning(
+                "[THREAT] Dropped invalid ip_address_hash=%s token=%s",
+                pseudonymize(ip_address), token,
+            )
             return token
 
         sev = _normalize_severity(severity)
@@ -1508,11 +1676,9 @@ class SentinelNexus:
             }
         )
 
-        severity_map = {
-            "LOW": ThreatSeverity.LOW,
-            "MEDIUM": ThreatSeverity.MEDIUM,
-            "HIGH": ThreatSeverity.HIGH,
-        }
+        # Map this “simple threat” to a ThreatAssessment for the response engine
+        # (This is intentionally conservative: you can refine mapping later.)
+        severity_map = {"LOW": ThreatSeverity.LOW, "MEDIUM": ThreatSeverity.MEDIUM, "HIGH": ThreatSeverity.HIGH}
         threat_kind_map = {
             "PORT_SCAN": ThreatKind.GENERIC_INTRUSION,
             "BRUTE_FORCE": ThreatKind.CREDENTIAL_ATTACK,
@@ -1523,7 +1689,7 @@ class SentinelNexus:
         }
 
         assessment = ThreatAssessment(
-            identity=f"ip:{ip}",
+            identity=f"ip:{ip}",             # keep identity stable and non-PII
             source_ip=ip,
             threat_kind=threat_kind_map.get(ttype, ThreatKind.UNKNOWN),
             severity=severity_map.get(sev, ThreatSeverity.MEDIUM),
@@ -1534,6 +1700,8 @@ class SentinelNexus:
         )
 
         def stage_callable(mode: SentinelMode, meta: dict) -> Optional[str]:
+            # Override veto window delay in policy by temporarily staging in ACTIVE with custom delay
+            # We do it by staging normally then adjusting execute_at_ms if ACTIVE.
             pa = self.engine.handle_assessment(mode, assessment)
             if not pa:
                 return None
@@ -1542,6 +1710,7 @@ class SentinelNexus:
                 delay_s = int(meta.get("delay_seconds", 5))
                 execute_at_ms = _now_ms() + delay_s * 1000
 
+                # Safely adjust execute_at_ms only if still pending
                 with _db_conn() as conn:
                     conn.execute("BEGIN IMMEDIATE;")
                     try:
@@ -1564,6 +1733,7 @@ class SentinelNexus:
             return pa.action_id
 
         def shadow_callable() -> None:
+            # Shadow advisory log only (no staging)
             logger.info("[SHADOW] WOULD stage threat=%s ip=%s", ttype, pseudonymize(ip))
 
         req = ActionRequest(
@@ -1580,7 +1750,15 @@ class SentinelNexus:
             shadow_callable=shadow_callable,
         )
 
-        logger.info("[THREAT] %s from %s severity=%s source=%s action_id=%s", ttype, ip, sev, src, action_id)
+        # Fix (scrub #5): ip is the raw validated IP; logging it verbatim on
+        # every single threat event was the highest-volume raw-PII leak in
+        # this file. source_id (src) is an internal sensor identifier, not
+        # end-user PII, and is left as-is (same treatment as system_id/module
+        # elsewhere in this file).
+        logger.info(
+            "[THREAT] %s from ip_hash=%s severity=%s source=%s action_id=%s",
+            ttype, pseudonymize(ip), sev, src, action_id,
+        )
         staged = self.oversight.schedule_action(req)
         return staged or action_id
 
@@ -1590,6 +1768,7 @@ class SentinelNexus:
 # ============================================================
 
 if __name__ == "__main__":
+    # Minimal logging for local runs
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
 
     allowed = {s.strip() for s in _env("SENTINEL_ALLOWED_OPERATORS", "admin,ops").split(",") if s.strip()}
