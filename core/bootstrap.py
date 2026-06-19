@@ -42,7 +42,8 @@ Responsibilities:
   - Verify JWT signing configuration before the server accepts traffic.
   - Verify WebSocket auth enforcement before production startup.
   - Verify test injection is disabled in production.
-  - Verify auth pepper exists before the first auth-key verification call.
+  - Verify auth pepper exists and meets minimum length before the first
+    auth-key verification call.
 """
 
 from __future__ import annotations
@@ -70,6 +71,10 @@ APPROVED_JWT_ALGORITHMS: Final[frozenset[str]] = frozenset({"HS256"})
 LOCAL_TEST_ENVIRONMENTS: Final[frozenset[str]] = frozenset(
     {"development", "dev", "local", "test"}
 )
+
+# Minimum pepper length enforced at startup. Must match or exceed the
+# effective entropy floor used by AuthKeyStore._hash_token().
+_MIN_PEPPER_BYTES: Final[int] = 32
 
 
 # =============================================================================
@@ -104,7 +109,7 @@ def bootstrap_expectations() -> None:
       - S43_JWT_ALGORITHM is not in APPROVED_JWT_ALGORITHMS
       - S43_JWT_ISSUER is missing
       - S43_JWT_AUDIENCE is missing
-      - S43_AUTH_PEPPER is missing
+      - S43_AUTH_PEPPER is missing or < 32 bytes (UTF-8 encoded)
       - S43_WS_REQUIRE_AUTH is not true
       - S43_ENABLE_TEST_INJECTION is true
 
@@ -163,16 +168,26 @@ def bootstrap_expectations() -> None:
             "Set to 'sentinel-43-dashboard' or your deployment-specific audience."
         )
 
-    # Auth key-store pepper
+    # Auth key-store pepper — presence and minimum length.
     # AuthKeyStore._pepper() raises on first key verification if this is
     # missing. Catching it here ensures the server refuses to start rather
     # than failing mid-request on the first auth attempt.
+    # Fix (scrub): also enforce minimum length so a short/weak pepper cannot
+    # be used in production. The threshold matches _MIN_PEPPER_BYTES (32).
     if not auth_pepper:
         errors.append(
             "S43_AUTH_PEPPER is missing. "
             "The PBKDF2 auth key store requires a pepper in production. "
             'Generate with: python -c "import secrets; print(secrets.token_hex(32))"'
         )
+    else:
+        pepper_bytes = auth_pepper.encode("utf-8")
+        if len(pepper_bytes) < _MIN_PEPPER_BYTES:
+            errors.append(
+                f"S43_AUTH_PEPPER is too short ({len(pepper_bytes)} bytes UTF-8 encoded). "
+                f"Must be at least {_MIN_PEPPER_BYTES} bytes. "
+                'Generate with: python -c "import secrets; print(secrets.token_hex(32))"'
+            )
 
     # WebSocket auth enforcement
     if not ws_require_auth:
