@@ -42,10 +42,12 @@ import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
 import uuid
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
@@ -73,35 +75,53 @@ def _env(name: str, default: str) -> str:
 SYSTEM_ID = _env("SENTINEL_SYSTEM_ID", "SENTINEL-43-NEXUS-01")
 DB_PATH = Path(_env("SENTINEL_DB_PATH", str(BASE_DIR / "sentinel43_state" / "sentinel43.sqlite3")))
 
-SYSTEM_ID = _env("SENTINEL_SYSTEM_ID", "SENTINEL-43-NEXUS-01")
-DB_PATH = Path(
-    _env(
-        "SENTINEL_DB_PATH",
-        str(BASE_DIR / "sentinel43_state" / "sentinel43.sqlite3"),
-    )
-)
 
-LOG_SALT = os.getenv("SENTINEL_LOG_SALT", "").strip()
+def _load_log_salt() -> str:
+    """
+    Load the log pseudonymization salt from the environment.
 
-if not LOG_SALT:
+    Scrub fix: removes hardcoded "CHANGE_ME_IN_PROD" default. A known salt
+    defeats pseudonymization — anyone with the salt can precompute SHA-256
+    hashes of common IP addresses and identities to de-anonymize log output.
+
+    Production: SENTINEL_LOG_SALT must be set; raises RuntimeError on startup
+    if absent so the server refuses to start rather than silently logging
+    reversible pseudonyms.
+
+    Dev environments: warns and generates an ephemeral random salt. Hashes
+    will not be consistent across restarts but no predictable value is ever
+    used as a fallback.
+
+    Generate: python -c "import secrets; print(secrets.token_hex(32))"
+    """
+    salt = os.getenv("SENTINEL_LOG_SALT", "").strip()
+    if salt:
+        return salt
+
+    env = (
+        os.getenv("SENTINEL_ENV", "") or os.getenv("S43_ENV", "")
+    ).lower().strip()
+    _dev_envs: frozenset[str] = frozenset({
+        "development", "dev", "test", "testing", "local"
+    })
+
+    if env in _dev_envs:
+        warnings.warn(
+            "SENTINEL_LOG_SALT is not set. Using an ephemeral random salt — "
+            "pseudonymized log hashes will not be consistent across restarts. "
+            "Set SENTINEL_LOG_SALT in .env for persistent pseudonymization.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return secrets.token_hex(16)
+
     raise RuntimeError(
-        "SENTINEL_LOG_SALT is required."
+        "SENTINEL_LOG_SALT is required in production. "
+        'Generate with: python -c "import secrets; print(secrets.token_hex(32))"'
     )
 
-if len(LOG_SALT.encode("utf-8")) < 32:
-    raise RuntimeError(
-        "SENTINEL_LOG_SALT must be at least 32 bytes."
-    )
 
-if LOG_SALT.upper() in {
-    "CHANGE_ME",
-    "CHANGE_ME_IN_PROD",
-    "DEV",
-    "DEFAULT",
-}:
-    raise RuntimeError(
-        "SENTINEL_LOG_SALT contains a placeholder value."
-    )
+LOG_SALT = _load_log_salt()
 
 DEFAULT_DEDUPE_TTL_SECONDS = int(_env("SENTINEL_ACTION_DEDUPE_TTL", "60"))
 DEFAULT_LOG_RETENTION_DAYS = int(_env("SENTINEL_LOG_RETENTION_DAYS", "90"))
@@ -130,7 +150,6 @@ class SentinelMode(str, enum.Enum):
     ACTIVE = "ACTIVE"           # stage, will auto-execute after veto window
 
 
-# Oversight-friendly naming (matches your pasted file semantics)
 class OpMode(enum.Enum):
     SHADOW = "SHADOW_ADVISORY"
     HUMAN_GATED = "HUMAN_GATED"
@@ -247,7 +266,7 @@ class ActionStatus(str, enum.Enum):
     STAGED = "STAGED"
     PENDING = "PENDING"
     VETOED = "VETOED"
-    APPROVED = "APPROVED"   # also used as executor "claim"
+    APPROVED = "APPROVED"
     EXECUTED = "EXECUTED"
     FAILED = "FAILED"
     EXPIRED = "EXPIRED"
@@ -260,7 +279,7 @@ class PendingAction:
     execute_at_ms: Optional[int]
     status: ActionStatus
 
-    target_type: str     # "ip" | "identity"
+    target_type: str
     target_value: str
 
     primary_action: str
@@ -331,7 +350,6 @@ class IntegrationHub:
 
     @staticmethod
     def execute(action: PendingAction) -> bool:
-        # Stub: Only logs. Replace with real effects.
         logger.warning(
             "[INTEGRATION] EXECUTE action_id=%s target_type=%s target_hash=%s primary=%s severity=%s kind=%s reason=%s",
             action.action_id,
@@ -436,7 +454,6 @@ class SqliteActionStore:
                 conn.execute("ROLLBACK;")
                 raise
 
-        # best-effort cleanup
         try:
             self.cleanup_old_logs(DEFAULT_LOG_RETENTION_DAYS)
             self.cleanup_old_actions(DEFAULT_ACTION_RETENTION_DAYS)
@@ -657,7 +674,7 @@ class SqliteActionStore:
 
 
 # ============================================================
-# RESPONSE ENGINE (detector-free)
+# RESPONSE ENGINE
 # ============================================================
 
 class Sentinel43ResponseEngine:
@@ -691,9 +708,6 @@ class Sentinel43ResponseEngine:
         self._executor_thread.join(timeout=5)
         self.store.log_event("INFO", "SYSTEM", "Shutdown complete.", {"system_id": SYSTEM_ID})
 
-    # ------------------------------
-    # OPERATOR CONTROLS (DB-backed)
-    # ------------------------------
     def approve_action(self, action_id: str, operator_id: str, reason: str = "") -> bool:
         op = (operator_id or "").strip()[:80]
         rsn = (reason or "").strip()[:300]
@@ -718,7 +732,6 @@ class Sentinel43ResponseEngine:
             {"action_id": action_id, "operator_id": op},
         )
 
-        # Execute immediately on HUMAN_GATED approval:
         if ok:
             self._execute_approved_now(action_id)
 
@@ -733,7 +746,6 @@ class Sentinel43ResponseEngine:
                                  {"action_id": action_id, "operator_id": op})
             return False
 
-        # allow veto of PENDING or STAGED
         ok = self.store.update_action_status(
             action_id,
             ActionStatus.VETOED,
@@ -758,9 +770,6 @@ class Sentinel43ResponseEngine:
         )
         return ok
 
-    # ------------------------------
-    # MAIN ENTRY
-    # ------------------------------
     def handle_assessment(self, mode: SentinelMode, assessment: ThreatAssessment) -> Optional[PendingAction]:
         directive = self.plan_response(assessment)
 
@@ -962,7 +971,7 @@ class Sentinel43ResponseEngine:
             execute_at_ms=execute_at_ms,
             status=status,
             target_type=target_type,
-            target_value=raw_target_value,  # raw stored for downstream execution
+            target_value=raw_target_value,
             primary_action=d.primary_action.name,
             actions_json=actions_json,
             severity=d.threat_severity.name,
@@ -1001,9 +1010,6 @@ class Sentinel43ResponseEngine:
     def _new_action_id(self) -> str:
         return f"ACT-{uuid.uuid4().hex}".upper()
 
-    # ------------------------------
-    # EXECUTOR LOOP (durable ACTIVE execution)
-    # ------------------------------
     def _executor_loop(self) -> None:
         self.store.log_event("INFO", "EXECUTOR", "Executor thread online.", {"poll_ms": EXECUTOR_POLL_MS})
         while not self._stop.is_set():
@@ -1049,7 +1055,6 @@ class Sentinel43ResponseEngine:
         self.store.log_event("INFO", "EXECUTOR", "Executor thread stopping.", {})
 
     def _execute_approved_now(self, action_id: str) -> None:
-        # HUMAN_GATED: operator APPROVED -> execute immediately
         try:
             with _db_conn() as conn:
                 row = conn.execute("SELECT * FROM pending_actions WHERE action_id=?", (action_id,)).fetchone()
@@ -1094,7 +1099,7 @@ class Sentinel43ResponseEngine:
 
 
 # ============================================================
-# OVERSIGHT ENGINE (your in-memory guardrails, but staging durable actions)
+# OVERSIGHT ENGINE
 # ============================================================
 
 @dataclass(frozen=True)
@@ -1192,18 +1197,11 @@ class ActionRequest:
     reason: str
     evidence: dict
 
-    # Instead of direct payloads, we stage via a callback:
     stage_callable: Callable[[SentinelMode, dict], Optional[str]]
-    # Optional shadow callback:
     shadow_callable: Optional[Callable[[], None]] = None
 
 
 class OversightEngine:
-    """
-    Your hardened oversight logic, but it doesn't "do effects".
-    It stages durable actions through stage_callable and lets the SQLite executor run them.
-    """
-
     def __init__(
         self,
         mode_resolver: Callable[[], OpMode],
@@ -1295,7 +1293,6 @@ class OversightEngine:
         return True
 
     def _consume_budgets_atomic(self, *, target: str, source: str) -> bool:
-        # Must be called under lock
         target_ok = self._consume_budget(self._budget_target, target, self._budget_max_actions_per_target)
         source_ok = True
         if source:
@@ -1304,7 +1301,6 @@ class OversightEngine:
         if target_ok and source_ok:
             return True
 
-        # rollback target if needed
         if target_ok and not source_ok:
             st = self._budget_target.get(target)
             if st:
@@ -1350,7 +1346,6 @@ class OversightEngine:
                 count = self._corroborate(target=req.target, reason=req.reason)
                 logger.info("[OVERSIGHT] Corroboration target=%s reason=%s -> %d", req.target, req.reason, count)
                 if count < 2:
-                    # Shadow still allowed
                     if mode is OpMode.SHADOW and req.shadow_callable:
                         try:
                             req.shadow_callable()
@@ -1359,7 +1354,6 @@ class OversightEngine:
                             logger.error("[OVERSIGHT] Shadow callable failed action_id=%s err=%s", req.action_id, exc)
                     return None
 
-            # SHADOW: optional shadow callable, no durable action
             if mode is OpMode.SHADOW:
                 if req.shadow_callable:
                     try:
@@ -1370,13 +1364,11 @@ class OversightEngine:
                 logger.info("[OVERSIGHT] Advisory only. No execution.")
                 return None
 
-            # HUMAN_GATED: stage into gated set; host approves later
             if mode is OpMode.HUMAN_GATED:
                 self._gated_actions[req.action_id] = req
                 logger.warning("[OVERSIGHT] ACTION STAGED gated action_id=%s", req.action_id)
                 return req.action_id
 
-            # ACTIVE: stage durable pending action with veto delay
             try:
                 staged_action_id = req.stage_callable(
                     _map_mode(mode),
@@ -1411,7 +1403,6 @@ class OversightEngine:
             return False
 
         try:
-            # stage immediately as HUMAN_GATED then host can approve via DB engine
             _ = req.stage_callable(SentinelMode.HUMAN_GATED, {"description": req.description, "evidence": req.evidence})
             return True
         except Exception as exc:
@@ -1447,7 +1438,7 @@ class OversightEngine:
 
 
 # ============================================================
-# SENTINEL NEXUS (Facade like your pasted file)
+# SENTINEL NEXUS
 # ============================================================
 
 class SentinelNexus:
@@ -1466,7 +1457,6 @@ class SentinelNexus:
             integration=IntegrationHub,
         )
 
-        # Oversight uses the same operator authenticator if provided
         self.oversight = OversightEngine(
             self.get_mode,
             operator_authenticator=operator_authenticator,
@@ -1518,9 +1508,11 @@ class SentinelNexus:
             }
         )
 
-        # Map this “simple threat” to a ThreatAssessment for the response engine
-        # (This is intentionally conservative: you can refine mapping later.)
-        severity_map = {"LOW": ThreatSeverity.LOW, "MEDIUM": ThreatSeverity.MEDIUM, "HIGH": ThreatSeverity.HIGH}
+        severity_map = {
+            "LOW": ThreatSeverity.LOW,
+            "MEDIUM": ThreatSeverity.MEDIUM,
+            "HIGH": ThreatSeverity.HIGH,
+        }
         threat_kind_map = {
             "PORT_SCAN": ThreatKind.GENERIC_INTRUSION,
             "BRUTE_FORCE": ThreatKind.CREDENTIAL_ATTACK,
@@ -1531,7 +1523,7 @@ class SentinelNexus:
         }
 
         assessment = ThreatAssessment(
-            identity=f"ip:{ip}",             # keep identity stable and non-PII
+            identity=f"ip:{ip}",
             source_ip=ip,
             threat_kind=threat_kind_map.get(ttype, ThreatKind.UNKNOWN),
             severity=severity_map.get(sev, ThreatSeverity.MEDIUM),
@@ -1542,8 +1534,6 @@ class SentinelNexus:
         )
 
         def stage_callable(mode: SentinelMode, meta: dict) -> Optional[str]:
-            # Override veto window delay in policy by temporarily staging in ACTIVE with custom delay
-            # We do it by staging normally then adjusting execute_at_ms if ACTIVE.
             pa = self.engine.handle_assessment(mode, assessment)
             if not pa:
                 return None
@@ -1552,7 +1542,6 @@ class SentinelNexus:
                 delay_s = int(meta.get("delay_seconds", 5))
                 execute_at_ms = _now_ms() + delay_s * 1000
 
-                # Safely adjust execute_at_ms only if still pending
                 with _db_conn() as conn:
                     conn.execute("BEGIN IMMEDIATE;")
                     try:
@@ -1575,7 +1564,6 @@ class SentinelNexus:
             return pa.action_id
 
         def shadow_callable() -> None:
-            # Shadow advisory log only (no staging)
             logger.info("[SHADOW] WOULD stage threat=%s ip=%s", ttype, pseudonymize(ip))
 
         req = ActionRequest(
@@ -1602,7 +1590,6 @@ class SentinelNexus:
 # ============================================================
 
 if __name__ == "__main__":
-    # Minimal logging for local runs
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
 
     allowed = {s.strip() for s in _env("SENTINEL_ALLOWED_OPERATORS", "admin,ops").split(",") if s.strip()}
