@@ -81,6 +81,54 @@ def _env(name: str, default: str) -> str:
     return os.getenv(legacy, default)
 
 
+def _required_env_secret(
+    name: str,
+    *,
+    min_bytes: int = 32,
+    legacy_prefix: str = "AEGIS_",
+) -> str:
+    """
+    Resolve a required secret from the environment and fail closed if absent.
+
+    This intentionally does NOT provide a placeholder fallback. A missing, blank,
+    weak, or obvious placeholder secret must stop startup before any internet-
+    facing beta deployment can expose developer defaults.
+    """
+    value = os.getenv(name)
+
+    if value is None and name.startswith("SENTINEL_"):
+        legacy_name = name.replace("SENTINEL_", legacy_prefix, 1)
+        value = os.getenv(legacy_name)
+
+    value = (value or "").strip()
+
+    if not value:
+        raise RuntimeError(
+            f"Missing required secret: {name}. "
+            'Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"'
+        )
+
+    blocked_placeholders = {
+        "CHANGE_ME",
+        "CHANGE_ME_IN_PROD",
+        "CHANGEME",
+        "dev-placeholder",
+        "development",
+        "password",
+        "secret",
+    }
+    if value in blocked_placeholders:
+        raise RuntimeError(f"{name} is set to a placeholder value and must be replaced.")
+
+    if len(value.encode("utf-8")) < int(min_bytes):
+        raise RuntimeError(
+            f"{name} must be at least {min_bytes} bytes when encoded as UTF-8 "
+            f"(current: {len(value.encode('utf-8'))} bytes)."
+        )
+
+    return value
+
+
 DB_PATH = Path(_env("SENTINEL_DB_PATH", str(BASE_DIR / "sentinel43_state" / "sentinel43.sqlite3")))
 SYSTEM_ID = _env("SENTINEL_SYSTEM_ID", "SENTINEL-43-NEXUS-01")
 
@@ -88,8 +136,8 @@ DEFAULT_DEDUPE_TTL_SECONDS = int(_env("SENTINEL_ACTION_DEDUPE_TTL", "60"))
 DEFAULT_LOG_RETENTION_DAYS = int(_env("SENTINEL_LOG_RETENTION_DAYS", "90"))
 DEFAULT_ACTION_RETENTION_DAYS = int(_env("SENTINEL_ACTION_RETENTION_DAYS", "30"))
 
-# Hash salt for privacy-safe logs (do not leave default in anything you ship)
-LOG_SALT = _env("SENTINEL_LOG_SALT", "CHANGE_ME_IN_PROD")
+# Required salt for privacy-safe log pseudonymization. No dev/prod fallback.
+LOG_SALT = _required_env_secret("SENTINEL_LOG_SALT", min_bytes=32)
 
 # ACTIVE executor behavior
 EXECUTOR_POLL_MS = int(_env("SENTINEL_EXECUTOR_POLL_MS", "500"))
