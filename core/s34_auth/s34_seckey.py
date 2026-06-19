@@ -55,20 +55,15 @@ __all__ = [
 ]
 
 # Environments in which a missing S43_AUTH_PEPPER is tolerated (with a
-# warning) by falling back to a hardcoded development-only pepper.
+# warning) by falling back to an ephemeral random pepper.
 _DEV_ENVIRONMENTS: frozenset[str] = frozenset({
     "development", "dev", "test", "testing", "local",
 })
 
 # Fix #1: safe allowlist for PBKDF2 hash algorithms.
-# hashlib.pbkdf2_hmac accepts any digest name without complaint, so an
-# operator setting hash_alg = "md5" would silently get 128-bit weak hashing.
 _SAFE_HASH_ALGORITHMS: frozenset[str] = frozenset({"sha256", "sha512"})
 
 # Fix #2: allowlist for table names used in PRAGMA table_info.
-# PRAGMA statements don't support parameter binding, so the table name is
-# interpolated directly. Validating against a known-good set prevents
-# injection if the pattern is ever extended beyond "auth_keys".
 _KNOWN_TABLE_NAMES: frozenset[str] = frozenset({"auth_keys", "schema_meta"})
 
 
@@ -344,8 +339,23 @@ class AuthKeyStore:
         """
         Resolve the PBKDF2 pepper. Fails closed outside _DEV_ENVIRONMENTS.
 
-        Fix #3: result is cached in self._pepper_cache after first successful
-        resolve so os.environ.get is not called on every PBKDF2 invocation.
+        Fix (scrub): The previous implementation used a hardcoded literal
+        b"DEV_ONLY__SET_S43_AUTH_PEPPER" as the dev fallback. That value
+        was exposed in code review and must be treated as burned. It is
+        replaced with secrets.token_bytes(32) — a random ephemeral pepper
+        generated at first call and cached for the lifetime of the process.
+
+        Consequence: in dev environments without S43_AUTH_PEPPER set, issued
+        keys are only valid until the next process restart. Set S43_AUTH_PEPPER
+        in .env to make keys persistent across restarts.
+
+        Fix #3 (prior): result is cached in self._pepper_cache after first
+        successful resolve so os.environ.get is not called on every PBKDF2
+        invocation.
+
+        Env var priority: SENTINEL_ENV is checked first (matches main.py and
+        bootstrap.py). S43_ENV is checked as a fallback for backward
+        compatibility.
         """
         if self._pepper_cache is not None:
             return self._pepper_cache
@@ -355,21 +365,33 @@ class AuthKeyStore:
             self._pepper_cache = pepper.encode("utf-8")
             return self._pepper_cache
 
-        env = os.environ.get("S43_ENV", "").lower().strip()
+        # Fix: prefer SENTINEL_ENV (consistent with main.py and bootstrap.py),
+        # fall back to S43_ENV for backward compatibility.
+        env = (
+            os.environ.get("SENTINEL_ENV", "")
+            or os.environ.get("S43_ENV", "")
+        ).lower().strip()
+
         if env in _DEV_ENVIRONMENTS:
             warnings.warn(
-                f"{self.cfg.pepper_env_var} is not set. Using development-only pepper.",
+                f"{self.cfg.pepper_env_var} is not set. Using an ephemeral random "
+                "pepper — all issued keys will be invalidated on next process restart. "
+                "Set S43_AUTH_PEPPER in .env to make keys persistent.",
                 RuntimeWarning,
                 stacklevel=4,
             )
-            self._pepper_cache = b"DEV_ONLY__SET_S43_AUTH_PEPPER"
+            # Fix (scrub): generate a random ephemeral pepper instead of using
+            # a hardcoded string. No predictable value ever exists in the
+            # codebase; the trade-off is dev keys are session-scoped.
+            self._pepper_cache = secrets.token_bytes(32)
             return self._pepper_cache
 
         raise RuntimeError(
             f"Missing required secret: {self.cfg.pepper_env_var}. "
             "Required in any environment not in "
             f"{sorted(_DEV_ENVIRONMENTS)!r}. "
-            f"Current S43_ENV={os.environ.get('S43_ENV')!r}."
+            f"Current SENTINEL_ENV={os.environ.get('SENTINEL_ENV')!r}, "
+            f"S43_ENV={os.environ.get('S43_ENV')!r}."
         )
 
     def _hash_token(self, token: str, salt: bytes) -> bytes:
@@ -609,7 +631,6 @@ class AuthKeyStore:
     @staticmethod
     def _column_names(*, cx: sqlite3.Connection, table_name: str) -> set[str]:
         # Fix #2: validate table_name before interpolating into PRAGMA.
-        # PRAGMA table_info() does not support parameter binding in SQLite.
         if table_name not in _KNOWN_TABLE_NAMES:
             raise ValueError(f"Unknown table name: {table_name!r}")
         rows = cx.execute(f"PRAGMA table_info({table_name});").fetchall()
