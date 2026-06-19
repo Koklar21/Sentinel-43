@@ -73,7 +73,35 @@ def _env(name: str, default: str) -> str:
 SYSTEM_ID = _env("SENTINEL_SYSTEM_ID", "SENTINEL-43-NEXUS-01")
 DB_PATH = Path(_env("SENTINEL_DB_PATH", str(BASE_DIR / "sentinel43_state" / "sentinel43.sqlite3")))
 
-LOG_SALT = _env("SENTINEL_LOG_SALT", "CHANGE_ME_IN_PROD")
+SYSTEM_ID = _env("SENTINEL_SYSTEM_ID", "SENTINEL-43-NEXUS-01")
+DB_PATH = Path(
+    _env(
+        "SENTINEL_DB_PATH",
+        str(BASE_DIR / "sentinel43_state" / "sentinel43.sqlite3"),
+    )
+)
+
+LOG_SALT = os.getenv("SENTINEL_LOG_SALT", "").strip()
+
+if not LOG_SALT:
+    raise RuntimeError(
+        "SENTINEL_LOG_SALT is required."
+    )
+
+if len(LOG_SALT.encode("utf-8")) < 32:
+    raise RuntimeError(
+        "SENTINEL_LOG_SALT must be at least 32 bytes."
+    )
+
+if LOG_SALT.upper() in {
+    "CHANGE_ME",
+    "CHANGE_ME_IN_PROD",
+    "DEV",
+    "DEFAULT",
+}:
+    raise RuntimeError(
+        "SENTINEL_LOG_SALT contains a placeholder value."
+    )
 
 DEFAULT_DEDUPE_TTL_SECONDS = int(_env("SENTINEL_ACTION_DEDUPE_TTL", "60"))
 DEFAULT_LOG_RETENTION_DAYS = int(_env("SENTINEL_LOG_RETENTION_DAYS", "90"))
