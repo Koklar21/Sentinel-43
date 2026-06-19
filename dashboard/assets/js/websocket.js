@@ -1,7 +1,16 @@
 /* =============================================================================
    Sentinel-43 Dashboard
    websocket.js — Hardened WebSocket bridge
-   v1.5.1
+   v1.5.2
+
+   Changes from v1.5.1:
+     - Fix: _sendAuthFrame() now sets _manuallyClosed = true before closing
+       the socket when no token is found. Previously the socket closed with
+       code 1000 (normal closure), which is not in NO_RECONNECT_CODES, so
+       _scheduleReconnect() fired and produced a tight connect → auth_required
+       → no token → close → reconnect loop. Reconnecting without a token is
+       pointless; marking the close as manual stops it immediately and lets
+       the sentinel:ws:auth_failed event prompt the operator to set a JWT.
 
    Changes from v1.5.0:
      - Fix: _getDevToken() now searches the same key set as dashboard.js
@@ -375,6 +384,12 @@ function _sendAuthFrame(token) {
             error: "WebSocket authentication required, but no JWT was found.",
             timestamp: _nowIso(),
         });
+        // Fix v1.5.2: mark as manually closed BEFORE calling close() so the
+        // close event handler sees _manuallyClosed=true and skips
+        // _scheduleReconnect(). Without this, the socket closes with code
+        // 1000 (not in NO_RECONNECT_CODES) and the reconnect loop fires
+        // immediately — pointless when there is no token to authenticate with.
+        _manuallyClosed = true;
         if (_ws) {
             try { _ws.close(); } catch {}
         }
