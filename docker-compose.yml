@@ -71,7 +71,7 @@ services:
     environment:
       S43_WATCHTOWER_HOST: 0.0.0.0
       S43_WATCHTOWER_PORT: 9100
-      SENTINEL_ENV:        ${SENTINEL_ENV:-development}
+      SENTINEL_ENV:        ${SENTINEL_ENV}
       S43_LOG_LEVEL:       INFO
       DATABASE_URL:        ${DATABASE_URL}
       REDIS_URL:           redis://:${REDIS_PASSWORD}@s43-redis:6379/0
@@ -99,7 +99,7 @@ services:
       - "8000:8000"
     environment:
       # --- Runtime environment -------------------------------------------
-      SENTINEL_ENV:              ${SENTINEL_ENV:-development}
+      SENTINEL_ENV:              ${SENTINEL_ENV}
       S43_LOG_LEVEL:             INFO
 
       # --- Service endpoints ---------------------------------------------
@@ -108,27 +108,25 @@ services:
       REDIS_URL:                 redis://:${REDIS_PASSWORD}@s43-redis:6379/0
 
       # --- JWT authentication -------------------------------------------
-      # In development these can be empty — bootstrap_expectations() only
-      # enforces them when SENTINEL_ENV is not in LOCAL_TEST_ENVIRONMENTS.
-      # In production all four must be set in .env before starting.
-      S43_JWT_SECRET:            ${S43_JWT_SECRET:-}
-      S43_JWT_ALGORITHM:         ${S43_JWT_ALGORITHM:-HS256}
-      S43_JWT_ISSUER:            ${S43_JWT_ISSUER:-sentinel-43}
-      S43_JWT_AUDIENCE:          ${S43_JWT_AUDIENCE:-sentinel-43-dashboard}
+      S43_JWT_SECRET:            ${S43_JWT_SECRET}
+      S43_JWT_ALGORITHM:         ${S43_JWT_ALGORITHM}
+      S43_JWT_ISSUER:            ${S43_JWT_ISSUER}
+      S43_JWT_AUDIENCE:          ${S43_JWT_AUDIENCE}
+
+      # --- Auth key-store pepper ----------------------------------------
+      S43_AUTH_PEPPER:           ${S43_AUTH_PEPPER}
+
+      # --- Log redaction / audit salt -----------------------------------
+      SENTINEL_LOG_SALT:         ${SENTINEL_LOG_SALT}
 
       # --- WebSocket auth -----------------------------------------------
-      # Set to true in production. False is acceptable for local dev.
-      S43_WS_REQUIRE_AUTH:       ${S43_WS_REQUIRE_AUTH:-false}
+      S43_WS_REQUIRE_AUTH:       ${S43_WS_REQUIRE_AUTH}
 
       # --- CORS origins -------------------------------------------------
-      # FIX: was CORS_ORIGINS — main.py reads S43_ALLOWED_ORIGINS.
-      # Dev default covers Live Server on port 5500.
-      # Production: set S43_ALLOWED_ORIGINS=https://yourdomain.com in .env
-      S43_ALLOWED_ORIGINS:       ${S43_ALLOWED_ORIGINS:-http://localhost:5500,http://127.0.0.1:5500,http://localhost:8000,http://127.0.0.1:8000}
+      S43_ALLOWED_ORIGINS:       ${S43_ALLOWED_ORIGINS}
 
       # --- Test injection -----------------------------------------------
-      # Never set to true in production.
-      S43_ENABLE_TEST_INJECTION: ${S43_ENABLE_TEST_INJECTION:-false}
+      S43_ENABLE_TEST_INJECTION: ${S43_ENABLE_TEST_INJECTION}
 
       # --- Storage paths ------------------------------------------------
       SENTINEL43_DATA_DIR:       /app/sentinel43_state
