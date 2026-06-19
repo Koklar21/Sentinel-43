@@ -2,18 +2,20 @@
 # Sentinel-43 — Docker Compose
 #
 # Required .env variables:
-#   POSTGRES_PASSWORD       strong random password for Postgres
-#   REDIS_PASSWORD          strong random password for Redis
-#   DATABASE_URL            postgresql+asyncpg://s43:<POSTGRES_PASSWORD>@s43-db:5432/s43
+#   POSTGRES_PASSWORD          strong random password for Postgres
+#   REDIS_PASSWORD             strong random password for Redis
+#   DATABASE_URL               postgresql+asyncpg://s43:<POSTGRES_PASSWORD>@s43-db:5432/s43
+#   S43_AUTH_PEPPER            cryptographic pepper for credential hashing
+#   SENTINEL_LOG_SALT          salt for masking sensitive fields in audit logs
 #
 # For production, also set in .env:
-#   SENTINEL_ENV            production
-#   S43_JWT_SECRET          output of: python -c "import secrets; print(secrets.token_urlsafe(32))"
-#   S43_JWT_ALGORITHM       HS256
-#   S43_JWT_ISSUER          sentinel-43
-#   S43_JWT_AUDIENCE        sentinel-43-dashboard
-#   S43_WS_REQUIRE_AUTH     true
-#   S43_ALLOWED_ORIGINS     https://yourdomain.com
+#   SENTINEL_ENV               production
+#   S43_JWT_SECRET             output of: python -c "import secrets; print(secrets.token_urlsafe(32))"
+#   S43_JWT_ALGORITHM          HS256
+#   S43_JWT_ISSUER             sentinel-43
+#   S43_JWT_AUDIENCE           sentinel-43-dashboard
+#   S43_WS_REQUIRE_AUTH        true
+#   S43_ALLOWED_ORIGINS        https://yourdomain.com
 #   S43_ENABLE_TEST_INJECTION  false  (or omit entirely)
 # =============================================================================
 
@@ -75,6 +77,8 @@ services:
       S43_LOG_LEVEL:       INFO
       DATABASE_URL:        ${DATABASE_URL}
       REDIS_URL:           redis://:${REDIS_PASSWORD}@s43-redis:6379/0
+      S43_AUTH_PEPPER:     ${S43_AUTH_PEPPER}
+      SENTINEL_LOG_SALT:   ${SENTINEL_LOG_SALT}
     volumes:
       - ./logs:/app/logs
     depends_on:
