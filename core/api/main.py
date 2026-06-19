@@ -141,7 +141,7 @@ _ALLOWED_ORIGINS: frozenset[str] = _env_frozenset(
     "http://127.0.0.1:8000,http://localhost:8000",
 )
 
-MAX_WS_CLIENTS    = _env_int("S43_MAX_WS_CLIENTS", 50)
+MAX_WS_CLIENTS     = _env_int("S43_MAX_WS_CLIENTS", 50)
 MAX_WS_FRAME_BYTES = _env_int("S43_MAX_WS_FRAME_BYTES", 64 * 1024)
 
 WS_REQUIRE_AUTH = _env_bool("S43_WS_REQUIRE_AUTH", False)
@@ -170,9 +170,6 @@ ACTION_ID_RE = re.compile(r"^[A-Z0-9_-]{1,64}$")
 # (created at import time; started/stopped in lifespan)
 # =============================================================================
 
-# MonitoringManager — instantiated at module level so it can be passed to
-# SentinelFirewall middleware which is added before the app starts.
-# start() is called in lifespan; stop() on shutdown.
 _monitoring_manager: Any | None = None
 
 try:
@@ -184,17 +181,9 @@ try:
 except Exception as _mm_exc:
     logger.warning("MonitoringManager unavailable: %s -- running without it", _mm_exc)
 
-# SystemOrchestrator — optional governance engine for HUMAN_GATED decisions.
-# Populated in lifespan if S43_GOVERNANCE_ENABLED=true.
 _orchestrator: Any | None = None
-
-# SpartaCore — optional file integrity watchdog.
-# Task handle stored so we can stop it on shutdown.
 _sparta_instance: Any | None = None
 _sparta_task:     asyncio.Task | None = None  # type: ignore[type-arg]
-
-# Fenrir — optional local-only monitoring node.
-# Runs as an in-process background task when S43_FENRIR_ENABLED=true.
 _fenrir_instance: Any | None = None
 _fenrir_task:     asyncio.Task | None = None  # type: ignore[type-arg]
 
@@ -607,9 +596,6 @@ async def lifespan(api: FastAPI):
         except Exception as exc:
             logger.error("MonitoringManager failed to start: %s", exc)
 
-        # Wire the monitoring manager into the remote gateway so security
-        # events (auth failures, rate limits, role mismatches) route through
-        # the monitoring pipeline rather than raw httpx POSTs alone.
         try:
             from core.monitoring import set_monitoring_manager
             set_monitoring_manager(_monitoring_manager)
@@ -622,8 +608,6 @@ async def lifespan(api: FastAPI):
         try:
             from core.monitoring import SpartaCore, IntegrityConfig
 
-            # File paths/hashes come from S43_SPARTA_HASH_* env vars;
-            # IntegrityConfig.from_env() reads them automatically.
             _watched_files: dict[str, str] = {}
             for key, val in os.environ.items():
                 if key.startswith("S43_SPARTA_HASH_"):
@@ -800,7 +784,6 @@ async def dashboard_approve_action(
     reason   = _require_reason(body)
     operator = _get_operator(request)
 
-    # Update dashboard action store
     action = _update_action_status(
         action_id,
         allowed_statuses={"STAGED"},
@@ -809,8 +792,6 @@ async def dashboard_approve_action(
         operator=operator,
     )
 
-    # If a SystemOrchestrator is running and the action carries a decision_id,
-    # route the approval through the HUMAN_GATED governance flow.
     decision_id = body.get("decision_id") or action.get("payload", {}).get("decision_id")
     if _orchestrator is not None and decision_id:
         try:
@@ -896,9 +877,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# SentinelFirewall: applied before all routes so blocked requests never
-# reach handlers. _monitoring_manager is set at module level before
-# add_middleware is called, so the firewall receives it at construction time.
 try:
     from core.middleware import SentinelFirewall, FirewallConfig
     app.add_middleware(
@@ -912,8 +890,6 @@ except ImportError:
 except Exception as _fw_exc:
     logger.error("SentinelFirewall middleware failed to register: %s", _fw_exc)
 
-# Node API router from SpartaCore (mounted unconditionally so /node/health
-# works even without a live SpartaCore instance; it reports state=INITIALIZING)
 try:
     from core.monitoring import SpartaCore as _SC, IntegrityConfig as _IC, create_node_router
     _node_router_sparta = _SC(
@@ -931,11 +907,37 @@ except Exception as _nr_exc:
 # WebSocket endpoint
 # =============================================================================
 
+async def _ws_safe_close(websocket: WebSocket, code: int = 1008) -> None:
+    """
+    Close a WebSocket, swallowing RuntimeError if it is already closed.
+
+    Starlette/uvicorn raises RuntimeError("Unexpected ASGI message
+    'websocket.close', after sending 'websocket.close' or response already
+    completed") when the client disconnects between the server's send_json and
+    its close() call, or when close() is attempted on a connection that was
+    rejected before accept(). This helper centralises the guard so every
+    auth-rejection path stays readable.
+    """
+    try:
+        await websocket.close(code=code)
+    except RuntimeError:
+        pass
+
+
 @app.websocket("/ws")
 async def dashboard_websocket(websocket: WebSocket) -> None:
+    # ------------------------------------------------------------------
+    # Fix: origin rejection must NOT call close() before accept().
+    # Calling websocket.close() before websocket.accept() puts the ASGI
+    # state machine into "response completed" via an HTTP-rejection path.
+    # Any subsequent close attempt — including uvicorn's own cleanup —
+    # then raises RuntimeError("Unexpected ASGI message 'websocket.close',
+    # after sending 'websocket.close' or response already completed").
+    # Correct pattern: just return without accept(). Uvicorn automatically
+    # sends an HTTP 403 upgrade rejection.
+    # ------------------------------------------------------------------
     origin = websocket.headers.get("origin", "")
     if _ALLOWED_ORIGINS and origin not in _ALLOWED_ORIGINS:
-        await websocket.close(code=1008)
         return
 
     if len(_dashboard_ws_clients) >= MAX_WS_CLIENTS:
@@ -944,7 +946,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
             "type": "error",
             "payload": {"error": "Server is at maximum dashboard capacity"},
         })
-        await websocket.close(code=1008)
+        await _ws_safe_close(websocket)
         return
 
     await websocket.accept()
@@ -952,44 +954,79 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
     if WS_REQUIRE_AUTH:
         await websocket.send_json({
             "type": "auth_required",
-            "payload": {"message": 'Send {"type":"auth","payload":{"token":"<bearer>"}} to continue'},
+            "payload": {
+                "message": (
+                    'Send {"type":"auth","payload":{"token":"<bearer>"}} to continue'
+                )
+            },
         })
+
+        # ------------------------------------------------------------------
+        # Fix: WebSocketDisconnect is separated from the other exceptions.
+        # When the client disconnects (no token, auth_failed fired client-
+        # side), _receive_ws_message raises WebSocketDisconnect. The
+        # original code caught it alongside TimeoutError and then called
+        # close() on an already-dead connection — the double-close that
+        # produced the RuntimeError. Disconnected sockets need no close.
+        # ------------------------------------------------------------------
         try:
-            auth_msg = await asyncio.wait_for(_receive_ws_message(websocket), timeout=15.0)
-        except (asyncio.TimeoutError, ValueError, WebSocketDisconnect):
-            await websocket.close(code=1008)
+            auth_msg = await asyncio.wait_for(
+                _receive_ws_message(websocket), timeout=15.0
+            )
+        except WebSocketDisconnect:
+            return
+        except (asyncio.TimeoutError, ValueError):
+            await _ws_safe_close(websocket)
             return
 
         if auth_msg.get("type") != "auth":
-            await websocket.send_json({"type": "error", "payload": {"error": "First message must be an auth frame"}})
-            await websocket.close(code=1008)
+            await websocket.send_json({
+                "type": "error",
+                "payload": {"error": "First message must be an auth frame"},
+            })
+            await _ws_safe_close(websocket)
             return
 
         token = str(auth_msg.get("payload", {}).get("token") or "").strip()
         if not token:
-            await websocket.send_json({"type": "error", "payload": {"error": "Token missing"}})
-            await websocket.close(code=1008)
+            await websocket.send_json({
+                "type": "error",
+                "payload": {"error": "Token missing"},
+            })
+            await _ws_safe_close(websocket)
             return
 
         try:
             ws_claims = _verify_jwt_token(token)
         except pyjwt.ExpiredSignatureError:
-            await websocket.send_json({"type": "error", "payload": {"error": "Token has expired"}})
-            await websocket.close(code=1008)
+            await websocket.send_json({
+                "type": "error",
+                "payload": {"error": "Token has expired"},
+            })
+            await _ws_safe_close(websocket)
             return
         except pyjwt.InvalidKeyError:
-            await websocket.send_json({"type": "error", "payload": {"error": "JWT not configured"}})
-            await websocket.close(code=1008)
+            await websocket.send_json({
+                "type": "error",
+                "payload": {"error": "JWT not configured"},
+            })
+            await _ws_safe_close(websocket)
             return
         except pyjwt.PyJWTError:
-            await websocket.send_json({"type": "error", "payload": {"error": "Invalid token"}})
-            await websocket.close(code=1008)
+            await websocket.send_json({
+                "type": "error",
+                "payload": {"error": "Invalid token"},
+            })
+            await _ws_safe_close(websocket)
             return
 
         role = str(ws_claims.get("role") or ws_claims.get("scope") or "").strip()
         if role not in _APPROVED_ROLES:
-            await websocket.send_json({"type": "error", "payload": {"error": "Operator role required"}})
-            await websocket.close(code=1008)
+            await websocket.send_json({
+                "type": "error",
+                "payload": {"error": "Operator role required"},
+            })
+            await _ws_safe_close(websocket)
             return
 
     _dashboard_ws_clients[websocket] = set()
@@ -1004,7 +1041,10 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
             try:
                 message = await _receive_ws_message(websocket)
             except ValueError as exc:
-                await websocket.send_json({"type": "error", "payload": {"error": str(exc)}})
+                await websocket.send_json({
+                    "type": "error",
+                    "payload": {"error": str(exc)},
+                })
                 continue
 
             event_type = message.get("type")
@@ -1013,17 +1053,29 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 payload = {}
 
             if event_type == "ping":
-                await websocket.send_json({"type": "pong", "payload": {"timestamp": utc_now()}})
+                await websocket.send_json({
+                    "type": "pong",
+                    "payload": {"timestamp": utc_now()},
+                })
                 continue
 
             if event_type == "subscribe":
                 channel = str(payload.get("channel") or "").strip()[:64]
                 _dashboard_ws_clients[websocket].add(channel)
-                await websocket.send_json({"type": "subscribed", "payload": {"channel": channel, "timestamp": utc_now()}})
+                await websocket.send_json({
+                    "type": "subscribed",
+                    "payload": {"channel": channel, "timestamp": utc_now()},
+                })
                 if channel == "actions":
-                    await websocket.send_json({"type": "actions_snapshot", "payload": {"actions": _list_actions()}})
+                    await websocket.send_json({
+                        "type": "actions_snapshot",
+                        "payload": {"actions": _list_actions()},
+                    })
                 if channel == "vault":
-                    await websocket.send_json({"type": "vault_stats", "payload": {"records": _vault_records()}})
+                    await websocket.send_json({
+                        "type": "vault_stats",
+                        "payload": {"records": _vault_records()},
+                    })
                 if channel == "governance" and _orchestrator is not None:
                     await websocket.send_json({
                         "type": "governance_pending_snapshot",
@@ -1034,11 +1086,17 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
             if event_type == "unsubscribe":
                 channel = str(payload.get("channel") or "").strip()[:64]
                 _dashboard_ws_clients[websocket].discard(channel)
-                await websocket.send_json({"type": "unsubscribed", "payload": {"channel": channel, "timestamp": utc_now()}})
+                await websocket.send_json({
+                    "type": "unsubscribed",
+                    "payload": {"channel": channel, "timestamp": utc_now()},
+                })
                 continue
 
             safe_type = repr(str(event_type or "")[:64])
-            await websocket.send_json({"type": "error", "payload": {"error": f"Unsupported event: {safe_type}"}})
+            await websocket.send_json({
+                "type": "error",
+                "payload": {"error": f"Unsupported event: {safe_type}"},
+            })
 
     except WebSocketDisconnect:
         return
@@ -1230,7 +1288,6 @@ def intercom_status() -> dict[str, Any]:
     }
 
 
-
 # =============================================================================
 # Fenrir local monitoring router
 # =============================================================================
@@ -1302,7 +1359,7 @@ def ready() -> dict[str, str]:
 
 
 # =============================================================================
-# Status / version / metrics (used by root + compat routers)
+# Status / version / metrics
 # =============================================================================
 
 @root_router.get("/status")
