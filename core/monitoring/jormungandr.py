@@ -34,7 +34,7 @@
 # =============================================================================
 
 """
-Sentinel-43 Jormungandr v2.4.1 — Cryptographic Security Node
+Sentinel-43 Jormungandr v2.4.2 — Cryptographic Security Node
 
 AEAD encrypted audit storage with:
 
@@ -49,6 +49,15 @@ AEAD encrypted audit storage with:
   - Bounded MonitoringManager queue with one persistent worker thread.
   - Strict historical AAD identity during decryption.
   - AuditStore-compatible append(payload) interface.
+
+Changes from v2.4.1:
+  - Fix (scrub): build_jormungandr() now reads S43_JORM_ROOT_KEY from the
+    environment as a hex-encoded root key (>= 32 bytes / 64 hex chars).
+    When set, KEKs are deterministically derived across restarts and the
+    encrypted audit trail remains decryptable after a process restart.
+    When absent, os.urandom(32) is used as before — all encrypted records
+    are unreadable after restart. Generate with:
+        python -c "import secrets; print(secrets.token_hex(32))"
 
 Changes from v2.4:
   - Fix: append() used errors="ignore" in the UTF-8 encode for the size
@@ -65,7 +74,8 @@ Notes on key hygiene:
 
   - Old epoch KEKs are removed from the in-process KEK cache per mode.
   - Python cannot guarantee secure memory zeroization of byte strings.
-  - For strong production forward secrecy, provide root_key from KMS/HSM.
+  - For strong production forward secrecy, provide root_key from KMS/HSM
+    or set S43_JORM_ROOT_KEY in the deployment environment.
 """
 
 from __future__ import annotations
@@ -110,8 +120,6 @@ class Mode:
 
 VALID_SEVERITIES: frozenset[str] = frozenset({"Low", "Medium", "High", "Critical"})
 
-# Fix: MappingProxyType prevents accidental mutation of this security-critical
-# scoring table (e.g. _THREAT_SCORE_MAP["Fake"] = 999 now raises TypeError).
 _THREAT_SCORE_MAP: MappingProxyType = MappingProxyType({
     "Low":      1,
     "Medium":   5,
@@ -186,6 +194,8 @@ class JormungandrConfig:
       S43_JORM_THREAT_LOG_CAP        bounded threat log size
       S43_JORM_MAX_APPEND_BYTES      max serialized append(payload) bytes
       S43_JORM_MONITORING_QUEUE_SIZE bounded monitoring queue capacity
+      S43_JORM_ROOT_KEY              hex-encoded root key for persistent KEK
+                                     derivation (read by build_jormungandr())
     """
 
     mode: str = Mode.FORENSIC
@@ -653,10 +663,6 @@ class JormungandrNode:
         if severity not in VALID_SEVERITIES:
             raise JormungandrError(f"Invalid severity: {severity!r}")
         message = f"Source: {source} | {description}"
-        # In CALM posture: stored as plaintext (no encryption overhead).
-        # In VIGILANT/HOSTILE: stored encrypted. Source and description are
-        # preserved inside the ciphertext for FORENSIC-mode recovery;
-        # console output is separately redacted by _console_log.
         encrypt = self.posture != Posture.CALM
         self._record("THREAT", message, severity, encrypt)
         self.threat_score += _THREAT_SCORE_MAP[severity]
@@ -758,9 +764,6 @@ class JormungandrNode:
             logger.warning("JormungandrNode.append: payload serialization failed: %s", exc)
             message = repr(payload)
 
-        # Fix: encode("utf-8") with default strict handling. errors="ignore"
-        # would silently drop non-encodable characters, making the byte count
-        # smaller than the actual payload and defeating the size guard.
         payload_size = len(message.encode("utf-8"))
         if payload_size > self._config.max_append_payload_bytes:
             raise JormungandrConfigError(
@@ -857,7 +860,6 @@ class JormungandrNode:
                 for record in self._threat_log
             ]
             status_snapshot = dict(self.system_status)
-            # get_summary() under RLock: re-entry is safe.
             summary = self.get_summary()
 
         return {
@@ -911,7 +913,6 @@ class JormungandrNode:
         }
 
     def close(self) -> None:
-        # Signal the worker to stop on its next queue.Empty timeout.
         self._monitoring_stop.set()
 
         worker = self._monitoring_worker
@@ -919,9 +920,6 @@ class JormungandrNode:
             return
 
         if worker.is_alive():
-            # Try the sentinel for an immediate clean exit. If the queue is
-            # full, skip it — the worker will drain the queue then see
-            # _monitoring_stop.is_set() on the next queue.Empty and exit.
             try:
                 self._monitoring_queue.put_nowait(None)
             except queue.Full:
@@ -948,8 +946,38 @@ def build_jormungandr(
     root_key: bytes | None = None,
     monitoring_manager: MonitoringManagerProtocol | None = None,
 ) -> JormungandrNode:
-    """Build a JormungandrNode from S43_JORM_* environment configuration."""
+    """
+    Build a JormungandrNode from S43_JORM_* environment configuration.
+
+    S43_JORM_ROOT_KEY (optional): hex-encoded root key >= 32 bytes (64 hex
+    characters) for deterministic KEK derivation. When set, the encrypted
+    audit trail survives process restarts and encrypted records remain
+    decryptable across sessions. When absent, os.urandom(32) is used and
+    all encrypted records become unreadable after a restart.
+
+    Generate a root key:
+        python -c "import secrets; print(secrets.token_hex(32))"
+
+    The caller-supplied root_key argument takes precedence over the env var.
+    """
     config = JormungandrConfig.from_env()
+
+    if root_key is None:
+        raw_key = _env("S43_JORM_ROOT_KEY")
+        if raw_key:
+            try:
+                root_key = bytes.fromhex(raw_key)
+            except ValueError as exc:
+                raise JormungandrConfigError(
+                    f"S43_JORM_ROOT_KEY is not valid hex: {exc}"
+                ) from exc
+            if len(root_key) < 32:
+                raise JormungandrConfigError(
+                    f"S43_JORM_ROOT_KEY decoded to {len(root_key)} bytes; "
+                    "must be >= 32 bytes (64 hex characters). "
+                    'Generate with: python -c "import secrets; print(secrets.token_hex(32))"'
+                )
+
     return JormungandrNode(
         config=config,
         root_key=root_key,
@@ -987,7 +1015,7 @@ if __name__ == "__main__":
 
     node = JormungandrNode(JormungandrConfig(mode=Mode.FORENSIC, retain_epochs=6))
     try:
-        print("--- JORMUNGANDR v2.4.1 ---")
+        print("--- JORMUNGANDR v2.4.2 ---")
         print(_json.dumps(node.get_summary(), indent=2))
 
         node.log_threat_and_react("192.168.1.10", "ICMP Ping Sweep", "Low")
