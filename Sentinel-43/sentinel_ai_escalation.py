@@ -9,16 +9,16 @@
 #
 # Sentinel-43 is distributed under a dual-license model:
 #
-#   1. GNU Affero General Public License (AGPL v3.0)
-#      for open-source use, modification, and distribution.
+# 1. GNU Affero General Public License (AGPL v3.0)
+# for open-source use, modification, and distribution.
 #
-#   2. Commercial License
-#      for proprietary, enterprise, government, or other commercial use
-#      not permitted under the AGPL v3.0.
+# 2. Commercial License
+# for proprietary, enterprise, government, or other commercial use
+# not permitted under the AGPL v3.0.
 #
-# Unauthorized copying, redistribution, relicensing, reverse engineering,
-# or commercial exploitation outside the terms of the applicable license
-# is strictly prohibited.
+# Use, modification, redistribution, and commercial use are governed by
+# the terms of the applicable license. Any use outside those terms is
+# prohibited.
 #
 # By accessing, modifying, distributing, or using this software, you agree
 # to comply with the terms of the applicable license.
@@ -56,6 +56,38 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 # ============================================================
 
 logger = logging.getLogger(__name__)
+
+# ============================================================
+# Public-beta security scrub — changelog (this pass)
+# ============================================================
+#   Brought in line with the same hardening pass applied to Shadow_mode.py.
+#   This file's _required_env_secret() / LOG_SALT handling was independently
+#   already correct (fails closed, blocks known placeholder values, enforces
+#   min_bytes) and is untouched here. The remaining four fixes:
+#
+#   1. ActionStatus.EXECUTING added. mark_pending_executing() now claims a
+#      PENDING (auto-execute / ACTIVE-mode) action by transitioning it to
+#      EXECUTING instead of APPROVED. finalize_execution() now expects
+#      EXECUTING. APPROVED is reserved exclusively for the human-approval
+#      path (STAGED -> APPROVED via approve_action(), executed synchronously
+#      in _execute_approved_now()). Reusing APPROVED for both made the
+#      action lifecycle ambiguous — a crashed auto-execute claim could be
+#      misread as a human decision, or vice versa.
+#   2. cleanup_old_actions() no longer deletes APPROVED rows. APPROVED is a
+#      transient mid-flight state; deleting it during routine retention
+#      cleanup could silently discard an action that crashed between
+#      approval and execution, with no audit trail of what happened to it.
+#   3. pending_actions gained a target_hash column (pseudonymized SHA-256,
+#      same scheme used in logs and the audit chain). target_value remains
+#      stored raw because execution needs the real IP/identity; target_hash
+#      lets dashboards and log views display/query without touching the
+#      raw value. Existing databases are migrated in place (ALTER TABLE)
+#      and backfilled on next startup.
+#   4. stage_directive()'s "Duplicate directive suppressed" log embedded the
+#      raw dedupe_key (which contains the raw target value) directly into
+#      the persisted event_logs table, defeating pseudonymize() for every
+#      suppressed duplicate. Now logs the hash instead.
+# ============================================================
 
 
 # ============================================================
@@ -257,7 +289,13 @@ class ActionStatus(str, enum.Enum):
     STAGED = "STAGED"
     PENDING = "PENDING"
     VETOED = "VETOED"
-    APPROVED = "APPROVED"
+    APPROVED = "APPROVED"     # human approved (STAGED -> APPROVED), about to
+                               # execute synchronously. Reserved exclusively
+                               # for the human-approval path; never set by
+                               # the auto-execute executor (see EXECUTING).
+    EXECUTING = "EXECUTING"    # executor claimed a PENDING (ACTIVE-mode,
+                               # post-veto-window) action for auto-execution.
+                               # Distinct from APPROVED — see changelog #1.
     EXECUTED = "EXECUTED"
     FAILED = "FAILED"
     EXPIRED = "EXPIRED"
@@ -345,7 +383,7 @@ class IntegrationHub:
         # Stub: do NOT do real blocking here unless you wire it intentionally.
         # This function is the only place you're allowed to touch the outside world.
         logger.warning(
-            "[INTEGRATION] EXECUTE %s target_type=%s target=%s primary=%s severity=%s reason=%s",
+            "[INTEGRATION] EXECUTE %s target_type=%s target_hash=%s primary=%s severity=%s reason=%s",
             directive.action_id,
             directive.target_type,
             pseudonymize(directive.target_value),
@@ -423,6 +461,7 @@ class SqliteActionStore:
                         status TEXT NOT NULL,
                         target_type TEXT NOT NULL,
                         target_value TEXT NOT NULL,
+                        target_hash TEXT,
                         primary_action TEXT NOT NULL,
                         actions_json TEXT NOT NULL,
                         severity TEXT NOT NULL,
@@ -438,6 +477,15 @@ class SqliteActionStore:
                 )
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_actions_status_exec ON pending_actions(status, execute_at_ms)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_actions_created ON pending_actions(created_at_ms)")
+
+                # Fix (scrub #3): migrate databases created before target_hash
+                # existed. New installs already have it from CREATE TABLE
+                # above; this handles in-place upgrades of existing DBs.
+                existing_cols = {
+                    row[1] for row in conn.execute("PRAGMA table_info(pending_actions)").fetchall()
+                }
+                if "target_hash" not in existing_cols:
+                    conn.execute("ALTER TABLE pending_actions ADD COLUMN target_hash TEXT NULL")
 
                 conn.execute(
                     """
@@ -479,6 +527,22 @@ class SqliteActionStore:
             except Exception:
                 conn.execute("ROLLBACK;")
                 raise
+
+        # Fix (scrub #3): backfill target_hash for rows written before this
+        # column existed, so every row has one going forward. Best-effort —
+        # a failure here must not block startup.
+        try:
+            with _db_conn() as backfill_conn:
+                rows = backfill_conn.execute(
+                    "SELECT action_id, target_value FROM pending_actions WHERE target_hash IS NULL"
+                ).fetchall()
+                for action_id, target_value in rows:
+                    backfill_conn.execute(
+                        "UPDATE pending_actions SET target_hash=? WHERE action_id=?",
+                        (pseudonymize(target_value), action_id),
+                    )
+        except Exception as exc:
+            logger.warning("target_hash backfill skipped: %s", exc)
 
         # best-effort cleanup (never block boot)
         try:
@@ -565,13 +629,13 @@ class SqliteActionStore:
                     """
                     INSERT INTO pending_actions (
                         action_id, created_at_ms, execute_at_ms, status,
-                        target_type, target_value,
+                        target_type, target_value, target_hash,
                         primary_action, actions_json,
                         severity, kind, source_kind, score,
                         reason, system_id,
                         operator_id, operator_reason
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         pa.action_id,
@@ -580,6 +644,7 @@ class SqliteActionStore:
                         pa.status.value,
                         pa.target_type,
                         pa.target_value,
+                        pseudonymize(pa.target_value),
                         pa.primary_action,
                         pa.actions_json,
                         pa.severity,
@@ -673,11 +738,17 @@ class SqliteActionStore:
     def mark_pending_executing(self, action_id: str) -> bool:
         """
         Claim the action atomically so only one executor runs it.
-        Uses expected_status=PENDING -> APPROVED as "claimed for execution".
+
+        Fix (scrub #1): transitions PENDING -> EXECUTING, not APPROVED.
+        APPROVED is reserved for the human-approval lifecycle (STAGED ->
+        APPROVED via approve_action()). Reusing APPROVED for both "a human
+        approved this" and "the executor claimed this for auto-run" made
+        the state machine ambiguous — a crashed claim could be misread as
+        a human decision, or vice versa.
         """
         return self.update_action_status(
             action_id,
-            ActionStatus.APPROVED,
+            ActionStatus.EXECUTING,
             operator_id="executor",
             operator_reason="claimed_for_execution",
             expected_status=ActionStatus.PENDING,
@@ -685,13 +756,16 @@ class SqliteActionStore:
 
     def finalize_execution(self, action_id: str, *, ok: bool, operator_reason: str = "") -> None:
         new_status = ActionStatus.EXECUTED if ok else ActionStatus.FAILED
-        # Expected_status is APPROVED because executor claimed it.
+        # Fix (scrub #1): expected_status is EXECUTING (executor claimed it
+        # via mark_pending_executing()), not APPROVED. This only affects
+        # the ACTIVE/auto-execute path; _execute_approved_now() below still
+        # correctly expects APPROVED for the human-approval path.
         self.update_action_status(
             action_id,
             new_status,
             operator_id="executor",
             operator_reason=(operator_reason or "")[:300],
-            expected_status=ActionStatus.APPROVED,
+            expected_status=ActionStatus.EXECUTING,
         )
 
     def expire_overdue(self, *, now_ms: int) -> int:
@@ -725,19 +799,24 @@ class SqliteActionStore:
             return int(cur.rowcount or 0)
 
     def cleanup_old_actions(self, retention_days: int) -> int:
+        # Fix (scrub #2): APPROVED removed from the deletion list. APPROVED
+        # is a transient mid-flight state (human approved, about to execute
+        # synchronously inside the same call). Deleting it during routine
+        # retention cleanup could discard an action that crashed between
+        # approval and execution with zero audit trail of what happened.
+        # Only genuinely terminal states are eligible for cleanup.
         cutoff_ms = _now_ms() - int(retention_days) * 86400 * 1000
         with _db_conn() as conn:
             cur = conn.execute(
                 """
                 DELETE FROM pending_actions
                  WHERE created_at_ms < ?
-                   AND status IN (?, ?, ?, ?, ?)
+                   AND status IN (?, ?, ?, ?)
                 """,
                 (
                     cutoff_ms,
                     ActionStatus.VETOED.value,
                     ActionStatus.EXECUTED.value,
-                    ActionStatus.APPROVED.value,
                     ActionStatus.FAILED.value,
                     ActionStatus.EXPIRED.value,
                 ),
@@ -1039,11 +1118,15 @@ class Sentinel43ResponseEngine:
         )
 
         if not self.store.dedupe_check_and_set(dedupe_key, self.dedupe_ttl_seconds):
+            # Fix (scrub #4): dedupe_key embeds the raw target value
+            # (f"{target_type}:{target_value}:..."). Logging it verbatim
+            # into the persisted event_logs table defeated pseudonymize()
+            # for every suppressed duplicate. Log the hash instead.
             self.store.log_event(
                 "INFO",
                 "RESPONSE",
                 "Duplicate directive suppressed (dedupe window)",
-                {"dedupe_key": dedupe_key, "ttl_seconds": self.dedupe_ttl_seconds},
+                {"dedupe_hash": pseudonymize(dedupe_key), "ttl_seconds": self.dedupe_ttl_seconds},
             )
             return None
 
@@ -1205,7 +1288,8 @@ class Sentinel43ResponseEngine:
             except Exception as exc:
                 err = str(exc)
 
-            # IMPORTANT: expected_status is APPROVED (operator set it)
+            # IMPORTANT: expected_status is APPROVED (operator set it).
+            # This stays APPROVED, not EXECUTING — see changelog #1.
             self.store.update_action_status(
                 action_id,
                 ActionStatus.EXECUTED if ok else ActionStatus.FAILED,
