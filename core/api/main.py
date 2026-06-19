@@ -894,7 +894,7 @@ try:
     from core.monitoring import SpartaCore as _SC, IntegrityConfig as _IC, create_node_router
     _node_router_sparta = _SC(
         _IC(watched_files={}, node_signature="sentinel43-api",
-            token_secret=_env_str("S43_SPARTA_TOKEN_SECRET", "dev-placeholder"),
+            token_secret=_env_str("S43_SPARTA_TOKEN_SECRET"),
             node_api_token=_env_str("S43_SPARTA_NODE_TOKEN", ""))
     )
     app.include_router(create_node_router(_node_router_sparta))
