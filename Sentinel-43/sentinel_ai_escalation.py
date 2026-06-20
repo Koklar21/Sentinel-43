@@ -87,6 +87,13 @@ logger = logging.getLogger(__name__)
 #      raw dedupe_key (which contains the raw target value) directly into
 #      the persisted event_logs table, defeating pseudonymize() for every
 #      suppressed duplicate. Now logs the hash instead.
+#   5. ThreatKind / ThreatSeverity / ThreatSourceKind / ThreatAssessment
+#      were defined locally here as plain enum.Enum (auto()-valued),
+#      independently and incompatibly from sentinel_threat_detector.py's
+#      own str-Enum versions of the same names. Now imported from a single
+#      shared sentinel_threat_types.py that both layers use. See the
+#      import block further down in this file for the compatibility
+#      analysis of why this was safe here.
 # ============================================================
 
 
@@ -189,42 +196,30 @@ class SentinelMode(str, enum.Enum):
 # ============================================================
 # THREAT TYPES (INPUT CONTRACT)
 # AI stays elsewhere. Sentinel consumes assessments only.
+#
+# Fix (scrub, public-beta hardening): ThreatKind / ThreatSourceKind /
+# ThreatSeverity / ThreatAssessment used to be defined locally here as
+# plain enum.Enum (auto()-valued). sentinel_threat_detector.py
+# independently defined its own incompatible versions (str-Enum) with the
+# same names. Wiring the detector's output directly into
+# Sentinel43ResponseEngine.handle_assessment() would silently break on any
+# isinstance/identity check. All four now live in one place,
+# sentinel_threat_types.py, and every consumer imports the same
+# definitions. Verified safe for this file specifically: the only place
+# `indicators` is touched is a pure pass-through copy in plan_response()
+# (`indicators=assessment.indicators`), never inspected or branched on, so
+# the default changing from None to {} has zero behavioral effect here.
+#
+# Import path note: adjust if your package layout differs from
+# sentinel_43_ai/detection/sentinel_threat_types.py.
 # ============================================================
 
-class ThreatKind(enum.Enum):
-    GENERIC_INTRUSION = enum.auto()
-    MALWARE_DELIVERY = enum.auto()
-    SPYWARE_ACTIVITY = enum.auto()
-    DATA_EXFILTRATION = enum.auto()
-    CREDENTIAL_ATTACK = enum.auto()
-    UNKNOWN = enum.auto()
-
-
-class ThreatSourceKind(enum.Enum):
-    HUMAN_LIKELY = enum.auto()
-    AI_AUTOMATION_LIKELY = enum.auto()
-    MIXED_OR_UNKNOWN = enum.auto()
-
-
-class ThreatSeverity(enum.Enum):
-    LOW = enum.auto()
-    MEDIUM = enum.auto()
-    HIGH = enum.auto()
-    CRITICAL = enum.auto()
-
-
-@dataclass(frozen=True)
-class ThreatAssessment:
-    identity: str
-    source_ip: str
-    threat_kind: ThreatKind
-    severity: ThreatSeverity
-    source_kind: ThreatSourceKind
-    score: float
-    indicators: Optional[object] = None
-    supporting_tags: List[str] = field(default_factory=list)
-    window_size: int = 0
-    generated_at: float = field(default_factory=time.time)
+from sentinel_43_ai.detection.sentinel_threat_types import (
+    ThreatKind,
+    ThreatSeverity,
+    ThreatSourceKind,
+    ThreatAssessment,
+)
 
 
 # ============================================================
