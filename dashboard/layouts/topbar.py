@@ -28,3 +28,5 @@ class Topbar:
 
 
 topbar = Topbar()
+def build_topbar() -> Topbar:
+    return Topbar()
