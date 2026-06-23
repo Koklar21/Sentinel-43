@@ -11,10 +11,11 @@ import re
 import urllib.parse
 from typing import Any
 
-from dashboard.services.api_client import ApiClient, ApiResponse
+from dashboard.services.api_client import ApiClient, ApiResponse, api_client
 
 
 AUDIT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 500
 
@@ -65,11 +66,14 @@ def _validate_pagination(*, limit: int, offset: int) -> tuple[int, int]:
 
 
 def get_audit_records(
-    client: ApiClient,
+    client: ApiClient | None = None,
     *,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
 ) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     try:
         safe_limit, safe_offset = _validate_pagination(
             limit=limit,
@@ -86,14 +90,20 @@ def get_audit_records(
     return client.get(f"/audit?{query}").to_dict()
 
 
-def get_audit_status(client: ApiClient) -> dict[str, Any]:
+def get_audit_status(client: ApiClient | None = None) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     return client.get("/audit/status").to_dict()
 
 
 def get_audit_record(
-    client: ApiClient,
     audit_id: Any,
+    client: ApiClient | None = None,
 ) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     cleaned = _validate_audit_id(audit_id)
 
     if cleaned is None:
@@ -105,11 +115,14 @@ def get_audit_record(
 
 
 def get_audit_snapshot(
-    client: ApiClient,
+    client: ApiClient | None = None,
     *,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
 ) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     records = get_audit_records(
         client,
         limit=limit,
@@ -141,8 +154,10 @@ def get_audit_snapshot(
         headers={},
         is_json=True,
     ).to_dict()
+
+
 def fetch_audit_logs(
-    client: ApiClient,
+    client: ApiClient | None = None,
     *,
     limit: int = DEFAULT_LIMIT,
     offset: int = 0,
@@ -152,24 +167,11 @@ def fetch_audit_logs(
 
 def normalize_audit_logs(raw: dict[str, Any]) -> list[dict[str, Any]]:
     data = raw.get("data")
+
     if isinstance(data, list):
         return data
+
     if isinstance(data, dict):
         return data.get("records") or []
-    return []
-def fetch_audit_logs(
-    client: ApiClient,
-    *,
-    limit: int = DEFAULT_LIMIT,
-    offset: int = 0,
-) -> dict[str, Any]:
-    return get_audit_records(client, limit=limit, offset=offset)
 
-
-def normalize_audit_logs(raw: dict[str, Any]) -> list[dict[str, Any]]:
-    data = raw.get("data")
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        return data.get("records") or []
     return []
