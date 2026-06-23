@@ -219,3 +219,53 @@ def get_remote_gateway_snapshot(
         headers={},
         is_json=True,
     ).to_dict()
+def fetch_remote_operations(
+    client: ApiClient,
+    *,
+    limit: int = DEFAULT_TARGET_LIMIT,
+    offset: int = 0,
+) -> dict[str, Any]:
+    return get_remote_targets(client, limit=limit, offset=offset)
+
+
+def get_remote_gateway_records(
+    client: ApiClient,
+    *,
+    limit: int = DEFAULT_TARGET_LIMIT,
+    offset: int = 0,
+) -> dict[str, Any]:
+    return get_remote_targets(client, limit=limit, offset=offset)
+
+
+def normalize_remote_operations(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    data = raw.get("data")
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("targets") or []
+    return []
+
+
+def submit_remote_gateway_event(
+    client: ApiClient,
+    *,
+    operator_id: str,
+    operator_role: str,
+    target_id: str,
+    event_type: str,
+    reason: str,
+    correlation_id: str,
+    dry_run: bool = False,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return activate_remote_event(
+        client,
+        operator_id=operator_id,
+        operator_role=operator_role,
+        target_id=target_id,
+        event_type=event_type,
+        reason=reason,
+        correlation_id=correlation_id,
+        dry_run=dry_run,
+        payload=payload,
+    )
