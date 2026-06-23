@@ -51,3 +51,5 @@ def get_watchtower_summary() -> dict[str, Any]:
         "alerts_ok": data["alerts"].get("ok", False),
         "metrics_ok": data["metrics"].get("ok", False),
     }
+def build_watchtower_page() -> dict[str, Any]:
+    return load_watchtower_page()
