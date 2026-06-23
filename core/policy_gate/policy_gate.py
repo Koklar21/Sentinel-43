@@ -446,7 +446,6 @@ __all__ = [
     "STATUS_REQUIRES_HUMAN",
     "STATUS_UNKNOWN_ACTION",
 ]
-'''
 
 path = Path("/mnt/data/policy_gate.py")
 path.write_text(content, encoding="utf-8")
