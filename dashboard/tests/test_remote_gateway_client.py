@@ -16,19 +16,16 @@ from dashboard.services.remote_gateway_client import (
 
 def test_get_remote_gateway_health_returns_dict() -> None:
     result = get_remote_gateway_health()
-
     assert isinstance(result, dict)
 
 
 def test_get_remote_targets_returns_dict() -> None:
     result = get_remote_targets()
-
     assert isinstance(result, dict)
 
 
 def test_get_remote_audit_records_requires_correlation_id() -> None:
     result = get_remote_audit_records("")
-
     assert result["ok"] is False
     assert result["error"] is not None
 
@@ -43,14 +40,14 @@ def test_activate_remote_event_returns_dict() -> None:
         correlation_id="TEST-123456",
         dry_run=True,
     )
-
     assert isinstance(result, dict)
 
 
 def test_get_remote_gateway_snapshot_returns_dict() -> None:
     result = get_remote_gateway_snapshot()
-
     assert isinstance(result, dict)
-
-    assert "health" in result
-    assert "targets" in result
+    # Snapshot wraps output in ApiResponse.to_dict() — health and targets
+    # live inside result["data"], not at the top level.
+    data = result.get("data", {})
+    assert "health" in data
+    assert "targets" in data
