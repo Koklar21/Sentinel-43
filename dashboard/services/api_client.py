@@ -415,3 +415,4 @@ class ApiClient:
                     return value.strip()
 
         return fallback
+api_client = ApiClient()
