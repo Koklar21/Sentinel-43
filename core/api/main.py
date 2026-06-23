@@ -920,7 +920,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
     # Origin check — return without accept() so uvicorn sends HTTP 403.
     # Never call close() before accept().
     origin = websocket.headers.get("origin", "")
-   if _ALLOWED_ORIGINS and origin and origin not in _ALLOWED_ORIGINS:
+    if _ALLOWED_ORIGINS and origin and origin not in _ALLOWED_ORIGINS:
         return
 
     if len(_dashboard_ws_clients) >= MAX_WS_CLIENTS:
