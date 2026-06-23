@@ -45,3 +45,6 @@ def get_dashboard_summary() -> dict[str, Any]:
         "watchtower_online": data["watchtower"].get("ok", False),
         "remote_gateway_online": data["remote_gateway"].get("ok", False),
     }
+def build_dashboard_page() -> dict[str, Any]:
+    return load_dashboard_page()
+    
