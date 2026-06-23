@@ -27,14 +27,21 @@
 """
 Sentinel-43 — FenrirHunter
 
-Active threat hunting node. Owns a SentinelThreatDetector instance,
-runs assess_all() on every scan interval, filters findings by minimum
-severity, and reports qualifying findings to both:
+Active threat hunting node. Owns both a SentinelThreatDetector (threshold-
+based scoring) and a FenrirAnomalyLayer (Welford statistical baseline tracking).
 
-  1. Watchtower  — HTTP POST to the configured Watchtower event endpoint
-  2. Dashboard   — HTTP POST to the API's internal broadcast endpoint,
-                   which fans findings out to connected WebSocket clients
+Every scan:
+  1. detector.assess_all()    — threshold-based scoring of all tracked windows
+  2. anomaly_layer.update()   — z-score + cumulative pressure check on every
+                                assessment regardless of severity
 
+Two reporting paths:
+  Path A — Threshold:  severity >= min_report_severity → report
+  Path B — Anomaly:    statistical anomaly regardless of severity → report
+                       catches slow/low-and-slow attacks that never cross
+                       fixed score thresholds
+
+All findings forward to Watchtower and dashboard broadcast concurrently.
 Fenrir hunts. It does not bite.
 
 Non-responsibilities:
@@ -43,48 +50,44 @@ Non-responsibilities:
   - No firewall changes
   - No secret handling
 
-Incorporated fixes (this pass):
-  - Dedicated ThreadPoolExecutor isolates detector scans from the shared
-    default pool, preventing cross-contamination with other async executor
-    work (Gemini review, valid).
-  - State machine corrected: DEGRADED means limping-but-running (still
-    reports ready), ERROR means hard stop (reports not-ready). First N-1
-    errors transition to DEGRADED; crossing max_consecutive_errors flips
-    to ERROR (Gemini review, valid).
-  - asyncio.gather backpressure concern rejected: process_finding() is
-    awaited sequentially inside the hunt loop — one finding at a time,
-    no concurrent accumulation of unresolved futures (Gemini review,
-    not applicable to this loop structure).
-  - executor.shutdown(wait=True) inside async shutdown replaced with
-    wait=False + asyncio.to_thread to avoid blocking the event loop
-    if the detector is mid-execution at shutdown time (new bug introduced
-    by Gemini's refactor, fixed here).
+Anomaly layer extracted and adapted from Aegis42 OnlineAnomalyDetector:
+  - sklearn/IsolationForest removed (not in S43 stack)
+  - Cumulative pressure gains exponential time-decay (was unbounded)
+  - Per-identity LRU eviction and stale-key pruning added
+  - Thread-safe for run_in_executor context
+
+State machine:
+  DEGRADED = below error threshold — readiness 200 (limping but hunting)
+  ERROR    = at/above threshold    — readiness 503 (hard stop)
 
 Import path note:
-  Adjust the two imports marked ADJUST IMPORT PATH to match your actual
-  package layout. Hard import — Fenrir refuses to start if the detector
-  is not importable.
+  Adjust the two detector imports marked ADJUST IMPORT PATH to match your
+  actual package layout. Hard imports — Fenrir refuses to start if either
+  is missing.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import math
 import os
 import signal as _signal
+import threading
+import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import aiohttp
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 
 # ---------------------------------------------------------------------------
 # ADJUST IMPORT PATH if your package layout differs from sentinel_43_ai/detection/
-# Hard import — Fenrir refuses to start if the detector is not importable.
+# Hard imports — Fenrir refuses to start if either is not importable.
 # ---------------------------------------------------------------------------
 from sentinel_43_ai.detection.sentinel_threat_detector import (
     DetectorConfig,
@@ -104,18 +107,190 @@ logger = logging.getLogger("sentinel43.fenrir")
 # =============================================================================
 
 _SEVERITY_RANK: dict[ThreatSeverity, int] = {
-    ThreatSeverity.LOW: 0,
-    ThreatSeverity.MEDIUM: 1,
-    ThreatSeverity.HIGH: 2,
+    ThreatSeverity.LOW:      0,
+    ThreatSeverity.MEDIUM:   1,
+    ThreatSeverity.HIGH:     2,
     ThreatSeverity.CRITICAL: 3,
 }
 
 _SEVERITY_FROM_STR: dict[str, ThreatSeverity] = {
-    "LOW": ThreatSeverity.LOW,
-    "MEDIUM": ThreatSeverity.MEDIUM,
-    "HIGH": ThreatSeverity.HIGH,
+    "LOW":      ThreatSeverity.LOW,
+    "MEDIUM":   ThreatSeverity.MEDIUM,
+    "HIGH":     ThreatSeverity.HIGH,
     "CRITICAL": ThreatSeverity.CRITICAL,
 }
+
+
+# =============================================================================
+# Anomaly layer — Welford streaming baseline
+# =============================================================================
+
+@dataclass
+class _WelfordStream:
+    """
+    Online mean/variance tracker using Welford's algorithm.
+    Single-value streaming. Caller must hold the enclosing RLock.
+    """
+
+    count: int   = 0
+    mean:  float = 0.0
+    _m2:   float = 0.0
+
+    def update(self, value: float) -> None:
+        self.count += 1
+        delta      = value - self.mean
+        self.mean += delta / self.count
+        delta2     = value - self.mean
+        self._m2  += delta * delta2
+
+    @property
+    def variance(self) -> float:
+        if self.count < 2:
+            return 0.0
+        return self._m2 / (self.count - 1)
+
+    @property
+    def std(self) -> float:
+        v = self.variance
+        return math.sqrt(v) if v > 0 else 0.0
+
+    def zscore(self, value: float) -> float:
+        s = self.std
+        if s == 0.0 or self.count < 2:
+            return 0.0
+        return abs((value - self.mean) / s)
+
+
+@dataclass
+class _IdentityBaseline:
+    """
+    Score history for one (identity, ip) pair.
+
+    Tracks a Welford stream for z-score detection and a cumulative
+    threat pressure total with exponential time-decay.
+    """
+
+    stream:    _WelfordStream = field(default_factory=_WelfordStream)
+    pressure:  float          = 0.0
+    last_seen: float          = field(default_factory=time.time)
+
+    def update(self, score: float, *, now: float, decay_rate: float) -> None:
+        elapsed       = max(0.0, now - self.last_seen)
+        self.pressure *= math.exp(-decay_rate * elapsed)
+        self.pressure += score
+        self.stream.update(score)
+        self.last_seen = now
+
+
+class FenrirAnomalyLayer:
+    """
+    Per-identity statistical baseline tracking using Welford's algorithm.
+
+    Thread-safe — runs in the dedicated ThreadPoolExecutor alongside
+    SentinelThreatDetector.assess_all().
+
+    Two signals:
+      1. Z-score: single score deviates from identity's historical baseline.
+         Catches sudden spikes for previously quiet identities.
+      2. Cumulative pressure: decayed running total exceeds threshold.
+         Catches sustained low-score activity across many scan cycles.
+    """
+
+    def __init__(
+        self,
+        *,
+        zscore_threshold:   float = 3.5,
+        pressure_threshold: float = 150.0,
+        decay_rate:         float = 0.002,
+        min_observations:   int   = 5,
+        max_keys:           int   = 10_000,
+        stale_seconds:      float = 3_600.0,
+    ) -> None:
+        self.zscore_threshold   = zscore_threshold
+        self.pressure_threshold = pressure_threshold
+        self.decay_rate         = decay_rate
+        self.min_observations   = min_observations
+        self.max_keys           = max_keys
+        self.stale_seconds      = stale_seconds
+
+        self._baselines: OrderedDict[Tuple[str, str], _IdentityBaseline] = OrderedDict()
+        self._lock = threading.RLock()
+
+        self._stats: dict[str, int] = {
+            "updates":        0,
+            "zscore_fires":   0,
+            "pressure_fires": 0,
+            "keys_evicted":   0,
+            "keys_pruned":    0,
+        }
+
+    def update(self, assessment: ThreatAssessment) -> Optional[dict[str, Any]]:
+        """Update baseline and return anomaly dict if either signal fires."""
+        key   = (assessment.identity, assessment.source_ip)
+        now   = time.time()
+        score = assessment.score
+
+        with self._lock:
+            self._stats["updates"] += 1
+
+            if key not in self._baselines and len(self._baselines) >= self.max_keys:
+                self._baselines.popitem(last=False)
+                self._stats["keys_evicted"] += 1
+
+            baseline = self._baselines.get(key)
+            if baseline is None:
+                baseline = _IdentityBaseline()
+                self._baselines[key] = baseline
+            else:
+                self._baselines.move_to_end(key)
+
+            baseline.update(score, now=now, decay_rate=self.decay_rate)
+
+            if baseline.stream.count < self.min_observations:
+                return None
+
+            anomaly: dict[str, Any] = {}
+
+            z = baseline.stream.zscore(score)
+            if z >= self.zscore_threshold:
+                self._stats["zscore_fires"] += 1
+                anomaly["zscore"]           = round(z, 3)
+                anomaly["zscore_threshold"] = self.zscore_threshold
+                anomaly["baseline_mean"]    = round(baseline.stream.mean, 3)
+                anomaly["baseline_std"]     = round(baseline.stream.std, 3)
+
+            if baseline.pressure >= self.pressure_threshold:
+                self._stats["pressure_fires"] += 1
+                anomaly["cumulative_pressure"] = round(baseline.pressure, 3)
+                anomaly["pressure_threshold"]  = self.pressure_threshold
+
+            if not anomaly:
+                return None
+
+            anomaly["observations"] = baseline.stream.count
+            return anomaly
+
+    def prune(self) -> int:
+        """Remove identities silent for stale_seconds. Returns count pruned."""
+        now    = time.time()
+        cutoff = now - self.stale_seconds
+        with self._lock:
+            stale = [k for k, b in self._baselines.items() if b.last_seen < cutoff]
+            for k in stale:
+                del self._baselines[k]
+            self._stats["keys_pruned"] += len(stale)
+            return len(stale)
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                **self._stats,
+                "active_keys":        len(self._baselines),
+                "zscore_threshold":   self.zscore_threshold,
+                "pressure_threshold": self.pressure_threshold,
+                "decay_rate":         self.decay_rate,
+                "min_observations":   self.min_observations,
+            }
 
 
 # =============================================================================
@@ -126,9 +301,9 @@ class FenrirState(str, Enum):
     INITIALIZING = "INITIALIZING"
     HUNTING      = "HUNTING"
     TRACKING     = "TRACKING"
-    DEGRADED     = "DEGRADED"   # limping — readiness returns 200
+    DEGRADED     = "DEGRADED"
     DORMANT      = "DORMANT"
-    ERROR        = "ERROR"      # hard stop — readiness returns 503
+    ERROR        = "ERROR"
 
 
 # =============================================================================
@@ -144,80 +319,75 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 @dataclass(slots=True)
 class FenrirConfig:
-    # Node identity
     node_id: str = field(
         default_factory=lambda: os.getenv("S43_FENRIR_NODE_ID", "fenrir-hunter-01")
     )
-
-    # When embedded_mode=True the health server is skipped — the parent
-    # process (e.g. FastAPI lifespan) owns lifecycle and health reporting.
     embedded_mode: bool = field(
         default_factory=lambda: _env_bool("S43_FENRIR_EMBEDDED", True)
     )
-
-    # Health server (standalone mode only)
     host: str = field(
         default_factory=lambda: os.getenv("S43_FENRIR_HOST", "0.0.0.0")
     )
     health_port: int = field(
         default_factory=lambda: int(os.getenv("S43_FENRIR_HEALTH_PORT", "9201"))
     )
-
-    # Hunt loop
     scan_interval_seconds: float = field(
         default_factory=lambda: float(os.getenv("S43_FENRIR_SCAN_INTERVAL", "2.0"))
     )
     max_consecutive_errors: int = field(
         default_factory=lambda: int(os.getenv("S43_FENRIR_MAX_ERRORS", "3"))
     )
-
-    # Minimum severity to report externally.
-    # LOW and MEDIUM are counted in metrics but not forwarded.
     min_report_severity: str = field(
         default_factory=lambda: os.getenv("S43_FENRIR_MIN_SEVERITY", "HIGH").upper()
     )
-
-    # Reporting endpoints
     watchtower_url: str = field(
         default_factory=lambda: os.getenv(
-            "S43_FENRIR_WATCHTOWER_URL",
-            "http://s43-api:8000/watchtower/events",
+            "S43_FENRIR_WATCHTOWER_URL", "http://s43-api:8000/watchtower/events"
         )
     )
     api_broadcast_url: str = field(
         default_factory=lambda: os.getenv(
-            "S43_FENRIR_BROADCAST_URL",
-            "http://s43-api:8000/internal/events/broadcast",
+            "S43_FENRIR_BROADCAST_URL", "http://s43-api:8000/internal/events/broadcast"
         )
     )
-
-    # HTTP timeout for outbound reports
     report_timeout_seconds: float = field(
         default_factory=lambda: float(os.getenv("S43_FENRIR_REPORT_TIMEOUT", "5.0"))
     )
-
-    # Internal token for API calls
     api_token: Optional[str] = field(
         default_factory=lambda: os.getenv("S43_FENRIR_API_TOKEN")
     )
-
     log_level: str = field(
         default_factory=lambda: os.getenv("S43_FENRIR_LOG_LEVEL", "INFO")
     )
-
-    # Detector tuning
     detector_window_seconds: float = field(
         default_factory=lambda: float(os.getenv("S43_FENRIR_WINDOW_SECONDS", "60.0"))
     )
     detector_max_keys: int = field(
         default_factory=lambda: int(os.getenv("S43_FENRIR_MAX_KEYS", "0"))
     )
-
-    # Dedicated thread pool size for detector scans.
-    # 2 workers is enough — assess_all() is single-threaded internally
-    # (RLock) so extra workers only matter for concurrent ingest() calls.
     detector_pool_workers: int = field(
         default_factory=lambda: int(os.getenv("S43_FENRIR_POOL_WORKERS", "2"))
+    )
+    anomaly_zscore_threshold: float = field(
+        default_factory=lambda: float(os.getenv("S43_FENRIR_ANOMALY_ZSCORE", "3.5"))
+    )
+    anomaly_pressure_threshold: float = field(
+        default_factory=lambda: float(os.getenv("S43_FENRIR_ANOMALY_PRESSURE", "150.0"))
+    )
+    anomaly_decay_rate: float = field(
+        default_factory=lambda: float(os.getenv("S43_FENRIR_ANOMALY_DECAY", "0.002"))
+    )
+    anomaly_min_observations: int = field(
+        default_factory=lambda: int(os.getenv("S43_FENRIR_ANOMALY_MIN_OBS", "5"))
+    )
+    anomaly_max_keys: int = field(
+        default_factory=lambda: int(os.getenv("S43_FENRIR_ANOMALY_MAX_KEYS", "10000"))
+    )
+    anomaly_stale_seconds: float = field(
+        default_factory=lambda: float(os.getenv("S43_FENRIR_ANOMALY_STALE", "3600.0"))
+    )
+    anomaly_prune_interval: int = field(
+        default_factory=lambda: int(os.getenv("S43_FENRIR_PRUNE_INTERVAL", "300"))
     )
 
 
@@ -229,22 +399,17 @@ class FenrirHunter:
     """
     Fenrir hunter node for Sentinel-43.
 
-    Owns a SentinelThreatDetector. On every scan interval:
-      1. Calls detector.assess_all() in an isolated thread pool (non-blocking).
-      2. Filters assessments to min_report_severity and above.
-      3. Reports each qualifying finding to Watchtower and the dashboard
-         WebSocket broadcast endpoint concurrently.
+    Path A — Threshold (SentinelThreatDetector):
+      Assessments at or above min_report_severity become findings.
 
-    LOW and MEDIUM findings are counted in metrics but not forwarded.
+    Path B — Statistical anomaly (FenrirAnomalyLayer):
+      Assessments below threshold but flagged by Welford z-score or
+      cumulative pressure become anomaly escalation findings.
 
-    State machine:
-      INITIALIZING → HUNTING       normal startup
-      HUNTING      → TRACKING      finding detected
-      TRACKING     → HUNTING       no findings this scan
-      HUNTING      → DEGRADED      error, below threshold
-      DEGRADED     → HUNTING       recovered
-      HUNTING      → ERROR         errors >= max_consecutive_errors
-      any          → DORMANT       shutdown complete
+    All findings report to Watchtower and dashboard broadcast concurrently.
+    Reporting failures are logged and counted but never crash the hunt loop.
+
+    Fenrir hunts. It does not bite.
     """
 
     def __init__(self, config: Optional[FenrirConfig] = None) -> None:
@@ -255,35 +420,39 @@ class FenrirHunter:
             format="%(asctime)s - FenrirHunter - %(levelname)s - %(message)s",
         )
 
-        self.state = FenrirState.INITIALIZING
-        self.started_at = datetime.now(timezone.utc)
-        self.last_scan_at: Optional[str] = None
-        self.last_finding: Optional[dict[str, Any]] = None
+        self.state              = FenrirState.INITIALIZING
+        self.started_at         = datetime.now(timezone.utc)
+        self.last_scan_at:        Optional[str]           = None
+        self.last_finding:        Optional[dict[str, Any]] = None
         self.consecutive_errors = 0
+        self._scan_count        = 0
 
         self.shutdown_event = asyncio.Event()
-        self.runner: Optional[web.AppRunner] = None
+        self.runner:    Optional[web.AppRunner]      = None
         self.main_task: Optional[asyncio.Task[None]] = None
-        self._session: Optional[ClientSession] = None
-        self._started = False
-        self._lock = asyncio.Lock()
+        self._session:  Optional[ClientSession]      = None
+        self._started   = False
+        self._lock      = asyncio.Lock()
 
-        # Dedicated pool — isolates detector scans from the shared default
-        # executor, preventing cross-contamination with FastAPI's own
-        # executor work. 2 workers matches assess_all()'s internal RLock
-        # (it can only run one scan at a time anyway).
         self._executor = ThreadPoolExecutor(
             max_workers=self.config.detector_pool_workers,
             thread_name_prefix="fenrir_detector",
         )
 
-        # Hard import already enforced at module level. If we get here,
-        # the detector is importable.
         self.detector = SentinelThreatDetector(
             cfg=DetectorConfig(
                 window_seconds=self.config.detector_window_seconds,
                 max_keys_hint=self.config.detector_max_keys,
             )
+        )
+
+        self.anomaly_layer = FenrirAnomalyLayer(
+            zscore_threshold=self.config.anomaly_zscore_threshold,
+            pressure_threshold=self.config.anomaly_pressure_threshold,
+            decay_rate=self.config.anomaly_decay_rate,
+            min_observations=self.config.anomaly_min_observations,
+            max_keys=self.config.anomaly_max_keys,
+            stale_seconds=self.config.anomaly_stale_seconds,
         )
 
         resolved = _SEVERITY_FROM_STR.get(self.config.min_report_severity)
@@ -296,30 +465,34 @@ class FenrirHunter:
         self._min_severity_rank: int = _SEVERITY_RANK[resolved]
 
         self.metrics: dict[str, Any] = {
-            "scans": 0,
-            "assessments_total": 0,
-            "findings_low": 0,
-            "findings_medium": 0,
-            "findings_high": 0,
-            "findings_critical": 0,
-            "findings_reported": 0,
-            "watchtower_ok": 0,
-            "watchtower_failures": 0,
-            "broadcast_ok": 0,
-            "broadcast_failures": 0,
-            "errors": 0,
-            "state_transitions": 0,
+            "scans":                0,
+            "assessments_total":    0,
+            "findings_low":         0,
+            "findings_medium":      0,
+            "findings_high":        0,
+            "findings_critical":    0,
+            "findings_reported":    0,
+            "anomaly_escalations":  0,
+            "watchtower_ok":        0,
+            "watchtower_failures":  0,
+            "broadcast_ok":         0,
+            "broadcast_failures":   0,
+            "errors":               0,
+            "state_transitions":    0,
         }
 
         logger.info(
-            "FenrirHunter initialized: node_id=%s embedded=%s min_severity=%s",
+            "FenrirHunter initialized: node_id=%s embedded=%s "
+            "min_severity=%s anomaly_zscore=%.1f anomaly_pressure=%.0f",
             self.config.node_id,
             self.config.embedded_mode,
             self.config.min_report_severity,
+            self.config.anomaly_zscore_threshold,
+            self.config.anomaly_pressure_threshold,
         )
 
     # -------------------------------------------------------------------------
-    # State management
+    # State
     # -------------------------------------------------------------------------
 
     def transition(self, new_state: FenrirState) -> None:
@@ -337,29 +510,36 @@ class FenrirHunter:
     def snapshot(self) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
         return {
-            "node_id": self.config.node_id,
-            "node_type": "fenrir_hunter",
-            "state": self.state.value,
-            "status": (
-                "ok"
-                if self.state not in {FenrirState.ERROR, FenrirState.DEGRADED}
+            "node_id":            self.config.node_id,
+            "node_type":          "fenrir_hunter",
+            "state":              self.state.value,
+            "status":             (
+                "error"
+                if self.state == FenrirState.ERROR
                 else "degraded"
+                if self.state == FenrirState.DEGRADED
+                else "ok"
             ),
-            "embedded_mode": self.config.embedded_mode,
-            "started": self._started,
-            "started_at": self.started_at.isoformat(),
-            "uptime_seconds": round((now - self.started_at).total_seconds(), 3),
-            "last_scan_at": self.last_scan_at,
-            "last_finding": self.last_finding,
+            "embedded_mode":      self.config.embedded_mode,
+            "started":            self._started,
+            "started_at":         self.started_at.isoformat(),
+            "uptime_seconds":     round((now - self.started_at).total_seconds(), 3),
+            "last_scan_at":       self.last_scan_at,
+            "last_finding":       self.last_finding,
             "consecutive_errors": self.consecutive_errors,
-            "metrics": dict(self.metrics),
+            "metrics":            dict(self.metrics),
+            "anomaly_layer":      self.anomaly_layer.stats(),
             "config": {
-                "scan_interval_seconds": self.config.scan_interval_seconds,
-                "min_report_severity": self.config.min_report_severity,
-                "detector_window_seconds": self.config.detector_window_seconds,
+                "scan_interval_seconds":      self.config.scan_interval_seconds,
+                "min_report_severity":        self.config.min_report_severity,
+                "detector_window_seconds":    self.config.detector_window_seconds,
+                "anomaly_zscore_threshold":   self.config.anomaly_zscore_threshold,
+                "anomaly_pressure_threshold": self.config.anomaly_pressure_threshold,
+                "anomaly_decay_rate":         self.config.anomaly_decay_rate,
             },
             "capabilities": [
                 "threat_detection",
+                "statistical_anomaly_detection",
                 "anomaly_tracking",
                 "watchtower_reporting",
                 "dashboard_broadcast",
@@ -370,8 +550,6 @@ class FenrirHunter:
         return web.json_response(self.snapshot())
 
     async def readiness(self, request: web.Request) -> web.Response:
-        # DEGRADED is still ready — limping but hunting.
-        # ERROR is not ready — needs operator attention.
         ready = self.state in {
             FenrirState.HUNTING,
             FenrirState.TRACKING,
@@ -379,9 +557,14 @@ class FenrirHunter:
         }
         return web.json_response(
             {
-                "ready": ready,
-                "state": self.state.value,
+                "ready":   ready,
+                "state":   self.state.value,
                 "node_id": self.config.node_id,
+                "status":  (
+                    "error"    if self.state == FenrirState.ERROR
+                    else "degraded" if self.state == FenrirState.DEGRADED
+                    else "ok"
+                ),
             },
             status=200 if ready else 503,
         )
@@ -390,44 +573,69 @@ class FenrirHunter:
     # Detection
     # -------------------------------------------------------------------------
 
-    def _assessment_to_finding(self, assessment: ThreatAssessment) -> dict[str, Any]:
-        return {
-            "source": "fenrir",
-            "node_id": self.config.node_id,
-            "type": "threat_finding",
-            "severity": assessment.severity.value,
-            "threat_kind": assessment.threat_kind.value,
-            "source_kind": assessment.source_kind.value,
-            "score": assessment.score,
-            "identity": assessment.identity,
-            "source_ip": assessment.source_ip,
-            "window_size": assessment.window_size,
-            "tags": list(assessment.supporting_tags),
-            "indicators": dict(assessment.indicators),
-            "generated_at": datetime.fromtimestamp(
+    def _assessment_to_finding(
+        self,
+        assessment: ThreatAssessment,
+        *,
+        detection_method: str,
+        anomaly: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        finding: dict[str, Any] = {
+            "source":           "fenrir",
+            "node_id":          self.config.node_id,
+            "type":             "threat_finding",
+            "detection_method": detection_method,
+            "severity":         assessment.severity.value,
+            "threat_kind":      assessment.threat_kind.value,
+            "source_kind":      assessment.source_kind.value,
+            "score":            assessment.score,
+            "identity":         assessment.identity,
+            "source_ip":        assessment.source_ip,
+            "window_size":      assessment.window_size,
+            "tags":             list(assessment.supporting_tags),
+            "indicators":       dict(assessment.indicators),
+            "generated_at":     datetime.fromtimestamp(
                 assessment.generated_at, tz=timezone.utc
             ).isoformat(),
-            "reported_at": datetime.now(timezone.utc).isoformat(),
+            "reported_at":      datetime.now(timezone.utc).isoformat(),
         }
+        if anomaly:
+            finding["anomaly"] = anomaly
+        return finding
 
-    async def observe_signals(self) -> list[ThreatAssessment]:
+    def _run_detection(
+        self,
+    ) -> tuple[list[ThreatAssessment], dict[tuple, dict[str, Any]]]:
         """
-        Run the detector and return assessments at or above min_report_severity.
+        Synchronous — runs in the dedicated thread pool.
+        Both detector and anomaly layer run in one executor call.
+        """
+        assessments = self.detector.assess_all()
+        anomaly_map: dict[tuple, dict[str, Any]] = {}
+        for a in assessments:
+            result = self.anomaly_layer.update(a)
+            if result is not None:
+                anomaly_map[(a.identity, a.source_ip)] = result
+        return assessments, anomaly_map
 
-        Uses the dedicated thread pool so detector scans don't compete with
-        FastAPI's default executor work.
+    async def observe_signals(self) -> list[dict[str, Any]]:
+        """
+        Run both detection paths. Returns unified finding dicts.
+
+        Path A: severity >= min_report_severity → threshold finding
+        Path B: anomaly fired on low/medium score → anomaly escalation
         """
         loop = asyncio.get_running_loop()
-        assessments: list[ThreatAssessment] = await loop.run_in_executor(
-            self._executor,
-            self.detector.assess_all,
+        assessments, anomaly_map = await loop.run_in_executor(
+            self._executor, self._run_detection
         )
 
         self.metrics["assessments_total"] += len(assessments)
-        qualifying: list[ThreatAssessment] = []
+        findings: list[dict[str, Any]] = []
 
         for a in assessments:
-            rank = _SEVERITY_RANK.get(a.severity, 0)
+            rank    = _SEVERITY_RANK.get(a.severity, 0)
+            anomaly = anomaly_map.get((a.identity, a.source_ip))
 
             if a.severity == ThreatSeverity.LOW:
                 self.metrics["findings_low"] += 1
@@ -439,35 +647,41 @@ class FenrirHunter:
                 self.metrics["findings_critical"] += 1
 
             if rank >= self._min_severity_rank:
-                qualifying.append(a)
+                findings.append(
+                    self._assessment_to_finding(
+                        a, detection_method="threshold", anomaly=anomaly
+                    )
+                )
+            elif anomaly:
+                self.metrics["anomaly_escalations"] += 1
+                findings.append(
+                    self._assessment_to_finding(
+                        a, detection_method="statistical_anomaly", anomaly=anomaly
+                    )
+                )
 
-        return qualifying
+        return findings
 
-    async def process_finding(self, assessment: ThreatAssessment) -> None:
-        """
-        Handle a qualifying threat assessment.
+    # -------------------------------------------------------------------------
+    # Reporting
+    # -------------------------------------------------------------------------
 
-        Reports to Watchtower and dashboard broadcast concurrently.
-        Neither failure crashes the hunt loop.
-
-        Note: process_finding() is awaited sequentially inside hunting_loop —
-        one finding at a time. There is no concurrent accumulation of
-        unresolved futures, so no semaphore is needed here.
-        """
+    async def process_finding(self, finding: dict[str, Any]) -> None:
         self.transition(FenrirState.TRACKING)
         self.metrics["findings_reported"] += 1
-
-        finding = self._assessment_to_finding(assessment)
         self.last_finding = finding
 
         logger.warning(
-            "Fenrir finding: severity=%s kind=%s identity=%s ip=%s score=%.2f tags=%s",
-            assessment.severity.value,
-            assessment.threat_kind.value,
-            assessment.identity,
-            assessment.source_ip,
-            assessment.score,
-            assessment.supporting_tags,
+            "Fenrir finding: method=%s severity=%s kind=%s "
+            "identity=%s ip=%s score=%.2f%s",
+            finding.get("detection_method", "?"),
+            finding.get("severity", "?"),
+            finding.get("threat_kind", "?"),
+            finding.get("identity", "?"),
+            finding.get("source_ip", "?"),
+            finding.get("score", 0.0),
+            f" [z={finding['anomaly'].get('zscore', '?')}]"
+            if finding.get("anomaly") else "",
         )
 
         await asyncio.gather(
@@ -475,10 +689,6 @@ class FenrirHunter:
             self._broadcast_to_dashboard(finding),
             return_exceptions=True,
         )
-
-    # -------------------------------------------------------------------------
-    # Reporting sinks
-    # -------------------------------------------------------------------------
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -490,7 +700,6 @@ class FenrirHunter:
         if not self._session or self._session.closed:
             self.metrics["watchtower_failures"] += 1
             return
-
         try:
             async with self._session.post(
                 self.config.watchtower_url,
@@ -502,34 +711,22 @@ class FenrirHunter:
                     self.metrics["watchtower_ok"] += 1
                 else:
                     self.metrics["watchtower_failures"] += 1
-                    logger.warning(
-                        "Watchtower rejected finding: status=%s", resp.status
-                    )
-
+                    logger.warning("Watchtower rejected finding: status=%s", resp.status)
         except asyncio.TimeoutError:
             self.metrics["watchtower_failures"] += 1
-            logger.warning(
-                "Watchtower report timed out after %.1fs",
-                self.config.report_timeout_seconds,
-            )
+            logger.warning("Watchtower timed out after %.1fs", self.config.report_timeout_seconds)
         except aiohttp.ClientError as exc:
             self.metrics["watchtower_failures"] += 1
             logger.warning("Watchtower report failed: %s", exc)
         except Exception as exc:
             self.metrics["watchtower_failures"] += 1
-            logger.exception("Watchtower report unexpected error: %s", exc)
+            logger.exception("Watchtower unexpected error: %s", exc)
 
     async def _broadcast_to_dashboard(self, finding: dict[str, Any]) -> None:
         if not self._session or self._session.closed:
             self.metrics["broadcast_failures"] += 1
             return
-
-        payload = {
-            "event_type": "fenrir_finding",
-            "channel": "security",
-            "data": finding,
-        }
-
+        payload = {"event_type": "fenrir_finding", "channel": "security", "data": finding}
         try:
             async with self._session.post(
                 self.config.api_broadcast_url,
@@ -541,16 +738,10 @@ class FenrirHunter:
                     self.metrics["broadcast_ok"] += 1
                 else:
                     self.metrics["broadcast_failures"] += 1
-                    logger.warning(
-                        "Dashboard broadcast rejected: status=%s", resp.status
-                    )
-
+                    logger.warning("Dashboard broadcast rejected: status=%s", resp.status)
         except asyncio.TimeoutError:
             self.metrics["broadcast_failures"] += 1
-            logger.warning(
-                "Dashboard broadcast timed out after %.1fs",
-                self.config.report_timeout_seconds,
-            )
+            logger.warning("Dashboard broadcast timed out after %.1fs", self.config.report_timeout_seconds)
         except aiohttp.ClientError as exc:
             self.metrics["broadcast_failures"] += 1
             logger.warning("Dashboard broadcast failed: %s", exc)
@@ -565,20 +756,33 @@ class FenrirHunter:
     async def hunting_loop(self) -> None:
         self.transition(FenrirState.HUNTING)
         logger.info(
-            "Fenrir hunt loop started: interval=%.1fs min_severity=%s",
+            "Fenrir hunt loop started: interval=%.1fs min_severity=%s "
+            "anomaly_zscore=%.1f anomaly_pressure=%.0f",
             self.config.scan_interval_seconds,
             self.config.min_report_severity,
+            self.config.anomaly_zscore_threshold,
+            self.config.anomaly_pressure_threshold,
         )
 
         while not self.shutdown_event.is_set():
             try:
+                self._scan_count      += 1
                 self.metrics["scans"] += 1
-                self.last_scan_at = datetime.now(timezone.utc).isoformat()
+                self.last_scan_at      = datetime.now(timezone.utc).isoformat()
+
+                # Periodic stale-key pruning
+                if self._scan_count % self.config.anomaly_prune_interval == 0:
+                    loop   = asyncio.get_running_loop()
+                    pruned = await loop.run_in_executor(
+                        self._executor, self.anomaly_layer.prune
+                    )
+                    if pruned:
+                        logger.debug("Anomaly layer pruned %d stale keys.", pruned)
 
                 findings = await self.observe_signals()
 
-                for assessment in findings:
-                    await self.process_finding(assessment)
+                for finding in findings:
+                    await self.process_finding(finding)
 
                 if not findings and self.state == FenrirState.TRACKING:
                     self.transition(FenrirState.HUNTING)
@@ -598,13 +802,11 @@ class FenrirHunter:
                 raise
 
             except Exception as exc:
-                self.metrics["errors"] += 1
+                self.metrics["errors"]  += 1
                 self.consecutive_errors += 1
                 logger.exception("Fenrir hunt loop error: %s", exc)
 
-                # Corrected state machine:
-                # First N-1 errors → DEGRADED (limping, still ready)
-                # Crossing max_consecutive_errors → ERROR (hard stop, not ready)
+                # DEGRADED = limping (readiness 200), ERROR = hard stop (readiness 503)
                 if self.consecutive_errors >= self.config.max_consecutive_errors:
                     self.transition(FenrirState.ERROR)
                 else:
@@ -629,76 +831,47 @@ class FenrirHunter:
     # -------------------------------------------------------------------------
 
     async def _start_session(self) -> None:
-        """
-        Create the shared aiohttp ClientSession.
-
-        Called after the event loop is running — never in __init__.
-        Idempotent: re-entry is safe.
-        """
         if self._session and not self._session.closed:
             return
-        connector = TCPConnector(limit=10)
-        self._session = ClientSession(connector=connector)
+        self._session = ClientSession(connector=TCPConnector(limit=10))
         logger.debug("Fenrir HTTP session created.")
 
     async def start_health_server(self) -> None:
         app = web.Application()
         app.router.add_get("/health", self.health)
-        app.router.add_get("/ready", self.readiness)
-
+        app.router.add_get("/ready",  self.readiness)
         self.runner = web.AppRunner(app)
         await self.runner.setup()
-
         site = web.TCPSite(self.runner, self.config.host, self.config.health_port)
         await site.start()
-
         logger.info(
             "Fenrir health server listening on %s:%s",
-            self.config.host,
-            self.config.health_port,
+            self.config.host, self.config.health_port,
         )
 
     async def start(self) -> None:
-        """
-        Start Fenrir. Idempotent — safe to call more than once.
-
-        When embedded_mode=True the health server is skipped; the parent
-        process owns lifecycle. When False (standalone), the health server
-        starts on health_port.
-        """
+        """Start Fenrir. Idempotent."""
         async with self._lock:
             if self._started:
                 return
-
             self.shutdown_event.clear()
             self.transition(FenrirState.INITIALIZING)
-
             await self._start_session()
-
             if not self.config.embedded_mode:
                 await self.start_health_server()
-
             self.main_task = asyncio.create_task(
-                self.hunting_loop(),
-                name="sentinel43-fenrir-hunter",
+                self.hunting_loop(), name="sentinel43-fenrir-hunter"
             )
             self._started = True
             logger.info("Fenrir started.")
 
     async def shutdown(self, reason: str = "shutdown") -> None:
-        """
-        Graceful shutdown. Idempotent.
-
-        executor.shutdown() is run via asyncio.to_thread with wait=False
-        to avoid blocking the event loop if assess_all() is mid-execution.
-        """
+        """Graceful shutdown. Idempotent."""
         async with self._lock:
             if not self._started and self.state == FenrirState.DORMANT:
                 return
-
             logger.warning("Fenrir shutdown: %s", reason)
             self.shutdown_event.set()
-
             if self.main_task and self.main_task is not asyncio.current_task():
                 self.main_task.cancel()
                 try:
@@ -706,20 +879,16 @@ class FenrirHunter:
                 except asyncio.CancelledError:
                     pass
                 self.main_task = None
-
             if self.runner:
                 await self.runner.cleanup()
                 self.runner = None
-
             if self._session and not self._session.closed:
                 await self._session.close()
                 self._session = None
-
-            # Fix: wait=False avoids blocking the event loop if a detector
-            # scan is in-flight. Threads complete naturally after the task
-            # that submitted them finishes.
+            # wait=False avoids blocking the event loop if a detector scan
+            # is in-flight at shutdown time. Threads complete naturally once
+            # the task that submitted them finishes.
             self._executor.shutdown(wait=False)
-
             self.transition(FenrirState.DORMANT)
             self._started = False
             logger.info("Fenrir shutdown complete.")
@@ -729,12 +898,8 @@ class FenrirHunter:
         await self.shutdown(reason)
 
     async def run(self) -> None:
-        """
-        Standalone entry point. Sets embedded_mode=False and owns its
-        own lifecycle including signal handling.
-        """
+        """Standalone entry point. Sets embedded_mode=False."""
         self.config.embedded_mode = False
-
         loop = asyncio.get_running_loop()
         for sig in (_signal.SIGINT, _signal.SIGTERM):
             try:
@@ -744,7 +909,6 @@ class FenrirHunter:
                 )
             except NotImplementedError:
                 pass
-
         await self.start()
         try:
             await self.shutdown_event.wait()
