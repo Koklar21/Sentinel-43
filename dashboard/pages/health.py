@@ -48,3 +48,5 @@ def get_health_summary() -> dict[str, Any]:
         "status_ok": data["status"].get("ok", False),
         "metrics_ok": data["metrics"].get("ok", False),
     }
+def build_health_page() -> dict[str, Any]:
+    return load_health_page()
