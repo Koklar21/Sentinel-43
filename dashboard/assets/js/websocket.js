@@ -119,12 +119,13 @@ const WS_CONFIG = Object.freeze({
     // Full channel set matching main.py subscriptions including governance
     // (HUMAN_GATED decision queue) and Fenrir hunting event channels.
     CHANNELS: Object.freeze([
-        "actions",
-        "vault",
-        "governance",
-        "watchtower",
-        "dependencies",
-    ]),
+    "actions",
+    "vault",
+    "governance",
+    "watchtower",
+    "dependencies",
+    "security",
+]),,
 });
 
 /* =============================================================================
