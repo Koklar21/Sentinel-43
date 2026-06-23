@@ -47,3 +47,11 @@ def build_main_layout(
         page_title=page_title,
         page_content=page_content,
     )
+def build_main_layout(
+    page_title: str,
+    page_content: dict[str, Any],
+) -> dict[str, Any]:
+    return main_layout.render(
+        page_title=page_title,
+        page_content=page_content,
+    )
