@@ -73,3 +73,5 @@ def get_remote_operations_summary() -> dict[str, Any]:
         "health_ok": data["health"].get("ok", False),
         "targets_ok": data["targets"].get("ok", False),
     }
+def build_remote_operations_page() -> dict[str, Any]:
+    return load_remote_operations_page()
