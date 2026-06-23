@@ -47,3 +47,5 @@ def get_nodes_summary() -> dict[str, Any]:
         "status_ok": status.get("ok", False),
         "node_count": node_count,
     }
+def build_nodes_page() -> dict[str, Any]:
+    return load_nodes_page()
