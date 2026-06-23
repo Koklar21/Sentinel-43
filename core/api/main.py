@@ -126,7 +126,7 @@ def _env_frozenset(name: str, default: str = "") -> frozenset[str]:
 
 APP_NAME    = "sentinel-43-api"
 APP_VERSION = _env_str("SENTINEL_VERSION", "0.1.0")
-
+None
 SENTINEL_ENV = _env_str("SENTINEL_ENV", "production")
 
 WATCHTOWER_URL               = _env_str("S43_WATCHTOWER_URL", "http://s43-core:9100").rstrip("/")
@@ -920,7 +920,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
     # Origin check — return without accept() so uvicorn sends HTTP 403.
     # Never call close() before accept().
     origin = websocket.headers.get("origin", "")
-    if _ALLOWED_ORIGINS and origin not in _ALLOWED_ORIGINS:
+   if _ALLOWED_ORIGINS and origin and origin not in _ALLOWED_ORIGINS:
         return
 
     if len(_dashboard_ws_clients) >= MAX_WS_CLIENTS:
