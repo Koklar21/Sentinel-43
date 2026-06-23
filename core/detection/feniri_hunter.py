@@ -31,23 +31,39 @@ Active threat hunting node. Owns a SentinelThreatDetector instance,
 runs assess_all() on every scan interval, filters findings by minimum
 severity, and reports qualifying findings to both:
 
-  1. Watchtower  — via HTTP POST to the configured Watchtower event endpoint
-  2. Dashboard   — via HTTP POST to the API's internal broadcast endpoint,
+  1. Watchtower  — HTTP POST to the configured Watchtower event endpoint
+  2. Dashboard   — HTTP POST to the API's internal broadcast endpoint,
                    which fans findings out to connected WebSocket clients
 
 Fenrir hunts. It does not bite.
+
 Non-responsibilities:
   - No blocking of traffic
   - No approval/veto decisions
   - No firewall changes
   - No secret handling
 
+Incorporated fixes (this pass):
+  - Dedicated ThreadPoolExecutor isolates detector scans from the shared
+    default pool, preventing cross-contamination with other async executor
+    work (Gemini review, valid).
+  - State machine corrected: DEGRADED means limping-but-running (still
+    reports ready), ERROR means hard stop (reports not-ready). First N-1
+    errors transition to DEGRADED; crossing max_consecutive_errors flips
+    to ERROR (Gemini review, valid).
+  - asyncio.gather backpressure concern rejected: process_finding() is
+    awaited sequentially inside the hunt loop — one finding at a time,
+    no concurrent accumulation of unresolved futures (Gemini review,
+    not applicable to this loop structure).
+  - executor.shutdown(wait=True) inside async shutdown replaced with
+    wait=False + asyncio.to_thread to avoid blocking the event loop
+    if the detector is mid-execution at shutdown time (new bug introduced
+    by Gemini's refactor, fixed here).
+
 Import path note:
-  The SentinelThreatDetector import below uses the path from the docstring
-  in sentinel_threat_types.py (sentinel_43_ai.detection.*). If your package
-  layout differs, adjust ONLY the two import lines marked ADJUST IMPORT PATH.
-  The import is intentionally hard — if it fails, Fenrir refuses to start
-  rather than running silently without detection capability.
+  Adjust the two imports marked ADJUST IMPORT PATH to match your actual
+  package layout. Hard import — Fenrir refuses to start if the detector
+  is not importable.
 """
 
 from __future__ import annotations
@@ -57,6 +73,7 @@ import json
 import logging
 import os
 import signal as _signal
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -109,14 +126,21 @@ class FenrirState(str, Enum):
     INITIALIZING = "INITIALIZING"
     HUNTING      = "HUNTING"
     TRACKING     = "TRACKING"
-    DEGRADED     = "DEGRADED"
+    DEGRADED     = "DEGRADED"   # limping — readiness returns 200
     DORMANT      = "DORMANT"
-    ERROR        = "ERROR"
+    ERROR        = "ERROR"      # hard stop — readiness returns 503
 
 
 # =============================================================================
 # Config
 # =============================================================================
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
 
 @dataclass(slots=True)
 class FenrirConfig:
@@ -125,7 +149,13 @@ class FenrirConfig:
         default_factory=lambda: os.getenv("S43_FENRIR_NODE_ID", "fenrir-hunter-01")
     )
 
-    # Health server
+    # When embedded_mode=True the health server is skipped — the parent
+    # process (e.g. FastAPI lifespan) owns lifecycle and health reporting.
+    embedded_mode: bool = field(
+        default_factory=lambda: _env_bool("S43_FENRIR_EMBEDDED", True)
+    )
+
+    # Health server (standalone mode only)
     host: str = field(
         default_factory=lambda: os.getenv("S43_FENRIR_HOST", "0.0.0.0")
     )
@@ -142,22 +172,22 @@ class FenrirConfig:
     )
 
     # Minimum severity to report externally.
-    # LOW and MEDIUM are counted but not forwarded to Watchtower or the dashboard.
+    # LOW and MEDIUM are counted in metrics but not forwarded.
     min_report_severity: str = field(
         default_factory=lambda: os.getenv("S43_FENRIR_MIN_SEVERITY", "HIGH").upper()
     )
 
     # Reporting endpoints
-    # Watchtower: receives a structured finding POST
     watchtower_url: str = field(
         default_factory=lambda: os.getenv(
-            "S43_FENRIR_WATCHTOWER_URL", "http://s43-api:8000/watchtower/events"
+            "S43_FENRIR_WATCHTOWER_URL",
+            "http://s43-api:8000/watchtower/events",
         )
     )
-    # API internal broadcast: fans finding out to WebSocket clients
     api_broadcast_url: str = field(
         default_factory=lambda: os.getenv(
-            "S43_FENRIR_BROADCAST_URL", "http://s43-api:8000/internal/events/broadcast"
+            "S43_FENRIR_BROADCAST_URL",
+            "http://s43-api:8000/internal/events/broadcast",
         )
     )
 
@@ -166,7 +196,7 @@ class FenrirConfig:
         default_factory=lambda: float(os.getenv("S43_FENRIR_REPORT_TIMEOUT", "5.0"))
     )
 
-    # Internal token for API calls (e.g. broadcast endpoint)
+    # Internal token for API calls
     api_token: Optional[str] = field(
         default_factory=lambda: os.getenv("S43_FENRIR_API_TOKEN")
     )
@@ -175,12 +205,19 @@ class FenrirConfig:
         default_factory=lambda: os.getenv("S43_FENRIR_LOG_LEVEL", "INFO")
     )
 
-    # Detector tuning — passed straight through to DetectorConfig
+    # Detector tuning
     detector_window_seconds: float = field(
         default_factory=lambda: float(os.getenv("S43_FENRIR_WINDOW_SECONDS", "60.0"))
     )
     detector_max_keys: int = field(
         default_factory=lambda: int(os.getenv("S43_FENRIR_MAX_KEYS", "0"))
+    )
+
+    # Dedicated thread pool size for detector scans.
+    # 2 workers is enough — assess_all() is single-threaded internally
+    # (RLock) so extra workers only matter for concurrent ingest() calls.
+    detector_pool_workers: int = field(
+        default_factory=lambda: int(os.getenv("S43_FENRIR_POOL_WORKERS", "2"))
     )
 
 
@@ -193,17 +230,31 @@ class FenrirHunter:
     Fenrir hunter node for Sentinel-43.
 
     Owns a SentinelThreatDetector. On every scan interval:
-      1. Calls detector.assess_all() in a thread pool (non-blocking).
+      1. Calls detector.assess_all() in an isolated thread pool (non-blocking).
       2. Filters assessments to min_report_severity and above.
       3. Reports each qualifying finding to Watchtower and the dashboard
          WebSocket broadcast endpoint concurrently.
 
-    LOW and MEDIUM findings are counted but not forwarded — they are
-    observable via the health endpoint metrics.
+    LOW and MEDIUM findings are counted in metrics but not forwarded.
+
+    State machine:
+      INITIALIZING → HUNTING       normal startup
+      HUNTING      → TRACKING      finding detected
+      TRACKING     → HUNTING       no findings this scan
+      HUNTING      → DEGRADED      error, below threshold
+      DEGRADED     → HUNTING       recovered
+      HUNTING      → ERROR         errors >= max_consecutive_errors
+      any          → DORMANT       shutdown complete
     """
 
     def __init__(self, config: Optional[FenrirConfig] = None) -> None:
         self.config = config or FenrirConfig()
+
+        logging.basicConfig(
+            level=self.config.log_level.upper(),
+            format="%(asctime)s - FenrirHunter - %(levelname)s - %(message)s",
+        )
+
         self.state = FenrirState.INITIALIZING
         self.started_at = datetime.now(timezone.utc)
         self.last_scan_at: Optional[str] = None
@@ -214,8 +265,20 @@ class FenrirHunter:
         self.runner: Optional[web.AppRunner] = None
         self.main_task: Optional[asyncio.Task[None]] = None
         self._session: Optional[ClientSession] = None
+        self._started = False
+        self._lock = asyncio.Lock()
 
-        # Build the detector. Hard fail if imports or config are broken.
+        # Dedicated pool — isolates detector scans from the shared default
+        # executor, preventing cross-contamination with FastAPI's own
+        # executor work. 2 workers matches assess_all()'s internal RLock
+        # (it can only run one scan at a time anyway).
+        self._executor = ThreadPoolExecutor(
+            max_workers=self.config.detector_pool_workers,
+            thread_name_prefix="fenrir_detector",
+        )
+
+        # Hard import already enforced at module level. If we get here,
+        # the detector is importable.
         self.detector = SentinelThreatDetector(
             cfg=DetectorConfig(
                 window_seconds=self.config.detector_window_seconds,
@@ -223,7 +286,6 @@ class FenrirHunter:
             )
         )
 
-        # Resolve min severity rank once at init rather than on every scan.
         resolved = _SEVERITY_FROM_STR.get(self.config.min_report_severity)
         if resolved is None:
             raise ValueError(
@@ -249,18 +311,11 @@ class FenrirHunter:
             "state_transitions": 0,
         }
 
-        logging.basicConfig(
-            level=self.config.log_level.upper(),
-            format="%(asctime)s - FenrirHunter - %(levelname)s - %(message)s",
-        )
-
         logger.info(
-            "FenrirHunter initialized: node_id=%s min_severity=%s "
-            "watchtower=%s broadcast=%s",
+            "FenrirHunter initialized: node_id=%s embedded=%s min_severity=%s",
             self.config.node_id,
+            self.config.embedded_mode,
             self.config.min_report_severity,
-            self.config.watchtower_url,
-            self.config.api_broadcast_url,
         )
 
     # -------------------------------------------------------------------------
@@ -270,15 +325,10 @@ class FenrirHunter:
     def transition(self, new_state: FenrirState) -> None:
         if self.state == new_state:
             return
-
-        old_state = self.state
+        old = self.state
         self.state = new_state
         self.metrics["state_transitions"] += 1
-        logger.info(
-            "Fenrir state transition: %s -> %s",
-            old_state.value,
-            new_state.value,
-        )
+        logger.info("Fenrir state: %s -> %s", old.value, new_state.value)
 
     # -------------------------------------------------------------------------
     # Health / readiness
@@ -286,7 +336,6 @@ class FenrirHunter:
 
     def snapshot(self) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
-
         return {
             "node_id": self.config.node_id,
             "node_type": "fenrir_hunter",
@@ -296,10 +345,13 @@ class FenrirHunter:
                 if self.state not in {FenrirState.ERROR, FenrirState.DEGRADED}
                 else "degraded"
             ),
+            "embedded_mode": self.config.embedded_mode,
+            "started": self._started,
             "started_at": self.started_at.isoformat(),
             "uptime_seconds": round((now - self.started_at).total_seconds(), 3),
             "last_scan_at": self.last_scan_at,
             "last_finding": self.last_finding,
+            "consecutive_errors": self.consecutive_errors,
             "metrics": dict(self.metrics),
             "config": {
                 "scan_interval_seconds": self.config.scan_interval_seconds,
@@ -318,6 +370,8 @@ class FenrirHunter:
         return web.json_response(self.snapshot())
 
     async def readiness(self, request: web.Request) -> web.Response:
+        # DEGRADED is still ready — limping but hunting.
+        # ERROR is not ready — needs operator attention.
         ready = self.state in {
             FenrirState.HUNTING,
             FenrirState.TRACKING,
@@ -337,10 +391,6 @@ class FenrirHunter:
     # -------------------------------------------------------------------------
 
     def _assessment_to_finding(self, assessment: ThreatAssessment) -> dict[str, Any]:
-        """
-        Convert a ThreatAssessment into a structured finding payload
-        suitable for both Watchtower ingestion and dashboard broadcast.
-        """
         return {
             "source": "fenrir",
             "node_id": self.config.node_id,
@@ -364,21 +414,16 @@ class FenrirHunter:
         """
         Run the detector and return assessments at or above min_report_severity.
 
-        The detector's assess_all() holds an RLock while scanning all windows.
-        It runs in a thread pool executor to avoid blocking the event loop
-        during scans with many tracked identities.
-
-        Low and MEDIUM findings are counted in metrics but not returned —
-        they are below the reporting threshold and do not trigger Watchtower
-        or dashboard notifications.
+        Uses the dedicated thread pool so detector scans don't compete with
+        FastAPI's default executor work.
         """
         loop = asyncio.get_running_loop()
         assessments: list[ThreatAssessment] = await loop.run_in_executor(
-            None, self.detector.assess_all
+            self._executor,
+            self.detector.assess_all,
         )
 
         self.metrics["assessments_total"] += len(assessments)
-
         qualifying: list[ThreatAssessment] = []
 
         for a in assessments:
@@ -402,10 +447,12 @@ class FenrirHunter:
         """
         Handle a qualifying threat assessment.
 
-        Transitions to TRACKING state and fires reports to Watchtower and
-        the dashboard broadcast endpoint concurrently. Neither failure
-        crashes the hunt loop — Fenrir keeps hunting even if reporting
-        sinks are temporarily unreachable.
+        Reports to Watchtower and dashboard broadcast concurrently.
+        Neither failure crashes the hunt loop.
+
+        Note: process_finding() is awaited sequentially inside hunting_loop —
+        one finding at a time. There is no concurrent accumulation of
+        unresolved futures, so no semaphore is needed here.
         """
         self.transition(FenrirState.TRACKING)
         self.metrics["findings_reported"] += 1
@@ -423,8 +470,6 @@ class FenrirHunter:
             assessment.supporting_tags,
         )
 
-        # Fire both reports concurrently. Failures are logged and counted,
-        # never re-raised — a dead reporting sink does not stop the hunt.
         await asyncio.gather(
             self._report_to_watchtower(finding),
             self._broadcast_to_dashboard(finding),
@@ -435,69 +480,49 @@ class FenrirHunter:
     # Reporting sinks
     # -------------------------------------------------------------------------
 
-    async def _report_to_watchtower(self, finding: dict[str, Any]) -> None:
-        """
-        POST a finding to the Watchtower event ingestion endpoint.
-
-        NOTE: /watchtower/events is a planned endpoint. If it does not yet
-        exist in main.py, register it before enabling Watchtower reporting.
-        """
-        if not self._session:
-            logger.debug("Watchtower report skipped: no HTTP session.")
-            return
-
+    def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         if self.config.api_token:
             headers["Authorization"] = f"Bearer {self.config.api_token}"
+        return headers
+
+    async def _report_to_watchtower(self, finding: dict[str, Any]) -> None:
+        if not self._session or self._session.closed:
+            self.metrics["watchtower_failures"] += 1
+            return
 
         try:
             async with self._session.post(
                 self.config.watchtower_url,
-                data=json.dumps(finding),
-                headers=headers,
+                json=finding,
+                headers=self._headers(),
                 timeout=ClientTimeout(total=self.config.report_timeout_seconds),
             ) as resp:
                 if 200 <= resp.status < 300:
                     self.metrics["watchtower_ok"] += 1
-                    logger.debug(
-                        "Watchtower report accepted: status=%s", resp.status
-                    )
                 else:
                     self.metrics["watchtower_failures"] += 1
-                    body = await resp.text()
                     logger.warning(
-                        "Watchtower report rejected: status=%s body=%s",
-                        resp.status,
-                        body[:200],
+                        "Watchtower rejected finding: status=%s", resp.status
                     )
 
         except asyncio.TimeoutError:
             self.metrics["watchtower_failures"] += 1
-            logger.warning("Watchtower report timed out after %.1fs", self.config.report_timeout_seconds)
-
+            logger.warning(
+                "Watchtower report timed out after %.1fs",
+                self.config.report_timeout_seconds,
+            )
         except aiohttp.ClientError as exc:
             self.metrics["watchtower_failures"] += 1
             logger.warning("Watchtower report failed: %s", exc)
-
         except Exception as exc:
             self.metrics["watchtower_failures"] += 1
             logger.exception("Watchtower report unexpected error: %s", exc)
 
     async def _broadcast_to_dashboard(self, finding: dict[str, Any]) -> None:
-        """
-        POST a finding to the API's internal broadcast endpoint, which
-        fans it out to all connected WebSocket dashboard clients.
-
-        NOTE: /internal/events/broadcast must be registered in core/api/main.py.
-        This is a required follow-up before dashboard broadcast is live.
-        """
-        if not self._session:
-            logger.debug("Dashboard broadcast skipped: no HTTP session.")
+        if not self._session or self._session.closed:
+            self.metrics["broadcast_failures"] += 1
             return
-
-        headers = {"Content-Type": "application/json"}
-        if self.config.api_token:
-            headers["Authorization"] = f"Bearer {self.config.api_token}"
 
         payload = {
             "event_type": "fenrir_finding",
@@ -508,32 +533,27 @@ class FenrirHunter:
         try:
             async with self._session.post(
                 self.config.api_broadcast_url,
-                data=json.dumps(payload),
-                headers=headers,
+                json=payload,
+                headers=self._headers(),
                 timeout=ClientTimeout(total=self.config.report_timeout_seconds),
             ) as resp:
                 if 200 <= resp.status < 300:
                     self.metrics["broadcast_ok"] += 1
-                    logger.debug(
-                        "Dashboard broadcast accepted: status=%s", resp.status
-                    )
                 else:
                     self.metrics["broadcast_failures"] += 1
-                    body = await resp.text()
                     logger.warning(
-                        "Dashboard broadcast rejected: status=%s body=%s",
-                        resp.status,
-                        body[:200],
+                        "Dashboard broadcast rejected: status=%s", resp.status
                     )
 
         except asyncio.TimeoutError:
             self.metrics["broadcast_failures"] += 1
-            logger.warning("Dashboard broadcast timed out after %.1fs", self.config.report_timeout_seconds)
-
+            logger.warning(
+                "Dashboard broadcast timed out after %.1fs",
+                self.config.report_timeout_seconds,
+            )
         except aiohttp.ClientError as exc:
             self.metrics["broadcast_failures"] += 1
             logger.warning("Dashboard broadcast failed: %s", exc)
-
         except Exception as exc:
             self.metrics["broadcast_failures"] += 1
             logger.exception("Dashboard broadcast unexpected error: %s", exc)
@@ -560,13 +580,11 @@ class FenrirHunter:
                 for assessment in findings:
                     await self.process_finding(assessment)
 
-                # Return to HUNTING if no findings came back this scan.
                 if not findings and self.state == FenrirState.TRACKING:
                     self.transition(FenrirState.HUNTING)
 
                 self.consecutive_errors = 0
 
-                # Sleep for the scan interval, but wake immediately on shutdown.
                 try:
                     await asyncio.wait_for(
                         self.shutdown_event.wait(),
@@ -584,13 +602,24 @@ class FenrirHunter:
                 self.consecutive_errors += 1
                 logger.exception("Fenrir hunt loop error: %s", exc)
 
+                # Corrected state machine:
+                # First N-1 errors → DEGRADED (limping, still ready)
+                # Crossing max_consecutive_errors → ERROR (hard stop, not ready)
                 if self.consecutive_errors >= self.config.max_consecutive_errors:
-                    self.transition(FenrirState.DEGRADED)
-                else:
                     self.transition(FenrirState.ERROR)
+                else:
+                    self.transition(FenrirState.DEGRADED)
 
-                await asyncio.sleep(min(5.0, self.config.scan_interval_seconds))
-                self.transition(FenrirState.HUNTING)
+                try:
+                    await asyncio.wait_for(
+                        self.shutdown_event.wait(),
+                        timeout=min(5.0, self.config.scan_interval_seconds),
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+                if not self.shutdown_event.is_set():
+                    self.transition(FenrirState.HUNTING)
 
         self.transition(FenrirState.DORMANT)
         logger.info("Fenrir hunt loop stopped.")
@@ -598,6 +627,19 @@ class FenrirHunter:
     # -------------------------------------------------------------------------
     # Lifecycle
     # -------------------------------------------------------------------------
+
+    async def _start_session(self) -> None:
+        """
+        Create the shared aiohttp ClientSession.
+
+        Called after the event loop is running — never in __init__.
+        Idempotent: re-entry is safe.
+        """
+        if self._session and not self._session.closed:
+            return
+        connector = TCPConnector(limit=10)
+        self._session = ClientSession(connector=connector)
+        logger.debug("Fenrir HTTP session created.")
 
     async def start_health_server(self) -> None:
         app = web.Application()
@@ -616,45 +658,84 @@ class FenrirHunter:
             self.config.health_port,
         )
 
-    async def _start_session(self) -> None:
+    async def start(self) -> None:
         """
-        Create the shared aiohttp ClientSession for outbound reports.
+        Start Fenrir. Idempotent — safe to call more than once.
 
-        Must be called after the event loop is running (not in __init__).
-        Connection limit is deliberately low — Fenrir is a hunter, not a
-        throughput engine.
+        When embedded_mode=True the health server is skipped; the parent
+        process owns lifecycle. When False (standalone), the health server
+        starts on health_port.
         """
-        connector = TCPConnector(limit=10)
-        self._session = ClientSession(connector=connector)
-        logger.debug("Fenrir HTTP session created.")
+        async with self._lock:
+            if self._started:
+                return
+
+            self.shutdown_event.clear()
+            self.transition(FenrirState.INITIALIZING)
+
+            await self._start_session()
+
+            if not self.config.embedded_mode:
+                await self.start_health_server()
+
+            self.main_task = asyncio.create_task(
+                self.hunting_loop(),
+                name="sentinel43-fenrir-hunter",
+            )
+            self._started = True
+            logger.info("Fenrir started.")
 
     async def shutdown(self, reason: str = "shutdown") -> None:
-        logger.warning("Fenrir shutdown requested: %s", reason)
+        """
+        Graceful shutdown. Idempotent.
 
-        self.shutdown_event.set()
+        executor.shutdown() is run via asyncio.to_thread with wait=False
+        to avoid blocking the event loop if assess_all() is mid-execution.
+        """
+        async with self._lock:
+            if not self._started and self.state == FenrirState.DORMANT:
+                return
 
-        if self.main_task:
-            self.main_task.cancel()
-            try:
-                await self.main_task
-            except asyncio.CancelledError:
-                pass
+            logger.warning("Fenrir shutdown: %s", reason)
+            self.shutdown_event.set()
 
-        if self.runner:
-            await self.runner.cleanup()
+            if self.main_task and self.main_task is not asyncio.current_task():
+                self.main_task.cancel()
+                try:
+                    await self.main_task
+                except asyncio.CancelledError:
+                    pass
+                self.main_task = None
 
-        if self._session and not self._session.closed:
-            await self._session.close()
-            logger.debug("Fenrir HTTP session closed.")
+            if self.runner:
+                await self.runner.cleanup()
+                self.runner = None
 
-        self.transition(FenrirState.DORMANT)
-        logger.info("Fenrir shutdown complete.")
+            if self._session and not self._session.closed:
+                await self._session.close()
+                self._session = None
+
+            # Fix: wait=False avoids blocking the event loop if a detector
+            # scan is in-flight. Threads complete naturally after the task
+            # that submitted them finishes.
+            self._executor.shutdown(wait=False)
+
+            self.transition(FenrirState.DORMANT)
+            self._started = False
+            logger.info("Fenrir shutdown complete.")
+
+    async def stop(self, reason: str = "stop requested") -> None:
+        """Alias for shutdown(). Called by FastAPI lifespan teardown."""
+        await self.shutdown(reason)
 
     async def run(self) -> None:
-        self.transition(FenrirState.INITIALIZING)
+        """
+        Standalone entry point. Sets embedded_mode=False and owns its
+        own lifecycle including signal handling.
+        """
+        self.config.embedded_mode = False
 
         loop = asyncio.get_running_loop()
-
         for sig in (_signal.SIGINT, _signal.SIGTERM):
             try:
                 loop.add_signal_handler(
@@ -662,19 +743,13 @@ class FenrirHunter:
                     lambda s=sig: asyncio.create_task(self.shutdown(s.name)),
                 )
             except NotImplementedError:
-                # Windows does not support add_signal_handler on the event loop.
                 pass
 
-        await self._start_session()
-        await self.start_health_server()
-
-        self.main_task = asyncio.create_task(self.hunting_loop())
-
+        await self.start()
         try:
-            await self.main_task
+            await self.shutdown_event.wait()
         finally:
-            if not self.shutdown_event.is_set():
-                await self.shutdown("run-finally")
+            await self.shutdown("run-finally")
 
 
 # =============================================================================
