@@ -44,3 +44,5 @@ def get_settings_summary() -> dict[str, Any]:
         "settings_loaded": True,
         "settings_count": len(data.get("settings", {})),
     }
+def build_settings_page() -> dict[str, Any]:
+    return load_settings_page()
