@@ -166,28 +166,22 @@ class _IdentityBaseline:
     """
     Score history for one (identity, ip) pair.
 
-    Tracks a Welford stream for z-score detection and a cumulative
-    threat pressure total with exponential time-decay.
+    Pure data container. All update logic lives in FenrirAnomalyLayer.update()
+    so that z-score and pressure checks are calculated against the EXISTING
+    baseline before the new score contaminates it.
     """
 
     stream:    _WelfordStream = field(default_factory=_WelfordStream)
     pressure:  float          = 0.0
     last_seen: float          = field(default_factory=time.time)
 
-    def update(self, score: float, *, now: float, decay_rate: float) -> None:
-        elapsed       = max(0.0, now - self.last_seen)
-        self.pressure *= math.exp(-decay_rate * elapsed)
-        self.pressure += score
-        self.stream.update(score)
-        self.last_seen = now
-
 
 class FenrirAnomalyLayer:
     """
     Per-identity statistical baseline tracking using Welford's algorithm.
 
-    Thread-safe — runs in the dedicated ThreadPoolExecutor alongside
-    SentinelThreatDetector.assess_all().
+    Thread-safe. Called from the dedicated detection executor after
+    assess_all() returns, inside the same _run_detection() call.
 
     Two signals:
       1. Z-score: single score deviates from identity's historical baseline.
@@ -225,7 +219,14 @@ class FenrirAnomalyLayer:
         }
 
     def update(self, assessment: ThreatAssessment) -> Optional[dict[str, Any]]:
-        """Update baseline and return anomaly dict if either signal fires."""
+        """
+        Update the baseline for this identity/IP and check for anomalies.
+
+        Critical ordering: z-score and pressure are calculated against the
+        EXISTING baseline BEFORE the new score is incorporated. Updating
+        first would let a suspicious score blend into its own mean, reducing
+        its anomaly signal. "Let the criminal vote on whether crime happened."
+        """
         key   = (assessment.identity, assessment.source_ip)
         now   = time.time()
         score = assessment.score
@@ -244,30 +245,49 @@ class FenrirAnomalyLayer:
             else:
                 self._baselines.move_to_end(key)
 
-            baseline.update(score, now=now, decay_rate=self.decay_rate)
+            # --- Step 1: read existing state BEFORE touching the baseline ---
+            previous_count = baseline.stream.count
+            prev_mean      = baseline.stream.mean
+            prev_std       = baseline.stream.std
 
-            if baseline.stream.count < self.min_observations:
+            # z-score against existing history (not yet contaminated)
+            z = baseline.stream.zscore(score)
+
+            # Decay pressure and project what it will be after adding this score
+            elapsed            = max(0.0, now - baseline.last_seen)
+            decayed_pressure   = baseline.pressure * math.exp(-self.decay_rate * elapsed)
+            projected_pressure = decayed_pressure + score
+
+            # --- Step 2: commit the update ---
+            baseline.stream.update(score)
+            baseline.pressure  = projected_pressure
+            baseline.last_seen = now
+
+            # --- Step 3: evaluate signals using pre-update state ---
+            # Use previous_count so we require min_observations PRIOR to this
+            # score — the observation we're currently judging doesn't count
+            # toward its own baseline qualification.
+            if previous_count < self.min_observations:
                 return None
 
             anomaly: dict[str, Any] = {}
 
-            z = baseline.stream.zscore(score)
             if z >= self.zscore_threshold:
                 self._stats["zscore_fires"] += 1
                 anomaly["zscore"]           = round(z, 3)
                 anomaly["zscore_threshold"] = self.zscore_threshold
-                anomaly["baseline_mean"]    = round(baseline.stream.mean, 3)
-                anomaly["baseline_std"]     = round(baseline.stream.std, 3)
+                anomaly["baseline_mean"]    = round(prev_mean, 3)
+                anomaly["baseline_std"]     = round(prev_std, 3)
 
-            if baseline.pressure >= self.pressure_threshold:
+            if projected_pressure >= self.pressure_threshold:
                 self._stats["pressure_fires"] += 1
-                anomaly["cumulative_pressure"] = round(baseline.pressure, 3)
+                anomaly["cumulative_pressure"] = round(projected_pressure, 3)
                 anomaly["pressure_threshold"]  = self.pressure_threshold
 
             if not anomaly:
                 return None
 
-            anomaly["observations"] = baseline.stream.count
+            anomaly["observations"] = previous_count
             return anomaly
 
     def prune(self) -> int:
@@ -615,7 +635,11 @@ class FenrirHunter:
         for a in assessments:
             result = self.anomaly_layer.update(a)
             if result is not None:
-                anomaly_map[(a.identity, a.source_ip)] = result
+                # Include threat_kind and source_kind in the key so multiple
+                # assessments for the same identity/IP don't overwrite each other.
+                anomaly_map[
+                    (a.identity, a.source_ip, a.threat_kind.value, a.source_kind.value)
+                ] = result
         return assessments, anomaly_map
 
     async def observe_signals(self) -> list[dict[str, Any]]:
@@ -635,7 +659,9 @@ class FenrirHunter:
 
         for a in assessments:
             rank    = _SEVERITY_RANK.get(a.severity, 0)
-            anomaly = anomaly_map.get((a.identity, a.source_ip))
+            anomaly = anomaly_map.get(
+                (a.identity, a.source_ip, a.threat_kind.value, a.source_kind.value)
+            )
 
             if a.severity == ThreatSeverity.LOW:
                 self.metrics["findings_low"] += 1
