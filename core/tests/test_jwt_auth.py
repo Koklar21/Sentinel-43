@@ -221,9 +221,6 @@ class TestVerifyJwtToken:
         algorithm list from server config — it does not read alg from
         the token.
         """
-        # PyJWT refuses to encode with "none" unless options are overridden,
-        # which mirrors the fact that a real attacker would need to forge
-        # the header by hand. We build the token manually to simulate that.
         import base64
         import json
 
@@ -240,7 +237,6 @@ class TestVerifyJwtToken:
             raw = json.dumps(data).encode()
             return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
-        # alg=none tokens have an empty signature segment.
         forged_token = f"{b64url(header)}.{b64url(payload)}."
 
         with pytest.raises(pyjwt.PyJWTError):
@@ -527,6 +523,7 @@ class TestBootstrapExpectations:
         monkeypatch.setenv("S43_JWT_AUDIENCE",  TEST_AUDIENCE)
         monkeypatch.setenv("S43_WS_REQUIRE_AUTH", "true")
         monkeypatch.setenv("S43_ENABLE_TEST_INJECTION", "false")
+        monkeypatch.setenv("S43_AUTH_PEPPER", "a" * 64)  # FIX: pepper required in production
 
         from core.bootstrap import bootstrap_expectations
         bootstrap_expectations()  # must not raise
