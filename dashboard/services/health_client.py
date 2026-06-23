@@ -12,7 +12,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from dashboard.services.api_client import ApiClient, ApiResponse
+from dashboard.services.api_client import ApiClient, ApiResponse, api_client
 
 
 CRITICAL_KEYS = frozenset({"health", "ready"})
@@ -85,23 +85,35 @@ def _get_with_retry(
     return last_result or _error("request failed")
 
 
-def get_api_health(client: ApiClient) -> dict[str, Any]:
+def get_api_health(client: ApiClient | None = None) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     return _get_with_retry(client, "/health")
 
 
-def get_api_ready(client: ApiClient) -> dict[str, Any]:
+def get_api_ready(client: ApiClient | None = None) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     return _get_with_retry(client, "/ready")
 
 
-def get_api_status(client: ApiClient) -> dict[str, Any]:
+def get_api_status(client: ApiClient | None = None) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     return client.get("/status").to_dict()
 
 
 def get_api_metrics(
-    client: ApiClient,
+    client: ApiClient | None = None,
     *,
     include_sensitive: bool = False,
 ) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     result = client.get("/metrics").to_dict()
 
     if include_sensitive or not result.get("ok", False):
@@ -129,11 +141,14 @@ def get_api_metrics(
 
 
 def get_system_routes(
-    client: ApiClient,
+    client: ApiClient | None = None,
     *,
     limit: int = DEFAULT_ROUTE_LIMIT,
     offset: int = 0,
 ) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     try:
         safe_limit, safe_offset = _validate_limit_offset(
             limit=limit,
@@ -150,12 +165,15 @@ def get_system_routes(
     return client.get(f"/system/routes?{query}").to_dict()
 
 
-def get_routes_status(client: ApiClient) -> dict[str, Any]:
+def get_routes_status(client: ApiClient | None = None) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     return client.get("/system/routes/status").to_dict()
 
 
 def get_health_snapshot(
-    client: ApiClient,
+    client: ApiClient | None = None,
     *,
     include_sensitive_metrics: bool = False,
     route_limit: int = DEFAULT_ROUTE_LIMIT,
@@ -168,6 +186,8 @@ def get_health_snapshot(
     moment in time because the underlying API endpoints are queried separately.
     Yes, time remains rude.
     """
+    if client is None:
+        client = api_client
 
     def call_endpoint(key: str, path: str) -> dict[str, Any]:
         if key == "health":
