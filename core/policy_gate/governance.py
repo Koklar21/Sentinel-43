@@ -204,10 +204,23 @@ DEFAULT_GOVERNANCE = GovernanceRules(
                 ACTION_NETWORK_BLOCK,
             }
         ),
+        # FIX: AUTONOMOUS_VETO must include human_required actions so the
+        # policy gate can reach the autonomous veto logic and apply the
+        # correct tag. Previously only READ and WRITE were listed, causing
+        # DELETE and other high-risk actions to short-circuit at
+        # not_allowed_in_mode before the veto logic could fire.
+        # Design intent: AUTONOMOUS_VETO recognizes all actions, then
+        # automatically blocks human_required ones without operator input.
         MODE_AUTONOMOUS_VETO: frozenset(
             {
                 ACTION_READ,
                 ACTION_WRITE,
+                ACTION_EXECUTE,
+                ACTION_DELETE,
+                ACTION_QUARANTINE,
+                ACTION_ISOLATE,
+                ACTION_SHUTDOWN,
+                ACTION_NETWORK_BLOCK,
             }
         ),
     },
