@@ -61,3 +61,5 @@ class Sidebar:
 
 
 sidebar = Sidebar()
+def build_sidebar() -> Sidebar:
+    return Sidebar()
