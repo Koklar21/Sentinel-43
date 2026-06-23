@@ -1,418 +1,177 @@
 """
 Sentinel-43 Dashboard Service
-API Client
+Audit Client
 
-Shared HTTP client helpers for dashboard service modules.
+Provides dashboard access to audit-related API endpoints.
 """
 
 from __future__ import annotations
 
-import json
-import os
-import socket
-import urllib.error
+import re
 import urllib.parse
-import urllib.request
-from dataclasses import dataclass
 from typing import Any
 
-
-LOCAL_DEV_ALLOWED_HTTP_HOSTS = frozenset({
-    "localhost",
-    "127.0.0.1",
-    "s43-api",
-    "sentinel-api",
-})
-
-ALLOWED_METHODS = frozenset({
-    "GET",
-    "POST",
-    "PUT",
-    "PATCH",
-    "DELETE",
-    "HEAD",
-})
-
-PROTECTED_HEADERS = frozenset({
-    "accept",
-    "authorization",
-    "content-type",
-})
-
-SAFE_RESPONSE_HEADERS = frozenset({
-    "x-request-id",
-    "x-correlation-id",
-    "retry-after",
-})
-
-MAX_PAYLOAD_BYTES = 1 * 1024 * 1024
+from dashboard.services.api_client import ApiClient, ApiResponse, api_client
 
 
-@dataclass(frozen=True, slots=True)
-class ApiResponse:
-    ok: bool
-    status_code: int | None
-    data: Any = None
-    error: str | None = None
-    headers: dict[str, str] | None = None
-    is_json: bool = True
+AUDIT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "ok": self.ok,
-            "status_code": self.status_code,
-            "data": self.data,
-            "error": self.error,
-            "headers": dict(self.headers or {}),
-            "is_json": self.is_json,
-        }
+DEFAULT_LIMIT = 100
+MAX_LIMIT = 500
 
 
-def _parse_timeout(raw: str | None, default: float = 5.0) -> float:
-    if raw is None:
-        return default
+def _error(message: str) -> dict[str, Any]:
+    return ApiResponse(
+        ok=False,
+        status_code=None,
+        data=None,
+        error=message,
+        headers={},
+        is_json=True,
+    ).to_dict()
+
+
+def _validate_audit_id(audit_id: Any) -> str | None:
+    if not isinstance(audit_id, str):
+        return None
+
+    cleaned = audit_id.strip()
+
+    if not cleaned:
+        return None
+
+    if not AUDIT_ID_RE.fullmatch(cleaned):
+        return None
+
+    return cleaned
+
+
+def _validate_pagination(*, limit: int, offset: int) -> tuple[int, int]:
+    if not isinstance(limit, int):
+        raise ValueError("limit must be an integer")
+
+    if not isinstance(offset, int):
+        raise ValueError("offset must be an integer")
+
+    if limit <= 0:
+        raise ValueError("limit must be greater than 0")
+
+    if limit > MAX_LIMIT:
+        raise ValueError(f"limit must not exceed {MAX_LIMIT}")
+
+    if offset < 0:
+        raise ValueError("offset must not be negative")
+
+    return limit, offset
+
+
+def get_audit_records(
+    client: ApiClient | None = None,
+    *,
+    limit: int = DEFAULT_LIMIT,
+    offset: int = 0,
+) -> dict[str, Any]:
+    if client is None:
+        client = api_client
 
     try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return default
-
-    if value <= 0:
-        return default
-
-    return value
-
-
-def _default_base_url() -> str:
-    raw = os.getenv("SENTINEL_DASHBOARD_API_URL", "").strip()
-
-    if not raw:
-        return "http://localhost:8000"
-
-    return raw
-
-
-class ApiClient:
-    """
-    Lightweight dashboard API client.
-
-    Uses urllib from the Python standard library.
-    No requests/httpx dependency needed. Humanity endures.
-    """
-
-    def __init__(
-        self,
-        *,
-        base_url: str | None = None,
-        timeout_seconds: float | None = None,
-        token: str | None = None,
-        allow_insecure_local_http: bool = True,
-    ) -> None:
-        self.base_url = self._validate_base_url(
-            base_url or _default_base_url(),
-            allow_insecure_local_http=allow_insecure_local_http,
+        safe_limit, safe_offset = _validate_pagination(
+            limit=limit,
+            offset=offset,
         )
-        self.timeout_seconds = self._validate_timeout(
-            timeout_seconds
-            if timeout_seconds is not None
-            else _parse_timeout(os.getenv("SENTINEL_DASHBOARD_API_TIMEOUT"))
+    except ValueError as exc:
+        return _error(str(exc))
+
+    query = urllib.parse.urlencode({
+        "limit": safe_limit,
+        "offset": safe_offset,
+    })
+
+    return client.get(f"/audit?{query}").to_dict()
+
+
+def get_audit_status(client: ApiClient | None = None) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
+    return client.get("/audit/status").to_dict()
+
+
+def get_audit_record(
+    audit_id: Any,
+    client: ApiClient | None = None,
+) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
+    cleaned = _validate_audit_id(audit_id)
+
+    if cleaned is None:
+        return _error(
+            "audit_id must be 1-64 alphanumeric, dash, or underscore characters"
         )
-        self.token = token or os.getenv("SENTINEL_DASHBOARD_API_TOKEN")
 
-    def get(self, path: str) -> ApiResponse:
-        return self.request("GET", path)
+    return client.get(f"/audit/{cleaned}").to_dict()
 
-    def post(
-        self,
-        path: str,
-        payload: dict[str, Any] | None = None,
-    ) -> ApiResponse:
-        return self.request("POST", path, payload=payload)
 
-    def put(
-        self,
-        path: str,
-        payload: dict[str, Any] | None = None,
-    ) -> ApiResponse:
-        return self.request("PUT", path, payload=payload)
+def get_audit_snapshot(
+    client: ApiClient | None = None,
+    *,
+    limit: int = DEFAULT_LIMIT,
+    offset: int = 0,
+) -> dict[str, Any]:
+    if client is None:
+        client = api_client
 
-    def patch(
-        self,
-        path: str,
-        payload: dict[str, Any] | None = None,
-    ) -> ApiResponse:
-        return self.request("PATCH", path, payload=payload)
+    records = get_audit_records(
+        client,
+        limit=limit,
+        offset=offset,
+    )
+    status = get_audit_status(client)
 
-    def delete(self, path: str) -> ApiResponse:
-        return self.request("DELETE", path)
+    errors = [
+        result.get("error")
+        for result in (records, status)
+        if not result.get("ok", False) and result.get("error")
+    ]
 
-    def request(
-        self,
-        method: str,
-        path: str,
-        *,
-        payload: dict[str, Any] | None = None,
-        extra_headers: dict[str, str] | None = None,
-    ) -> ApiResponse:
-        try:
-            normalized_method = self._validate_method(method)
-            url = self._build_url(path)
-            headers = self._build_headers(extra_headers)
-            body = self._encode_payload(payload)
+    ok = records.get("ok", False) and status.get("ok", False)
 
-            request = urllib.request.Request(
-                url=url,
-                data=body,
-                headers=headers,
-                method=normalized_method,
-            )
+    return ApiResponse(
+        ok=ok,
+        status_code=200 if ok else None,
+        data={
+            "records": records.get("data"),
+            "status": status.get("data"),
+            "raw": {
+                "records": records,
+                "status": status,
+            },
+            "non_atomic": True,
+        },
+        error="; ".join(errors) if errors else None,
+        headers={},
+        is_json=True,
+    ).to_dict()
 
-            with urllib.request.urlopen(
-                request,
-                timeout=self.timeout_seconds,
-            ) as response:
-                raw = response.read().decode("utf-8")
-                data, is_json = self._parse_response_body(raw)
 
-                return ApiResponse(
-                    ok=200 <= response.status < 300,
-                    status_code=response.status,
-                    data=data,
-                    error=None if is_json else "API returned non-JSON response.",
-                    headers=self._safe_headers(dict(response.headers.items())),
-                    is_json=is_json,
-                )
+def fetch_audit_logs(
+    client: ApiClient | None = None,
+    *,
+    limit: int = DEFAULT_LIMIT,
+    offset: int = 0,
+) -> dict[str, Any]:
+    return get_audit_records(client, limit=limit, offset=offset)
 
-        except urllib.error.HTTPError as exc:
-            raw_error = self._safe_read_error(exc)
-            parsed_error, is_json = self._parse_response_body(raw_error)
-            fallback = f"HTTP error {exc.code}"
 
-            return ApiResponse(
-                ok=False,
-                status_code=exc.code,
-                data=parsed_error if is_json else None,
-                error=self._extract_error_message(
-                    parsed_error,
-                    fallback=fallback,
-                ),
-                headers=self._safe_headers(
-                    dict(exc.headers.items()) if exc.headers else {}
-                ),
-                is_json=is_json,
-            )
+def normalize_audit_logs(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    data = raw.get("data")
 
-        except socket.timeout:
-            return ApiResponse(
-                ok=False,
-                status_code=None,
-                data=None,
-                error="API request timed out.",
-                headers={},
-                is_json=True,
-            )
+    if isinstance(data, list):
+        return data
 
-        except urllib.error.URLError as exc:
-            reason = exc.reason.__class__.__name__
+    if isinstance(data, dict):
+        return data.get("records") or []
 
-            return ApiResponse(
-                ok=False,
-                status_code=None,
-                data=None,
-                error=f"API unreachable: {reason}",
-                headers={},
-                is_json=True,
-            )
-
-        except ValueError as exc:
-            return ApiResponse(
-                ok=False,
-                status_code=None,
-                data=None,
-                error=str(exc),
-                headers={},
-                is_json=True,
-            )
-
-        except Exception as exc:
-            return ApiResponse(
-                ok=False,
-                status_code=None,
-                data=None,
-                error=f"API request failed: {exc.__class__.__name__}",
-                headers={},
-                is_json=True,
-            )
-
-    def _build_url(self, path: str) -> str:
-        if not isinstance(path, str) or not path.strip():
-            raise ValueError("path must be a non-empty relative path")
-
-        cleaned_path = path.strip()
-
-        if cleaned_path.startswith(("http://", "https://")):
-            raise ValueError("absolute URLs are not permitted in path")
-
-        if "\r" in cleaned_path or "\n" in cleaned_path:
-            raise ValueError("path must not contain CRLF characters")
-
-        if not cleaned_path.startswith("/"):
-            cleaned_path = f"/{cleaned_path}"
-
-        return f"{self.base_url}{cleaned_path}"
-
-    def _build_headers(
-        self,
-        extra_headers: dict[str, str] | None,
-    ) -> dict[str, str]:
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }
-
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-
-        if not extra_headers:
-            return headers
-
-        for key, value in extra_headers.items():
-            if not isinstance(key, str) or not isinstance(value, str):
-                raise ValueError("extra_headers must contain string keys and values")
-
-            normalized_key = key.lower().strip()
-
-            if normalized_key in PROTECTED_HEADERS:
-                raise ValueError(f"Cannot override protected header: {key!r}")
-
-            if any(char in key for char in ("\r", "\n")):
-                raise ValueError(f"Header name contains CRLF: {key!r}")
-
-            if any(char in value for char in ("\r", "\n")):
-                raise ValueError(f"Header value contains CRLF for: {key!r}")
-
-            headers[key.strip()] = value.strip()
-
-        return headers
-
-    @staticmethod
-    def _encode_payload(payload: dict[str, Any] | None) -> bytes | None:
-        if payload is None:
-            return None
-
-        if not isinstance(payload, dict):
-            raise ValueError("payload must be a dictionary")
-
-        try:
-            body = json.dumps(
-                payload,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            ).encode("utf-8")
-        except (TypeError, ValueError) as exc:
-            raise ValueError("payload must be JSON serializable") from exc
-
-        if len(body) > MAX_PAYLOAD_BYTES:
-            raise ValueError(
-                f"Request payload too large: {len(body)} bytes"
-            )
-
-        return body
-
-    @staticmethod
-    def _validate_method(method: str) -> str:
-        if not isinstance(method, str):
-            raise ValueError("method must be a string")
-
-        normalized = method.upper().strip()
-
-        if normalized not in ALLOWED_METHODS:
-            raise ValueError(f"Disallowed HTTP method: {method!r}")
-
-        return normalized
-
-    @staticmethod
-    def _validate_timeout(timeout_seconds: float) -> float:
-        try:
-            value = float(timeout_seconds)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("timeout_seconds must be a positive number") from exc
-
-        if value <= 0:
-            raise ValueError("timeout_seconds must be greater than 0")
-
-        return value
-
-    @staticmethod
-    def _validate_base_url(
-        base_url: str,
-        *,
-        allow_insecure_local_http: bool,
-    ) -> str:
-        if not isinstance(base_url, str) or not base_url.strip():
-            raise ValueError("base_url must be a non-empty string")
-
-        cleaned = base_url.strip().rstrip("/")
-
-        if "\r" in cleaned or "\n" in cleaned:
-            raise ValueError("base_url must not contain CRLF characters")
-
-        parsed = urllib.parse.urlparse(cleaned)
-
-        if parsed.scheme not in {"http", "https"}:
-            raise ValueError("base_url must use http or https")
-
-        if not parsed.netloc:
-            raise ValueError("base_url must include a host")
-
-        if parsed.scheme == "http":
-            host = parsed.hostname or ""
-
-            if not allow_insecure_local_http or host not in LOCAL_DEV_ALLOWED_HTTP_HOSTS:
-                raise ValueError(
-                    "insecure HTTP base_url is only allowed for local development hosts"
-                )
-
-        return cleaned
-
-    @staticmethod
-    def _parse_response_body(raw: str) -> tuple[Any, bool]:
-        if not raw:
-            return None, True
-
-        try:
-            return json.loads(raw), True
-        except json.JSONDecodeError:
-            return None, False
-
-    @staticmethod
-    def _safe_read_error(exc: urllib.error.HTTPError) -> str:
-        try:
-            return exc.read().decode("utf-8")
-        except (OSError, UnicodeDecodeError):
-            return ""
-
-    @staticmethod
-    def _safe_headers(headers: dict[str, str]) -> dict[str, str]:
-        safe: dict[str, str] = {}
-
-        for key, value in headers.items():
-            normalized = key.lower()
-
-            if normalized in SAFE_RESPONSE_HEADERS:
-                safe[key] = value
-
-        return safe
-
-    @staticmethod
-    def _extract_error_message(parsed: Any, *, fallback: str) -> str:
-        if isinstance(parsed, dict):
-            for key in ("detail", "error", "message"):
-                value = parsed.get(key)
-
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-
-        return fallback
-api_client = ApiClient()
+    return []
