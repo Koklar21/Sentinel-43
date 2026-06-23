@@ -12,7 +12,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from dashboard.services.api_client import ApiClient, ApiResponse
+from dashboard.services.api_client import ApiClient, ApiResponse, api_client
 
 
 LIVENESS_KEYS = frozenset({"health", "status"})
@@ -109,20 +109,29 @@ def _get_with_retry(
     return last_result or _error("request failed")
 
 
-def get_watchtower_health(client: ApiClient) -> dict[str, Any]:
+def get_watchtower_health(client: ApiClient | None = None) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     return _get_with_retry(client, "/watchtower/health")
 
 
-def get_watchtower_status(client: ApiClient) -> dict[str, Any]:
+def get_watchtower_status(client: ApiClient | None = None) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     return _get_with_retry(client, "/watchtower/status")
 
 
 def get_watchtower_nodes(
-    client: ApiClient,
+    client: ApiClient | None = None,
     *,
     limit: int = DEFAULT_LIMIT,
     status: str | None = None,
 ) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     try:
         safe_limit = _validate_limit(limit)
         safe_status = _validate_optional_enum(
@@ -144,12 +153,15 @@ def get_watchtower_nodes(
 
 
 def get_watchtower_alerts(
-    client: ApiClient,
+    client: ApiClient | None = None,
     *,
     limit: int = DEFAULT_LIMIT,
     severity: str | None = None,
     since: str | None = None,
 ) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     try:
         safe_limit = _validate_limit(limit)
         safe_severity = _validate_optional_enum(
@@ -176,10 +188,13 @@ def get_watchtower_alerts(
 
 
 def get_watchtower_metrics(
-    client: ApiClient,
+    client: ApiClient | None = None,
     *,
     include_sensitive: bool = False,
 ) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     result = client.get("/watchtower/metrics").to_dict()
 
     if include_sensitive or not result.get("ok", False):
@@ -207,7 +222,7 @@ def get_watchtower_metrics(
 
 
 def get_watchtower_snapshot(
-    client: ApiClient,
+    client: ApiClient | None = None,
     *,
     node_limit: int = DEFAULT_LIMIT,
     node_status: str | None = None,
@@ -216,6 +231,9 @@ def get_watchtower_snapshot(
     alert_since: str | None = None,
     include_sensitive_metrics: bool = False,
 ) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     calls = {
         "health": lambda: get_watchtower_health(client),
         "status": lambda: get_watchtower_status(client),
@@ -294,16 +312,24 @@ def get_watchtower_snapshot(
         headers={},
         is_json=True,
     ).to_dict()
-def fetch_watchtower_status(client: ApiClient) -> dict[str, Any]:
+
+
+# ---------------------------------------------------------------------------
+# Factory / alias functions expected by dashboard/services/__init__.py
+# ---------------------------------------------------------------------------
+
+def fetch_watchtower_status(client: ApiClient | None = None) -> dict[str, Any]:
     return get_watchtower_status(client)
 
 
-def get_watchtower_dashboard_status(client: ApiClient) -> dict[str, Any]:
+def get_watchtower_dashboard_status(client: ApiClient | None = None) -> dict[str, Any]:
     return get_watchtower_snapshot(client)
 
 
 def normalize_watchtower_status(raw: dict[str, Any]) -> dict[str, Any]:
     data = raw.get("data")
+
     if isinstance(data, dict):
         return data
+
     return {}
