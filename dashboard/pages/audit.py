@@ -47,3 +47,5 @@ def get_audit_summary() -> dict[str, Any]:
         "records_ok": data["records"].get("ok", False),
         "status_ok": data["status"].get("ok", False),
     }
+def build_audit_page() -> dict[str, Any]:
+    return load_audit_page()
