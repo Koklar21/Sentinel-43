@@ -16,7 +16,7 @@ from dashboard.components.remote_event_form import (
     RemoteEventForm,
     RemoteEventFormData,
 )
-from dashboard.services.api_client import ApiClient, ApiResponse
+from dashboard.services.api_client import ApiClient, ApiResponse, api_client
 
 
 CORRELATION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{8,64}$")
@@ -67,16 +67,22 @@ def _validate_limit_offset(*, limit: int, offset: int) -> tuple[int, int]:
     return limit, offset
 
 
-def get_remote_gateway_health(client: ApiClient) -> dict[str, Any]:
+def get_remote_gateway_health(client: ApiClient | None = None) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     return client.get("/remote/health").to_dict()
 
 
 def get_remote_targets(
-    client: ApiClient,
+    client: ApiClient | None = None,
     *,
     limit: int = DEFAULT_TARGET_LIMIT,
     offset: int = 0,
 ) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     try:
         safe_limit, safe_offset = _validate_limit_offset(
             limit=limit,
@@ -94,7 +100,7 @@ def get_remote_targets(
 
 
 def activate_remote_event(
-    client: ApiClient,
+    client: ApiClient | None = None,
     *,
     operator_id: str,
     operator_role: str,
@@ -106,6 +112,9 @@ def activate_remote_event(
     payload: dict[str, Any] | None = None,
     form: RemoteEventForm | None = None,
 ) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     validator = form or RemoteEventForm()
 
     form_data = RemoteEventFormData(
@@ -132,9 +141,12 @@ def activate_remote_event(
 
 
 def get_remote_audit_records(
-    client: ApiClient,
     correlation_id: Any,
+    client: ApiClient | None = None,
 ) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     cleaned = _validate_correlation_id(correlation_id)
 
     if cleaned is None:
@@ -146,9 +158,12 @@ def get_remote_audit_records(
 
 
 def get_remote_event_status(
-    client: ApiClient,
     correlation_id: Any,
+    client: ApiClient | None = None,
 ) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     cleaned = _validate_correlation_id(correlation_id)
 
     if cleaned is None:
@@ -160,11 +175,14 @@ def get_remote_event_status(
 
 
 def get_remote_gateway_snapshot(
-    client: ApiClient,
+    client: ApiClient | None = None,
     *,
     target_limit: int = DEFAULT_TARGET_LIMIT,
     target_offset: int = 0,
 ) -> dict[str, Any]:
+    if client is None:
+        client = api_client
+
     calls = {
         "health": lambda: get_remote_gateway_health(client),
         "targets": lambda: get_remote_targets(
@@ -219,8 +237,14 @@ def get_remote_gateway_snapshot(
         headers={},
         is_json=True,
     ).to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Factory / alias functions expected by dashboard/services/__init__.py
+# ---------------------------------------------------------------------------
+
 def fetch_remote_operations(
-    client: ApiClient,
+    client: ApiClient | None = None,
     *,
     limit: int = DEFAULT_TARGET_LIMIT,
     offset: int = 0,
@@ -229,7 +253,7 @@ def fetch_remote_operations(
 
 
 def get_remote_gateway_records(
-    client: ApiClient,
+    client: ApiClient | None = None,
     *,
     limit: int = DEFAULT_TARGET_LIMIT,
     offset: int = 0,
@@ -239,15 +263,18 @@ def get_remote_gateway_records(
 
 def normalize_remote_operations(raw: dict[str, Any]) -> list[dict[str, Any]]:
     data = raw.get("data")
+
     if isinstance(data, list):
         return data
+
     if isinstance(data, dict):
         return data.get("targets") or []
+
     return []
 
 
 def submit_remote_gateway_event(
-    client: ApiClient,
+    client: ApiClient | None = None,
     *,
     operator_id: str,
     operator_role: str,
