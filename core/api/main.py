@@ -71,7 +71,7 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# Env helpers  (fix: all module-level casts were previously unguarded)
+# Env helpers
 # =============================================================================
 
 def _env_str(name: str, default: str = "") -> str:
@@ -133,10 +133,8 @@ WATCHTOWER_URL               = _env_str("S43_WATCHTOWER_URL", "http://s43-core:9
 WATCHTOWER_TIMEOUT           = _env_float("S43_WATCHTOWER_TIMEOUT", 2.0)
 WATCHTOWER_HEARTBEAT_SECONDS = _env_int("S43_WATCHTOWER_HEARTBEAT_SECONDS", 15)
 
-# Origins: default to empty (deny-all) so production must set this explicitly.
 _ALLOWED_ORIGINS: frozenset[str] = _env_frozenset(
     "S43_ALLOWED_ORIGINS",
-    # Only used when the env var is completely absent (local dev convenience).
     "http://127.0.0.1:5500,http://localhost:5500,"
     "http://127.0.0.1:8000,http://localhost:8000",
 )
@@ -167,7 +165,6 @@ ACTION_ID_RE = re.compile(r"^[A-Z0-9_-]{1,64}$")
 
 # =============================================================================
 # Optional module-level singletons
-# (created at import time; started/stopped in lifespan)
 # =============================================================================
 
 _monitoring_manager: Any | None = None
@@ -181,15 +178,17 @@ try:
 except Exception as _mm_exc:
     logger.warning("MonitoringManager unavailable: %s -- running without it", _mm_exc)
 
-_orchestrator: Any | None = None
-_sparta_instance: Any | None = None
-_sparta_task:     asyncio.Task | None = None  # type: ignore[type-arg]
-_fenrir_instance: Any | None = None
-_fenrir_task:     asyncio.Task | None = None  # type: ignore[type-arg]
+_orchestrator:    Any | None               = None
+_sparta_instance: Any | None               = None
+_sparta_task:     asyncio.Task | None      = None  # type: ignore[type-arg]
+_fenrir_instance: Any | None               = None
+# _fenrir_task is no longer used — FenrirHunter manages its own internal task.
+# Kept here for backward compatibility with any tooling that checks this name.
+_fenrir_task:     asyncio.Task | None      = None  # type: ignore[type-arg]
 
 
 # =============================================================================
-# Module-level State
+# Module-level state
 # =============================================================================
 
 _action_store_lock = threading.Lock()
@@ -203,11 +202,11 @@ _heartbeat_task: asyncio.Task[None] | None = None
 
 _watchtower_lock = threading.Lock()
 _watchtower_last_status: dict[str, Any] = {
-    "reachable": False,
-    "registered": False,
+    "reachable":        False,
+    "registered":       False,
     "last_register_ts": None,
     "last_heartbeat_ts": None,
-    "last_error": None,
+    "last_error":       None,
 }
 
 
@@ -362,9 +361,9 @@ def _update_action_status(
                 status_code=409,
                 detail=f"action status is {action['status']}; expected one of {sorted(allowed_statuses)}",
             )
-        action["status"] = new_status
+        action["status"]          = new_status
         action["decision_reason"] = reason
-        action["operator"] = operator
+        action["operator"]        = operator
         return copy.deepcopy(action)
 
 
@@ -457,8 +456,8 @@ def watchtower_health_check() -> dict[str, Any]:
     result = _watchtower_request("GET", "/watchtower/health")
     reachable = "error" not in result
     with _watchtower_lock:
-        _watchtower_last_status["reachable"] = reachable
-        _watchtower_last_status["last_error"] = None if reachable else result
+        _watchtower_last_status["reachable"]   = reachable
+        _watchtower_last_status["last_error"]  = None if reachable else result
     return {"reachable": reachable, "url": WATCHTOWER_URL, "response": result}
 
 
@@ -474,8 +473,10 @@ def register_api_with_watchtower() -> dict[str, Any]:
         capabilities.append("sparta_integrity_watchdog")
     if _env_bool("S43_JORM_ENABLED"):
         capabilities.append("jormungandr_audit")
-    if _fenrir_instance is not None or _env_any_bool(("S43_FENRIR_ENABLED", "SENTINEL_FENRIR_ENABLED", "FENRIR_ENABLED")):
-        capabilities.append("fenrir_local_monitoring")
+    if _fenrir_instance is not None or _env_any_bool(
+        ("S43_FENRIR_ENABLED", "SENTINEL_FENRIR_ENABLED", "FENRIR_ENABLED")
+    ):
+        capabilities.append("fenrir_hunter")
     try:
         from core.middleware import SentinelFirewall  # noqa: F401
         capabilities.append("sentinel_firewall")
@@ -483,15 +484,15 @@ def register_api_with_watchtower() -> dict[str, Any]:
         pass
 
     payload = {
-        "module_id": APP_NAME,
+        "module_id":   APP_NAME,
         "module_type": "api",
-        "version": APP_VERSION,
-        "endpoint": _env_str("S43_API_PUBLIC_URL", "http://s43-api:8000"),
+        "version":     APP_VERSION,
+        "endpoint":    _env_str("S43_API_PUBLIC_URL", "http://s43-api:8000"),
         "capabilities": capabilities,
         "metadata": {
             "environment": SENTINEL_ENV,
-            "started_ts": START_TIME,
-            "timestamp": utc_now(),
+            "started_ts":  START_TIME,
+            "timestamp":   utc_now(),
         },
     }
     result = _watchtower_request("POST", "/watchtower/modules/register", payload)
@@ -507,9 +508,9 @@ def register_api_with_watchtower() -> dict[str, Any]:
 def send_api_heartbeat(status: str = "online") -> dict[str, Any]:
     payload = {
         "module_id": APP_NAME,
-        "status": status,
-        "metrics": {"uptime_seconds": uptime_seconds(), "timestamp": utc_now()},
-        "message": f"Sentinel-43 API heartbeat: {status}",
+        "status":    status,
+        "metrics":   {"uptime_seconds": uptime_seconds(), "timestamp": utc_now()},
+        "message":   f"Sentinel-43 API heartbeat: {status}",
     }
     result = _watchtower_request("POST", "/watchtower/modules/heartbeat", payload)
     ok = "error" not in result
@@ -584,7 +585,7 @@ async def _async_heartbeat_loop() -> None:
 async def lifespan(api: FastAPI):
     global _stop_heartbeat_event, _heartbeat_task
     global _orchestrator, _sparta_instance, _sparta_task
-    global _fenrir_instance, _fenrir_task
+    global _fenrir_instance
 
     bootstrap_expectations()
 
@@ -620,10 +621,7 @@ async def lifespan(api: FastAPI):
                 _sparta_task     = asyncio.create_task(
                     _sparta_instance.run(), name="sentinel43-sparta-watchdog"
                 )
-                logger.info(
-                    "SpartaCore watchdog started: watching %d files",
-                    len(_watched_files),
-                )
+                logger.info("SpartaCore watchdog started: watching %d files", len(_watched_files))
             else:
                 logger.warning(
                     "S43_SPARTA_ENABLED=true but no S43_SPARTA_HASH_* vars found; "
@@ -632,21 +630,22 @@ async def lifespan(api: FastAPI):
         except Exception as exc:
             logger.error("SpartaCore failed to start: %s", exc)
 
-    # --- Optional: Fenrir local-only monitoring node ---
+    # --- Optional: FenrirHunter (threat detection + statistical anomaly layer) ---
+    # ---------------------------------------------------------------------------
+    # ADJUST IMPORT PATH: change "core.fenrir_hunter" to match where
+    # fenrir_hunter.py actually lives in your repo.
+    # ---------------------------------------------------------------------------
     if _env_any_bool(("S43_FENRIR_ENABLED", "SENTINEL_FENRIR_ENABLED", "FENRIR_ENABLED")):
         try:
-            from core.monitoring import FenrirConfig, FenrirNode
+            from core.fenrir_hunter import FenrirHunter  # ADJUST IMPORT PATH
 
-            fenrir_cfg = FenrirConfig.from_environment()
-            _fenrir_instance = FenrirNode(fenrir_cfg)
-            _fenrir_task = asyncio.create_task(
-                _fenrir_instance.main(), name="sentinel43-fenrir-node"
-            )
+            _fenrir_instance = FenrirHunter()  # reads all config from env vars
+            await _fenrir_instance.start()     # embedded_mode=True skips health server
             logger.info(
-                "Fenrir node task started (node_id=%s mode=%s scope=%s)",
-                fenrir_cfg.node_id,
-                fenrir_cfg.mode.value,
-                fenrir_cfg.deployment_scope,
+                "FenrirHunter started: node_id=%s min_severity=%s anomaly_zscore=%.1f",
+                _fenrir_instance.config.node_id,
+                _fenrir_instance.config.min_report_severity,
+                _fenrir_instance.config.anomaly_zscore_threshold,
             )
         except Exception as exc:
             logger.error("Fenrir failed to start: %s", exc)
@@ -660,14 +659,14 @@ async def lifespan(api: FastAPI):
                 env         = SENTINEL_ENV
                 strict_mode = _env_bool("S43_GOVERNANCE_STRICT", True)
                 data_dir    = _env_str("S43_DATA_DIR", "/var/sentinel43/data")
-                audit_signing_key   = _env_str("S43_GOVERNANCE_SIGNING_KEY")
-                audit_jsonl_path    = _env_str("S43_GOVERNANCE_JSONL_PATH")
-                default_mode        = _env_str("S43_GOVERNANCE_DEFAULT_MODE", "SHADOW")
-                hash_device_ids     = _env_bool("S43_GOVERNANCE_HASH_DEVICE_IDS", False)
-                velocity_window_seconds   = _env_int("S43_VELOCITY_WINDOW_SECONDS", 60)
-                velocity_limit            = _env_int("S43_VELOCITY_LIMIT", 10)
-                velocity_gc_interval_seconds   = _env_int("S43_VELOCITY_GC_INTERVAL", 300)
-                velocity_max_entries_per_user  = _env_int("S43_VELOCITY_MAX_ENTRIES", 1000)
+                audit_signing_key            = _env_str("S43_GOVERNANCE_SIGNING_KEY")
+                audit_jsonl_path             = _env_str("S43_GOVERNANCE_JSONL_PATH")
+                default_mode                 = _env_str("S43_GOVERNANCE_DEFAULT_MODE", "SHADOW")
+                hash_device_ids              = _env_bool("S43_GOVERNANCE_HASH_DEVICE_IDS", False)
+                velocity_window_seconds      = _env_int("S43_VELOCITY_WINDOW_SECONDS", 60)
+                velocity_limit               = _env_int("S43_VELOCITY_LIMIT", 10)
+                velocity_gc_interval_seconds = _env_int("S43_VELOCITY_GC_INTERVAL", 300)
+                velocity_max_entries_per_user = _env_int("S43_VELOCITY_MAX_ENTRIES", 1000)
 
             _orchestrator = build_orchestrator_from_settings(
                 _Settings(),
@@ -707,18 +706,15 @@ async def lifespan(api: FastAPI):
         except (asyncio.TimeoutError, asyncio.CancelledError):
             _heartbeat_task.cancel()
 
+    # FenrirHunter manages its own internal task — just call shutdown().
     if _fenrir_instance is not None:
         try:
-            await _fenrir_instance.shutdown()
+            await asyncio.wait_for(_fenrir_instance.shutdown(), timeout=5.0)
+            logger.info("FenrirHunter shutdown complete.")
+        except asyncio.TimeoutError:
+            logger.warning("FenrirHunter shutdown timed out.")
         except Exception as exc:
-            logger.warning("Fenrir shutdown error: %s", exc)
-    if _fenrir_task is not None:
-        try:
-            await asyncio.wait_for(_fenrir_task, timeout=5.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            _fenrir_task.cancel()
-        except Exception as exc:
-            logger.warning("Fenrir task ended with error: %s", exc)
+            logger.warning("FenrirHunter shutdown error: %s", exc)
 
     if _sparta_instance is not None:
         _sparta_instance.stop()
@@ -747,12 +743,12 @@ root_router = APIRouter(tags=["root"])
 @root_router.get("/")
 def root() -> dict[str, Any]:
     return {
-        "service": APP_NAME,
-        "version": APP_VERSION,
-        "status": "online",
+        "service":        APP_NAME,
+        "version":        APP_VERSION,
+        "status":         "online",
         "watchtower_url": WATCHTOWER_URL,
         "uptime_seconds": uptime_seconds(),
-        "timestamp": utc_now(),
+        "timestamp":      utc_now(),
     }
 
 
@@ -804,8 +800,7 @@ async def dashboard_approve_action(
             )
         except KeyError:
             logger.debug(
-                "approve_action: decision_id=%s not in pending reviews (may have "
-                "already been resolved or originated outside governance)",
+                "approve_action: decision_id=%s not in pending reviews",
                 decision_id,
             )
 
@@ -840,10 +835,7 @@ async def dashboard_veto_action(
                 reason=reason,
             )
         except KeyError:
-            logger.debug(
-                "veto_action: decision_id=%s not in pending reviews",
-                decision_id,
-            )
+            logger.debug("veto_action: decision_id=%s not in pending reviews", decision_id)
 
     await _broadcast_dashboard_event("action_status_changed", {"action": action})
     await _broadcast_dashboard_event("vault_stats", {"records": _vault_records()})
@@ -852,7 +844,6 @@ async def dashboard_veto_action(
 
 @root_router.get("/governance/pending")
 def governance_pending_reviews(request: Request) -> dict[str, Any]:
-    """List pending HUMAN_GATED governance decisions awaiting operator action."""
     _get_operator(request)
     if _orchestrator is None:
         return {"enabled": False, "pending": [], "timestamp": utc_now()}
@@ -893,9 +884,12 @@ except Exception as _fw_exc:
 try:
     from core.monitoring import SpartaCore as _SC, IntegrityConfig as _IC, create_node_router
     _node_router_sparta = _SC(
-        _IC(watched_files={}, node_signature="sentinel43-api",
+        _IC(
+            watched_files={},
+            node_signature="sentinel43-api",
             token_secret=_env_str("S43_SPARTA_TOKEN_SECRET"),
-            node_api_token=_env_str("S43_SPARTA_NODE_TOKEN", ""))
+            node_api_token=_env_str("S43_SPARTA_NODE_TOKEN", ""),
+        )
     )
     app.include_router(create_node_router(_node_router_sparta))
     logger.info("SpartaCore node API router registered at /node")
@@ -909,14 +903,11 @@ except Exception as _nr_exc:
 
 async def _ws_safe_close(websocket: WebSocket, code: int = 1008) -> None:
     """
-    Close a WebSocket, swallowing RuntimeError if it is already closed.
+    Close a WebSocket, swallowing RuntimeError if already closed.
 
-    Starlette/uvicorn raises RuntimeError("Unexpected ASGI message
-    'websocket.close', after sending 'websocket.close' or response already
-    completed") when the client disconnects between the server's send_json and
-    its close() call, or when close() is attempted on a connection that was
-    rejected before accept(). This helper centralises the guard so every
-    auth-rejection path stays readable.
+    Starlette/uvicorn raises RuntimeError when close() is attempted on a
+    connection that was rejected before accept(), or when the client
+    already disconnected. This helper guards every auth-rejection path.
     """
     try:
         await websocket.close(code=code)
@@ -926,16 +917,8 @@ async def _ws_safe_close(websocket: WebSocket, code: int = 1008) -> None:
 
 @app.websocket("/ws")
 async def dashboard_websocket(websocket: WebSocket) -> None:
-    # ------------------------------------------------------------------
-    # Fix: origin rejection must NOT call close() before accept().
-    # Calling websocket.close() before websocket.accept() puts the ASGI
-    # state machine into "response completed" via an HTTP-rejection path.
-    # Any subsequent close attempt — including uvicorn's own cleanup —
-    # then raises RuntimeError("Unexpected ASGI message 'websocket.close',
-    # after sending 'websocket.close' or response already completed").
-    # Correct pattern: just return without accept(). Uvicorn automatically
-    # sends an HTTP 403 upgrade rejection.
-    # ------------------------------------------------------------------
+    # Origin check — return without accept() so uvicorn sends HTTP 403.
+    # Never call close() before accept().
     origin = websocket.headers.get("origin", "")
     if _ALLOWED_ORIGINS and origin not in _ALLOWED_ORIGINS:
         return
@@ -961,14 +944,6 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
             },
         })
 
-        # ------------------------------------------------------------------
-        # Fix: WebSocketDisconnect is separated from the other exceptions.
-        # When the client disconnects (no token, auth_failed fired client-
-        # side), _receive_ws_message raises WebSocketDisconnect. The
-        # original code caught it alongside TimeoutError and then called
-        # close() on an already-dead connection — the double-close that
-        # produced the RuntimeError. Disconnected sockets need no close.
-        # ------------------------------------------------------------------
         try:
             auth_msg = await asyncio.wait_for(
                 _receive_ws_message(websocket), timeout=15.0
@@ -999,33 +974,21 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
         try:
             ws_claims = _verify_jwt_token(token)
         except pyjwt.ExpiredSignatureError:
-            await websocket.send_json({
-                "type": "error",
-                "payload": {"error": "Token has expired"},
-            })
+            await websocket.send_json({"type": "error", "payload": {"error": "Token has expired"}})
             await _ws_safe_close(websocket)
             return
         except pyjwt.InvalidKeyError:
-            await websocket.send_json({
-                "type": "error",
-                "payload": {"error": "JWT not configured"},
-            })
+            await websocket.send_json({"type": "error", "payload": {"error": "JWT not configured"}})
             await _ws_safe_close(websocket)
             return
         except pyjwt.PyJWTError:
-            await websocket.send_json({
-                "type": "error",
-                "payload": {"error": "Invalid token"},
-            })
+            await websocket.send_json({"type": "error", "payload": {"error": "Invalid token"}})
             await _ws_safe_close(websocket)
             return
 
         role = str(ws_claims.get("role") or ws_claims.get("scope") or "").strip()
         if role not in _APPROVED_ROLES:
-            await websocket.send_json({
-                "type": "error",
-                "payload": {"error": "Operator role required"},
-            })
+            await websocket.send_json({"type": "error", "payload": {"error": "Operator role required"}})
             await _ws_safe_close(websocket)
             return
 
@@ -1041,10 +1004,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
             try:
                 message = await _receive_ws_message(websocket)
             except ValueError as exc:
-                await websocket.send_json({
-                    "type": "error",
-                    "payload": {"error": str(exc)},
-                })
+                await websocket.send_json({"type": "error", "payload": {"error": str(exc)}})
                 continue
 
             event_type = message.get("type")
@@ -1053,10 +1013,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 payload = {}
 
             if event_type == "ping":
-                await websocket.send_json({
-                    "type": "pong",
-                    "payload": {"timestamp": utc_now()},
-                })
+                await websocket.send_json({"type": "pong", "payload": {"timestamp": utc_now()}})
                 continue
 
             if event_type == "subscribe":
@@ -1105,6 +1062,50 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
 
 
 # =============================================================================
+# Internal event broadcast endpoint
+# Used by FenrirHunter and other internal services to push events to the
+# dashboard WebSocket clients without connecting as a WS client themselves.
+# =============================================================================
+
+internal_router = APIRouter(prefix="/internal", tags=["internal"])
+
+
+@internal_router.post("/events/broadcast")
+async def internal_broadcast_event(
+    body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """
+    Broadcast a structured event to connected WebSocket dashboard clients.
+
+    Called by FenrirHunter when it has a finding to report.
+    Requires operator auth — Fenrir uses S43_FENRIR_API_TOKEN for this.
+
+    Body:
+      event_type: str  — WebSocket event type (e.g. "fenrir_finding")
+      channel:    str  — optional channel filter (e.g. "security")
+      data:       dict — event payload forwarded to dashboard clients
+    """
+    _get_operator(request)
+
+    event_type = str(body.get("event_type") or "event")[:64]
+    channel    = str(body.get("channel") or "") or None
+    data       = body.get("data") or {}
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=422, detail="data must be an object")
+
+    await _broadcast_dashboard_event(event_type, data, channel=channel)
+
+    return {
+        "ok":         True,
+        "event_type": event_type,
+        "channel":    channel,
+        "clients":    len(_dashboard_ws_clients),
+        "timestamp":  utc_now(),
+    }
+
+
+# =============================================================================
 # Watchtower bridge
 # =============================================================================
 
@@ -1149,23 +1150,48 @@ def api_watchtower_modules() -> dict[str, Any]:
 
 @watchtower_router.get("/check")
 def watchtower_check() -> dict[str, Any]:
-    health_result  = watchtower_health_check()
-    ready_result   = _watchtower_request("GET", "/watchtower/ready")
-    status_result  = _watchtower_request("GET", "/watchtower/status")
+    health_result = watchtower_health_check()
+    ready_result  = _watchtower_request("GET", "/watchtower/ready")
+    status_result = _watchtower_request("GET", "/watchtower/status")
     with _watchtower_lock:
         wt_snapshot = dict(_watchtower_last_status)
     return {
-        "service": "watchtower_bridge",
+        "service":        "watchtower_bridge",
         "watchtower_url": WATCHTOWER_URL,
         "checks": {
-            "health": "ok" if health_result["reachable"] else "failed",
-            "ready":  "ok" if "error" not in ready_result else "failed",
-            "status": "ok" if "error" not in status_result else "failed",
+            "health":         "ok" if health_result["reachable"] else "failed",
+            "ready":          "ok" if "error" not in ready_result else "failed",
+            "status":         "ok" if "error" not in status_result else "failed",
             "api_registered": wt_snapshot.get("registered", False),
         },
-        "responses": {"health": health_result, "ready": ready_result, "status": status_result},
+        "responses": {
+            "health": health_result,
+            "ready":  ready_result,
+            "status": status_result,
+        },
         "timestamp": utc_now(),
     }
+
+
+@watchtower_router.post("/events")
+async def watchtower_ingest_event(
+    body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """
+    Ingest a structured event from an internal service (e.g. FenrirHunter)
+    and forward it to the Watchtower core. Also broadcasts to dashboard
+    clients subscribed to the "watchtower" channel.
+
+    Called by FenrirHunter when it has a finding to report to Watchtower.
+    """
+    _get_operator(request)
+    result = await asyncio.to_thread(_watchtower_request, "POST", "/watchtower/events", body)
+    await _broadcast_dashboard_event(
+        "watchtower_event",
+        {"event": body, "watchtower_response": result, "timestamp": utc_now()},
+        channel="watchtower",
+    )
+    return {"ok": True, "forwarded": result, "timestamp": utc_now()}
 
 
 # =============================================================================
@@ -1178,9 +1204,11 @@ core_router = APIRouter(prefix="/core", tags=["core"])
 async def core_status() -> dict[str, Any]:
     await asyncio.to_thread(report_dependency_to_watchtower, "sentinel-43-core", "online",
                             {"source": "api-core-status-route"})
-    await _broadcast_dashboard_event("dependency_state",
-                                     {"name": "sentinel-43-core", "status": "online", "timestamp": utc_now()},
-                                     channel="dependencies")
+    await _broadcast_dashboard_event(
+        "dependency_state",
+        {"name": "sentinel-43-core", "status": "online", "timestamp": utc_now()},
+        channel="dependencies",
+    )
     return {"service": "s43_core", "status": "online", "state": "ACTIVE",
             "watchtower_reported": True, "timestamp": utc_now()}
 
@@ -1192,13 +1220,17 @@ def core_health() -> dict[str, Any]:
 
 @core_router.post("/heartbeat")
 async def core_heartbeat() -> dict[str, Any]:
-    result = await asyncio.to_thread(report_dependency_to_watchtower, "sentinel-43-core", "online",
-                                     {"heartbeat_source": "api", "uptime_seconds": uptime_seconds(),
-                                      "timestamp": utc_now()})
-    await _broadcast_dashboard_event("dependency_state",
-                                     {"name": "sentinel-43-core", "status": "online", "timestamp": utc_now()},
-                                     channel="dependencies")
-    return {"service": "s43_core", "heartbeat": "sent", "watchtower_response": result, "timestamp": utc_now()}
+    result = await asyncio.to_thread(
+        report_dependency_to_watchtower, "sentinel-43-core", "online",
+        {"heartbeat_source": "api", "uptime_seconds": uptime_seconds(), "timestamp": utc_now()},
+    )
+    await _broadcast_dashboard_event(
+        "dependency_state",
+        {"name": "sentinel-43-core", "status": "online", "timestamp": utc_now()},
+        channel="dependencies",
+    )
+    return {"service": "s43_core", "heartbeat": "sent", "watchtower_response": result,
+            "timestamp": utc_now()}
 
 
 rules_router = APIRouter(prefix="/rules", tags=["rules"])
@@ -1216,7 +1248,8 @@ config_router = APIRouter(prefix="/config", tags=["config"])
 
 @config_router.get("/status")
 def config_status() -> dict[str, Any]:
-    return {"service": "config", "status": "loaded", "environment": SENTINEL_ENV, "timestamp": utc_now()}
+    return {"service": "config", "status": "loaded", "environment": SENTINEL_ENV,
+            "timestamp": utc_now()}
 
 @config_router.get("/")
 def config_root() -> dict[str, Any]:
@@ -1231,17 +1264,23 @@ def dependencies_status() -> dict[str, Any]:
     return {
         "service": "dependencies",
         "checks": {
-            "api": "ok", "core": "ok",
+            "api":        "ok",
+            "core":       "ok",
             "watchtower": "ok" if wt["reachable"] else "failed",
-            "redis": "unknown", "postgres": "unknown",
+            "redis":      "unknown",
+            "postgres":   "unknown",
         },
-        "watchtower_url": WATCHTOWER_URL, "timestamp": utc_now(),
+        "watchtower_url": WATCHTOWER_URL,
+        "timestamp": utc_now(),
     }
 
 @dependencies_router.post("/report/{name}/{state}")
 def report_dependency(name: str, state: str) -> dict[str, Any]:
-    result = report_dependency_to_watchtower(name, state, {"source": "api-dependency-report-route"})
-    return {"dependency": name, "state": state, "watchtower_response": result, "timestamp": utc_now()}
+    result = report_dependency_to_watchtower(
+        name, state, {"source": "api-dependency-report-route"}
+    )
+    return {"dependency": name, "state": state, "watchtower_response": result,
+            "timestamp": utc_now()}
 
 
 system_router = APIRouter(prefix="/system", tags=["system"])
@@ -1250,27 +1289,35 @@ system_router = APIRouter(prefix="/system", tags=["system"])
 def system_status() -> dict[str, Any]:
     wt = _watchtower_request("GET", "/watchtower/status")
     return {
-        "system": "sentinel-43", "status": "online", "version": APP_VERSION,
+        "system":         "sentinel-43",
+        "status":         "online",
+        "version":        APP_VERSION,
         "uptime_seconds": uptime_seconds(),
         "components": {
-            "api": "online", "core": "online",
-            "watchtower": "online" if "error" not in wt else "unreachable",
-            "rules": "loaded", "config": "loaded",
+            "api":                "online",
+            "core":               "online",
+            "watchtower":         "online" if "error" not in wt else "unreachable",
+            "rules":              "loaded",
+            "config":             "loaded",
             "monitoring_manager": "active" if _monitoring_manager else "disabled",
-            "sparta": "active" if _sparta_instance else "disabled",
-            "fenrir": "active" if _fenrir_instance else "disabled",
-            "governance": "active" if _orchestrator else "disabled",
-            "redis": "unknown", "postgres": "unknown",
+            "sparta":             "active" if _sparta_instance else "disabled",
+            "fenrir":             "active" if _fenrir_instance else "disabled",
+            "governance":         "active" if _orchestrator else "disabled",
+            "redis":              "unknown",
+            "postgres":           "unknown",
         },
-        "watchtower": wt, "timestamp": utc_now(),
+        "watchtower": wt,
+        "timestamp":  utc_now(),
     }
 
 @system_router.get("/routes")
 def system_routes() -> dict[str, Any]:
     route_list = [
-        {"path": getattr(r, "path", None),
-         "name": getattr(r, "name", None),
-         "methods": sorted(getattr(r, "methods", None) or [])}
+        {
+            "path":    getattr(r, "path", None),
+            "name":    getattr(r, "name", None),
+            "methods": sorted(getattr(r, "methods", None) or []),
+        }
         for r in app.routes if getattr(r, "path", None)
     ]
     return {"service": APP_NAME, "route_count": len(route_list),
@@ -1278,44 +1325,51 @@ def system_routes() -> dict[str, Any]:
 
 @system_router.get("/intercom/status")
 def intercom_status() -> dict[str, Any]:
-    wt_health   = watchtower_health_check()
-    wt_modules  = _watchtower_request("GET", "/watchtower/modules")
+    wt_health  = watchtower_health_check()
+    wt_modules = _watchtower_request("GET", "/watchtower/modules")
     return {
-        "service": "sentinel-43-intercom", "api": "online",
-        "watchtower": "online" if wt_health["reachable"] else "unreachable",
+        "service":        "sentinel-43-intercom",
+        "api":            "online",
+        "watchtower":     "online" if wt_health["reachable"] else "unreachable",
         "watchtower_url": WATCHTOWER_URL,
-        "modules": wt_modules, "timestamp": utc_now(),
+        "modules":        wt_modules,
+        "timestamp":      utc_now(),
     }
 
 
 # =============================================================================
-# Fenrir local monitoring router
+# Fenrir router
 # =============================================================================
 
 fenrir_router = APIRouter(prefix="/fenrir", tags=["fenrir"])
 
+
 def _fenrir_snapshot() -> dict[str, Any]:
     if _fenrir_instance is None:
         return {
-            "enabled": _env_any_bool(("S43_FENRIR_ENABLED", "SENTINEL_FENRIR_ENABLED", "FENRIR_ENABLED")),
-            "status": "disabled",
+            "enabled":   _env_any_bool(
+                ("S43_FENRIR_ENABLED", "SENTINEL_FENRIR_ENABLED", "FENRIR_ENABLED")
+            ),
+            "status":    "disabled",
             "timestamp": utc_now(),
         }
 
-    return {
-        "enabled": True,
-        "status": getattr(getattr(_fenrir_instance, "state", None), "value", "unknown"),
-        "node_id": getattr(getattr(_fenrir_instance, "config", None), "node_id", "unknown"),
-        "mode": getattr(getattr(getattr(_fenrir_instance, "config", None), "mode", None), "value", "unknown"),
-        "deployment_scope": getattr(getattr(_fenrir_instance, "config", None), "deployment_scope", "unknown"),
-        "metrics": (
-            _fenrir_instance.metrics.as_dict()
-            if getattr(_fenrir_instance, "metrics", None) is not None
-            else {}
-        ),
-        "task_done": bool(_fenrir_task.done()) if _fenrir_task is not None else None,
-        "timestamp": utc_now(),
-    }
+    # FenrirHunter.snapshot() returns a complete status dict. Use it directly.
+    try:
+        snap = _fenrir_instance.snapshot()
+        snap["enabled"] = True
+        return snap
+    except Exception as exc:
+        logger.warning("Fenrir snapshot error: %s", exc)
+        return {
+            "enabled":   True,
+            "status":    "unknown",
+            "node_id":   getattr(
+                getattr(_fenrir_instance, "config", None), "node_id", "unknown"
+            ),
+            "error":     str(exc),
+            "timestamp": utc_now(),
+        }
 
 
 @fenrir_router.get("/status")
@@ -1327,20 +1381,21 @@ def fenrir_status(request: Request) -> dict[str, Any]:
 @fenrir_router.get("/health")
 def fenrir_health(request: Request) -> dict[str, Any]:
     _get_operator(request)
-    snapshot = _fenrir_snapshot()
-    return {"service": "fenrir", **snapshot}
+    snap = _fenrir_snapshot()
+    return {"service": "fenrir", **snap}
 
 
 @fenrir_router.get("/metrics")
 def fenrir_metrics(request: Request) -> dict[str, Any]:
     _get_operator(request)
-    snapshot = _fenrir_snapshot()
+    snap = _fenrir_snapshot()
     return {
-        "service": "fenrir",
-        "enabled": snapshot.get("enabled", False),
-        "status": snapshot.get("status", "disabled"),
-        "metrics": snapshot.get("metrics", {}),
-        "timestamp": utc_now(),
+        "service":      "fenrir",
+        "enabled":      snap.get("enabled", False),
+        "status":       snap.get("status", "disabled"),
+        "metrics":      snap.get("metrics", {}),
+        "anomaly_layer": snap.get("anomaly_layer", {}),
+        "timestamp":    utc_now(),
     }
 
 
@@ -1350,8 +1405,12 @@ def fenrir_metrics(request: Request) -> dict[str, Any]:
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "service": APP_NAME, "version": APP_VERSION,
-            "environment": SENTINEL_ENV}
+    return {
+        "status":      "ok",
+        "service":     APP_NAME,
+        "version":     APP_VERSION,
+        "environment": SENTINEL_ENV,
+    }
 
 @app.get("/ready")
 def ready() -> dict[str, str]:
@@ -1367,10 +1426,14 @@ def status() -> dict[str, Any]:
     with _watchtower_lock:
         wt_local = dict(_watchtower_last_status)
     return {
-        "service": APP_NAME, "version": APP_VERSION, "status": "online",
-        "environment": SENTINEL_ENV, "uptime_seconds": uptime_seconds(),
-        "watchtower_url": WATCHTOWER_URL, "watchtower_local_state": wt_local,
-        "timestamp": utc_now(),
+        "service":               APP_NAME,
+        "version":               APP_VERSION,
+        "status":                "online",
+        "environment":           SENTINEL_ENV,
+        "uptime_seconds":        uptime_seconds(),
+        "watchtower_url":        WATCHTOWER_URL,
+        "watchtower_local_state": wt_local,
+        "timestamp":             utc_now(),
     }
 
 @root_router.get("/version")
@@ -1380,8 +1443,11 @@ def version() -> dict[str, Any]:
 @root_router.get("/metrics")
 def metrics() -> dict[str, Any]:
     return {
-        "service": APP_NAME, "uptime_seconds": uptime_seconds(), "status": "online",
-        "watchtower_heartbeat_seconds": WATCHTOWER_HEARTBEAT_SECONDS, "timestamp": utc_now(),
+        "service":                    APP_NAME,
+        "uptime_seconds":             uptime_seconds(),
+        "status":                     "online",
+        "watchtower_heartbeat_seconds": WATCHTOWER_HEARTBEAT_SECONDS,
+        "timestamp":                  utc_now(),
     }
 
 
@@ -1430,7 +1496,8 @@ def compat_api_watchtower_ready() -> dict[str, Any]:
 
 app.include_router(root_router)
 app.include_router(remote_gateway_router)
-app.include_router(watchtower_router)
+app.include_router(internal_router)       # /internal/events/broadcast
+app.include_router(watchtower_router)     # /watchtower/events now included
 app.include_router(core_router)
 app.include_router(rules_router)
 app.include_router(config_router)
@@ -1450,9 +1517,9 @@ async def not_found_handler(request: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(
         status_code=404,
         content={
-            "error": "route_not_found",
-            "path": str(request.url.path),
-            "message": "Requested route is not registered in Sentinel-43 API.",
+            "error":     "route_not_found",
+            "path":      str(request.url.path),
+            "message":   "Requested route is not registered in Sentinel-43 API.",
             "timestamp": utc_now(),
         },
     )
