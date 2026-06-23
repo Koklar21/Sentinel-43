@@ -61,11 +61,18 @@ from core.policy_gate.policy_gate import PolicyContext, evaluate
 
 def _assert_schema(dec: dict) -> None:
     # Schema must be stable for audit + API clients.
+    # Includes full audit trail fields — auditability is a core feature,
+    # not a side quest. Do not remove these fields to satisfy a slim schema.
     expected = {
         "allowed",
         "status",
         "mode",
         "action",
+        "actor_id",
+        "tenant_id",
+        "resource",
+        "request_id",
+        "correlation_id",
         "reasons",
         "tags",
         "shadow_would_status",
@@ -76,6 +83,11 @@ def _assert_schema(dec: dict) -> None:
     assert isinstance(dec["status"], str)
     assert isinstance(dec["mode"], str)
     assert isinstance(dec["action"], str)
+    assert isinstance(dec["actor_id"], str)
+    assert isinstance(dec["tenant_id"], str)
+    assert isinstance(dec["resource"], str)
+    assert (dec["request_id"] is None) or isinstance(dec["request_id"], str)
+    assert (dec["correlation_id"] is None) or isinstance(dec["correlation_id"], str)
     assert isinstance(dec["reasons"], list)
     assert isinstance(dec["tags"], list)
     assert (dec["shadow_would_status"] is None) or isinstance(dec["shadow_would_status"], str)
