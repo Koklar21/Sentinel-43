@@ -157,3 +157,19 @@ def normalize_audit_logs(raw: dict[str, Any]) -> list[dict[str, Any]]:
     if isinstance(data, dict):
         return data.get("records") or []
     return []
+def fetch_audit_logs(
+    client: ApiClient,
+    *,
+    limit: int = DEFAULT_LIMIT,
+    offset: int = 0,
+) -> dict[str, Any]:
+    return get_audit_records(client, limit=limit, offset=offset)
+
+
+def normalize_audit_logs(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    data = raw.get("data")
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("records") or []
+    return []
