@@ -294,3 +294,16 @@ def get_watchtower_snapshot(
         headers={},
         is_json=True,
     ).to_dict()
+def fetch_watchtower_status(client: ApiClient) -> dict[str, Any]:
+    return get_watchtower_status(client)
+
+
+def get_watchtower_dashboard_status(client: ApiClient) -> dict[str, Any]:
+    return get_watchtower_snapshot(client)
+
+
+def normalize_watchtower_status(raw: dict[str, Any]) -> dict[str, Any]:
+    data = raw.get("data")
+    if isinstance(data, dict):
+        return data
+    return {}
