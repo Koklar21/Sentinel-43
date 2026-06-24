@@ -126,32 +126,58 @@ async def _try_connect(
     timeout: float = CONNECT_TIMEOUT,
 ) -> tuple[bool, str]:
     """
-    Attempt a WebSocket connection. Returns (success, detail).
-    """
-    headers = {}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    Attempt a WebSocket connection.
 
+    Correct auth flow:
+    1. Connect.
+    2. Read server's first message.
+    3. If auth_required, send auth frame.
+    4. Then verify connected/error/close.
+    """
     try:
         async with asyncio.timeout(timeout):
-            async with websockets.connect(
-                url,
-                additional_headers=headers,
-            ) as ws:
-                await ws.send(_ping_message())
+            async with websockets.connect(url) as ws:
+                first_raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                first_msg = json.loads(first_raw) if isinstance(first_raw, str) else {}
+                first_type = first_msg.get("type", "unknown")
 
-                try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                if first_type == "auth_required":
+                    if not token:
+                        return False, "auth required and no token provided"
+
+                    await ws.send(json.dumps({
+                        "type": "auth",
+                        "payload": {"token": token},
+                    }))
+
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                    except (ConnectionClosedError, ConnectionClosedOK) as exc:
+                        return False, f"connection closed after auth: {exc}"
+
                     msg = json.loads(raw) if isinstance(raw, str) else {}
                     msg_type = msg.get("type", "unknown")
-                    return True, f"connected, received type={msg_type!r}"
-                except asyncio.TimeoutError:
-                    return True, "connected, no response to ping within timeout"
+
+                    if msg_type == "connected":
+                        return True, "authenticated and connected"
+
+                    if msg_type == "error":
+                        return False, f"auth rejected: {msg.get('payload', {})}"
+
+                    return False, f"unexpected post-auth message type={msg_type!r}"
+
+                if first_type == "connected":
+                    return True, "connected without auth_required"
+
+                if first_type == "error":
+                    return False, f"server error: {first_msg.get('payload', {})}"
+
+                return False, f"unexpected first message type={first_type!r}"
 
     except ConnectionClosedError as exc:
         return False, f"connection closed: code={exc.rcvd.code if exc.rcvd else '?'}"
     except ConnectionClosedOK:
-        return False, "connection closed cleanly (rejected)"
+        return False, "connection closed cleanly"
     except InvalidHandshake as exc:
         return False, f"handshake rejected: {exc}"
     except asyncio.TimeoutError:
