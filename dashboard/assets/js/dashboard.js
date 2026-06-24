@@ -4,23 +4,48 @@
 // UI logic module. WebSocket transport is handled by websocket.js which
 // dispatches sentinel:ws:* events consumed here.
 //
-// v1.5.2
-// Fixes:
+// v1.6.0
+// Changes:
+// - Watchtower subsystem health integration:
+//     renderWatchtower(data)        — renders #wtGrid, #wtOverall, header chip
+//     fetchWatchtower()             — probes GET /watchtower/status with
+//                                     watchtowerProbeInFlight guard (no
+//                                     concurrent probes; handles wtRefreshBtn)
+//     startWatchtowerPolling()      — separate 30 s interval, independent of
+//                                     the main fallback poll (pollTimer)
+//     sentinel:ws:message           — watchtower_state handler now calls
+//                                     renderWatchtower() when payload contains
+//                                     subsystem data
+// - Governance mode alias:
+//     MODE_ALIASES constant
+//     setGovernanceMode(mode)       — updates #modeText + #modeAlias with
+//                                     alias; called from updateStaticConfig(),
+//                                     performRefresh() summary, and new
+//                                     governance_mode / mode_changed WS cases
+// - Assessment layer metrics:
+//     updateAssessmentMetrics(data) — populates #criticalThreats,
+//                                     #totalAssessments, #totalDecisions,
+//                                     #fenrirSignals only when backend returns
+//                                     those fields; never overwrites — with a
+//                                     fake value
+// - api.watchtowerStatus           — GET /watchtower/status; demo stub served
+//                                     from DEMO_WATCHTOWER
+// - api.dashboardSummary           — GET /dashboard/summary; demo stub served
+//                                     from DEMO_SUMMARY; swallows 404 so
+//                                     existing refresh flow is unaffected if
+//                                     endpoint not yet implemented
+// - watchtowerTimer cleared in beforeunload alongside existing pollTimer
+// - DEMO_WATCHTOWER / DEMO_SUMMARY objects for ?demo=1 mode
+//
+// v1.5.2 (prior):
 // - Removed sendWebSocketAuthFrame(). websocket.js owns the auth exchange
-//   entirely: it proactively sends auth on open and responds to auth_required
-//   internally before dispatching sentinel:ws:auth_required as a notification.
-//   dashboard.js previously called sendWebSocketAuthFrame() from the
-//   sentinel:ws:auth_required listener AND from the sentinel:ws:message
-//   auth_required case, causing a double auth frame race on every challenge.
-// - sentinel:ws:auth_required listener now logs only — no auth send.
-// - auth_required removed from sentinel:ws:message switch (dead code: websocket.js
-//   handles auth_required internally and returns early, never dispatching it
-//   as a general sentinel:ws:message event).
+//   entirely.
+// - sentinel:ws:auth_required listener now logs only.
+// - auth_required removed from sentinel:ws:message switch (dead code).
 //
 // v1.5.1-authfix (prior):
 // - Uses a wider dev JWT lookup path matching websocket.js.
-// - Handles sentinel:ws:auth_required directly instead of depending only on
-//   sentinel:ws:message.
+// - Handles sentinel:ws:auth_required directly.
 // - Supports both SentinelWS.sendAuth(token) and SentinelWS.auth().
 // - Does not log raw JWTs.
 // - Treats authenticated/auth_ok/connected as successful live state.
@@ -89,6 +114,46 @@ const DEV_JWT_KEYS = Object.freeze([
     "token",
 ]);
 
+// Governance mode → interface alias mapping.
+// HUMAN_GATED has no alias (same name); omitted intentionally so the alias
+// span stays hidden rather than showing a redundant label.
+const MODE_ALIASES = Object.freeze({
+    SHADOW:          "ADVISORY",
+    AUTONOMOUS_VETO: "ACTIVE_PLANNING",
+});
+
+// Watchtower probe interval — kept separate from FALLBACK_POLL_MS so the two
+// timers never compete. 30 s is conservative; probes are lightweight.
+const WT_PROBE_MS = 30_000;
+
+// =============================================================================
+// Demo stubs (used when ?demo=1 is active)
+// =============================================================================
+
+// Watchtower demo: WebSocket Bridge deliberately degraded so the grid renders
+// mixed state and operators can see the amber indicator during demo walkthroughs.
+const DEMO_WATCHTOWER = Object.freeze({
+    overall: "degraded",
+    subsystems: Object.freeze([
+        { name: "Core Advisory Engine", status: "online",   latencyMs: 11, detail: "Advisory & decision routing" },
+        { name: "Fenrir",               status: "online",   latencyMs: 7,  detail: "Threat hunting & behavioral analysis" },
+        { name: "Governance Layer",     status: "online",   latencyMs: 5,  detail: "Mode control & gate enforcement" },
+        { name: "Audit Layer",          status: "online",   latencyMs: 9,  detail: "Jormungandr audit chain" },
+        { name: "WebSocket Bridge",     status: "degraded", latencyMs: 38, detail: "Live transport layer" },
+        { name: "Database",             status: "online",   latencyMs: 14, detail: "PostgreSQL persistence" },
+    ]),
+});
+
+// Dashboard summary demo values — deliberately modest to avoid implying
+// the demo represents a production traffic baseline.
+const DEMO_SUMMARY = Object.freeze({
+    totalAssessments: 142,
+    criticalThreats:  3,
+    totalDecisions:   31,
+    fenrirSignals:    7,
+    mode:             "HUMAN_GATED",
+});
+
 // =============================================================================
 // Element References
 // =============================================================================
@@ -100,6 +165,7 @@ const el = {
     statusDot:    $("statusDot"),
     statusText:   $("statusText"),
     modeText:     $("modeText"),
+    modeAlias:    $("modeAlias"),          // NEW v1.6.0
     queueCount:   $("queueCount"),
     lastSync:     $("lastSync"),
     pollFlash:    $("pollFlash"),
@@ -107,11 +173,22 @@ const el = {
     jwtRiskBadge: $("jwtRiskBadge"),
     liveRegion:   $("liveRegion"),
 
-    // Stats
+    // Watchtower header chip (NEW v1.6.0)
+    wtHeaderChip:   $("wtHeaderChip"),
+    wtHeaderDot:    $("wtHeaderDot"),
+    wtHeaderStatus: $("wtHeaderStatus"),
+
+    // Stats — action-state row (existing)
     pendingCount:  $("pendingCount"),
     stagedCount:   $("stagedCount"),
     approvedCount: $("approvedCount"),
     vaultCount:    $("vaultCount"),
+
+    // Stats — assessment row (NEW v1.6.0)
+    criticalThreats:  $("criticalThreats"),
+    totalAssessments: $("totalAssessments"),
+    totalDecisions:   $("totalDecisions"),
+    fenrirSignals:    $("fenrirSignals"),
 
     // Config panel
     apiBaseText:   $("apiBaseText"),
@@ -126,6 +203,12 @@ const el = {
     themeBtn:   $("themeBtn"),
     authBtn:    $("authBtn"),
     kbHelpBtn:  $("kbHelpBtn"),
+
+    // Watchtower panel (NEW v1.6.0)
+    wtGrid:       $("wtGrid"),
+    wtOverall:    $("wtOverall"),
+    wtProbeTime:  $("wtProbeTime"),
+    wtRefreshBtn: $("wtRefreshBtn"),
 
     // Actions table
     actionsBody:    $("actionsBody"),
@@ -186,9 +269,11 @@ let prevCounts       = {pending: null, staged: null, approved: null};
 let lastDataSyncAt   = null;
 let refreshPromise   = null;
 let pollTimer        = null;
+let watchtowerTimer  = null;            // NEW v1.6.0 — separate from pollTimer
+let watchtowerProbeInFlight = false;    // NEW v1.6.0 — guard against concurrent probes
 let kbToastTimer     = null;
 let injectInFlight   = false;
-let wsConnected      = false; // true only after server confirms auth/session
+let wsConnected      = false;
 let isLight          = false;
 
 // =============================================================================
@@ -412,9 +497,6 @@ function extractVaultRecords(value) {
 // WebSocket Live State
 // =============================================================================
 
-// Called when the server confirms auth accepted (authenticated/auth_ok/connected).
-// wsConnected is only ever set true here — never on socket open — so the
-// polling fallback is suppressed only when we're actually live.
 function markWebSocketLive(type = "connected") {
     wsConnected = true;
     setStatus("Live");
@@ -546,6 +628,22 @@ const api = {
             : CONFIG.LIVE_TEST_MODE
                 ? fetchJson("/actions/test-inject", {method: "POST"})
                 : Promise.reject(new Error("Inject requires demo or local test mode")),
+
+    // NEW v1.6.0
+    // Endpoint must be registered in main.py. Adjust path if your router
+    // mounts it differently (e.g. /api/watchtower/status).
+    watchtowerStatus: () =>
+        CONFIG.DEMO_MODE
+            ? Promise.resolve({...DEMO_WATCHTOWER, subsystems: [...DEMO_WATCHTOWER.subsystems]})
+            : fetchJson("/watchtower/status"),
+
+    // NEW v1.6.0
+    // Swallows failures so missing endpoint doesn't break the main refresh
+    // cycle. When the backend returns this data, assessment metrics populate.
+    dashboardSummary: () =>
+        CONFIG.DEMO_MODE
+            ? Promise.resolve({...DEMO_SUMMARY})
+            : fetchJson("/dashboard/summary").catch(() => null),
 };
 
 // =============================================================================
@@ -973,6 +1071,153 @@ function openReasonModal({title, subtitle, confirmText, confirmClass = "green"})
 }
 
 // =============================================================================
+// Governance Mode  (NEW v1.6.0)
+// =============================================================================
+
+// Updates #modeText and #modeAlias (mode-chip-alias class).
+// Called from updateStaticConfig(), performRefresh() summary branch,
+// and the governance_mode / mode_changed WebSocket cases.
+function setGovernanceMode(mode) {
+    const normalized = normalizeString(mode, "UNKNOWN").toUpperCase();
+    if (el.modeText) el.modeText.textContent = normalized;
+
+    const alias = MODE_ALIASES[normalized] ?? null;
+    if (el.modeAlias) {
+        el.modeAlias.textContent = alias ?? "";
+        el.modeAlias.classList.toggle("visible", alias !== null);
+    }
+}
+
+// =============================================================================
+// Assessment Metrics  (NEW v1.6.0)
+// =============================================================================
+
+// Populates the assessment stat row only when the backend actually returns
+// those fields. Never overwrites — with a zero or fake value.
+// Handles both camelCase and snake_case field names from the backend.
+function updateAssessmentMetrics(data) {
+    if (data == null || typeof data !== "object") return;
+
+    const pairs = [
+        [el.criticalThreats,  data.criticalThreats  ?? data.criticalCount    ?? data.critical_count],
+        [el.totalAssessments, data.totalAssessments  ?? data.total_assessments],
+        [el.totalDecisions,   data.totalDecisions    ?? data.total_decisions],
+        [el.fenrirSignals,    data.fenrirSignals     ?? data.fenrir_signals   ?? data.anomalyCount ?? data.anomaly_count],
+    ];
+
+    for (const [node, value] of pairs) {
+        if (!node || typeof value !== "number") continue;
+        node.textContent = value.toLocaleString();
+        bumpStat(node);
+    }
+
+    // Update mode if the summary includes it.
+    if (data.mode) setGovernanceMode(data.mode);
+}
+
+// =============================================================================
+// Watchtower  (NEW v1.6.0)
+// =============================================================================
+
+// Renders the #wtGrid with subsystem health cards and updates the header chip.
+// Uses the shared escHtml utility — no separate escapeHtml needed.
+function renderWatchtower(data) {
+    if (!el.wtGrid) return;
+
+    const overall = normalizeString(data?.overall, "unknown").toLowerCase();
+
+    // Overall status chip inside the panel header
+    if (el.wtOverall) {
+        el.wtOverall.textContent = overall.toUpperCase();
+        el.wtOverall.className =
+            overall === "ok"       ? "chip ok"      :
+            overall === "degraded" ? "chip degraded" :
+                                     "chip offline";
+    }
+
+    // Header chip (always visible after first successful probe)
+    if (el.wtHeaderChip) el.wtHeaderChip.hidden = false;
+    if (el.wtHeaderStatus) el.wtHeaderStatus.textContent = overall.toUpperCase();
+    if (el.wtHeaderDot) {
+        el.wtHeaderDot.classList.remove("online", "offline");
+        el.wtHeaderDot.classList.add(overall === "ok" ? "online" : "offline");
+    }
+
+    // Subsystem cards
+    const subsystems = Array.isArray(data?.subsystems) ? data.subsystems : [];
+
+    if (!subsystems.length) {
+        el.wtGrid.innerHTML =
+            `<div style="grid-column:1/-1;padding:18px;text-align:center;` +
+            `font-family:var(--font-mono);font-size:10px;color:var(--muted);` +
+            `text-transform:uppercase;letter-spacing:.1em;">` +
+            `No subsystem data returned.</div>`;
+    } else {
+        el.wtGrid.innerHTML = subsystems.map(s => {
+            const status = normalizeString(s.status, "unknown").toLowerCase();
+            const latency = s.latencyMs != null
+                ? `${escHtml(String(s.latencyMs))}ms`
+                : "—";
+            return (
+                `<div class="wt-card ${escHtml(status)}" role="status"` +
+                ` aria-label="${escHtml(normalizeString(s.name, "Unknown"))}: ${escHtml(status)}">` +
+                `<div class="wt-card-name">${escHtml(normalizeString(s.name, "Unknown"))}</div>` +
+                `<div class="wt-card-detail">${escHtml(normalizeString(s.detail, ""))}</div>` +
+                `<div class="wt-card-footer">` +
+                `<span class="wt-latency">${latency}</span>` +
+                `<span class="wt-badge ${escHtml(status)}">${escHtml(status)}</span>` +
+                `</div>` +
+                `</div>`
+            );
+        }).join("");
+    }
+
+    if (el.wtProbeTime) {
+        el.wtProbeTime.textContent = `Last probe: ${nowStamp()}`;
+    }
+}
+
+// Probes GET /watchtower/status and calls renderWatchtower().
+// watchtowerProbeInFlight prevents concurrent probes (covers button debounce).
+async function fetchWatchtower() {
+    if (watchtowerProbeInFlight) return;
+    watchtowerProbeInFlight = true;
+
+    // Visually indicate probing is in progress
+    if (el.wtRefreshBtn) el.wtRefreshBtn.disabled = true;
+
+    try {
+        const data = await api.watchtowerStatus();
+        renderWatchtower(data);
+        log("Watchtower probe complete.", "ok");
+    } catch (err) {
+        log(`Watchtower probe failed: ${err.message ?? err}`, "warn");
+
+        // Reflect unreachable state in the UI without wiping the last grid
+        if (el.wtOverall) {
+            el.wtOverall.textContent = "UNREACHABLE";
+            el.wtOverall.className = "chip offline";
+        }
+        if (el.wtHeaderDot) {
+            el.wtHeaderDot.classList.remove("online");
+            el.wtHeaderDot.classList.add("offline");
+        }
+        if (el.wtHeaderStatus) el.wtHeaderStatus.textContent = "UNREACHABLE";
+        if (el.wtHeaderChip) el.wtHeaderChip.hidden = false;
+    } finally {
+        watchtowerProbeInFlight = false;
+        if (el.wtRefreshBtn) el.wtRefreshBtn.disabled = false;
+    }
+}
+
+// Starts the 30 s Watchtower probe cycle.
+// Called once from init. Separate timer from startPollingFallback().
+function startWatchtowerPolling() {
+    if (watchtowerTimer) clearInterval(watchtowerTimer);
+    watchtowerTimer = setInterval(fetchWatchtower, WT_PROBE_MS);
+}
+
+// =============================================================================
 // Refresh / Data Sync
 // =============================================================================
 
@@ -981,9 +1226,13 @@ async function performRefresh(manual = false) {
     if (manual) setStatus("Syncing");
     try {
         updateStaticConfig();
-        const [rawActions, vault] = await Promise.all([
+        // NEW v1.6.0: dashboardSummary added to parallel fetch.
+        // It swallows its own errors so a missing endpoint won't fail the whole
+        // refresh cycle.
+        const [rawActions, vault, summary] = await Promise.all([
             api.listActions(),
             api.vaultStats().catch(() => null),
+            api.dashboardSummary().catch(() => null),
         ]);
         replaceActions(rawActions, wsConnected ? "live-sync" : "poll-sync");
         const records = extractVaultRecords(vault);
@@ -992,6 +1241,9 @@ async function performRefresh(manual = false) {
                 ? records.toLocaleString()
                 : "--";
         }
+        // NEW v1.6.0: populate assessment metrics and mode if backend returns them
+        if (summary) updateAssessmentMetrics(summary);
+
         setStatus(wsConnected ? "Live" : "Online");
         if (manual) {
             log(`Refresh complete — ${applyFilters(allActions).length} action(s) visible.`, "ok");
@@ -1244,7 +1496,11 @@ function exportVisibleActions() {
 function updateStaticConfig() {
     if (el.apiBaseText) el.apiBaseText.textContent = CONFIG.API_BASE;
     if (el.pollText) el.pollText.textContent = `fallback ${CONFIG.FALLBACK_POLL_MS} ms`;
-    if (el.modeText) el.modeText.textContent = "HUMAN_GATED";
+
+    // NEW v1.6.0: setGovernanceMode() instead of direct textContent assignment
+    // so the alias span is handled consistently. "HUMAN_GATED" remains the
+    // static default until the backend returns an actual mode value.
+    setGovernanceMode("HUMAN_GATED");
 
     const demoActive = CONFIG.DEMO_MODE || CONFIG.LIVE_TEST_MODE;
     if (el.demoText) {
@@ -1286,14 +1542,8 @@ function applyTheme(light) {
 function initTheme() {
     try {
         const stored = localStorage.getItem("s43-theme");
-        if (stored === "light") {
-            applyTheme(true);
-            return;
-        }
-        if (stored === "dark") {
-            applyTheme(false);
-            return;
-        }
+        if (stored === "light") { applyTheme(true);  return; }
+        if (stored === "dark")  { applyTheme(false); return; }
     } catch {}
     applyTheme(
         window.matchMedia?.("(prefers-color-scheme: light)").matches ?? false
@@ -1313,7 +1563,6 @@ function closeJwtModal() {
 async function handleAuthChanged() {
     updateStaticConfig();
     if (!CONFIG.DEMO_MODE) {
-        // Reconnect triggers websocket.js's full auth flow with the new token.
         window.SentinelWS?.disconnect();
         window.SentinelWS?.connect();
     }
@@ -1384,9 +1633,6 @@ window.addEventListener("sentinel:ws:open", () => {
     log("WebSocket connected. Awaiting auth handshake.", "info");
 });
 
-// Fix v1.5.2: auth_required is handled internally by websocket.js before this
-// event fires. Do not send a second auth frame here — that causes a double-auth
-// race. This listener exists solely for UI notification (log + status).
 window.addEventListener("sentinel:ws:auth_required", () => {
     log("WebSocket auth challenge received.", "info");
 });
@@ -1448,19 +1694,10 @@ window.addEventListener("sentinel:ws:stale", () => {
     log("WebSocket connection stale — forcing reconnect.", "warn");
 });
 
-// All server-to-dashboard messages arrive here after websocket.js has
-// validated the frame, checked the byte limit, and parsed the JSON.
 window.addEventListener("sentinel:ws:message", event => {
     const {type, payload} = event.detail;
 
     switch (type) {
-
-        // Fix v1.5.2: auth_required is handled internally by websocket.js and
-        // never re-dispatched to sentinel:ws:message. This case is dead code
-        // and is removed to avoid confusion. The auth flow is:
-        //   open → proactive auth (websocket.js)
-        //   OR server sends auth_required → websocket.js responds internally
-        //       → dispatches sentinel:ws:auth_required for UI notification only
 
         case "authenticated":
         case "auth_ok":
@@ -1502,11 +1739,24 @@ window.addEventListener("sentinel:ws:message", event => {
             log(`Governance pending queue: ${(payload.pending ?? []).length} item(s).`, "info");
             break;
 
+        // NEW v1.6.0: governance mode pushed over WebSocket updates modeText
+        // and the alias span immediately without waiting for the next poll.
+        case "governance_mode":
+        case "mode_changed":
+            setGovernanceMode(normalizeString(payload.mode, "UNKNOWN"));
+            log(`Governance mode: ${normalizeString(payload.mode, "UNKNOWN")}`, "info");
+            break;
+
+        // NEW v1.6.0: if the payload includes subsystem data, render it.
+        // If it only has a reachable flag (legacy shape), log and skip render.
         case "watchtower_state":
             log(
                 `Watchtower ${payload.reachable ? "reachable" : "unreachable"}.`,
                 payload.reachable ? "ok" : "warn"
             );
+            if (payload.subsystems || payload.overall) {
+                renderWatchtower(payload);
+            }
             break;
 
         case "dependency_state":
@@ -1541,6 +1791,11 @@ el.clearLogBtn?.addEventListener("click", () => {
     if (el.logConsole) el.logConsole.innerHTML = "";
     log("Console cleared.", "info");
 });
+
+// NEW v1.6.0: Watchtower manual re-probe.
+// watchtowerProbeInFlight inside fetchWatchtower() prevents concurrent probes
+// so no separate debounce is needed here.
+el.wtRefreshBtn?.addEventListener("click", () => fetchWatchtower());
 
 el.searchInput?.addEventListener("input", () => {
     searchQuery = el.searchInput.value;
@@ -1644,18 +1899,9 @@ document.addEventListener("keydown", e => {
     const inInput = ["INPUT", "TEXTAREA", "SELECT"].includes(tag);
 
     if (e.key === "Escape") {
-        if (!el.reasonModal?.hidden) {
-            el.modalCancel?.click();
-            return;
-        }
-        if (!el.jwtModal?.hidden) {
-            closeJwtModal();
-            return;
-        }
-        if (!el.injectModal?.hidden) {
-            closeInjectModal();
-            return;
-        }
+        if (!el.reasonModal?.hidden) { el.modalCancel?.click(); return; }
+        if (!el.jwtModal?.hidden)    { closeJwtModal();          return; }
+        if (!el.injectModal?.hidden) { closeInjectModal();       return; }
         el.kbToast?.classList.remove("show");
         if (selectedIds.size) clearSelection();
         return;
@@ -1689,9 +1935,7 @@ document.addEventListener("keydown", e => {
         const id = rows[focusedRowIndex].dataset.id;
         const action = allActions.find(a => a.id === id);
         if (action?.status === "STAGED") {
-            doApprove(id).then(ok => {
-                if (ok) refreshDashboard(true, {force: true});
-            });
+            doApprove(id).then(ok => { if (ok) refreshDashboard(true, {force: true}); });
         }
         return;
     }
@@ -1699,9 +1943,7 @@ document.addEventListener("keydown", e => {
         const id = rows[focusedRowIndex].dataset.id;
         const action = allActions.find(a => a.id === id);
         if (action && ["PENDING", "STAGED"].includes(action.status)) {
-            doVeto(id).then(ok => {
-                if (ok) refreshDashboard(true, {force: true});
-            });
+            doVeto(id).then(ok => { if (ok) refreshDashboard(true, {force: true}); });
         }
     }
 });
@@ -1711,7 +1953,8 @@ document.addEventListener("keydown", e => {
 // =============================================================================
 
 window.addEventListener("beforeunload", () => {
-    if (pollTimer) clearInterval(pollTimer);
+    if (pollTimer)       clearInterval(pollTimer);
+    if (watchtowerTimer) clearInterval(watchtowerTimer); // NEW v1.6.0
 });
 
 // =============================================================================
@@ -1721,7 +1964,6 @@ window.addEventListener("beforeunload", () => {
 log("Dashboard initializing…", "info");
 
 if (CONFIG.DEMO_MODE) {
-    // websocket.js auto-connects on load; cut it immediately in demo mode.
     window.SentinelWS?.disconnect();
     log("Demo mode active. WebSocket disconnected. Use ?demo=1 for local testing only.", "warn");
 } else if (!CONFIG.LIVE_TEST_MODE) {
@@ -1732,4 +1974,6 @@ initTheme();
 updateStaticConfig();
 setStatus("Booting");
 startPollingFallback();
+startWatchtowerPolling();   // NEW v1.6.0 — 30 s probe cycle, separate timer
+fetchWatchtower();          // NEW v1.6.0 — immediate first probe on load
 refreshDashboard(true, {force: true});
