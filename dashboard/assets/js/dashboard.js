@@ -1811,16 +1811,30 @@ window.addEventListener("sentinel:ws:message", event => {
             log(`Governance mode: ${normalizeString(payload.mode, "UNKNOWN")}`, "info");
             break;
 
-        // NEW v1.6.0: if the payload includes subsystem data, render it.
-        // v1.6.1: run through normalizeWatchtowerResponse() so the heartbeat
-        // broadcast shape { reachable, url, timestamp } and the bridge shape
-        // { watchtower: {...} } are both handled correctly.
+        // Heartbeat broadcasts carry { reachable, url, timestamp } only — no
+        // tower data. These update the header chip and log, but never touch
+        // the tower grid (which would wipe it with "No subsystem data returned").
+        // Full tower renders only happen when the payload contains watchtower,
+        // subsystems, or overall keys — i.e. from the HTTP probe or a future
+        // WS push of a complete status payload.
         case "watchtower_state":
             log(
                 `Watchtower ${payload.reachable ? "reachable" : "unreachable"}.`,
                 payload.reachable ? "ok" : "warn"
             );
-            if (payload.subsystems || payload.overall || "watchtower" in payload || "reachable" in payload) {
+            if ("reachable" in payload && !("watchtower" in payload) && !("subsystems" in payload)) {
+                // Heartbeat-only shape — update chip, preserve grid
+                if (el.wtHeaderChip) el.wtHeaderChip.hidden = false;
+                if (el.wtHeaderStatus) {
+                    el.wtHeaderStatus.textContent = payload.reachable ? "REACHABLE" : "UNREACHABLE";
+                }
+                if (el.wtHeaderDot) {
+                    el.wtHeaderDot.classList.toggle("online",  !!payload.reachable);
+                    el.wtHeaderDot.classList.toggle("offline", !payload.reachable);
+                }
+                break;
+            }
+            if (payload.subsystems || payload.overall || "watchtower" in payload) {
                 renderWatchtower(normalizeWatchtowerResponse(payload));
             }
             break;
