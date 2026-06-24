@@ -4,50 +4,33 @@
 // UI logic module. WebSocket transport is handled by websocket.js which
 // dispatches sentinel:ws:* events consumed here.
 //
-// v1.6.0
+// v1.6.1
 // Changes:
-// - Watchtower subsystem health integration:
-//     renderWatchtower(data)        — renders #wtGrid, #wtOverall, header chip
-//     fetchWatchtower()             — probes GET /watchtower/status with
-//                                     watchtowerProbeInFlight guard (no
-//                                     concurrent probes; handles wtRefreshBtn)
-//     startWatchtowerPolling()      — separate 30 s interval, independent of
-//                                     the main fallback poll (pollTimer)
-//     sentinel:ws:message           — watchtower_state handler now calls
-//                                     renderWatchtower() when payload contains
-//                                     subsystem data
-// - Governance mode alias:
-//     MODE_ALIASES constant
-//     setGovernanceMode(mode)       — updates #modeText + #modeAlias with
-//                                     alias; called from updateStaticConfig(),
-//                                     performRefresh() summary, and new
-//                                     governance_mode / mode_changed WS cases
-// - Assessment layer metrics:
-//     updateAssessmentMetrics(data) — populates #criticalThreats,
-//                                     #totalAssessments, #totalDecisions,
-//                                     #fenrirSignals only when backend returns
-//                                     those fields; never overwrites — with a
-//                                     fake value
-// - api.watchtowerStatus           — GET /watchtower/status; demo stub served
-//                                     from DEMO_WATCHTOWER
-// - api.dashboardSummary           — GET /dashboard/summary; demo stub served
-//                                     from DEMO_SUMMARY; swallows 404 so
-//                                     existing refresh flow is unaffected if
-//                                     endpoint not yet implemented
-// - watchtowerTimer cleared in beforeunload alongside existing pollTimer
-// - DEMO_WATCHTOWER / DEMO_SUMMARY objects for ?demo=1 mode
+// - normalizeWatchtowerResponse() added: maps the main.py bridge response
+//   shape (GET /watchtower/status returns { bridge, reachable, watchtower:
+//   { state, towers: [...8 Octagon segments...] } }) into the standard
+//   { overall, subsystems } format renderWatchtower() expects.
+//   Root cause of "No subsystem data returned" on first deployment: the
+//   bridge wrapper was passed directly to renderWatchtower(), which found
+//   neither `overall` nor `subsystems` keys and hit the empty branch.
+//   Tower status derived from tower.enabled + tower.alert_count (no explicit
+//   status field exists on Octagon segments). latencyMs is null (not
+//   available per-tower). Tower type labels mapped to human-readable detail.
+// - fetchWatchtower() now calls normalizeWatchtowerResponse(raw) before
+//   renderWatchtower(data).
+//
+// v1.6.0 (prior):
+// - Watchtower subsystem health integration (renderWatchtower, fetchWatchtower,
+//   startWatchtowerPolling, MODE_ALIASES, setGovernanceMode,
+//   updateAssessmentMetrics, api.watchtowerStatus, api.dashboardSummary).
 //
 // v1.5.2 (prior):
-// - Removed sendWebSocketAuthFrame(). websocket.js owns the auth exchange
-//   entirely.
+// - Removed sendWebSocketAuthFrame(). websocket.js owns the auth exchange.
 // - sentinel:ws:auth_required listener now logs only.
 // - auth_required removed from sentinel:ws:message switch (dead code).
 //
 // v1.5.1-authfix (prior):
 // - Uses a wider dev JWT lookup path matching websocket.js.
-// - Handles sentinel:ws:auth_required directly.
-// - Supports both SentinelWS.sendAuth(token) and SentinelWS.auth().
-// - Does not log raw JWTs.
 // - Treats authenticated/auth_ok/connected as successful live state.
 // =============================================================================
 
@@ -1177,6 +1160,86 @@ function renderWatchtower(data) {
     }
 }
 
+// Normalizes the bridge response from GET /watchtower/status into the
+// standard { overall, subsystems } shape that renderWatchtower() expects.
+//
+// The API endpoint is a bridge wrapper:
+//   { bridge, reachable, watchtower: { state, towers: [...], ... }, timestamp }
+//
+// The real subsystem data lives in watchtower.towers — the 8 Octagon segments.
+// Each tower has name, tower_type, enabled, alert_count, malformed_input_count.
+// Status is derived (no explicit field): online / degraded / offline.
+// latencyMs is not available per-tower from the Octagon so cards show —.
+//
+// If the response is already in { overall, subsystems } form (demo stub or
+// future direct endpoint) it passes through unchanged.
+function normalizeWatchtowerResponse(raw) {
+    if (!raw || typeof raw !== "object") return raw;
+
+    // Already in expected format — pass through
+    if ("subsystems" in raw) return raw;
+
+    // Bridge response shape from main.py GET /watchtower/status
+    if ("watchtower" in raw) {
+        const reachable = raw.reachable !== false;
+
+        if (!reachable) {
+            return {overall: "offline", subsystems: []};
+        }
+
+        const wt = raw.watchtower ?? {};
+
+        // Map Watchtower state to overall chip value
+        const state = normalizeString(wt.state, "UNKNOWN").toUpperCase();
+        const overall =
+            state === "ACTIVE"   ? "ok"       :
+            state === "DEGRADED" ? "degraded" :
+                                   "offline";
+
+        const TOWER_TYPE_LABELS = Object.freeze({
+            API_HEALTH:         "api health monitoring",
+            EXPECTATION_GUARD:  "expectation & contract guard",
+            CONFIG_DRIFT:       "configuration drift detection",
+            LOGGING_AUDIT:      "audit chain integrity",
+            ERROR_RATE:         "runtime error rate",
+            DEPENDENCY_HEALTH:  "dependency health",
+            RESOURCE_PRESSURE:  "resource pressure",
+            SECURITY_BASELINE:  "security baseline",
+        });
+
+        const towers = Array.isArray(wt.towers) ? wt.towers : [];
+
+        const subsystems = towers.map(t => {
+            // Derive status from available tower fields:
+            //   disabled → offline
+            //   alert_count > 0 → degraded
+            //   otherwise → online
+            let status = "online";
+            if (t.enabled === false) {
+                status = "offline";
+            } else if (typeof t.alert_count === "number" && t.alert_count > 0) {
+                status = "degraded";
+            }
+
+            const towerType = normalizeString(t.tower_type, "");
+            const detail = TOWER_TYPE_LABELS[towerType]
+                ?? towerType.toLowerCase().replace(/_/g, " ");
+
+            return {
+                name:      normalizeString(t.name, "Unknown Tower"),
+                status,
+                latencyMs: null,  // not available per Octagon tower
+                detail,
+            };
+        });
+
+        return {overall, subsystems};
+    }
+
+    // Unknown shape — pass through and let renderWatchtower() handle it
+    return raw;
+}
+
 // Probes GET /watchtower/status and calls renderWatchtower().
 // watchtowerProbeInFlight prevents concurrent probes (covers button debounce).
 async function fetchWatchtower() {
@@ -1187,7 +1250,8 @@ async function fetchWatchtower() {
     if (el.wtRefreshBtn) el.wtRefreshBtn.disabled = true;
 
     try {
-        const data = await api.watchtowerStatus();
+        const raw  = await api.watchtowerStatus();
+        const data = normalizeWatchtowerResponse(raw);
         renderWatchtower(data);
         log("Watchtower probe complete.", "ok");
     } catch (err) {
@@ -1748,14 +1812,16 @@ window.addEventListener("sentinel:ws:message", event => {
             break;
 
         // NEW v1.6.0: if the payload includes subsystem data, render it.
-        // If it only has a reachable flag (legacy shape), log and skip render.
+        // v1.6.1: run through normalizeWatchtowerResponse() so the heartbeat
+        // broadcast shape { reachable, url, timestamp } and the bridge shape
+        // { watchtower: {...} } are both handled correctly.
         case "watchtower_state":
             log(
                 `Watchtower ${payload.reachable ? "reachable" : "unreachable"}.`,
                 payload.reachable ? "ok" : "warn"
             );
-            if (payload.subsystems || payload.overall) {
-                renderWatchtower(payload);
+            if (payload.subsystems || payload.overall || "watchtower" in payload || "reachable" in payload) {
+                renderWatchtower(normalizeWatchtowerResponse(payload));
             }
             break;
 
