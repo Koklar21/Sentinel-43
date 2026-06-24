@@ -1,9 +1,16 @@
 /* =============================================================================
    Sentinel-43 Dashboard
    websocket.js — Hardened WebSocket bridge
-   v1.5.2
+   v1.5.3
 
-   Changes from v1.5.1:
+   Changes from v1.5.2:
+     - Fix: double comma (,,) after CHANNELS Object.freeze([...]) removed.
+       The extra comma was a SyntaxError that prevented the entire module from
+       parsing. window.SentinelWS was never defined, connect() was never
+       called, and no WebSocket connection was ever established. The dashboard
+       fell back silently to HTTP polling only.
+
+   Changes from v1.5.2:
      - Fix: _sendAuthFrame() now sets _manuallyClosed = true before closing
        the socket when no token is found. Previously the socket closed with
        code 1000 (normal closure), which is not in NO_RECONNECT_CODES, so
@@ -15,35 +22,15 @@
    Changes from v1.5.0:
      - Fix: _getDevToken() now searches the same key set as dashboard.js
        (DEV_JWT_KEYS across sessionStorage, localStorage, and window globals).
-       Previously only sessionStorage["SENTINEL_JWT"] was checked; tokens
-       stored under any other key were invisible to the auth path, causing
-       websocket.js to fail the proactive auth-on-open and then re-dispatch
-       auth_required to dashboard.js which could also not find the token via
-       SentinelWS.auth(). Both sides now see the same token regardless of
-       which key or storage mechanism the operator used.
-
-   Changes from v1.4.0 (carried forward from v1.5.0):
      - Fix: no longer reconnects on close code 1008 (auth failure) or 1003
-       (unsupported data). These codes mean the server rejected the client;
-       reconnecting just repeats the same failure. The client now stops and
-       dispatches sentinel:ws:auth_failed so the UI can prompt for re-login.
-     - Fix: page-hide no longer disconnects. For an active security hunting
-       platform, the operator must receive alerts even when the dashboard is
-       in a background tab. Disable RECONNECT_WHEN_VISIBLE if you want the
-       old aggressive-disconnect behaviour.
-     - Fix: outgoing frame size cap added to _sendRaw(). The server enforces
-       64 KB on incoming frames; the client now mirrors that guard before send.
-     - Fix: incoming message rate limiter. Server floods (or misbehaving
-       connections) no longer exhaust the event loop. MAX_MSGS_PER_SECOND
-       frames pass; excess frames are counted and a throttle event dispatched.
-     - Fix: _getDevToken() called only once per connection open — token is
-       captured in a local variable rather than read from sessionStorage twice.
-     - Added: governance, watchtower, dependencies channels to CHANNELS so the
-       dashboard receives HUMAN_GATED decision queues, Watchtower state
-       transitions, and dependency health events produced by the recoded main.py.
+       (unsupported data).
+     - Fix: page-hide no longer disconnects.
+     - Fix: outgoing frame size cap added to _sendRaw().
+     - Fix: incoming message rate limiter.
+     - Fix: _getDevToken() called only once per connection open.
+     - Added: governance, watchtower, dependencies channels to CHANNELS.
      - Added: explicit handlers for governance_pending_snapshot,
        watchtower_state, and dependency_state message types.
-     - Minor: raw.length fast-path in _validateFrame labelled with a comment.
 
    Protocol:
      - Backend may send: auth_required
@@ -58,6 +45,13 @@
        also dispatches sentinel:ws:auth_required as a notification so dashboard
        layers can update their UI. dashboard.js must NOT send a second auth
        frame in response to that event — doing so causes a double-auth race.
+
+   Watchtower note:
+     - The server broadcasts watchtower_state over WebSocket with heartbeat
+       data only: { reachable, url, timestamp }. No Octagon tower data comes
+       through WebSocket. The full tower grid is populated exclusively by the
+       HTTP probe in dashboard.js (fetchWatchtower → GET /watchtower/status).
+       The watchtower_state WS handler updates the header chip only.
 
    This module exposes window.SentinelWS and dispatches sentinel:ws:* events.
    ============================================================================= */
@@ -98,13 +92,13 @@ const WS_CONFIG = Object.freeze({
     // If true, client sends auth immediately on open when a token exists.
     AUTH_FIRST_WHEN_TOKEN_PRESENT: true,
 
-    // Fix: active hunting context — keep the connection alive in background
-    // tabs so operators receive alerts even when the dashboard is not focused.
+    // Active hunting context — keep the connection alive in background tabs
+    // so operators receive alerts even when the dashboard is not focused.
     // Set to true to restore v1.4.0 behaviour (disconnect on page hide).
     DISCONNECT_ON_PAGE_HIDE: false,
 
-    // Fix: close codes that must NOT trigger a reconnect attempt. 1008 is
-    // what main.py sends on auth failure; reconnecting just repeats the same
+    // Close codes that must NOT trigger a reconnect attempt. 1008 is what
+    // main.py sends on auth failure; reconnecting just repeats the same
     // rejected-token cycle indefinitely until the 30s cap is hit every time.
     NO_RECONNECT_CODES: Object.freeze(new Set([
         1008,   // Policy violation (auth failure)
@@ -112,29 +106,29 @@ const WS_CONFIG = Object.freeze({
         1011,   // Server error — reconnecting won't fix a server-side crash
     ])),
 
-    // Fix: incoming rate limiter. Excess messages are dropped and a throttle
+    // Incoming rate limiter. Excess messages are dropped and a throttle
     // event is dispatched so the UI can display a warning.
     MAX_MSGS_PER_SECOND: 30,
 
     // Full channel set matching main.py subscriptions including governance
     // (HUMAN_GATED decision queue) and Fenrir hunting event channels.
+    // Fix v1.5.3: removed trailing double comma ,, which was a SyntaxError.
     CHANNELS: Object.freeze([
-    "actions",
-    "vault",
-    "governance",
-    "watchtower",
-    "dependencies",
-    "security",
-]),,
+        "actions",
+        "vault",
+        "governance",
+        "watchtower",
+        "dependencies",
+        "security",
+    ]),
 });
 
 /* =============================================================================
    Token Lookup
    ============================================================================= */
 
-// Fix v1.5.1: key list must stay in sync with dashboard.js DEV_JWT_KEYS so
-// that any token the UI layer can find is also visible to the auth path here.
-// Tokens stored under any other key were previously invisible to this module.
+// Key list must stay in sync with dashboard.js DEV_JWT_KEYS so that any
+// token the UI layer can find is also visible to the auth path here.
 const _DEV_JWT_KEYS = Object.freeze([
     "SENTINEL_JWT",
     "S43_JWT",
@@ -165,7 +159,7 @@ let _reconnectTimer    = null;
 let _heartbeatTimer    = null;
 let _lastMessageAt     = 0;
 
-// Fix: incoming rate limiter state.
+// Incoming rate limiter state.
 let _msgCountThisSecond = 0;
 let _msgRateTick = null;
 
@@ -186,9 +180,8 @@ function _dispatchMessage(parsed) {
     _dispatch(`sentinel:ws:${parsed.type}`, parsed);
 }
 
-// Fix v1.5.1: expanded token lookup. Checks sessionStorage first (shorter-
-// lived, more appropriate for session tokens), then localStorage for tokens
-// persisted across sessions, then window globals set by server-rendered pages.
+// Expanded token lookup: sessionStorage → localStorage → window globals.
+// Called once per connection open; token captured in a local variable.
 function _getDevToken() {
     if (!WS_CONFIG.ALLOW_DEV_TOKEN) return null;
 
@@ -246,7 +239,7 @@ function _resetConnectionState() {
 }
 
 /* =============================================================================
-   Incoming Rate Limiter (Fix)
+   Incoming Rate Limiter
    ============================================================================= */
 
 function _startRateLimitTick() {
@@ -289,7 +282,6 @@ function _validateFrame(raw) {
 
     // Fast-path: if the JS string length already exceeds the byte cap, we know
     // the UTF-8 byte count will too (UTF-8 bytes >= UTF-16 code units always).
-    // This avoids the encode() call for obviously-oversized frames.
     if (raw.length > WS_CONFIG.MAX_FRAME_BYTES) {
         throw new Error(`WebSocket frame exceeds ${WS_CONFIG.MAX_FRAME_BYTES} bytes`);
     }
@@ -358,7 +350,7 @@ function _sendRaw(type, payload = {}) {
         return false;
     }
 
-    // Fix: enforce outgoing frame size limit matching the server's incoming cap.
+    // Enforce outgoing frame size limit matching the server's incoming cap.
     if (serialized.length > WS_CONFIG.MAX_FRAME_BYTES) {
         _dispatch("sentinel:ws:error", {
             error: `Outgoing frame for '${type}' exceeds ${WS_CONFIG.MAX_FRAME_BYTES} bytes and was not sent`,
@@ -385,11 +377,10 @@ function _sendAuthFrame(token) {
             error: "WebSocket authentication required, but no JWT was found.",
             timestamp: _nowIso(),
         });
-        // Fix v1.5.2: mark as manually closed BEFORE calling close() so the
-        // close event handler sees _manuallyClosed=true and skips
-        // _scheduleReconnect(). Without this, the socket closes with code
-        // 1000 (not in NO_RECONNECT_CODES) and the reconnect loop fires
-        // immediately — pointless when there is no token to authenticate with.
+        // Mark as manually closed BEFORE calling close() so the close event
+        // handler sees _manuallyClosed=true and skips _scheduleReconnect().
+        // Without this, socket closes with code 1000 (not in NO_RECONNECT_CODES)
+        // and the reconnect loop fires immediately — pointless with no token.
         _manuallyClosed = true;
         if (_ws) {
             try { _ws.close(); } catch {}
@@ -408,8 +399,8 @@ function _subscribeConfiguredChannels() {
     if (!_canSend()) return false;
     if (_subscribed) return true;
 
-    // Guard: must be authenticated before subscribing. The server enforces
-    // this; subscribing before auth accepted produces an immediate rejection.
+    // Must be authenticated before subscribing. The server enforces this;
+    // subscribing before auth accepted produces an immediate rejection.
     if (!_connected) return false;
 
     for (const channel of WS_CONFIG.CHANNELS) {
@@ -522,7 +513,7 @@ function _markConnected(parsed) {
 function _handleMessage(event) {
     _lastMessageAt = Date.now();
 
-    // Fix: rate limiter — drop excess frames before any parsing work.
+    // Rate limiter — drop excess frames before any parsing work.
     if (_isRateLimited()) return;
 
     let parsed;
@@ -570,13 +561,11 @@ function _handleMessage(event) {
             _dispatchMessage(parsed);
             return;
 
-        // Watchtower state transition (reachable / unreachable).
+        // Watchtower heartbeat: { reachable, url, timestamp } only.
+        // No Octagon tower data comes through WebSocket. The full tower grid
+        // is populated by the HTTP probe in dashboard.js (fetchWatchtower).
+        // dashboard.js sentinel:ws:message handler updates the header chip.
         case "watchtower_state":
-            _dispatch("sentinel:ws:watchtower_state", {
-                reachable: parsed.payload?.reachable ?? false,
-                url: parsed.payload?.url ?? "",
-                timestamp: _nowIso(),
-            });
             _dispatchMessage(parsed);
             return;
 
@@ -643,11 +632,9 @@ function connect() {
 
         _dispatch("sentinel:ws:open", { timestamp: _nowIso() });
 
-        // Proactively send auth before the server asks for it. Reduces
-        // round-trip latency on connect. Token is read once here using the
-        // expanded _getDevToken() lookup (sessionStorage → localStorage →
-        // window globals). If not found, the server will send auth_required
-        // and _handleAuthRequired() will attempt the same lookup again.
+        // Proactively send auth before the server asks for it. Token read once
+        // here using the expanded _getDevToken() lookup. If not found, the
+        // server will send auth_required and _handleAuthRequired() retries.
         if (WS_CONFIG.AUTH_FIRST_WHEN_TOKEN_PRESENT) {
             const token = _getDevToken();
             if (token) {
