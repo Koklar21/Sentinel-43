@@ -67,18 +67,19 @@ services:
       dockerfile: core/api/Dockerfile
     container_name: s43_core
     restart: unless-stopped
-    command: python -m core.monitoring.watchtower
+    command: uvicorn core.monitoring.watchtower:app --host 0.0.0.0 --port 9100
     ports:
       - "9100:9100"
     environment:
       S43_WATCHTOWER_HOST: 0.0.0.0
       S43_WATCHTOWER_PORT: 9100
-      SENTINEL_ENV:        ${SENTINEL_ENV}
-      S43_LOG_LEVEL:       INFO
-      DATABASE_URL:        ${DATABASE_URL}
-      REDIS_URL:           redis://:${REDIS_PASSWORD}@s43-redis:6379/0
-      S43_AUTH_PEPPER:     ${S43_AUTH_PEPPER}
-      SENTINEL_LOG_SALT:   ${SENTINEL_LOG_SALT}
+      S43_EXPOSE_BIND_HOST: "true"
+      SENTINEL_ENV: ${SENTINEL_ENV}
+      S43_LOG_LEVEL: INFO
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@s43-redis:6379/0
+      S43_AUTH_PEPPER: ${S43_AUTH_PEPPER}
+      SENTINEL_LOG_SALT: ${SENTINEL_LOG_SALT}
     volumes:
       - ./logs:/app/logs
     depends_on:
