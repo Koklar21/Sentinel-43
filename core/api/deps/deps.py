@@ -1,7 +1,8 @@
 # =============================================================================
-# Copyright (c) 2026 Justin [LastName or Entity]
+# Copyright (c) 2026 Justin Armstrong
+# All Rights Reserved.
 #
-# Sentinel is dual-licensed:
+# Sentinel-43 is dual-licensed:
 #   (1) AGPL-3.0-or-later, or
 #   (2) a commercial license (see COMMERCIAL_LICENSE.md).
 #
@@ -445,3 +446,16 @@ def deps_status() -> dict[str, Any]:
         "factory_cache": _cached_factory.cache_info()._asdict(),
         "timestamp": utc_now(),
     }
+
+
+__all__ = [
+    "get_engine",
+    "get_store",
+    "deps_status",
+    "clear_factory_caches",
+    "reset_dev_store_state",
+    "DevEngine",
+    "DevStore",
+    "dev_engine_factory",
+    "dev_store_factory",
+]
