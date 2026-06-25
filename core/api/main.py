@@ -61,7 +61,8 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from ..bootstrap import bootstrap_expectations
 from .routers.audit import router as audit_router
@@ -895,6 +896,38 @@ try:
     logger.info("SpartaCore node API router registered at /node")
 except Exception as _nr_exc:
     logger.warning("SpartaCore node router not registered: %s", _nr_exc)
+
+
+# =============================================================================
+# Dashboard static file serving
+# Serves sentinel_43_dashboard.html and all assets from dashboard/assets/.
+# S43_DASHBOARD_DIR defaults to "dashboard" (relative to CWD / Docker WORKDIR).
+# =============================================================================
+
+DASHBOARD_DIR       = _env_str("S43_DASHBOARD_DIR", "dashboard")
+DASHBOARD_ASSETS_DIR = os.path.join(DASHBOARD_DIR, "assets")
+DASHBOARD_HTML      = os.path.join(DASHBOARD_DIR, "sentinel_43_dashboard.html")
+
+if os.path.isdir(DASHBOARD_ASSETS_DIR):
+    app.mount(
+        "/assets",
+        StaticFiles(directory=DASHBOARD_ASSETS_DIR),
+        name="dashboard-assets",
+    )
+else:
+    logger.warning(
+        "Dashboard assets directory not found: %s -- /assets will 404", DASHBOARD_ASSETS_DIR
+    )
+
+
+@app.get("/dashboard", include_in_schema=False)
+def serve_dashboard() -> FileResponse:
+    return FileResponse(DASHBOARD_HTML)
+
+
+@app.get("/dashboard.html", include_in_schema=False)
+def serve_dashboard_html() -> FileResponse:
+    return FileResponse(DASHBOARD_HTML)
 
 
 # =============================================================================
