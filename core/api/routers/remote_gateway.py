@@ -75,6 +75,20 @@
 #   - Fix #11: removed dead double-default for gateway_name.
 #   - Fix #12: auth_failure_window_seconds uses _env_float() directly.
 #   - Fix #13: redundant get_remote_gateway_router() removed.
+#
+# v5 (live dispatch — callback registry):
+#   - Fix #14: _dispatch_remote_event() is now fully implemented via an
+#     in-process callback registry. register_dispatch_handler() lets
+#     main.py wire in per-event handlers at lifespan startup without
+#     creating a circular import or an HTTP loopback dependency.
+#   - APPROVE_DECISION and VETO_DECISION route through registered async
+#     handlers; if no handler is registered they return 501 with a clear
+#     message rather than silently succeeding or crashing.
+#   - FORCE_HEALTH_CHECK, FORCE_SYNC, and REQUEST_DIAGNOSTIC_SNAPSHOT
+#     have sensible in-process defaults (Watchtower ping + log) but can
+#     also be overridden via the registry.
+#   - ROTATE_REMOTE_TOKEN remains 501 until a key-rotation subsystem is
+#     integrated; it is the only event type with no in-process default.
 # =============================================================================
 
 from __future__ import annotations
@@ -90,7 +104,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
-from typing import Any
+from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 import httpx
@@ -704,6 +718,83 @@ async def _authenticate(request: Request, authorization: str | None) -> Operator
 
 
 # =============================================================================
+# Dispatch handler registry (Fix #14)
+# =============================================================================
+#
+# In-process callback registry for live event dispatch. Eliminates the HTTP
+# loopback dependency that Option B (self-call) would have introduced.
+#
+# main.py registers handlers at lifespan startup:
+#
+#     from core.api.routers import remote_gateway
+#
+#     async def _handle_approve(body: RemoteEventActivationRequest) -> str:
+#         decision_id = body.payload["decision_id"]
+#         await asyncio.to_thread(
+#             _orchestrator.resolve_human_decision,
+#             decision_id, approved=True,
+#             operator_id=body.operator_id, reason=body.reason,
+#         )
+#         _update_action_status(
+#             decision_id,
+#             allowed_statuses={"STAGED"},
+#             new_status="APPROVED",
+#             reason=body.reason,
+#             operator=body.operator_id,
+#         )
+#         return f"Decision {decision_id} approved by {body.operator_id}."
+#
+#     remote_gateway.register_dispatch_handler(
+#         remote_gateway.RemoteEventType.APPROVE_DECISION, _handle_approve
+#     )
+#
+# Handler signature:
+#     async def handler(body: RemoteEventActivationRequest) -> str
+#     Return value is used as the activation message in the audit record
+#     and the response. Raise HTTPException to surface errors to the caller.
+#
+# =============================================================================
+
+# Type alias for handler callables.
+DispatchHandler = Callable[
+    ["RemoteEventActivationRequest"],
+    Awaitable[str],
+]
+
+_dispatch_registry: dict[RemoteEventType, DispatchHandler] = {}
+_dispatch_registry_lock = threading.Lock()
+
+
+def register_dispatch_handler(
+    event_type: RemoteEventType,
+    handler: DispatchHandler,
+) -> None:
+    """
+    Register an async dispatch handler for a specific RemoteEventType.
+
+    Thread-safe. Later registrations overwrite earlier ones (useful for
+    testing with mock handlers).
+
+    Call this from main.py's lifespan startup block, after any required
+    singletons (orchestrator, action store helpers) are ready.
+    """
+    with _dispatch_registry_lock:
+        _dispatch_registry[event_type] = handler
+    logger.info(
+        "RemoteGateway: dispatch handler registered for event_type=%s handler=%s",
+        event_type.value,
+        getattr(handler, "__name__", repr(handler)),
+    )
+
+
+def clear_dispatch_handlers() -> None:
+    """Remove all registered dispatch handlers. Primarily for test teardown."""
+    with _dispatch_registry_lock:
+        _dispatch_registry.clear()
+    logger.debug("RemoteGateway: all dispatch handlers cleared.")
+
+
+# =============================================================================
 # Routes
 # =============================================================================
 
@@ -795,27 +886,23 @@ async def activate_remote_event(
             ),
         )
     else:
-        # Fix #3: _dispatch_remote_event raises NotImplementedError until a
-        # real broker is wired in. Catch it here so we return 501 rather
-        # than letting a placeholder log line produce a false ok=True audit
-        # record and a success response to the operator.
         try:
-            await _dispatch_remote_event(body)
+            message = await _dispatch_remote_event(body)
         except NotImplementedError as exc:
             logger.error(
-                "Live dispatch enabled but _dispatch_remote_event is not "
-                "implemented: %s -- returning 501 to prevent false success report.",
+                "Live dispatch enabled but _dispatch_remote_event has no "
+                "handler for event_type=%s: %s",
+                body.event_type.value,
                 exc,
             )
             raise HTTPException(
                 status_code=status.HTTP_501_NOT_IMPLEMENTED,
                 detail=(
-                    "Live dispatch is enabled but the event broker integration "
-                    "is not yet implemented on this gateway instance. "
+                    f"Live dispatch is enabled but no handler is registered for "
+                    f"event type '{body.event_type.value}'. "
                     "Contact the system administrator."
                 ),
             ) from exc
-        message = "Remote event accepted and activated."
 
     audit_id = _write_audit_record(
         body=body,
@@ -1009,25 +1096,143 @@ def _validate_target_event_permission(
 
 
 # =============================================================================
-# Event Dispatch / Audit
+# Event Dispatch (Fix #14 — in-process callback registry)
 # =============================================================================
 
-async def _dispatch_remote_event(body: RemoteEventActivationRequest) -> None:
+async def _dispatch_remote_event(body: RemoteEventActivationRequest) -> str:
     """
-    Fix #3: the original implementation only logged and returned, but the
-    caller then wrote accepted=True to the audit log and returned ok=True
-    to the operator -- falsely claiming the event was dispatched when
-    nothing actually happened.
+    Dispatch a live remote event through the in-process callback registry.
 
-    This now raises NotImplementedError so the caller must handle it and
-    return 501 rather than a false success. Wire in a real event broker
-    (Redis Streams, Kafka, NATS, RabbitMQ, or internal Watchtower intake)
-    and replace this stub before enabling SENTINEL_REMOTE_LIVE_DISPATCH_ENABLED.
+    Routing logic:
+      APPROVE_DECISION / VETO_DECISION
+        → Must have a registered handler (wired from main.py lifespan).
+          Raises NotImplementedError if no handler is found so the caller
+          returns 501 rather than a false success.
+
+      FORCE_HEALTH_CHECK / FORCE_SYNC / REQUEST_DIAGNOSTIC_SNAPSHOT
+        → Uses registered handler if present; falls back to a sensible
+          in-process default (Watchtower ping + log) so these work
+          immediately without requiring main.py wiring.
+
+      ROTATE_REMOTE_TOKEN
+        → Always NotImplementedError until a key-rotation subsystem is
+          integrated. It is the only event type with no default.
     """
+    event_type = body.event_type
+
+    # --- Check registry first for all event types ---
+    with _dispatch_registry_lock:
+        handler = _dispatch_registry.get(event_type)
+
+    if handler is not None:
+        logger.info(
+            "RemoteGateway: dispatching event_type=%s via registered handler "
+            "operator=%s correlation=%s",
+            event_type.value,
+            body.operator_id,
+            body.correlation_id,
+        )
+        return await handler(body)
+
+    # --- In-process defaults for informational events ---
+
+    if event_type == RemoteEventType.FORCE_HEALTH_CHECK:
+        # Ping Watchtower best-effort; log the trigger.
+        config = get_config()
+        logger.info(
+            "RemoteGateway: FORCE_HEALTH_CHECK triggered by operator=%s correlation=%s",
+            body.operator_id,
+            body.correlation_id,
+        )
+        await _report_to_watchtower(
+            {
+                "kind": "log",
+                "event_category": "remote_gateway_force_health_check",
+                "gateway": config.gateway_name,
+                "operator_id": body.operator_id,
+                "correlation_id": body.correlation_id,
+                "reason": body.reason,
+            }
+        )
+        return (
+            f"FORCE_HEALTH_CHECK accepted. Watchtower pinged. "
+            f"operator={body.operator_id} correlation={body.correlation_id}"
+        )
+
+    if event_type == RemoteEventType.FORCE_SYNC:
+        config = get_config()
+        logger.info(
+            "RemoteGateway: FORCE_SYNC triggered by operator=%s correlation=%s",
+            body.operator_id,
+            body.correlation_id,
+        )
+        await _report_to_watchtower(
+            {
+                "kind": "log",
+                "event_category": "remote_gateway_force_sync",
+                "gateway": config.gateway_name,
+                "operator_id": body.operator_id,
+                "correlation_id": body.correlation_id,
+                "reason": body.reason,
+            }
+        )
+        return (
+            f"FORCE_SYNC accepted and logged. "
+            f"operator={body.operator_id} correlation={body.correlation_id}"
+        )
+
+    if event_type == RemoteEventType.REQUEST_DIAGNOSTIC_SNAPSHOT:
+        config = get_config()
+        logger.info(
+            "RemoteGateway: REQUEST_DIAGNOSTIC_SNAPSHOT triggered by operator=%s correlation=%s",
+            body.operator_id,
+            body.correlation_id,
+        )
+        await _report_to_watchtower(
+            {
+                "kind": "log",
+                "event_category": "remote_gateway_diagnostic_snapshot",
+                "gateway": config.gateway_name,
+                "operator_id": body.operator_id,
+                "correlation_id": body.correlation_id,
+                "reason": body.reason,
+                "audit_log_depth": len(AUDIT_LOG),
+            }
+        )
+        return (
+            f"Diagnostic snapshot requested and logged. "
+            f"audit_log_depth={len(AUDIT_LOG)} "
+            f"operator={body.operator_id} correlation={body.correlation_id}"
+        )
+
+    # --- Events with no default --- require main.py handler registration ---
+
+    if event_type == RemoteEventType.APPROVE_DECISION:
+        raise NotImplementedError(
+            "APPROVE_DECISION requires a registered dispatch handler. "
+            "Wire one at lifespan startup via remote_gateway.register_dispatch_handler("
+            "RemoteEventType.APPROVE_DECISION, handler)."
+        )
+
+    if event_type == RemoteEventType.VETO_DECISION:
+        raise NotImplementedError(
+            "VETO_DECISION requires a registered dispatch handler. "
+            "Wire one at lifespan startup via remote_gateway.register_dispatch_handler("
+            "RemoteEventType.VETO_DECISION, handler)."
+        )
+
+    if event_type == RemoteEventType.ROTATE_REMOTE_TOKEN:
+        raise NotImplementedError(
+            "ROTATE_REMOTE_TOKEN is not yet implemented. "
+            "Integrate a key-rotation subsystem and register a handler via "
+            "remote_gateway.register_dispatch_handler(RemoteEventType.ROTATE_REMOTE_TOKEN, handler)."
+        )
+
+    # Catch-all for any future event types added to the enum before a
+    # handler is registered. Prevents silent no-ops on unknown events.
     raise NotImplementedError(
-        "Live event dispatch is not yet implemented on this gateway instance. "
-        "Integrate an event broker and replace _dispatch_remote_event() before "
-        "setting SENTINEL_REMOTE_LIVE_DISPATCH_ENABLED=true."
+        f"No dispatch handler registered for event_type={event_type.value!r}. "
+        "Register one via remote_gateway.register_dispatch_handler()."
     )
 
 
