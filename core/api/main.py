@@ -67,6 +67,7 @@ from fastapi.staticfiles import StaticFiles
 from ..bootstrap import bootstrap_expectations
 from .routers.audit import router as audit_router
 from .routers.remote_gateway import router as remote_gateway_router
+from .routers.routers import router as watchgate_router
 
 logger = logging.getLogger(__name__)
 
@@ -604,6 +605,66 @@ async def lifespan(api: FastAPI):
             logger.info("MonitoringManager wired into remote gateway")
         except Exception as exc:
             logger.warning("Could not wire MonitoringManager into remote gateway: %s", exc)
+
+    # --- Remote gateway dispatch handlers (APPROVE/VETO mobile workflow) ---
+    try:
+        from .routers.remote_gateway import (
+            register_dispatch_handler,
+            RemoteEventType,
+            RemoteEventActivationRequest,
+        )
+
+        async def _rg_approve_handler(body: RemoteEventActivationRequest) -> str:
+            decision_id = str(body.payload.get("decision_id") or "").strip()
+            action = _update_action_status(
+                decision_id,
+                allowed_statuses={"STAGED"},
+                new_status="APPROVED",
+                reason=body.reason,
+                operator=body.operator_id,
+            )
+            if _orchestrator is not None:
+                try:
+                    await asyncio.to_thread(
+                        _orchestrator.resolve_human_decision,
+                        decision_id,
+                        approved=True,
+                        operator_id=body.operator_id,
+                        reason=body.reason,
+                    )
+                except KeyError:
+                    pass
+            await _broadcast_dashboard_event("action_status_changed", {"action": action})
+            return f"Decision {decision_id} approved via remote gateway by {body.operator_id}."
+
+        async def _rg_veto_handler(body: RemoteEventActivationRequest) -> str:
+            decision_id = str(body.payload.get("decision_id") or "").strip()
+            action = _update_action_status(
+                decision_id,
+                allowed_statuses={"PENDING", "STAGED"},
+                new_status="VETOED",
+                reason=body.reason,
+                operator=body.operator_id,
+            )
+            if _orchestrator is not None:
+                try:
+                    await asyncio.to_thread(
+                        _orchestrator.resolve_human_decision,
+                        decision_id,
+                        approved=False,
+                        operator_id=body.operator_id,
+                        reason=body.reason,
+                    )
+                except KeyError:
+                    pass
+            await _broadcast_dashboard_event("action_status_changed", {"action": action})
+            return f"Decision {decision_id} vetoed via remote gateway by {body.operator_id}."
+
+        register_dispatch_handler(RemoteEventType.APPROVE_DECISION, _rg_approve_handler)
+        register_dispatch_handler(RemoteEventType.VETO_DECISION, _rg_veto_handler)
+        logger.info("Remote gateway APPROVE/VETO dispatch handlers registered.")
+    except Exception as _rg_exc:
+        logger.error("Remote gateway dispatch handler registration failed: %s", _rg_exc)
 
     # --- Optional: SpartaCore file integrity watchdog ---
     if _env_bool("S43_SPARTA_ENABLED"):
@@ -1529,6 +1590,7 @@ def compat_api_watchtower_ready() -> dict[str, Any]:
 
 app.include_router(root_router)
 app.include_router(remote_gateway_router)
+app.include_router(watchgate_router)        # /health, /v1/assess, /v1/actions
 app.include_router(internal_router)       # /internal/events/broadcast
 app.include_router(watchtower_router)     # /watchtower/events now included
 app.include_router(core_router)
