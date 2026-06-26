@@ -698,8 +698,8 @@ async def lifespan(api: FastAPI):
     # fenrir_hunter.py actually lives in your repo.
     # ---------------------------------------------------------------------------
     if _env_any_bool(("S43_FENRIR_ENABLED", "SENTINEL_FENRIR_ENABLED", "FENRIR_ENABLED")):
-        try:
-           from core.detection.feniri_hunter import FenrirHunter  # ADJUST IMPORT PATH
+          try:
+            from core.detection.feniri_hunter import FenrirHunter  # ADJUST IMPORT PATH
 
             _fenrir_instance = FenrirHunter()  # reads all config from env vars
             await _fenrir_instance.start()     # embedded_mode=True skips health server
