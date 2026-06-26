@@ -128,7 +128,7 @@ def _env_frozenset(name: str, default: str = "") -> frozenset[str]:
 
 APP_NAME    = "sentinel-43-api"
 APP_VERSION = _env_str("SENTINEL_VERSION", "0.1.0")
-None
+
 SENTINEL_ENV = _env_str("SENTINEL_ENV", "production")
 
 WATCHTOWER_URL               = _env_str("S43_WATCHTOWER_URL", "http://s43-core:9100").rstrip("/")
@@ -693,13 +693,9 @@ async def lifespan(api: FastAPI):
             logger.error("SpartaCore failed to start: %s", exc)
 
     # --- Optional: FenrirHunter (threat detection + statistical anomaly layer) ---
-    # ---------------------------------------------------------------------------
-    # ADJUST IMPORT PATH: change "core.fenrir_hunter" to match where
-    # fenrir_hunter.py actually lives in your repo.
-    # ---------------------------------------------------------------------------
     if _env_any_bool(("S43_FENRIR_ENABLED", "SENTINEL_FENRIR_ENABLED", "FENRIR_ENABLED")):
-          try:
-           from core.detection.feniri_hunter import FenrirHunter  # ADJUST IMPORT PATH
+        try:
+            from core.detection.feniri_hunter import FenrirHunter
 
             _fenrir_instance = FenrirHunter()  # reads all config from env vars
             await _fenrir_instance.start()     # embedded_mode=True skips health server
@@ -965,9 +961,9 @@ except Exception as _nr_exc:
 # S43_DASHBOARD_DIR defaults to "dashboard" (relative to CWD / Docker WORKDIR).
 # =============================================================================
 
-DASHBOARD_DIR       = _env_str("S43_DASHBOARD_DIR", "dashboard")
+DASHBOARD_DIR        = _env_str("S43_DASHBOARD_DIR", "dashboard")
 DASHBOARD_ASSETS_DIR = os.path.join(DASHBOARD_DIR, "assets")
-DASHBOARD_HTML      = os.path.join(DASHBOARD_DIR, "sentinel_43_dashboard.html")
+DASHBOARD_HTML       = os.path.join(DASHBOARD_DIR, "sentinel_43_dashboard.html")
 
 if os.path.isdir(DASHBOARD_ASSETS_DIR):
     app.mount(
@@ -1448,7 +1444,6 @@ def _fenrir_snapshot() -> dict[str, Any]:
             "timestamp": utc_now(),
         }
 
-    # FenrirHunter.snapshot() returns a complete status dict. Use it directly.
     try:
         snap = _fenrir_instance.snapshot()
         snap["enabled"] = True
@@ -1484,12 +1479,12 @@ def fenrir_metrics(request: Request) -> dict[str, Any]:
     _get_operator(request)
     snap = _fenrir_snapshot()
     return {
-        "service":      "fenrir",
-        "enabled":      snap.get("enabled", False),
-        "status":       snap.get("status", "disabled"),
-        "metrics":      snap.get("metrics", {}),
+        "service":       "fenrir",
+        "enabled":       snap.get("enabled", False),
+        "status":        snap.get("status", "disabled"),
+        "metrics":       snap.get("metrics", {}),
         "anomaly_layer": snap.get("anomaly_layer", {}),
-        "timestamp":    utc_now(),
+        "timestamp":     utc_now(),
     }
 
 
@@ -1520,14 +1515,14 @@ def status() -> dict[str, Any]:
     with _watchtower_lock:
         wt_local = dict(_watchtower_last_status)
     return {
-        "service":               APP_NAME,
-        "version":               APP_VERSION,
-        "status":                "online",
-        "environment":           SENTINEL_ENV,
-        "uptime_seconds":        uptime_seconds(),
-        "watchtower_url":        WATCHTOWER_URL,
+        "service":                APP_NAME,
+        "version":                APP_VERSION,
+        "status":                 "online",
+        "environment":            SENTINEL_ENV,
+        "uptime_seconds":         uptime_seconds(),
+        "watchtower_url":         WATCHTOWER_URL,
         "watchtower_local_state": wt_local,
-        "timestamp":             utc_now(),
+        "timestamp":              utc_now(),
     }
 
 @root_router.get("/version")
@@ -1537,11 +1532,11 @@ def version() -> dict[str, Any]:
 @root_router.get("/metrics")
 def metrics() -> dict[str, Any]:
     return {
-        "service":                    APP_NAME,
-        "uptime_seconds":             uptime_seconds(),
-        "status":                     "online",
+        "service":                      APP_NAME,
+        "uptime_seconds":               uptime_seconds(),
+        "status":                       "online",
         "watchtower_heartbeat_seconds": WATCHTOWER_HEARTBEAT_SECONDS,
-        "timestamp":                  utc_now(),
+        "timestamp":                    utc_now(),
     }
 
 
@@ -1591,8 +1586,8 @@ def compat_api_watchtower_ready() -> dict[str, Any]:
 app.include_router(root_router)
 app.include_router(remote_gateway_router)
 app.include_router(watchgate_router)        # /health, /v1/assess, /v1/actions
-app.include_router(internal_router)       # /internal/events/broadcast
-app.include_router(watchtower_router)     # /watchtower/events now included
+app.include_router(internal_router)         # /internal/events/broadcast
+app.include_router(watchtower_router)       # /watchtower/events now included
 app.include_router(core_router)
 app.include_router(rules_router)
 app.include_router(config_router)
