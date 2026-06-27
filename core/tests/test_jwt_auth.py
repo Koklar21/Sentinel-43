@@ -247,7 +247,7 @@ class TestVerifyJwtToken:
         A token signed with HS384 must be rejected when the server only
         accepts HS256 — even though HS384 is itself a legitimate algorithm.
         """
-        token = _make_token(algorithm="HS384")
+        token = _make_token(algorithm="HS384", secret="x" * 64)
 
         with pytest.raises(pyjwt.InvalidAlgorithmError):
             jwt_env._verify_jwt_token(token)
