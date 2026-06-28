@@ -66,6 +66,7 @@ from fastapi.staticfiles import StaticFiles
 
 from ..bootstrap import bootstrap_expectations
 from .routers.audit import router as audit_router
+from .routers.auth import router as auth_router
 from .routers.remote_gateway import router as remote_gateway_router
 from .routers.routers import router as watchgate_router
 
@@ -1271,8 +1272,6 @@ async def watchtower_ingest_event(
     Ingest a structured event from an internal service (e.g. FenrirHunter)
     and forward it to the Watchtower core. Also broadcasts to dashboard
     clients subscribed to the "watchtower" channel.
-
-    Called by FenrirHunter when it has a finding to report to Watchtower.
     """
     _get_operator(request)
     result = await asyncio.to_thread(_watchtower_request, "POST", "/watchtower/events", body)
@@ -1584,6 +1583,7 @@ def compat_api_watchtower_ready() -> dict[str, Any]:
 # =============================================================================
 
 app.include_router(root_router)
+app.include_router(auth_router)             # /auth/login, /auth/verify
 app.include_router(remote_gateway_router)
 app.include_router(watchgate_router)        # /health, /v1/assess, /v1/actions
 app.include_router(internal_router)         # /internal/events/broadcast
