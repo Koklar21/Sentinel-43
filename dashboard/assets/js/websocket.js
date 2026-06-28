@@ -793,8 +793,17 @@ window.SentinelWS = Object.freeze({
    Auto-connect
    ============================================================================= */
 
-if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", connect);
-} else {
-    connect();
+// AFTER (v1.5.4):
+// Wait for auth.js to finish its token check before connecting.
+// If auth.js is not present, SentinelAuthReady is undefined and
+// Promise.resolve() falls through immediately — no hard dependency.
+async function _autoConnect() {
+    try { await window.SentinelAuthReady; } catch {}
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", connect);
+    } else {
+        connect();
+    }
 }
+
+_autoConnect();
