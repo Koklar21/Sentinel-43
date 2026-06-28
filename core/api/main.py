@@ -32,9 +32,7 @@
 # Sentinel-43™
 # Original Work and Protected Intellectual Property.
 # =============================================================================
-
 from __future__ import annotations
-
 import asyncio
 import copy
 import json
@@ -49,9 +47,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
-
 import jwt as pyjwt
-
 from fastapi import (
     APIRouter,
     FastAPI,
@@ -63,7 +59,6 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-
 from ..bootstrap import bootstrap_expectations
 from .routers.audit import router as audit_router
 from .routers.auth import router as auth_router
@@ -72,14 +67,11 @@ from .routers.routers import router as watchgate_router
 
 logger = logging.getLogger(__name__)
 
-
 # =============================================================================
 # Env helpers
 # =============================================================================
-
 def _env_str(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
-
 
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -91,7 +83,6 @@ def _env_int(name: str, default: int) -> int:
         logger.warning("Invalid int for %s=%r; using default %s", name, raw, default)
         return default
 
-
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
     if raw is None:
@@ -102,13 +93,11 @@ def _env_float(name: str, default: float) -> float:
         logger.warning("Invalid float for %s=%r; using default %s", name, raw, default)
         return default
 
-
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
-
 
 def _env_any_bool(names: tuple[str, ...], default: bool = False) -> bool:
     for name in names:
@@ -117,19 +106,15 @@ def _env_any_bool(names: tuple[str, ...], default: bool = False) -> bool:
             return raw.strip().lower() in {"1", "true", "yes", "on"}
     return default
 
-
 def _env_frozenset(name: str, default: str = "") -> frozenset[str]:
     raw = os.getenv(name, default)
     return frozenset(o.strip() for o in raw.split(",") if o.strip())
 
-
 # =============================================================================
 # Configuration
 # =============================================================================
-
 APP_NAME    = "sentinel-43-api"
 APP_VERSION = _env_str("SENTINEL_VERSION", "0.1.0")
-
 SENTINEL_ENV = _env_str("SENTINEL_ENV", "production")
 
 WATCHTOWER_URL               = _env_str("S43_WATCHTOWER_URL", "http://s43-core:9100").rstrip("/")
@@ -144,7 +129,6 @@ _ALLOWED_ORIGINS: frozenset[str] = _env_frozenset(
 
 MAX_WS_CLIENTS     = _env_int("S43_MAX_WS_CLIENTS", 50)
 MAX_WS_FRAME_BYTES = _env_int("S43_MAX_WS_FRAME_BYTES", 64 * 1024)
-
 WS_REQUIRE_AUTH = _env_bool("S43_WS_REQUIRE_AUTH", False)
 
 JWT_SECRET    = _env_str("S43_JWT_SECRET")
@@ -165,13 +149,10 @@ TEST_INJECTION_ENABLED: bool = _env_bool("S43_ENABLE_TEST_INJECTION", False)
 MAX_DASHBOARD_ACTIONS = 500
 ACTION_ID_RE = re.compile(r"^[A-Z0-9_-]{1,64}$")
 
-
 # =============================================================================
 # Optional module-level singletons
 # =============================================================================
-
 _monitoring_manager: Any | None = None
-
 try:
     from core.monitoring import MonitoringManager, WatchtowerConfig
     _monitoring_manager = MonitoringManager(
@@ -185,15 +166,14 @@ _orchestrator:    Any | None               = None
 _sparta_instance: Any | None               = None
 _sparta_task:     asyncio.Task | None      = None  # type: ignore[type-arg]
 _fenrir_instance: Any | None               = None
+
 # _fenrir_task is no longer used — FenrirHunter manages its own internal task.
 # Kept here for backward compatibility with any tooling that checks this name.
 _fenrir_task:     asyncio.Task | None      = None  # type: ignore[type-arg]
 
-
 # =============================================================================
 # Module-level state
 # =============================================================================
-
 _action_store_lock = threading.Lock()
 _action_store: dict[str, dict[str, Any]] = {}
 _vault_record_count: int = 0
@@ -212,19 +192,15 @@ _watchtower_last_status: dict[str, Any] = {
     "last_error":       None,
 }
 
-
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 def uptime_seconds() -> float:
     return round(time.time() - START_TIME, 3)
 
-
 # =============================================================================
 # Auth helpers
 # =============================================================================
-
 def _verify_jwt_token(token: str) -> dict[str, Any]:
     if not JWT_SECRET:
         raise pyjwt.InvalidKeyError("JWT signing key is not configured on this server")
@@ -236,7 +212,6 @@ def _verify_jwt_token(token: str) -> dict[str, Any]:
         audience=JWT_AUDIENCE,
         options={"require": ["exp", "iss", "aud", "sub"]},
     )
-
 
 def _get_operator(request: Request) -> str:
     auth = request.headers.get("Authorization", "").strip()
@@ -257,24 +232,18 @@ def _get_operator(request: Request) -> str:
                 raise HTTPException(status_code=503, detail="JWT validation not configured")
             except pyjwt.PyJWTError:
                 raise HTTPException(status_code=401, detail="Invalid token")
-
             role = str(claims.get("role") or claims.get("scope") or "").strip()
             if role not in _APPROVED_ROLES:
                 raise HTTPException(status_code=403, detail="Operator role required")
-
             subject = str(claims.get("sub") or "").strip()
             return subject if subject else f"bearer:{token[:16]}"
-
     if SENTINEL_ENV.lower() in LOCAL_TEST_ENVIRONMENTS:
         return "dev-operator"
-
     raise HTTPException(status_code=401, detail="Authentication required")
-
 
 # =============================================================================
 # Validation helpers
 # =============================================================================
-
 def _validate_action_id(action_id: str) -> str:
     if not isinstance(action_id, str):
         raise HTTPException(status_code=422, detail="action_id must be a string")
@@ -282,7 +251,6 @@ def _validate_action_id(action_id: str) -> str:
     if not ACTION_ID_RE.fullmatch(cleaned):
         raise HTTPException(status_code=422, detail="action_id has an invalid format")
     return cleaned
-
 
 def _require_reason(body: dict[str, Any]) -> str:
     if not isinstance(body, dict):
@@ -297,11 +265,9 @@ def _require_reason(body: dict[str, Any]) -> str:
         raise HTTPException(status_code=422, detail="reason must not exceed 500 characters")
     return cleaned
 
-
 # =============================================================================
 # Action store
 # =============================================================================
-
 def _create_synthetic_action() -> dict[str, Any]:
     return {
         "id": f"ACT-TEST-{uuid4().hex[:10].upper()}",
@@ -318,7 +284,6 @@ def _create_synthetic_action() -> dict[str, Any]:
         },
     }
 
-
 def _store_action(action: dict[str, Any]) -> dict[str, Any]:
     global _vault_record_count
     safe = copy.deepcopy(action)
@@ -333,18 +298,15 @@ def _store_action(action: dict[str, Any]) -> dict[str, Any]:
                 del _action_store[aid]
         return copy.deepcopy(safe)
 
-
 def _list_actions(limit: int = 250) -> list[dict[str, Any]]:
     safe_limit = max(1, min(limit, 500))
     with _action_store_lock:
         actions = [copy.deepcopy(a) for a in _action_store.values()]
     return sorted(actions, key=lambda a: a["created_at"], reverse=True)[:safe_limit]
 
-
 def _vault_records() -> int:
     with _action_store_lock:
         return _vault_record_count
-
 
 def _update_action_status(
     action_id: str,
@@ -369,11 +331,9 @@ def _update_action_status(
         action["operator"]        = operator
         return copy.deepcopy(action)
 
-
 # =============================================================================
 # WebSocket broadcast
 # =============================================================================
-
 async def _broadcast_dashboard_event(
     event_type: str,
     payload: dict[str, Any],
@@ -399,11 +359,9 @@ async def _broadcast_dashboard_event(
             logger.debug("Dropped dead WebSocket during %r broadcast: %s", event_type, result)
             _dashboard_ws_clients.pop(ws, None)
 
-
 # =============================================================================
 # WebSocket frame reader
 # =============================================================================
-
 async def _receive_ws_message(websocket: WebSocket) -> dict[str, Any]:
     raw = await websocket.receive_text()
     if len(raw.encode("utf-8")) > MAX_WS_FRAME_BYTES:
@@ -416,11 +374,9 @@ async def _receive_ws_message(websocket: WebSocket) -> dict[str, Any]:
         raise ValueError("WebSocket message must be a JSON object")
     return parsed
 
-
 # =============================================================================
 # Watchtower HTTP helpers
 # =============================================================================
-
 def _watchtower_request(
     method: str,
     path: str,
@@ -434,7 +390,6 @@ def _watchtower_request(
             data = json.dumps(payload).encode("utf-8")
         except (TypeError, ValueError) as exc:
             return {"error": "payload_serialization_error", "detail": str(exc)}
-
     req = urllib.request.Request(url=url, data=data, headers=headers, method=method.upper())
     try:
         with urllib.request.urlopen(req, timeout=WATCHTOWER_TIMEOUT) as response:
@@ -454,7 +409,6 @@ def _watchtower_request(
     except Exception as exc:
         return {"error": "watchtower_unreachable", "detail": str(exc)}
 
-
 def watchtower_health_check() -> dict[str, Any]:
     result = _watchtower_request("GET", "/watchtower/health")
     reachable = "error" not in result
@@ -462,7 +416,6 @@ def watchtower_health_check() -> dict[str, Any]:
         _watchtower_last_status["reachable"]   = reachable
         _watchtower_last_status["last_error"]  = None if reachable else result
     return {"reachable": reachable, "url": WATCHTOWER_URL, "response": result}
-
 
 def register_api_with_watchtower() -> dict[str, Any]:
     capabilities = [
@@ -485,7 +438,6 @@ def register_api_with_watchtower() -> dict[str, Any]:
         capabilities.append("sentinel_firewall")
     except ImportError:
         pass
-
     payload = {
         "module_id":   APP_NAME,
         "module_type": "api",
@@ -507,7 +459,6 @@ def register_api_with_watchtower() -> dict[str, Any]:
         _watchtower_last_status["last_error"]       = None if registered else result
     return {"registered": registered, "watchtower_url": WATCHTOWER_URL, "response": result}
 
-
 def send_api_heartbeat(status: str = "online") -> dict[str, Any]:
     payload = {
         "module_id": APP_NAME,
@@ -524,7 +475,6 @@ def send_api_heartbeat(status: str = "online") -> dict[str, Any]:
         _watchtower_last_status["last_error"] = None if ok else result
     return {"heartbeat_sent": ok, "watchtower_url": WATCHTOWER_URL, "response": result}
 
-
 def report_dependency_to_watchtower(
     name: str,
     status: str,
@@ -535,15 +485,12 @@ def report_dependency_to_watchtower(
         {"name": name, "status": status, "details": details or {}},
     )
 
-
 # =============================================================================
 # Async heartbeat loop
 # =============================================================================
-
 async def _async_heartbeat_loop() -> None:
     assert _stop_heartbeat_event is not None
     prev_reachable: bool | None = None
-
     while not _stop_heartbeat_event.is_set():
         try:
             await asyncio.wait_for(
@@ -553,14 +500,11 @@ async def _async_heartbeat_loop() -> None:
             break
         except asyncio.TimeoutError:
             pass
-
         if _stop_heartbeat_event.is_set():
             break
-
         try:
             result    = await asyncio.to_thread(send_api_heartbeat)
             reachable = result.get("heartbeat_sent", False)
-
             if prev_reachable is None or reachable != prev_reachable:
                 prev_reachable = reachable
                 await _broadcast_dashboard_event(
@@ -568,22 +512,18 @@ async def _async_heartbeat_loop() -> None:
                     {"reachable": reachable, "url": WATCHTOWER_URL, "timestamp": utc_now()},
                     channel="watchtower",
                 )
-
             if reachable:
                 await _broadcast_dashboard_event(
                     "dependency_state",
                     {"name": "watchtower", "status": "online", "timestamp": utc_now()},
                     channel="dependencies",
                 )
-
         except Exception as exc:
             logger.warning("Heartbeat loop error: %s", exc)
-
 
 # =============================================================================
 # Lifespan
 # =============================================================================
-
 @asynccontextmanager
 async def lifespan(api: FastAPI):
     global _stop_heartbeat_event, _heartbeat_task
@@ -599,7 +539,6 @@ async def lifespan(api: FastAPI):
             logger.info("MonitoringManager started")
         except Exception as exc:
             logger.error("MonitoringManager failed to start: %s", exc)
-
         try:
             from core.monitoring import set_monitoring_manager
             set_monitoring_manager(_monitoring_manager)
@@ -671,13 +610,11 @@ async def lifespan(api: FastAPI):
     if _env_bool("S43_SPARTA_ENABLED"):
         try:
             from core.monitoring import SpartaCore, IntegrityConfig
-
             _watched_files: dict[str, str] = {}
             for key, val in os.environ.items():
                 if key.startswith("S43_SPARTA_HASH_"):
                     file_key = key[len("S43_SPARTA_HASH_"):].lower().replace("_", "/")
                     _watched_files[file_key] = val
-
             if _watched_files:
                 sparta_cfg       = IntegrityConfig.from_env(_watched_files)
                 _sparta_instance = SpartaCore(sparta_cfg, monitoring_manager=_monitoring_manager)
@@ -697,9 +634,8 @@ async def lifespan(api: FastAPI):
     if _env_any_bool(("S43_FENRIR_ENABLED", "SENTINEL_FENRIR_ENABLED", "FENRIR_ENABLED")):
         try:
             from core.detection.feniri_hunter import FenrirHunter
-
-            _fenrir_instance = FenrirHunter()  # reads all config from env vars
-            await _fenrir_instance.start()     # embedded_mode=True skips health server
+            _fenrir_instance = FenrirHunter()
+            await _fenrir_instance.start()
             logger.info(
                 "FenrirHunter started: node_id=%s min_severity=%s anomaly_zscore=%.1f",
                 _fenrir_instance.config.node_id,
@@ -765,7 +701,6 @@ async def lifespan(api: FastAPI):
         except (asyncio.TimeoutError, asyncio.CancelledError):
             _heartbeat_task.cancel()
 
-    # FenrirHunter manages its own internal task — just call shutdown().
     if _fenrir_instance is not None:
         try:
             await asyncio.wait_for(_fenrir_instance.shutdown(), timeout=5.0)
@@ -791,13 +726,10 @@ async def lifespan(api: FastAPI):
         except Exception as exc:
             logger.warning("MonitoringManager stop error: %s", exc)
 
-
 # =============================================================================
 # Root router
 # =============================================================================
-
 root_router = APIRouter(tags=["root"])
-
 
 @root_router.get("/")
 def root() -> dict[str, Any]:
@@ -810,16 +742,13 @@ def root() -> dict[str, Any]:
         "timestamp":      utc_now(),
     }
 
-
 @root_router.get("/actions")
 def dashboard_actions(limit: int = 250) -> list[dict[str, Any]]:
     return _list_actions(limit)
 
-
 @root_router.get("/vault/stats")
 def dashboard_vault_stats() -> dict[str, Any]:
     return {"records": _vault_records(), "timestamp": utc_now()}
-
 
 @root_router.post("/actions/test-inject")
 async def dashboard_test_inject() -> dict[str, Any]:
@@ -831,14 +760,12 @@ async def dashboard_test_inject() -> dict[str, Any]:
     await _broadcast_dashboard_event("vault_stats", {"records": _vault_records()})
     return {"ok": True, "action": action, "vault_records": _vault_records(), "timestamp": utc_now()}
 
-
 @root_router.post("/actions/{action_id}/approve")
 async def dashboard_approve_action(
     action_id: str, body: dict[str, Any], request: Request,
 ) -> dict[str, Any]:
     reason   = _require_reason(body)
     operator = _get_operator(request)
-
     action = _update_action_status(
         action_id,
         allowed_statuses={"STAGED"},
@@ -846,7 +773,6 @@ async def dashboard_approve_action(
         reason=reason,
         operator=operator,
     )
-
     decision_id = body.get("decision_id") or action.get("payload", {}).get("decision_id")
     if _orchestrator is not None and decision_id:
         try:
@@ -858,15 +784,10 @@ async def dashboard_approve_action(
                 reason=reason,
             )
         except KeyError:
-            logger.debug(
-                "approve_action: decision_id=%s not in pending reviews",
-                decision_id,
-            )
-
+            logger.debug("approve_action: decision_id=%s not in pending reviews", decision_id)
     await _broadcast_dashboard_event("action_status_changed", {"action": action})
     await _broadcast_dashboard_event("vault_stats", {"records": _vault_records()})
     return {"ok": True, "action": action, "timestamp": utc_now()}
-
 
 @root_router.post("/actions/{action_id}/veto")
 async def dashboard_veto_action(
@@ -874,7 +795,6 @@ async def dashboard_veto_action(
 ) -> dict[str, Any]:
     reason   = _require_reason(body)
     operator = _get_operator(request)
-
     action = _update_action_status(
         action_id,
         allowed_statuses={"PENDING", "STAGED"},
@@ -882,7 +802,6 @@ async def dashboard_veto_action(
         reason=reason,
         operator=operator,
     )
-
     decision_id = body.get("decision_id") or action.get("payload", {}).get("decision_id")
     if _orchestrator is not None and decision_id:
         try:
@@ -895,11 +814,9 @@ async def dashboard_veto_action(
             )
         except KeyError:
             logger.debug("veto_action: decision_id=%s not in pending reviews", decision_id)
-
     await _broadcast_dashboard_event("action_status_changed", {"action": action})
     await _broadcast_dashboard_event("vault_stats", {"records": _vault_records()})
     return {"ok": True, "action": action, "timestamp": utc_now()}
-
 
 @root_router.get("/governance/pending")
 def governance_pending_reviews(request: Request) -> dict[str, Any]:
@@ -912,11 +829,9 @@ def governance_pending_reviews(request: Request) -> dict[str, Any]:
         "timestamp": utc_now(),
     }
 
-
 # =============================================================================
 # FastAPI application
 # =============================================================================
-
 app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
 
 app.add_middleware(
@@ -955,13 +870,11 @@ try:
 except Exception as _nr_exc:
     logger.warning("SpartaCore node router not registered: %s", _nr_exc)
 
-
 # =============================================================================
 # Dashboard static file serving
 # Serves sentinel_43_dashboard.html and all assets from dashboard/assets/.
 # S43_DASHBOARD_DIR defaults to "dashboard" (relative to CWD / Docker WORKDIR).
 # =============================================================================
-
 DASHBOARD_DIR        = _env_str("S43_DASHBOARD_DIR", "dashboard")
 DASHBOARD_ASSETS_DIR = os.path.join(DASHBOARD_DIR, "assets")
 DASHBOARD_HTML       = os.path.join(DASHBOARD_DIR, "sentinel_43_dashboard.html")
@@ -977,25 +890,20 @@ else:
         "Dashboard assets directory not found: %s -- /assets will 404", DASHBOARD_ASSETS_DIR
     )
 
-
 @app.get("/dashboard", include_in_schema=False)
 def serve_dashboard() -> FileResponse:
     return FileResponse(DASHBOARD_HTML)
-
 
 @app.get("/dashboard.html", include_in_schema=False)
 def serve_dashboard_html() -> FileResponse:
     return FileResponse(DASHBOARD_HTML)
 
-
 # =============================================================================
 # WebSocket endpoint
 # =============================================================================
-
 async def _ws_safe_close(websocket: WebSocket, code: int = 1008) -> None:
     """
     Close a WebSocket, swallowing RuntimeError if already closed.
-
     Starlette/uvicorn raises RuntimeError when close() is attempted on a
     connection that was rejected before accept(), or when the client
     already disconnected. This helper guards every auth-rejection path.
@@ -1005,11 +913,8 @@ async def _ws_safe_close(websocket: WebSocket, code: int = 1008) -> None:
     except RuntimeError:
         pass
 
-
 @app.websocket("/ws")
 async def dashboard_websocket(websocket: WebSocket) -> None:
-    # Origin check — return without accept() so uvicorn sends HTTP 403.
-    # Never call close() before accept().
     origin = websocket.headers.get("origin", "")
     if _ALLOWED_ORIGINS and origin and origin not in _ALLOWED_ORIGINS:
         return
@@ -1034,7 +939,6 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 )
             },
         })
-
         try:
             auth_msg = await asyncio.wait_for(
                 _receive_ws_message(websocket), timeout=15.0
@@ -1151,15 +1055,12 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
     finally:
         _dashboard_ws_clients.pop(websocket, None)
 
-
 # =============================================================================
 # Internal event broadcast endpoint
 # Used by FenrirHunter and other internal services to push events to the
 # dashboard WebSocket clients without connecting as a WS client themselves.
 # =============================================================================
-
 internal_router = APIRouter(prefix="/internal", tags=["internal"])
-
 
 @internal_router.post("/events/broadcast")
 async def internal_broadcast_event(
@@ -1167,7 +1068,6 @@ async def internal_broadcast_event(
 ) -> dict[str, Any]:
     """
     Broadcast a structured event to connected WebSocket dashboard clients.
-
     Called by FenrirHunter when it has a finding to report.
     Requires operator auth — Fenrir uses S43_FENRIR_API_TOKEN for this.
 
@@ -1195,18 +1095,56 @@ async def internal_broadcast_event(
         "timestamp":  utc_now(),
     }
 
+# =============================================================================
+# Proxy event ingestion
+# Accepts local proxy traffic summaries and broadcasts them to dashboard clients.
+# =============================================================================
+proxy_events_router = APIRouter(prefix="/events", tags=["events"])
+
+@proxy_events_router.post("/proxy")
+async def ingest_proxy_event(
+    body: dict[str, Any],
+    request: Request,
+) -> dict[str, Any]:
+    """
+    Ingest a local proxy traffic event and broadcast it to dashboard clients.
+    Accepts JSON from a local proxy script, normalizes the event, and
+    broadcasts to WebSocket clients subscribed to the "proxy" channel.
+    No threat detection yet — this is the ingestion wire only.
+    """
+    event = {
+        "type":          "proxy_event",
+        "source":        str(body.get("source") or "local_proxy")[:64],
+        "method":        body.get("method"),
+        "url":           body.get("url"),
+        "host":          body.get("host"),
+        "path":          body.get("path"),
+        "status_code":   body.get("status_code"),
+        "request_size":  body.get("request_size", 0),
+        "response_size": body.get("response_size", 0),
+        "user_agent":    body.get("user_agent", ""),
+        "client_host":   request.client.host if request.client else None,
+        "timestamp":     utc_now(),
+        "raw":           body,
+    }
+    await _broadcast_dashboard_event("proxy_event", event, channel="proxy")
+    return {
+        "ok":         True,
+        "event_type": "proxy_event",
+        "channel":    "proxy",
+        "clients":    len(_dashboard_ws_clients),
+        "event":      event,
+        "timestamp":  utc_now(),
+    }
 
 # =============================================================================
 # Watchtower bridge
 # =============================================================================
-
 watchtower_router = APIRouter(prefix="/watchtower", tags=["watchtower"])
-
 
 @watchtower_router.get("/health")
 def api_watchtower_health() -> dict[str, Any]:
     return watchtower_health_check()
-
 
 @watchtower_router.get("/status")
 def api_watchtower_status() -> dict[str, Any]:
@@ -1214,30 +1152,25 @@ def api_watchtower_status() -> dict[str, Any]:
     return {"bridge": "api_to_watchtower", "watchtower_url": WATCHTOWER_URL,
             "reachable": "error" not in result, "watchtower": result, "timestamp": utc_now()}
 
-
 @watchtower_router.get("/ready")
 def api_watchtower_ready() -> dict[str, Any]:
     result = _watchtower_request("GET", "/watchtower/ready")
     return {"bridge": "api_to_watchtower", "watchtower_url": WATCHTOWER_URL,
             "reachable": "error" not in result, "watchtower": result, "timestamp": utc_now()}
 
-
 @watchtower_router.post("/register")
 def api_register_watchtower() -> dict[str, Any]:
     return register_api_with_watchtower()
 
-
 @watchtower_router.post("/heartbeat")
 def api_heartbeat_watchtower() -> dict[str, Any]:
     return send_api_heartbeat()
-
 
 @watchtower_router.get("/modules")
 def api_watchtower_modules() -> dict[str, Any]:
     result = _watchtower_request("GET", "/watchtower/modules")
     return {"bridge": "api_to_watchtower", "reachable": "error" not in result,
             "watchtower": result, "timestamp": utc_now()}
-
 
 @watchtower_router.get("/check")
 def watchtower_check() -> dict[str, Any]:
@@ -1263,7 +1196,6 @@ def watchtower_check() -> dict[str, Any]:
         "timestamp": utc_now(),
     }
 
-
 @watchtower_router.post("/events")
 async def watchtower_ingest_event(
     body: dict[str, Any], request: Request
@@ -1282,11 +1214,9 @@ async def watchtower_ingest_event(
     )
     return {"ok": True, "forwarded": result, "timestamp": utc_now()}
 
-
 # =============================================================================
 # Core / rules / config / dependencies / system routers
 # =============================================================================
-
 core_router = APIRouter(prefix="/core", tags=["core"])
 
 @core_router.get("/status")
@@ -1321,7 +1251,6 @@ async def core_heartbeat() -> dict[str, Any]:
     return {"service": "s43_core", "heartbeat": "sent", "watchtower_response": result,
             "timestamp": utc_now()}
 
-
 rules_router = APIRouter(prefix="/rules", tags=["rules"])
 
 @rules_router.get("/status")
@@ -1331,7 +1260,6 @@ def rules_status() -> dict[str, Any]:
 @rules_router.get("/")
 def rules_root() -> dict[str, Any]:
     return {"service": "rules", "message": "Rules registry endpoint active", "timestamp": utc_now()}
-
 
 config_router = APIRouter(prefix="/config", tags=["config"])
 
@@ -1343,7 +1271,6 @@ def config_status() -> dict[str, Any]:
 @config_router.get("/")
 def config_root() -> dict[str, Any]:
     return {"service": "config", "environment": SENTINEL_ENV, "timestamp": utc_now()}
-
 
 dependencies_router = APIRouter(prefix="/dependencies", tags=["dependencies"])
 
@@ -1370,7 +1297,6 @@ def report_dependency(name: str, state: str) -> dict[str, Any]:
     )
     return {"dependency": name, "state": state, "watchtower_response": result,
             "timestamp": utc_now()}
-
 
 system_router = APIRouter(prefix="/system", tags=["system"])
 
@@ -1425,13 +1351,10 @@ def intercom_status() -> dict[str, Any]:
         "timestamp":      utc_now(),
     }
 
-
 # =============================================================================
 # Fenrir router
 # =============================================================================
-
 fenrir_router = APIRouter(prefix="/fenrir", tags=["fenrir"])
-
 
 def _fenrir_snapshot() -> dict[str, Any]:
     if _fenrir_instance is None:
@@ -1442,7 +1365,6 @@ def _fenrir_snapshot() -> dict[str, Any]:
             "status":    "disabled",
             "timestamp": utc_now(),
         }
-
     try:
         snap = _fenrir_instance.snapshot()
         snap["enabled"] = True
@@ -1459,19 +1381,16 @@ def _fenrir_snapshot() -> dict[str, Any]:
             "timestamp": utc_now(),
         }
 
-
 @fenrir_router.get("/status")
 def fenrir_status(request: Request) -> dict[str, Any]:
     _get_operator(request)
     return _fenrir_snapshot()
-
 
 @fenrir_router.get("/health")
 def fenrir_health(request: Request) -> dict[str, Any]:
     _get_operator(request)
     snap = _fenrir_snapshot()
     return {"service": "fenrir", **snap}
-
 
 @fenrir_router.get("/metrics")
 def fenrir_metrics(request: Request) -> dict[str, Any]:
@@ -1486,11 +1405,9 @@ def fenrir_metrics(request: Request) -> dict[str, Any]:
         "timestamp":     utc_now(),
     }
 
-
 # =============================================================================
 # Top-level health / ready
 # =============================================================================
-
 @app.get("/health")
 def health() -> dict[str, str]:
     return {
@@ -1504,11 +1421,9 @@ def health() -> dict[str, str]:
 def ready() -> dict[str, str]:
     return {"status": "ready", "service": APP_NAME}
 
-
 # =============================================================================
 # Status / version / metrics
 # =============================================================================
-
 @root_router.get("/status")
 def status() -> dict[str, Any]:
     with _watchtower_lock:
@@ -1538,11 +1453,9 @@ def metrics() -> dict[str, Any]:
         "timestamp":                    utc_now(),
     }
 
-
 # =============================================================================
 # API compat prefix router
 # =============================================================================
-
 api_router = APIRouter(prefix="/api", tags=["api-compat"])
 
 @api_router.get("/ready")
@@ -1577,16 +1490,15 @@ def compat_api_watchtower_health() -> dict[str, Any]:
 def compat_api_watchtower_ready() -> dict[str, Any]:
     return api_watchtower_ready()
 
-
 # =============================================================================
 # Register all routers
 # =============================================================================
-
 app.include_router(root_router)
 app.include_router(auth_router)             # /auth/login, /auth/verify
 app.include_router(remote_gateway_router)
 app.include_router(watchgate_router)        # /health, /v1/assess, /v1/actions
 app.include_router(internal_router)         # /internal/events/broadcast
+app.include_router(proxy_events_router)     # /events/proxy
 app.include_router(watchtower_router)       # /watchtower/events now included
 app.include_router(core_router)
 app.include_router(rules_router)
@@ -1597,11 +1509,9 @@ app.include_router(fenrir_router)
 app.include_router(api_router)
 app.include_router(audit_router)
 
-
 # =============================================================================
 # Error handler
 # =============================================================================
-
 @app.exception_handler(404)
 async def not_found_handler(request: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(
