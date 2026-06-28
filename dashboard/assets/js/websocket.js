@@ -1,7 +1,16 @@
 /* =============================================================================
    Sentinel-43 Dashboard
    websocket.js — Hardened WebSocket bridge
-   v1.5.3
+   v1.5.4
+
+   Changes from v1.5.3:
+     - Fix: _autoConnect() now awaits window.SentinelAuthReady before
+       connecting, so auth.js token verification completes before websocket.js
+       auto-connects. Without this, a stored-but-expired token could cause
+       websocket.js to attempt auth before auth.js had a chance to clear it.
+     - Fix: _sendRaw() outgoing byte check now uses TextEncoder for accurate
+       UTF-8 byte counting, matching the inbound _validateFrame() check.
+       The previous serialized.length check undercounted multi-byte payloads.
 
    Changes from v1.5.2:
      - Fix: double comma (,,) after CHANNELS Object.freeze([...]) removed.
@@ -9,8 +18,6 @@
        parsing. window.SentinelWS was never defined, connect() was never
        called, and no WebSocket connection was ever established. The dashboard
        fell back silently to HTTP polling only.
-
-   Changes from v1.5.2:
      - Fix: _sendAuthFrame() now sets _manuallyClosed = true before closing
        the socket when no token is found. Previously the socket closed with
        code 1000 (normal closure), which is not in NO_RECONNECT_CODES, so
@@ -112,7 +119,6 @@ const WS_CONFIG = Object.freeze({
 
     // Full channel set matching main.py subscriptions including governance
     // (HUMAN_GATED decision queue) and Fenrir hunting event channels.
-    // Fix v1.5.3: removed trailing double comma ,, which was a SyntaxError.
     CHANNELS: Object.freeze([
         "actions",
         "vault",
@@ -129,6 +135,7 @@ const WS_CONFIG = Object.freeze({
 
 // Key list must stay in sync with dashboard.js DEV_JWT_KEYS so that any
 // token the UI layer can find is also visible to the auth path here.
+// "SENTINEL_JWT" is the key auth.js writes to sessionStorage on login.
 const _DEV_JWT_KEYS = Object.freeze([
     "SENTINEL_JWT",
     "S43_JWT",
@@ -351,7 +358,9 @@ function _sendRaw(type, payload = {}) {
     }
 
     // Enforce outgoing frame size limit matching the server's incoming cap.
-    if (serialized.length > WS_CONFIG.MAX_FRAME_BYTES) {
+    // Use TextEncoder for accurate UTF-8 byte counting, matching _validateFrame().
+    // serialized.length undercounts multi-byte characters (e.g. emoji, CJK).
+    if (_WS_TEXT_ENCODER.encode(serialized).length > WS_CONFIG.MAX_FRAME_BYTES) {
         _dispatch("sentinel:ws:error", {
             error: `Outgoing frame for '${type}' exceeds ${WS_CONFIG.MAX_FRAME_BYTES} bytes and was not sent`,
             timestamp: _nowIso(),
@@ -791,12 +800,12 @@ window.SentinelWS = Object.freeze({
 
 /* =============================================================================
    Auto-connect
+   Awaits window.SentinelAuthReady (set by auth.js) before connecting so that
+   auth.js token verification completes first. If auth.js is not present,
+   SentinelAuthReady is undefined; Promise.resolve(undefined) falls through
+   immediately — no hard dependency on auth.js being loaded.
    ============================================================================= */
 
-// AFTER (v1.5.4):
-// Wait for auth.js to finish its token check before connecting.
-// If auth.js is not present, SentinelAuthReady is undefined and
-// Promise.resolve() falls through immediately — no hard dependency.
 async function _autoConnect() {
     try { await window.SentinelAuthReady; } catch {}
     if (document.readyState === "loading") {
