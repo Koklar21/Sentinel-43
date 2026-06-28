@@ -29,34 +29,40 @@
 # websocket.js reads that key and sends it in the WebSocket auth frame.
 # main.py's _verify_jwt_token() and _get_operator() consume the same JWT.
 #
-# Required environment variables:
-#   S43_JWT_SECRET              — HMAC signing key (required)
-#   S43_OPERATOR_USERNAME       — operator username (default: "operator")
-#   S43_OPERATOR_PASSWORD_HASH  — SHA-256 hex digest of the operator password
+# Note: main.py currently maintains its own _verify_jwt_token(). Both paths
+# use identical config so they behave the same. Future cleanup should import
+# verify_jwt_token() from here instead of maintaining two paths.
 #
-# Optional environment variables:
-#   S43_JWT_ALGORITHM           — default: HS256
-#   S43_JWT_ISSUER              — default: sentinel-43
-#   S43_JWT_AUDIENCE            — default: sentinel-43-dashboard
-#   S43_JWT_TTL_SECONDS         — default: 28800 (8 hours), clamped 60–86400
+# Required .env variables:
+#   S43_JWT_SECRET              — HMAC signing key
+#   S43_OPERATOR_USERNAME       — operator username (default: "operator")
+#   S43_OPERATOR_PASSWORD_HASH  — sha256(password).hexdigest() — NOT sha256 of hash
+#
+# Optional .env variables:
+#   S43_JWT_ALGORITHM     — HS256 | HS384 | HS512 (default: HS256)
+#   S43_JWT_ISSUER        — default: sentinel-43
+#   S43_JWT_AUDIENCE      — default: sentinel-43-dashboard
+#   S43_JWT_TTL_SECONDS   — default: 28800 (8 hours), clamped 60–86400
 #
 # Credential setup:
 #   Generate password hash:
 #     python -c "import hashlib; print(hashlib.sha256(b'yourpassword').hexdigest())"
-#   Set in .env:
-#     S43_OPERATOR_USERNAME=operator
-#     S43_OPERATOR_PASSWORD_HASH=<hash output>
+#   Generate JWT secret:
+#     python -c "import secrets; print(secrets.token_urlsafe(32))"
 #
 # Security note:
 #   SHA-256 is used here as a deployment-simple credential check for closed
-#   beta. Upgrade to bcrypt or Argon2 before public release. Both legs of
-#   credential comparison use secrets.compare_digest to prevent timing attacks.
+#   beta. Upgrade to bcrypt or Argon2 before public release.
+#   All credential comparisons use secrets.compare_digest to prevent timing
+#   attacks. Username comparison hashes both sides to fixed-width digests
+#   before compare_digest to prevent length-based timing leakage.
 # =============================================================================
 
 from __future__ import annotations
 
 import hashlib
 import os
+import re
 import secrets
 import time
 from datetime import datetime, timezone
@@ -70,7 +76,30 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 # =============================================================================
-# Config — all read at call time so Docker env injection works correctly.
+# Constants
+# =============================================================================
+
+MAX_USERNAME_LEN = 128
+MAX_PASSWORD_LEN = 1024
+MAX_TOKEN_LEN    = 4096
+
+# Only HMAC-family algorithms are permitted. Asymmetric algorithms and
+# "none" are never allowed regardless of what S43_JWT_ALGORITHM contains.
+_ALLOWED_JWT_ALGORITHMS: frozenset[str] = frozenset({"HS256", "HS384", "HS512"})
+
+# Approved operator roles. If a decoded JWT's "role" claim is missing or
+# outside this set, verify_jwt_token() raises 401.
+_APPROVED_ROLES: frozenset[str] = frozenset({"operator", "admin"})
+
+# Three-segment base64url shape. Validated before pyjwt.decode() to reject
+# obviously-malformed input without touching the decode path.
+JWT_SHAPE_RE = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
+
+
+# =============================================================================
+# Env helpers — all read at call time so Docker env injection works correctly.
+# Module-level calls are intentionally avoided so import does not crash the
+# process or test suite when env vars are absent.
 # =============================================================================
 
 def _e(name: str, default: str = "") -> str:
@@ -87,9 +116,36 @@ def _ei(name: str, default: int, *, lo: int, hi: int) -> int:
         return default
 
 
-MAX_USERNAME_LEN = 128
-MAX_PASSWORD_LEN = 1024
-MAX_TOKEN_LEN    = 4096
+# =============================================================================
+# Config validators — raise 503 at route time, never at import time.
+# =============================================================================
+
+def _jwt_algorithm() -> str:
+    """
+    Return the configured JWT algorithm, enforcing the HMAC allowlist.
+
+    Raises HTTP 503 if S43_JWT_ALGORITHM is set to anything outside
+    {HS256, HS384, HS512}. Fails loudly at the route rather than at import,
+    so app startup and pytest collection are not broken by missing config.
+    """
+    alg = _e("S43_JWT_ALGORITHM", "HS256").upper()
+    if alg not in _ALLOWED_JWT_ALGORITHMS:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="JWT algorithm is not configured correctly on this server.",
+        )
+    return alg
+
+
+def _valid_sha256_hex(value: str) -> bool:
+    """
+    Return True if value is a valid 64-character hex string.
+
+    A fat-fingered or truncated S43_OPERATOR_PASSWORD_HASH causes login
+    to fail silently with a misleading "Invalid credentials" response.
+    Catching it here surfaces the real config problem immediately.
+    """
+    return len(value) == 64 and all(c in "0123456789abcdefABCDEF" for c in value)
 
 
 # =============================================================================
@@ -120,7 +176,75 @@ class VerifyResponse(BaseModel):
 # =============================================================================
 
 def _sha256_hex(value: str) -> str:
+    """Return lowercase hex SHA-256 digest of value."""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _sha256_digest(value: str) -> bytes:
+    """Return raw SHA-256 digest bytes of value. Used for fixed-width timing-safe comparisons."""
+    return hashlib.sha256(value.encode("utf-8")).digest()
+
+
+def _validate_credentials(username: str, password: str) -> str:
+    """
+    Validate operator credentials against env-configured values.
+
+    Password comparison:
+      sha256(typed_password).hexdigest().lower()
+        compared with
+      S43_OPERATOR_PASSWORD_HASH.lower()
+
+    S43_OPERATOR_PASSWORD_HASH is already sha256(password).hexdigest().
+    Do NOT double-hash it.
+
+    Username comparison hashes both sides to fixed-width SHA-256 digests
+    before compare_digest to prevent length-based timing leakage.
+
+    Both comparisons always run before any error is raised to prevent
+    timing-based enumeration of which field failed.
+
+    Returns the canonical expected_username (not the operator's typed
+    casing) as the JWT subject, so the subject in the token is always
+    the value from config regardless of how the operator typed it.
+    """
+    expected_username = _e("S43_OPERATOR_USERNAME", "operator")
+    expected_hash     = _e("S43_OPERATOR_PASSWORD_HASH")
+
+    # Validate hash format before comparison. A truncated or malformed hash
+    # produces silent failures that look like wrong passwords.
+    if not expected_hash or not _valid_sha256_hex(expected_hash):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Operator credentials are not configured correctly on this server.",
+        )
+
+    normalized = username.strip()
+
+    # Username: hash both sides to SHA-256 digests before compare_digest.
+    # This produces fixed-width 32-byte values, eliminating timing leakage
+    # from variable-length string comparisons.
+    username_ok = secrets.compare_digest(
+        _sha256_digest(normalized.lower()),
+        _sha256_digest(expected_username.lower()),
+    )
+
+    # Password: compare sha256(typed_password).hexdigest() against the stored
+    # hash directly. The stored hash IS sha256(password) — do not re-hash it.
+    password_ok = secrets.compare_digest(
+        _sha256_hex(password).lower(),
+        expected_hash.lower(),
+    )
+
+    if not (username_ok and password_ok):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Return the canonical configured username, not the operator's typed
+    # casing. The JWT sub claim will always reflect the config value.
+    return expected_username
 
 
 def _issue_token(subject: str, role: str = "operator") -> tuple[str, datetime]:
@@ -140,10 +264,10 @@ def _issue_token(subject: str, role: str = "operator") -> tuple[str, datetime]:
             detail="JWT signing key is not configured on this server.",
         )
 
-    now     = int(time.time())
-    ttl     = _ei("S43_JWT_TTL_SECONDS", 28800, lo=60, hi=86400)
-    exp     = now + ttl
-    exp_dt  = datetime.fromtimestamp(exp, tz=timezone.utc)
+    now    = int(time.time())
+    ttl    = _ei("S43_JWT_TTL_SECONDS", 28800, lo=60, hi=86400)
+    exp    = now + ttl
+    exp_dt = datetime.fromtimestamp(exp, tz=timezone.utc)
 
     payload: dict[str, Any] = {
         "sub":  subject,
@@ -157,11 +281,15 @@ def _issue_token(subject: str, role: str = "operator") -> tuple[str, datetime]:
         "role": role,
     }
 
-    token = pyjwt.encode(
+    token: Any = pyjwt.encode(
         payload,
         secret,
-        algorithm=_e("S43_JWT_ALGORITHM", "HS256"),
+        algorithm=_jwt_algorithm(),
     )
+
+    # Older PyJWT versions (< 2.0) return bytes; normalize to str.
+    if isinstance(token, bytes):
+        token = token.decode("utf-8")
 
     if not isinstance(token, str) or not token or len(token) > MAX_TOKEN_LEN:
         raise HTTPException(
@@ -172,49 +300,21 @@ def _issue_token(subject: str, role: str = "operator") -> tuple[str, datetime]:
     return token, exp_dt
 
 
-def _validate_credentials(username: str, password: str) -> str:
-    """
-    Validate operator credentials against env-configured values.
-
-    Both comparisons always run to prevent timing-based enumeration.
-    Returns the normalized username on success; raises 401 on failure.
-    """
-    expected_username = _e("S43_OPERATOR_USERNAME", "operator")
-    expected_hash     = _e("S43_OPERATOR_PASSWORD_HASH")
-
-    if not expected_hash:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Operator credentials are not configured on this server.",
-        )
-
-    normalized = username.strip()
-
-    username_ok = secrets.compare_digest(
-        normalized.lower().encode("utf-8"),
-        expected_username.lower().encode("utf-8"),
-    )
-    password_ok = secrets.compare_digest(
-        _sha256_hex(password).encode("utf-8"),
-        expected_hash.lower().encode("utf-8"),
-    )
-
-    if not (username_ok and password_ok):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    return normalized
-
-
 def verify_jwt_token(token: str) -> dict[str, Any]:
     """
     Verify a dashboard JWT and return claims.
 
-    Exported so callers outside this router can reuse the same verifier
-    rather than duplicating validation logic.
+    Validates:
+      - Input type, length, and three-segment base64url shape
+      - HMAC signature against S43_JWT_SECRET
+      - Required claims: sub, exp, iss, aud, iat, nbf
+      - Issuer and audience match configured values
+      - Clock leeway: 30 seconds
+      - Role claim is present and in _APPROVED_ROLES
+
+    Exported so callers outside this router can reuse the same verifier.
+    main.py currently maintains its own _verify_jwt_token(); both use
+    identical config. Future cleanup should consolidate to this function.
     """
     secret = _e("S43_JWT_SECRET")
     if not secret:
@@ -223,14 +323,36 @@ def verify_jwt_token(token: str) -> dict[str, Any]:
             detail="JWT verification is not configured.",
         )
 
+    # Shape validation before decode — reject obviously-malformed input
+    # without engaging the crypto path.
+    if not isinstance(token, str) or not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if len(token) > MAX_TOKEN_LEN:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not JWT_SHAPE_RE.match(token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     try:
         claims = pyjwt.decode(
             token,
             secret,
-            algorithms=[_e("S43_JWT_ALGORITHM", "HS256")],
-            issuer=_e("S43_JWT_ISSUER", "sentinel-43"),
+            algorithms=[_jwt_algorithm()],
+            issuer=_e("S43_JWT_ISSUER",   "sentinel-43"),
             audience=_e("S43_JWT_AUDIENCE", "sentinel-43-dashboard"),
-            options={"require": ["sub", "exp", "iss", "aud", "iat"]},
+            options={"require": ["sub", "exp", "iss", "aud", "iat", "nbf"]},
+            leeway=30,
         )
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(
@@ -249,7 +371,17 @@ def verify_jwt_token(token: str) -> dict[str, Any]:
     if not subject:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token subject.",
+            detail="Invalid token.",
+        )
+
+    # Role validation: missing or unapproved role is a hard 401.
+    # This is the same check main.py's _get_operator() applies to HTTP
+    # routes and the WebSocket auth path applies to connections.
+    role = str(claims.get("role") or "").strip()
+    if role not in _APPROVED_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token.",
         )
 
     return claims
@@ -267,8 +399,8 @@ async def login(body: LoginRequest) -> LoginResponse:
     The JWT is consumed by auth.js (stored in sessionStorage) and then sent
     by websocket.js during the WebSocket authentication handshake.
     """
-    subject        = _validate_credentials(body.username, body.password)
-    token, exp_dt  = _issue_token(subject=subject, role="operator")
+    subject       = _validate_credentials(body.username, body.password)
+    token, exp_dt = _issue_token(subject=subject, role="operator")
 
     return LoginResponse(
         token=token,
@@ -304,6 +436,9 @@ async def verify(
         )
 
     raw_token = parts[1].strip()
+
+    # Shape and length are also validated inside verify_jwt_token(), but
+    # checking here first avoids reaching the function with obviously-bad input.
     if not raw_token or len(raw_token) > MAX_TOKEN_LEN:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -312,7 +447,7 @@ async def verify(
 
     claims  = verify_jwt_token(raw_token)
     subject = str(claims.get("sub", "")).strip()
-    role    = str(claims.get("role") or claims.get("scope") or "").strip()
+    role    = str(claims.get("role", "")).strip()
     exp     = claims.get("exp")
     exp_dt  = (
         datetime.fromtimestamp(exp, tz=timezone.utc).isoformat()
