@@ -1096,10 +1096,12 @@ async def internal_broadcast_event(
     }
 
 # =============================================================================
-# Proxy event ingestion
+# Local proxy test ingestion endpoint
 # Accepts local proxy traffic summaries and broadcasts them to dashboard clients.
 # =============================================================================
+
 proxy_events_router = APIRouter(prefix="/events", tags=["events"])
+
 
 @proxy_events_router.post("/proxy")
 async def ingest_proxy_event(
@@ -1108,35 +1110,43 @@ async def ingest_proxy_event(
 ) -> dict[str, Any]:
     """
     Ingest a local proxy traffic event and broadcast it to dashboard clients.
-    Accepts JSON from a local proxy script, normalizes the event, and
-    broadcasts to WebSocket clients subscribed to the "proxy" channel.
-    No threat detection yet — this is the ingestion wire only.
+
+    This is intentionally minimal:
+    - accepts JSON from a local proxy script
+    - normalizes the event
+    - broadcasts it to WebSocket clients subscribed to the "proxy" channel
     """
+
     event = {
-        "type":          "proxy_event",
-        "source":        str(body.get("source") or "local_proxy")[:64],
-        "method":        body.get("method"),
-        "url":           body.get("url"),
-        "host":          body.get("host"),
-        "path":          body.get("path"),
-        "status_code":   body.get("status_code"),
-        "request_size":  body.get("request_size", 0),
+        "type": "proxy_event",
+        "source": str(body.get("source") or "local_proxy")[:64],
+        "method": body.get("method"),
+        "url": body.get("url"),
+        "host": body.get("host"),
+        "path": body.get("path"),
+        "status_code": body.get("status_code"),
+        "request_size": body.get("request_size", 0),
         "response_size": body.get("response_size", 0),
-        "user_agent":    body.get("user_agent", ""),
-        "client_host":   request.client.host if request.client else None,
-        "timestamp":     utc_now(),
-        "raw":           body,
-    }
-    await _broadcast_dashboard_event("proxy_event", event, channel="proxy")
-    return {
-        "ok":         True,
-        "event_type": "proxy_event",
-        "channel":    "proxy",
-        "clients":    len(_dashboard_ws_clients),
-        "event":      event,
-        "timestamp":  utc_now(),
+        "user_agent": body.get("user_agent", ""),
+        "client_host": request.client.host if request.client else None,
+        "timestamp": utc_now(),
+        "raw": body,
     }
 
+    await _broadcast_dashboard_event(
+        "proxy_event",
+        event,
+        channel="proxy",
+    )
+
+    return {
+        "ok": True,
+        "event_type": "proxy_event",
+        "channel": "proxy",
+        "clients": len(_dashboard_ws_clients),
+        "event": event,
+        "timestamp": utc_now(),
+    }
 # =============================================================================
 # Watchtower bridge
 # =============================================================================
