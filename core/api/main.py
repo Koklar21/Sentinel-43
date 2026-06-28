@@ -1518,6 +1518,7 @@ app.include_router(system_router)
 app.include_router(fenrir_router)
 app.include_router(api_router)
 app.include_router(audit_router)
+app.include_router(proxy_events_router)      # /events/proxy
 
 # =============================================================================
 # Error handler
