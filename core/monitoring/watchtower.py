@@ -35,7 +35,7 @@
 
 """
 Sentinel-43 Watchtower Node
-v1.3.6 Hardened Octagon Interconnect
+v1.3.7 RLock Deadlock Fix
 
 Docker:
     S43_WATCHTOWER_SERVE=true python -m core.monitoring.watchtower
@@ -43,7 +43,19 @@ Docker:
 Production:
     uvicorn core.monitoring.watchtower:app --host 0.0.0.0 --port 9100
 
-Changes from v1.3.5:
+Changes from v1.3.6:
+  - Fix #10: _SINGLETON_LOCK changed from threading.Lock() to threading.RLock().
+    Root cause of container startup hang: _get_or_create_app() acquired
+    _SINGLETON_LOCK, then called _get_or_create_node() which attempted to
+    acquire the same non-reentrant Lock. Python's threading.Lock does not
+    allow the same thread to acquire it twice — the second acquisition
+    blocked forever. Uvicorn resolved `module:app` via __getattr__, which
+    called _get_or_create_app(), which deadlocked immediately. The process
+    remained alive as PID 1 but never bound to port 9100 and emitted zero
+    logs. threading.RLock (reentrant lock) allows the same thread to acquire
+    it multiple times, resolving the deadlock with no other logic changes.
+
+Changes from v1.3.5 (carried forward from v1.3.6):
   - Fix #1: NODE and app are now lazy singletons accessed via module-level
     __getattr__. Importing types (WatchtowerConfig, WatchtowerNode, etc.)
     no longer triggers node construction or FastAPI app creation at import
@@ -54,9 +66,7 @@ Changes from v1.3.5:
     raises AttributeError.
   - Fix #3: ThresholdProfile renamed to TowerThresholdProfile and
     thresholds_for renamed to tower_thresholds_for to eliminate the name
-    collision with the rules_engine ThresholdProfile enum. The monitoring
-    package public API exposes the rules_engine enum under those names;
-    this module exports the numeric-field dataclass under the new names.
+    collision with the rules_engine ThresholdProfile enum.
   - Fix #4: build_node() now raises RuntimeError if node.start() returns
     False instead of silently returning an INITIALIZING node.
   - Fix #5: create_api_app() no longer double-registers routes. All routes
@@ -91,7 +101,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 
-VERSION = "1.3.6"
+VERSION = "1.3.7"
 logger = logging.getLogger("SentinelWatchtower")
 
 
@@ -176,10 +186,7 @@ def _assign_event_id(event: dict[str, Any]) -> str:
 # Fix #3: renamed from ThresholdProfile / thresholds_for to
 # TowerThresholdProfile / tower_thresholds_for to eliminate the name
 # collision with the rules_engine.ThresholdProfile enum (DEV/TEST/PROD)
-# and rules_engine.thresholds_for(profile) function. The monitoring
-# package's __init__.py resolves "ThresholdProfile" / "thresholds_for"
-# from the rules_engine module; this module's numeric-field dataclass
-# is a separate internal concept.
+# and rules_engine.thresholds_for(profile) function.
 # =============================================================================
 
 @dataclass(frozen=True)
@@ -358,14 +365,14 @@ class WatchtowerConfig:
             recovery_clean_scan_threshold=_env_int("S43_RECOVERY_CLEAN_SCAN_THRESHOLD", 3, 1, 20),
             expose_bind_host=_env_bool("S43_EXPOSE_BIND_HOST", False),
             towers=(
-                TowerConfig("API Watchtower", TowerSlot.N, TowerType.API_HEALTH, sensitivity=7),
-                TowerConfig("Core Logic Watchtower", TowerSlot.NE, TowerType.EXPECTATION_GUARD, sensitivity=8),
-                TowerConfig("Configuration Watchtower", TowerSlot.E, TowerType.CONFIG_DRIFT, sensitivity=7),
-                TowerConfig("Audit Chain Watchtower", TowerSlot.SE, TowerType.LOGGING_AUDIT, sensitivity=8),
-                TowerConfig("Runtime Stability Watchtower", TowerSlot.S, TowerType.ERROR_RATE, sensitivity=8),
-                TowerConfig("Dependency Watchtower", TowerSlot.SW, TowerType.DEPENDENCY_HEALTH, sensitivity=7),
-                TowerConfig("Resource Watchtower", TowerSlot.W, TowerType.RESOURCE_PRESSURE, sensitivity=7),
-                TowerConfig("Security Watchtower", TowerSlot.NW, TowerType.SECURITY_BASELINE, sensitivity=9),
+                TowerConfig("API Watchtower",            TowerSlot.N,  TowerType.API_HEALTH,         sensitivity=7),
+                TowerConfig("Core Logic Watchtower",     TowerSlot.NE, TowerType.EXPECTATION_GUARD,   sensitivity=8),
+                TowerConfig("Configuration Watchtower",  TowerSlot.E,  TowerType.CONFIG_DRIFT,        sensitivity=7),
+                TowerConfig("Audit Chain Watchtower",    TowerSlot.SE, TowerType.LOGGING_AUDIT,       sensitivity=8),
+                TowerConfig("Runtime Stability Watchtower", TowerSlot.S, TowerType.ERROR_RATE,        sensitivity=8),
+                TowerConfig("Dependency Watchtower",     TowerSlot.SW, TowerType.DEPENDENCY_HEALTH,   sensitivity=7),
+                TowerConfig("Resource Watchtower",       TowerSlot.W,  TowerType.RESOURCE_PRESSURE,   sensitivity=7),
+                TowerConfig("Security Watchtower",       TowerSlot.NW, TowerType.SECURITY_BASELINE,   sensitivity=9),
             ),
         )
 
@@ -430,7 +437,6 @@ class DependencyReportRequest(BaseModel):
 class WatchtowerSegment:
     def __init__(self, cfg: TowerConfig) -> None:
         self.cfg = cfg
-        # Fix #3: use renamed tower_thresholds_for
         self._thresholds = tower_thresholds_for(cfg.sensitivity)
         self._last_scan_ts: float | None = None
         self._alert_count = 0
@@ -577,8 +583,6 @@ class WatchtowerSegment:
                 severity = AlertSeverity.MEDIUM
 
         elif tower_type == TowerType.SECURITY_BASELINE and kind in {"security", "mobile"}:
-            # "mobile" events from the gateway (APPROVE_DECISION / VETO_DECISION)
-            # carry the same security signal fields as "security" events.
             if event.get("secrets_exposed", False):
                 reason = "Possible secrets exposure detected"
                 severity = AlertSeverity.CRITICAL
@@ -646,8 +650,6 @@ class WatchtowerNode:
         WatchtowerState.FAILED: set(),
     }
 
-    # States in which scan_event drops events outright instead of scanning them.
-    # DEGRADED is intentionally NOT here so clean-scan recovery can advance.
     _DROP_EVENT_STATES: set[WatchtowerState] = {
         WatchtowerState.INITIALIZING,
         WatchtowerState.FAILED,
@@ -706,13 +708,6 @@ class WatchtowerNode:
             return self._set_state_locked(new_state)
 
     def start(self) -> None:
-        """
-        Transition INITIALIZING → ACTIVE.
-
-        Fix #9: previously returned bool, which callers (including
-        MonitoringManager.start()) never checked. Now raises RuntimeError
-        on failure so a silently-stuck-in-INITIALIZING node is impossible.
-        """
         with self._lock:
             if self._state == WatchtowerState.FAILED:
                 raise RuntimeError(
@@ -726,14 +721,6 @@ class WatchtowerNode:
                 )
 
     def stop(self) -> None:
-        """
-        Fix #2: previously missing. MonitoringManager.stop() calls this
-        and was raising AttributeError.
-
-        Transitions the node to FAILED (terminal state), causing all
-        subsequent scan_event() calls to drop events. Idempotent if the
-        node is already FAILED.
-        """
         with self._lock:
             if self._state == WatchtowerState.FAILED:
                 return
@@ -1061,12 +1048,6 @@ class WatchtowerNode:
             if item.get("status") in {"down", "offline", "failed", "degraded"}
         ]
 
-        # Fix #6: previously bad_dependencies double-counted stale items
-        # (items in stale_dependencies were also included in bad_dependencies
-        # via `computed_status == "stale"`, inflating the bad count and
-        # confusing dashboards that distinguish explicit failures from staleness).
-        # Now: stale_dependencies = items whose only problem is staleness.
-        #      bad_dependencies = items explicitly unhealthy (not just stale).
         stale_dependencies = [
             item["name"] for item in dependency_records
             if item.get("computed_status") == "stale"
@@ -1184,13 +1165,6 @@ class WatchtowerNode:
 # =============================================================================
 
 def build_node() -> WatchtowerNode:
-    """
-    Build and start a WatchtowerNode from the environment.
-
-    Fix #4: previously node.start() return value was ignored; if it
-    returned False the node silently stayed in INITIALIZING state and
-    dropped all events. start() now raises RuntimeError on failure.
-    """
     node_id = os.getenv("S43_WATCHTOWER_NODE_ID", "sentinel43-watchtower")
     config = WatchtowerConfig.default_sentinel_octagon(node_id)
     node = WatchtowerNode(config)
@@ -1199,10 +1173,6 @@ def build_node() -> WatchtowerNode:
 
 
 def get_node() -> WatchtowerNode:
-    """
-    Return the module-level WatchtowerNode singleton, creating it on
-    first call. Prefer this over accessing NODE directly.
-    """
     return _get_or_create_node()
 
 
@@ -1344,12 +1314,6 @@ def create_api_app(node: WatchtowerNode) -> FastAPI:
         ),
     )
 
-    # Fix #5: previously include_router was called twice -- once without a
-    # prefix and once with /watchtower -- registering every route at both
-    # bare paths (/health, /state/{state_name}) and prefixed paths
-    # (/watchtower/health, /watchtower/state/{state_name}). This caused
-    # duplicate operation IDs, ambiguous route matching, and admin endpoints
-    # exposed at the root level. Routes now live exclusively under /watchtower.
     watchtower_router = create_watchtower_router(node)
     api.include_router(watchtower_router)
 
@@ -1374,25 +1338,25 @@ def create_api_app(node: WatchtowerNode) -> FastAPI:
 # =============================================================================
 # Lazy module-level singletons
 #
-# Fix #1: NODE and app used to be constructed at module level:
+# Fix #10: _SINGLETON_LOCK changed from threading.Lock() to threading.RLock().
 #
-#     NODE = build_node()       ← reads env vars, starts node, side effects
-#     app  = create_api_app(NODE)  ← creates FastAPI app
+# The deadlock sequence was:
+#   1. uvicorn resolves `core.monitoring.watchtower:app`
+#   2. Python calls module __getattr__("app")
+#   3. __getattr__ calls _get_or_create_app()
+#   4. _get_or_create_app() acquires _SINGLETON_LOCK (Lock — non-reentrant)
+#   5. _get_or_create_app() calls _get_or_create_node()
+#   6. _get_or_create_node() tries to acquire _SINGLETON_LOCK again
+#   7. Same thread, non-reentrant lock → blocks forever
+#   8. uvicorn process alive as PID 1, port 9100 never bound, zero logs
 #
-# This meant any import of WatchtowerConfig (or any other type from this
-# module) silently triggered full node construction and app creation at
-# import time, before Docker env vars may have been injected and in every
-# test that imports a type here.
-#
-# Now NODE and app are lazy: the first time they're accessed (via
-# `from .watchtower import NODE` or uvicorn resolving `module:app`)
-# module-level __getattr__ creates and caches them. Pure type imports
-# (`from .watchtower import WatchtowerConfig`) have zero side effects.
+# threading.RLock (reentrant lock) allows the same thread to acquire it
+# multiple times. The fix requires no other logic changes.
 # =============================================================================
 
 _NODE_SINGLETON: WatchtowerNode | None = None
 _APP_SINGLETON: FastAPI | None = None
-_SINGLETON_LOCK = threading.Lock()
+_SINGLETON_LOCK = threading.RLock()  # Fix #10: was threading.Lock() — caused deadlock on startup
 
 
 def _get_or_create_node() -> WatchtowerNode:
@@ -1446,32 +1410,24 @@ if __name__ == "__main__":
 
 __all__ = [
     "VERSION",
-    # Fix #3: renamed types exported under new names
     "TowerThresholdProfile",
     "tower_thresholds_for",
-    # Enums
     "WatchtowerState",
     "TowerSlot",
     "TowerType",
     "AlertSeverity",
     "CoordinatorDecision",
-    # Data models
     "ScanResult",
     "TowerConfig",
     "WatchtowerConfig",
-    # Classes
     "WatchtowerSegment",
     "WatchtowerNode",
-    # Pydantic models
     "AnalyzeRequest",
     "ModuleRegisterRequest",
     "ModuleHeartbeatRequest",
     "DependencyReportRequest",
-    # Factories / accessors
     "build_node",
     "get_node",
     "create_watchtower_router",
     "create_api_app",
-    # Fix #7: NODE removed from __all__ -- use get_node() instead.
-    # `app` also removed; accessed lazily via module __getattr__ for uvicorn.
 ]
