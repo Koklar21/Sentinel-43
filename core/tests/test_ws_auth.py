@@ -1,0 +1,224 @@
+# =============================================================================
+# Sentinel-43 — WebSocket Auth Boundary Tests
+#
+# Purpose:
+#   Verify the dashboard WebSocket's auth handshake before closed beta.
+#
+# This is NOT a standard "reject the upgrade" pattern. Per core/api/main.py
+# dashboard_websocket():
+#   1. Server ALWAYS calls websocket.accept() first, regardless of auth.
+#   2. If S43_WS_REQUIRE_AUTH=true, server then sends:
+#        {"type": "auth_required", "payload": {...}}
+#   3. Server waits (up to 15s) for the client's FIRST message to be:
+#        {"type": "auth", "payload": {"token": "<bearer>"}}
+#   4. On success: sends {"type": "connected", ...} and the session proceeds.
+#   5. On failure: behavior differs by failure type —
+#        - bad/expired/forged token  -> sends an {"type":"error",...} frame,
+#                                       THEN closes with code 1008
+#        - wrong frame type / no token field -> same: error frame, then 1008
+#        - malformed JSON / non-dict frame   -> NO error frame, closes 1008
+#          immediately (caught by the ValueError branch in
+#          _receive_ws_message(), not the per-field validation branches)
+#
+# That last asymmetry is real and worth knowing before relying on auth.js
+# to always show an error message before disconnecting — it won't, for a
+# malformed first frame.
+#
+# WS_REQUIRE_AUTH, JWT_SECRET, JWT_ISSUER, JWT_AUDIENCE, JWT_ALGORITHM are
+# all module-level constants in core.api.main, read at import time. This
+# file does not assume it is the first test module to import that module —
+# pytest collection order is not something to rely on — so it forces the
+# values it needs with importlib.reload() rather than os.environ.setdefault.
+# =============================================================================
+
+from __future__ import annotations
+
+import importlib
+import os
+from datetime import datetime, timezone
+from typing import Any, Generator
+
+import jwt
+import pytest
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
+
+# ---------------------------------------------------------------------------
+# Test environment setup — hard-set, then reload, so this file's config
+# wins regardless of what other test modules already imported main with.
+# ---------------------------------------------------------------------------
+
+TEST_SUBJECT = "ws-test-operator"
+JWT_SECRET = "test-secret-for-ws-auth-boundary-tests"
+JWT_ALGORITHM = "HS256"
+JWT_ISSUER = "sentinel-43-test"
+JWT_AUDIENCE = "sentinel-43-dashboard-test"
+WRONG_SECRET = "a-completely-different-secret-for-ws-tests"
+
+os.environ["SENTINEL_ENV"] = "test"
+os.environ["S43_JWT_SECRET"] = JWT_SECRET
+os.environ["S43_JWT_ALGORITHM"] = JWT_ALGORITHM
+os.environ["S43_JWT_ISSUER"] = JWT_ISSUER
+os.environ["S43_JWT_AUDIENCE"] = JWT_AUDIENCE
+os.environ["S43_WS_REQUIRE_AUTH"] = "true"
+os.environ["S43_ENABLE_TEST_INJECTION"] = "false"
+
+import core.api.main as main_module  # noqa: E402
+
+importlib.reload(main_module)  # force constants to pick up the values above
+app = main_module.app
+
+WS_URL = "/ws"
+
+
+# ---------------------------------------------------------------------------
+# Pytest Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def client() -> Generator[TestClient, None, None]:
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+# ---------------------------------------------------------------------------
+# Token builders
+# ---------------------------------------------------------------------------
+
+def _build_token(
+    *,
+    secret: str = JWT_SECRET,
+    algorithm: str = JWT_ALGORITHM,
+    issuer: str | None = JWT_ISSUER,
+    audience: str | None = JWT_AUDIENCE,
+    subject: str | None = TEST_SUBJECT,
+    role: str | None = "operator",
+    exp_offset_seconds: int = 3600,
+) -> str:
+    now = datetime.now(timezone.utc)
+    payload: dict[str, Any] = {
+        "iat": int(now.timestamp()),
+        "exp": int(now.timestamp()) + exp_offset_seconds,
+    }
+    if issuer is not None:
+        payload["iss"] = issuer
+    if audience is not None:
+        payload["aud"] = audience
+    if subject is not None:
+        payload["sub"] = subject
+    if role is not None:
+        payload["role"] = role
+
+    return jwt.encode(payload, secret, algorithm=algorithm)
+
+
+def make_valid_token() -> str:
+    return _build_token()
+
+
+def make_expired_token() -> str:
+    return _build_token(exp_offset_seconds=-3600)
+
+
+def make_forged_token() -> str:
+    return _build_token(secret=WRONG_SECRET)
+
+
+# ---------------------------------------------------------------------------
+# Handshake helpers
+# ---------------------------------------------------------------------------
+
+def _consume_auth_required(ws) -> None:
+    """Every authenticated session opens with this frame. Assert and discard."""
+    frame = ws.receive_json()
+    assert frame["type"] == "auth_required"
+
+
+def _expect_rejection(ws, *, expected_error_substring: str | None = None) -> None:
+    """
+    Most rejection paths send an error frame, then close(1008). Assert
+    the error frame if a substring is given, then assert the close code.
+    """
+    if expected_error_substring is not None:
+        frame = ws.receive_json()
+        assert frame["type"] == "error"
+        assert expected_error_substring.lower() in frame["payload"]["error"].lower()
+
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        ws.receive_text()
+    assert exc_info.value.code == 1008
+
+
+# ---------------------------------------------------------------------------
+# Rejection Tests
+# ---------------------------------------------------------------------------
+
+def test_ws_rejects_missing_token_field(client: TestClient):
+    """Auth frame sent, but payload has no 'token' key at all."""
+    with client.websocket_connect(WS_URL) as ws:
+        _consume_auth_required(ws)
+        ws.send_json({"type": "auth", "payload": {}})
+        _expect_rejection(ws, expected_error_substring="token missing")
+
+
+def test_ws_rejects_wrong_frame_type(client: TestClient):
+    """First message sent is not type='auth' — protocol violation, not a bad token."""
+    with client.websocket_connect(WS_URL) as ws:
+        _consume_auth_required(ws)
+        ws.send_json({"type": "ping", "payload": {}})
+        _expect_rejection(ws, expected_error_substring="auth frame")
+
+
+def test_ws_rejects_malformed_json_frame(client: TestClient):
+    """
+    Not valid JSON at all. This hits the ValueError branch in
+    _receive_ws_message(), which closes WITHOUT sending an error frame —
+    distinct from every other rejection path in this file.
+    """
+    with client.websocket_connect(WS_URL) as ws:
+        _consume_auth_required(ws)
+        ws.send_text("this is not json")
+        _expect_rejection(ws, expected_error_substring=None)
+
+
+def test_ws_rejects_malformed_token_string(client: TestClient):
+    """Token field present but not a parseable JWT (DecodeError path)."""
+    with client.websocket_connect(WS_URL) as ws:
+        _consume_auth_required(ws)
+        ws.send_json({"type": "auth", "payload": {"token": "not-a-real-jwt"}})
+        _expect_rejection(ws, expected_error_substring="invalid token")
+
+
+def test_ws_rejects_forged_signature(client: TestClient):
+    """Structurally valid JWT, correct claims, signed with the wrong key."""
+    with client.websocket_connect(WS_URL) as ws:
+        _consume_auth_required(ws)
+        ws.send_json({"type": "auth", "payload": {"token": make_forged_token()}})
+        _expect_rejection(ws, expected_error_substring="invalid token")
+
+
+def test_ws_rejects_expired_token(client: TestClient):
+    with client.websocket_connect(WS_URL) as ws:
+        _consume_auth_required(ws)
+        ws.send_json({"type": "auth", "payload": {"token": make_expired_token()}})
+        _expect_rejection(ws, expected_error_substring="expired")
+
+
+# ---------------------------------------------------------------------------
+# Acceptance Test
+# ---------------------------------------------------------------------------
+
+def test_ws_accepts_valid_token(client: TestClient):
+    with client.websocket_connect(WS_URL) as ws:
+        _consume_auth_required(ws)
+        ws.send_json({"type": "auth", "payload": {"token": make_valid_token()}})
+
+        frame = ws.receive_json()
+        assert frame["type"] == "connected"
+        assert frame["payload"]["status"] == "ok"
+
+        # Confirm the session is actually live post-auth, not just that the
+        # connect frame was sent before an immediate drop.
+        ws.send_json({"type": "ping", "payload": {}})
+        pong = ws.receive_json()
+        assert pong["type"] == "pong"
