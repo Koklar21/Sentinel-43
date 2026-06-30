@@ -4,8 +4,29 @@
 // UI logic module. WebSocket transport is handled by websocket.js which
 // dispatches sentinel:ws:* events consumed here.
 //
-// v1.6.2
+// v1.6.3
 // Changes:
+// - Fix: getDevToken() was gating ALL token lookup — including
+//   SENTINEL_JWT, the real session token written by auth.js on login —
+//   behind ALLOW_DEV_JWT_STORAGE (local-hostname-only). Any beta tester
+//   not on localhost/127.0.0.1/::1 could log in successfully, see the
+//   dashboard populate (listActions/vaultStats aren't protected routes),
+//   and then get silent 401s the moment they hit Approve or Veto, since
+//   getAuthHeaders() never attached a real Authorization header. Same
+//   root cause and same fix as websocket.js v1.5.7's _getDevToken() bug.
+//   Split into a dedicated SESSION_TOKEN_KEY check (always read,
+//   regardless of hostname) followed by the local-only legacy key scan.
+//   DEV_JWT_KEYS no longer contains SENTINEL_JWT — it has its own
+//   always-on check now, consistent with websocket.js's _DEV_JWT_KEYS.
+// - Knock-on fix: authStateText / jwtRiskBadge in updateStaticConfig()
+//   read getDevToken()'s result to decide whether to show "DEV TOKEN
+//   PRESENT" and a risk badge. Now that the real session token is read
+//   unconditionally, a normal logged-in beta operator would otherwise be
+//   mislabeled as running a risky dev token. Distinguished real session
+//   tokens from legacy/dev tokens for that display only — does not change
+//   any auth behavior, just what the operator sees in the config panel.
+//
+// v1.6.2 (prior):
 // - normalizeWatchtowerResponse(): expanded state alias set.
 //   Previously only "ACTIVE" mapped to "ok" and "DEGRADED" to "degraded".
 //   Now accepts the full alias matrix emitted by known Watchtower backends:
@@ -87,9 +108,16 @@ const STATUS_CLASSES = Object.freeze({
     EXPIRED:  "expired",
     UNKNOWN:  "unknown",
 });
-// Must stay in sync with websocket.js _DEV_JWT_KEYS.
+// Canonical session token key — written by auth.js on successful login.
+// Always read regardless of hostname; this is the production auth path,
+// not a dev convenience. See getDevToken() below and the v1.5.7 fix note
+// in websocket.js (same bug, same fix, same root cause).
+const SESSION_TOKEN_KEY = "SENTINEL_JWT";
+
+// Legacy/dev fallback keys only — local-hostname-gated. Must stay in sync
+// with websocket.js _DEV_JWT_KEYS (minus SESSION_TOKEN_KEY, which has its
+// own always-on check).
 const DEV_JWT_KEYS = Object.freeze([
-    "SENTINEL_JWT",
     "S43_JWT",
     "S43_TOKEN",
     "s43_token",
@@ -111,8 +139,6 @@ const WT_PROBE_MS = 30_000;
 // =============================================================================
 // Demo stubs (used when ?demo=1 is active)
 // =============================================================================
-// Watchtower demo: WebSocket Bridge deliberately degraded so the grid renders
-// mixed state and operators can see the amber indicator during demo walkthroughs.
 const DEMO_WATCHTOWER = Object.freeze({
     overall: "degraded",
     subsystems: Object.freeze([
@@ -124,8 +150,6 @@ const DEMO_WATCHTOWER = Object.freeze({
         { name: "Database",             status: "online",   latencyMs: 14, detail: "PostgreSQL persistence" },
     ]),
 });
-// Dashboard summary demo values — deliberately modest to avoid implying
-// the demo represents a production traffic baseline.
 const DEMO_SUMMARY = Object.freeze({
     totalAssessments: 142,
     criticalThreats:  3,
@@ -138,64 +162,53 @@ const DEMO_SUMMARY = Object.freeze({
 // =============================================================================
 const $ = id => document.getElementById(id);
 const el = {
-    // Header
     statusDot:    $("statusDot"),
     statusText:   $("statusText"),
     modeText:     $("modeText"),
-    modeAlias:    $("modeAlias"),          // NEW v1.6.0
+    modeAlias:    $("modeAlias"),
     queueCount:   $("queueCount"),
     lastSync:     $("lastSync"),
     pollFlash:    $("pollFlash"),
     demoBadge:    $("demoBadge"),
     jwtRiskBadge: $("jwtRiskBadge"),
     liveRegion:   $("liveRegion"),
-    // Watchtower header chip (NEW v1.6.0)
     wtHeaderChip:   $("wtHeaderChip"),
     wtHeaderDot:    $("wtHeaderDot"),
     wtHeaderStatus: $("wtHeaderStatus"),
-    // Stats — action-state row (existing)
     pendingCount:  $("pendingCount"),
     stagedCount:   $("stagedCount"),
     approvedCount: $("approvedCount"),
     vaultCount:    $("vaultCount"),
-    // Stats — assessment row (NEW v1.6.0)
     criticalThreats:  $("criticalThreats"),
     totalAssessments: $("totalAssessments"),
     totalDecisions:   $("totalDecisions"),
     fenrirSignals:    $("fenrirSignals"),
-    // Config panel
     apiBaseText:   $("apiBaseText"),
     authStateText: $("authStateText"),
     pollText:      $("pollText"),
     demoText:      $("demoText"),
-    // Header buttons
     refreshBtn: $("refreshBtn"),
     injectBtn:  $("injectBtn"),
     exportBtn:  $("exportBtn"),
     themeBtn:   $("themeBtn"),
     authBtn:    $("authBtn"),
     kbHelpBtn:  $("kbHelpBtn"),
-    // Watchtower panel (NEW v1.6.0)
     wtGrid:       $("wtGrid"),
     wtOverall:    $("wtOverall"),
     wtProbeTime:  $("wtProbeTime"),
     wtRefreshBtn: $("wtRefreshBtn"),
-    // Actions table
     actionsBody:    $("actionsBody"),
     emptyState:     $("emptyState"),
     searchInput:    $("searchInput"),
     clearSearchBtn: $("clearSearchBtn"),
     selectAll:      $("selectAll"),
-    // Bulk bar
     bulkBar:        $("bulkBar"),
     bulkLabel:      $("bulkLabel"),
     bulkApproveBtn: $("bulkApproveBtn"),
     bulkVetoBtn:    $("bulkVetoBtn"),
     bulkClearBtn:   $("bulkClearBtn"),
-    // Log
     logConsole: $("logConsole"),
     clearLogBtn: $("clearLogBtn"),
-    // Reason modal
     reasonModal:    $("reasonModal"),
     modalTitle:     $("modalTitle"),
     modalSubtitle:  $("modalSubtitle"),
@@ -204,17 +217,14 @@ const el = {
     modalCharCount: $("modalCharCount"),
     modalCancel:    $("modalCancel"),
     modalConfirm:   $("modalConfirm"),
-    // JWT modal
     jwtModal:   $("jwtModal"),
     jwtInput:   $("jwtInput"),
     jwtCancel:  $("jwtCancel"),
     jwtClear:   $("jwtClear"),
     jwtConfirm: $("jwtConfirm"),
-    // Inject modal
     injectModal:   $("injectModal"),
     injectCancel:  $("injectCancel"),
     injectConfirm: $("injectConfirm"),
-    // Keyboard shortcut toast
     kbToast: $("kbToast"),
 };
 // =============================================================================
@@ -231,8 +241,8 @@ let prevCounts       = {pending: null, staged: null, approved: null};
 let lastDataSyncAt   = null;
 let refreshPromise   = null;
 let pollTimer        = null;
-let watchtowerTimer  = null;            // NEW v1.6.0 — separate from pollTimer
-let watchtowerProbeInFlight = false;    // NEW v1.6.0 — guard against concurrent probes
+let watchtowerTimer  = null;
+let watchtowerProbeInFlight = false;
 let kbToastTimer     = null;
 let injectInFlight   = false;
 let wsConnected      = false;
@@ -327,30 +337,44 @@ function _readStoredToken(storage, key) {
         return null;
     }
 }
-function getDevToken() {
-    if (!CONFIG.ALLOW_DEV_JWT_STORAGE) return null;
+// Always reads the real session token first, regardless of hostname — this
+// is the production login path, not a dev convenience (see v1.6.3 changelog
+// above). Only the legacy/dev fallback scan below stays gated to local
+// hostnames. Returns { token, isRealSession } so callers that care about the
+// distinction (currently just updateStaticConfig()'s risk-badge display) can
+// avoid mislabeling a real logged-in operator as running a dev token.
+function getDevTokenInfo() {
+    const sessionToken = _readStoredToken(sessionStorage, SESSION_TOKEN_KEY);
+    if (sessionToken) return { token: sessionToken, isRealSession: true };
+
+    if (!CONFIG.ALLOW_DEV_JWT_STORAGE) return { token: null, isRealSession: false };
+
     for (const key of DEV_JWT_KEYS) {
         const token = _readStoredToken(sessionStorage, key);
-        if (token) return token;
+        if (token) return { token, isRealSession: false };
     }
     for (const key of DEV_JWT_KEYS) {
         const token = _readStoredToken(localStorage, key);
-        if (token) return token;
+        if (token) return { token, isRealSession: false };
     }
     try {
         if (typeof window.SENTINEL_JWT === "string" && window.SENTINEL_JWT.trim()) {
-            return window.SENTINEL_JWT.trim();
+            return { token: window.SENTINEL_JWT.trim(), isRealSession: false };
         }
         if (
             typeof window.S43_DASHBOARD_TOKEN === "string" &&
             window.S43_DASHBOARD_TOKEN.trim()
         ) {
-            return window.S43_DASHBOARD_TOKEN.trim();
+            return { token: window.S43_DASHBOARD_TOKEN.trim(), isRealSession: false };
         }
     } catch {
-        return null;
+        return { token: null, isRealSession: false };
     }
-    return null;
+    return { token: null, isRealSession: false };
+}
+// Back-compat wrapper — most call sites only need the token value.
+function getDevToken() {
+    return getDevTokenInfo().token;
 }
 function getAuthHeaders() {
     const headers = {"Content-Type": "application/json"};
@@ -535,16 +559,10 @@ const api = {
             : CONFIG.LIVE_TEST_MODE
                 ? fetchJson("/actions/test-inject", {method: "POST"})
                 : Promise.reject(new Error("Inject requires demo or local test mode")),
-    // NEW v1.6.0
-    // Endpoint must be registered in main.py. Adjust path if your router
-    // mounts it differently (e.g. /api/watchtower/status).
     watchtowerStatus: () =>
         CONFIG.DEMO_MODE
             ? Promise.resolve({...DEMO_WATCHTOWER, subsystems: [...DEMO_WATCHTOWER.subsystems]})
             : fetchJson("/watchtower/status"),
-    // NEW v1.6.0
-    // Swallows failures so missing endpoint doesn't break the main refresh
-    // cycle. When the backend returns this data, assessment metrics populate.
     dashboardSummary: () =>
         CONFIG.DEMO_MODE
             ? Promise.resolve({...DEMO_SUMMARY})
@@ -914,11 +932,8 @@ function openReasonModal({title, subtitle, confirmText, confirmClass = "green"})
     });
 }
 // =============================================================================
-// Governance Mode  (NEW v1.6.0)
+// Governance Mode
 // =============================================================================
-// Updates #modeText and #modeAlias (mode-chip-alias class).
-// Called from updateStaticConfig(), performRefresh() summary branch,
-// and the governance_mode / mode_changed WebSocket cases.
 function setGovernanceMode(mode) {
     const normalized = normalizeString(mode, "UNKNOWN").toUpperCase();
     if (el.modeText) el.modeText.textContent = normalized;
@@ -929,11 +944,8 @@ function setGovernanceMode(mode) {
     }
 }
 // =============================================================================
-// Assessment Metrics  (NEW v1.6.0)
+// Assessment Metrics
 // =============================================================================
-// Populates the assessment stat row only when the backend actually returns
-// those fields. Never overwrites — with a zero or fake value.
-// Handles both camelCase and snake_case field names from the backend.
 function updateAssessmentMetrics(data) {
     if (data == null || typeof data !== "object") return;
     const pairs = [
@@ -947,18 +959,14 @@ function updateAssessmentMetrics(data) {
         node.textContent = value.toLocaleString();
         bumpStat(node);
     }
-    // Update mode if the summary includes it.
     if (data.mode) setGovernanceMode(data.mode);
 }
 // =============================================================================
-// Watchtower  (NEW v1.6.0)
+// Watchtower
 // =============================================================================
-// Renders the #wtGrid with subsystem health cards and updates the header chip.
-// Uses the shared escHtml utility — no separate escapeHtml needed.
 function renderWatchtower(data) {
     if (!el.wtGrid) return;
     const overall = normalizeString(data?.overall, "unknown").toLowerCase();
-    // Overall status chip inside the panel header
     if (el.wtOverall) {
         el.wtOverall.textContent = overall.toUpperCase();
         el.wtOverall.className =
@@ -966,14 +974,12 @@ function renderWatchtower(data) {
             overall === "degraded" ? "chip degraded" :
                                      "chip offline";
     }
-    // Header chip (always visible after first successful probe)
     if (el.wtHeaderChip) el.wtHeaderChip.hidden = false;
     if (el.wtHeaderStatus) el.wtHeaderStatus.textContent = overall.toUpperCase();
     if (el.wtHeaderDot) {
         el.wtHeaderDot.classList.remove("online", "offline");
         el.wtHeaderDot.classList.add(overall === "ok" ? "online" : "offline");
     }
-    // Subsystem cards
     const subsystems = Array.isArray(data?.subsystems) ? data.subsystems : [];
     if (!subsystems.length) {
         el.wtGrid.innerHTML =
@@ -1004,39 +1010,15 @@ function renderWatchtower(data) {
         el.wtProbeTime.textContent = `Last probe: ${nowStamp()}`;
     }
 }
-// Normalizes the bridge response from GET /watchtower/status into the
-// standard { overall, subsystems } shape that renderWatchtower() expects.
-//
-// The API endpoint is a bridge wrapper:
-//   { bridge, reachable, watchtower: { state, towers: [...], ... }, timestamp }
-//
-// The real subsystem data lives in watchtower.towers — the 8 Octagon segments.
-// Each tower has name, tower_type, enabled, alert_count, malformed_input_count.
-// Status is derived (no explicit field): online / degraded / offline.
-// latencyMs is not available per-tower from the Octagon so cards show —.
-//
-// If the response is already in { overall, subsystems } form (demo stub or
-// future direct endpoint) it passes through unchanged.
-//
-// UPDATED v1.6.2: expanded state alias set.
-// wt.state (or raw.status as a fallback) is normalised to uppercase and
-// matched against the full set of values known Watchtower backends emit:
-//   ok      ← ACTIVE | ONLINE | OK | READY | HEALTHY | RUNNING
-//   degraded ← DEGRADED | WARN | WARNING
-//   offline ← anything else
 function normalizeWatchtowerResponse(raw) {
     if (!raw || typeof raw !== "object") return raw;
-    // Already in expected format — pass through
     if ("subsystems" in raw) return raw;
-    // Bridge response shape from main.py GET /watchtower/status
     if ("watchtower" in raw) {
         const reachable = raw.reachable !== false;
         if (!reachable) {
             return {overall: "offline", subsystems: []};
         }
         const wt = raw.watchtower ?? {};
-        // Normalise state to uppercase; fall back to top-level raw.status so
-        // backends that surface it at the root level are also handled.
         const state = normalizeString(wt.state ?? raw.status, "UNKNOWN").toUpperCase();
         const overall =
             ["ACTIVE", "ONLINE", "OK", "READY", "HEALTHY", "RUNNING"].includes(state)
@@ -1056,10 +1038,6 @@ function normalizeWatchtowerResponse(raw) {
         });
         const towers = Array.isArray(wt.towers) ? wt.towers : [];
         const subsystems = towers.map(t => {
-            // Derive status from available tower fields:
-            //   disabled → offline
-            //   alert_count > 0 → degraded
-            //   otherwise → online
             let status = "online";
             if (t.enabled === false) {
                 status = "offline";
@@ -1072,34 +1050,26 @@ function normalizeWatchtowerResponse(raw) {
             return {
                 name:      normalizeString(t.name, "Unknown Tower"),
                 status,
-                latencyMs: null,  // not available per Octagon tower
+                latencyMs: null,
                 detail,
             };
         });
         return {overall, subsystems};
     }
-    // Unknown shape — pass through and let renderWatchtower() handle it
     return raw;
 }
-// Probes GET /watchtower/status and calls renderWatchtower().
-// watchtowerProbeInFlight prevents concurrent probes (covers button debounce).
 async function fetchWatchtower() {
     if (watchtowerProbeInFlight) return;
     watchtowerProbeInFlight = true;
-    // Visually indicate probing is in progress
     if (el.wtRefreshBtn) el.wtRefreshBtn.disabled = true;
     try {
         const raw  = await api.watchtowerStatus();
-        // UPDATED v1.6.2: debug log — inspect the raw bridge payload in
-        // DevTools (F12 → Console) to confirm field names and state values.
-        // Remove or gate behind a debug flag once the integration is stable.
         console.debug("[S43 Watchtower raw]", raw);
         const data = normalizeWatchtowerResponse(raw);
         renderWatchtower(data);
         log("Watchtower probe complete.", "ok");
     } catch (err) {
         log(`Watchtower probe failed: ${err.message ?? err}`, "warn");
-        // Reflect unreachable state in the UI without wiping the last grid
         if (el.wtOverall) {
             el.wtOverall.textContent = "UNREACHABLE";
             el.wtOverall.className = "chip offline";
@@ -1115,8 +1085,6 @@ async function fetchWatchtower() {
         if (el.wtRefreshBtn) el.wtRefreshBtn.disabled = false;
     }
 }
-// Starts the 30 s Watchtower probe cycle.
-// Called once from init. Separate timer from startPollingFallback().
 function startWatchtowerPolling() {
     if (watchtowerTimer) clearInterval(watchtowerTimer);
     watchtowerTimer = setInterval(fetchWatchtower, WT_PROBE_MS);
@@ -1129,9 +1097,6 @@ async function performRefresh(manual = false) {
     if (manual) setStatus("Syncing");
     try {
         updateStaticConfig();
-        // NEW v1.6.0: dashboardSummary added to parallel fetch.
-        // It swallows its own errors so a missing endpoint won't fail the whole
-        // refresh cycle.
         const [rawActions, vault, summary] = await Promise.all([
             api.listActions(),
             api.vaultStats().catch(() => null),
@@ -1144,7 +1109,6 @@ async function performRefresh(manual = false) {
                 ? records.toLocaleString()
                 : "--";
         }
-        // NEW v1.6.0: populate assessment metrics and mode if backend returns them
         if (summary) updateAssessmentMetrics(summary);
         setStatus(wsConnected ? "Live" : "Online");
         if (manual) {
@@ -1374,9 +1338,6 @@ function exportVisibleActions() {
 function updateStaticConfig() {
     if (el.apiBaseText) el.apiBaseText.textContent = CONFIG.API_BASE;
     if (el.pollText) el.pollText.textContent = `fallback ${CONFIG.FALLBACK_POLL_MS} ms`;
-    // NEW v1.6.0: setGovernanceMode() instead of direct textContent assignment
-    // so the alias span is handled consistently. "HUMAN_GATED" remains the
-    // static default until the backend returns an actual mode value.
     setGovernanceMode("HUMAN_GATED");
     const demoActive = CONFIG.DEMO_MODE || CONFIG.LIVE_TEST_MODE;
     if (el.demoText) {
@@ -1389,14 +1350,22 @@ function updateStaticConfig() {
     }
     if (el.demoBadge) el.demoBadge.hidden = !CONFIG.DEMO_MODE;
     if (el.injectBtn) el.injectBtn.disabled = (!demoActive) || injectInFlight;
-    const token = getDevToken();
+    // v1.6.3: distinguish a real logged-in session token from a legacy/dev
+    // fallback token for display purposes only. A real session no longer
+    // shows "DEV TOKEN PRESENT" / the risk badge — those are reserved for
+    // actual legacy-key or window-global tokens, which remain a real risk
+    // (visible in DevTools, copy-pasted around) in a way a normal login
+    // session is not.
+    const { token, isRealSession } = getDevTokenInfo();
     if (el.authStateText) {
         el.authStateText.textContent = token
-            ? "DEV TOKEN PRESENT"
+            ? (isRealSession ? "SESSION TOKEN PRESENT" : "DEV TOKEN PRESENT")
             : CONFIG.ALLOW_DEV_JWT_STORAGE ? "COOKIE / MISSING" : "COOKIE ONLY";
-        el.authStateText.style.color = token ? "var(--amber)" : "var(--green)";
+        el.authStateText.style.color = token
+            ? (isRealSession ? "var(--green)" : "var(--amber)")
+            : "var(--green)";
     }
-    if (el.jwtRiskBadge) el.jwtRiskBadge.hidden = !token;
+    if (el.jwtRiskBadge) el.jwtRiskBadge.hidden = !(token && !isRealSession);
     if (el.authBtn) el.authBtn.disabled = !CONFIG.ALLOW_DEV_JWT_STORAGE;
 }
 // =============================================================================
@@ -1579,26 +1548,17 @@ window.addEventListener("sentinel:ws:message", event => {
         case "governance_pending_snapshot":
             log(`Governance pending queue: ${(payload.pending ?? []).length} item(s).`, "info");
             break;
-        // NEW v1.6.0: governance mode pushed over WebSocket updates modeText
-        // and the alias span immediately without waiting for the next poll.
         case "governance_mode":
         case "mode_changed":
             setGovernanceMode(normalizeString(payload.mode, "UNKNOWN"));
             log(`Governance mode: ${normalizeString(payload.mode, "UNKNOWN")}`, "info");
             break;
-        // Heartbeat broadcasts carry { reachable, url, timestamp } only — no
-        // tower data. These update the header chip and log, but never touch
-        // the tower grid (which would wipe it with "No subsystem data returned").
-        // Full tower renders only happen when the payload contains watchtower,
-        // subsystems, or overall keys — i.e. from the HTTP probe or a future
-        // WS push of a complete status payload.
         case "watchtower_state":
             log(
                 `Watchtower ${payload.reachable ? "reachable" : "unreachable"}.`,
                 payload.reachable ? "ok" : "warn"
             );
             if ("reachable" in payload && !("watchtower" in payload) && !("subsystems" in payload)) {
-                // Heartbeat-only shape — update chip, preserve grid
                 if (el.wtHeaderChip) el.wtHeaderChip.hidden = false;
                 if (el.wtHeaderStatus) {
                     el.wtHeaderStatus.textContent = payload.reachable ? "REACHABLE" : "UNREACHABLE";
@@ -1640,9 +1600,6 @@ el.clearLogBtn?.addEventListener("click", () => {
     if (el.logConsole) el.logConsole.innerHTML = "";
     log("Console cleared.", "info");
 });
-// NEW v1.6.0: Watchtower manual re-probe.
-// watchtowerProbeInFlight inside fetchWatchtower() prevents concurrent probes
-// so no separate debounce is needed here.
 el.wtRefreshBtn?.addEventListener("click", () => fetchWatchtower());
 el.searchInput?.addEventListener("input", () => {
     searchQuery = el.searchInput.value;
@@ -1784,7 +1741,7 @@ document.addEventListener("keydown", e => {
 // =============================================================================
 window.addEventListener("beforeunload", () => {
     if (pollTimer)       clearInterval(pollTimer);
-    if (watchtowerTimer) clearInterval(watchtowerTimer); // NEW v1.6.0
+    if (watchtowerTimer) clearInterval(watchtowerTimer);
 });
 // =============================================================================
 // Initialization
@@ -1800,6 +1757,6 @@ initTheme();
 updateStaticConfig();
 setStatus("Booting");
 startPollingFallback();
-startWatchtowerPolling();   // NEW v1.6.0 — 30 s probe cycle, separate timer
-fetchWatchtower();          // NEW v1.6.0 — immediate first probe on load
+startWatchtowerPolling();
+fetchWatchtower();
 refreshDashboard(true, {force: true});
