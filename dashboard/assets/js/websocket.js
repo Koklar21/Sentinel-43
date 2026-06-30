@@ -1,7 +1,47 @@
 /* =============================================================================
    Sentinel-43 Dashboard
    websocket.js — Hardened WebSocket bridge
-   v1.5.6
+   v1.5.7
+   Changes from v1.5.6:
+     - Fix: the real session token written by auth.js to
+       sessionStorage["SENTINEL_JWT"] after a successful login was being
+       gated by ALLOW_DEV_TOKEN (local-hostname-only). That gate was meant
+       for legacy/dev fallback keys, not the canonical login token — but
+       _getDevToken() was the ONLY function reading any token, dev or real,
+       and it refused to look at sessionStorage at all on non-local
+       hostnames. Any beta tester not on localhost/127.0.0.1/::1 could log
+       in successfully via auth.js and still never get a WebSocket
+       connection: the client simply never sent a token. Split into
+       _getAuthToken(): always reads SENTINEL_JWT regardless of hostname,
+       then falls back to the local-only legacy key scan if that's empty.
+       Renamed _getDevToken() -> _getAuthToken() throughout (private,
+       no external API change).
+     - Fix: double-auth-frame race. On socket open, if a token is present,
+       the client proactively sends an auth frame. Separately, the message
+       handler unconditionally called _sendAuthFrame() again whenever the
+       server's auth_required frame arrived — with no guard against having
+       already sent one. The server sends auth_required regardless of
+       whether it already received the proactive frame, so in the common
+       case both fired: a second "auth" frame landed in the server's main
+       message loop (post-auth), which doesn't recognize "auth" as an
+       event type there and returned an "Unsupported event" error frame
+       right after every successful connect. Harmless to the connection,
+       but this is the exact "double-auth race" this file's own comments
+       warn dashboard.js not to cause — happening here instead. Added an
+       _authSent flag, set on successful send, checked before resending,
+       reset on _resetConnectionState().
+     - Fix: sentinel:ws:error event name collision. _dispatchMessage()
+       dispatches sentinel:ws:${parsed.type} for every server frame, so a
+       server-sent {"type":"error",...} frame fired sentinel:ws:error with
+       shape {type, payload}. That event name is also used throughout this
+       file for client-side failures (_sendRaw, _safeWsUrl, WebSocket
+       construction, transport errors) with an incompatible shape:
+       {error, timestamp}. Any single listener on sentinel:ws:error had to
+       handle two different payload shapes under one name. The "error"
+       case now dispatches sentinel:ws:message generically but skips the
+       colliding type-specific dispatch; sentinel:ws:server_error remains
+       the dedicated, consistently-shaped event for server-originated
+       error frames.
    Changes from v1.5.5:
      - Added: explicit proxy_event handler in _handleMessage. Dispatches
        sentinel:ws:proxy_event with { event, timestamp } detail so dashboard.js
@@ -59,6 +99,8 @@
        also dispatches sentinel:ws:auth_required as a notification so dashboard
        layers can update their UI. dashboard.js must NOT send a second auth
        frame in response to that event — doing so causes a double-auth race.
+       (See v1.5.7 changelog above: this file was itself causing that race
+       internally; _authSent now prevents it regardless of arrival order.)
    Watchtower note:
      - The server broadcasts watchtower_state over WebSocket with heartbeat
        data only: { reachable, url, timestamp }. No Octagon tower data comes
@@ -92,7 +134,10 @@ const WS_CONFIG = Object.freeze({
     HEARTBEAT_MS: 25_000,
     // Shared 64 KB limit with the server (main.py MAX_WS_FRAME_BYTES).
     MAX_FRAME_BYTES: 64 * 1_024,
-    // Dev token is only read from storage on local hostnames.
+    // Gates the LEGACY/DEV fallback key scan only. The real session token
+    // (SENTINEL_JWT, written by auth.js on login) is always readable
+    // regardless of hostname — see _getAuthToken(). This flag never gates
+    // the production login path; gating it there was the v1.5.6 bug.
     ALLOW_DEV_TOKEN: _locationIsLocal,
     // If true, client sends auth immediately on open when a token exists.
     AUTH_FIRST_WHEN_TOKEN_PRESENT: true,
@@ -127,11 +172,17 @@ const WS_CONFIG = Object.freeze({
 /* =============================================================================
    Token Lookup
    ============================================================================= */
-// Key list must stay in sync with dashboard.js DEV_JWT_KEYS so that any
-// token the UI layer can find is also visible to the auth path here.
-// "SENTINEL_JWT" is the key auth.js writes to sessionStorage on login.
+// Canonical session token key. This is the ONE auth.js writes to
+// sessionStorage on a successful login, and is always checked regardless
+// of hostname — it is the production auth path, not a dev convenience.
+const SESSION_TOKEN_KEY = "SENTINEL_JWT";
+
+// Legacy/dev fallback keys only. Kept in sync with dashboard.js DEV_JWT_KEYS
+// minus SESSION_TOKEN_KEY, which now has its own always-on check above.
+// These remain gated to local hostnames — they are guesswork convenience
+// lookups for testing without going through the real login flow, not a
+// second production path.
 const _DEV_JWT_KEYS = Object.freeze([
-    "SENTINEL_JWT",
     "S43_JWT",
     "S43_TOKEN",
     "s43_token",
@@ -152,6 +203,7 @@ let _authenticated = false;
 let _connected     = false;
 let _subscribed    = false;
 let _manuallyClosed    = false;
+let _authSent          = false;
 let _reconnectAttempts = 0;
 let _reconnectTimer    = null;
 let _heartbeatTimer    = null;
@@ -177,10 +229,24 @@ function _dispatchMessage(parsed) {
     _dispatch(`sentinel:ws:${parsed.type}`, parsed);
 }
 
-// Expanded token lookup: sessionStorage → localStorage → window globals.
-// Called once per connection open; token captured in a local variable.
-function _getDevToken() {
+// Generic-stream-only dispatch — used where the type-specific event name
+// would collide with an existing, differently-shaped event (see the
+// "error" case in _handleMessage and the v1.5.7 changelog above).
+function _dispatchGenericOnly(parsed) {
+    _dispatch("sentinel:ws:message", parsed);
+}
+
+// Always-on read of the real session token, then a local-only fallback
+// scan of legacy/dev key names. Called once per connection open; token
+// captured in a local variable by the caller.
+function _getAuthToken() {
+    try {
+        const sessionToken = sessionStorage.getItem(SESSION_TOKEN_KEY);
+        if (sessionToken && sessionToken.trim()) return sessionToken.trim();
+    } catch {}
+
     if (!WS_CONFIG.ALLOW_DEV_TOKEN) return null;
+
     for (const key of _DEV_JWT_KEYS) {
         try {
             const value = sessionStorage.getItem(key);
@@ -224,6 +290,7 @@ function _resetConnectionState() {
     _authenticated = false;
     _connected     = false;
     _subscribed    = false;
+    _authSent      = false;
     _lastMessageAt = 0;
 }
 
@@ -365,8 +432,18 @@ function _sendAuthFrame(token) {
         }
         return false;
     }
+    if (_authSent) {
+        // Already sent an auth frame this connection (proactive-on-open path
+        // and the server's auth_required handler can both reach this point
+        // depending on timing). Sending a second one lands in the server's
+        // post-auth message loop, which doesn't recognize "auth" there and
+        // returns an "Unsupported event" error — harmless, but pointless
+        // and confusing in logs. See v1.5.7 changelog.
+        return true;
+    }
     const ok = _sendRaw("auth", { token });
     if (ok) {
+        _authSent = true;
         _dispatch("sentinel:ws:auth_sent", { timestamp: _nowIso() });
     }
     return ok;
@@ -460,7 +537,7 @@ function _scheduleReconnect() {
 // second auth frame in response — that causes a double-auth race.
 function _handleAuthRequired() {
     _dispatch("sentinel:ws:auth_required", { timestamp: _nowIso() });
-    _sendAuthFrame(_getDevToken());
+    _sendAuthFrame(_getAuthToken());
 }
 
 function _markConnected(parsed) {
@@ -499,12 +576,18 @@ function _handleMessage(event) {
             _lastMessageAt = Date.now();
             return;
         case "error":
+            // Dedicated, consistently-shaped event for server-originated
+            // errors. Deliberately does NOT use _dispatchMessage() here —
+            // that would also fire sentinel:ws:error (parsed.type === "error"),
+            // colliding with the differently-shaped client-side error event
+            // of the same name used everywhere else in this file. See the
+            // v1.5.7 changelog above.
             _dispatch("sentinel:ws:server_error", {
                 error: parsed.payload?.error ?? parsed.payload?.detail ?? "WebSocket server error",
                 payload: parsed.payload,
                 timestamp: _nowIso(),
             });
-            _dispatchMessage(parsed);
+            _dispatchGenericOnly(parsed);
             return;
         // Governance: HUMAN_GATED pending decision queue snapshot.
         case "governance_pending_snapshot":
@@ -585,10 +668,10 @@ function connect() {
         _lastMessageAt     = Date.now();
         _dispatch("sentinel:ws:open", { timestamp: _nowIso() });
         // Proactively send auth before the server asks for it. Token read once
-        // here using the expanded _getDevToken() lookup. If not found, the
+        // here using the expanded _getAuthToken() lookup. If not found, the
         // server will send auth_required and _handleAuthRequired() retries.
         if (WS_CONFIG.AUTH_FIRST_WHEN_TOKEN_PRESENT) {
-            const token = _getDevToken();
+            const token = _getAuthToken();
             if (token) {
                 _sendAuthFrame(token);
             }
@@ -700,7 +783,7 @@ window.SentinelWS = Object.freeze({
         return send("subscribe", { channel: safeChannel });
     },
     auth() {
-        return _sendAuthFrame(_getDevToken());
+        return _sendAuthFrame(_getAuthToken());
     },
     get socketOpen() {
         return _socketOpen && _ws?.readyState === WebSocket.OPEN;
