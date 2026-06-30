@@ -1,5 +1,4 @@
-//
- =============================================================================
+// =============================================================================
 // Sentinel-43 Dashboard
 // dashboard.js
 // UI logic module. WebSocket transport is handled by websocket.js which
