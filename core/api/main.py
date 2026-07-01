@@ -129,7 +129,7 @@ _ALLOWED_ORIGINS: frozenset[str] = _env_frozenset(
 
 MAX_WS_CLIENTS     = _env_int("S43_MAX_WS_CLIENTS", 50)
 MAX_WS_FRAME_BYTES = _env_int("S43_MAX_WS_FRAME_BYTES", 64 * 1024)
-WS_REQUIRE_AUTH = _env_bool("S43_WS_REQUIRE_AUTH", False)
+WS_REQUIRE_AUTH = _env_bool("S43_WS_REQUIRE_AUTH", True)
 
 JWT_SECRET    = _env_str("S43_JWT_SECRET")
 JWT_ALGORITHM = _env_str("S43_JWT_ALGORITHM", "HS256")
@@ -213,7 +213,11 @@ def _verify_jwt_token(token: str) -> dict[str, Any]:
         options={"require": ["exp", "iss", "aud", "sub"]},
     )
 
-def _get_operator(request: Request) -> str:
+def _get_operator(
+    request: Request,
+    *,
+    allow_local_fallback: bool = True,
+) -> str:
     auth = request.headers.get("Authorization", "").strip()
     if auth.startswith("Bearer "):
         token = auth[7:].strip()
@@ -237,9 +241,20 @@ def _get_operator(request: Request) -> str:
                 raise HTTPException(status_code=403, detail="Operator role required")
             subject = str(claims.get("sub") or "").strip()
             return subject if subject else f"bearer:{token[:16]}"
-    if SENTINEL_ENV.lower() in LOCAL_TEST_ENVIRONMENTS:
+    if allow_local_fallback and SENTINEL_ENV.lower() in LOCAL_TEST_ENVIRONMENTS:
         return "dev-operator"
     raise HTTPException(status_code=401, detail="Authentication required")
+
+
+def _require_operator(request: Request) -> str:
+    """
+    Require explicit operator authentication.
+
+    Unlike _get_operator(), this does not allow the development/local/test
+    fallback. Use this for endpoints that must never become unauthenticated
+    just because SENTINEL_ENV is permissive.
+    """
+    return _get_operator(request, allow_local_fallback=False)
 
 # =============================================================================
 # Validation helpers
@@ -1116,6 +1131,7 @@ async def ingest_proxy_event(
     - normalizes the event
     - broadcasts it to WebSocket clients subscribed to the "proxy" channel
     """
+    _require_operator(request)
 
     event = {
         "type": "proxy_event",
@@ -1157,7 +1173,8 @@ def api_watchtower_health() -> dict[str, Any]:
     return watchtower_health_check()
 
 @watchtower_router.get("/status")
-def api_watchtower_status() -> dict[str, Any]:
+def api_watchtower_status(request: Request) -> dict[str, Any]:
+    _require_operator(request)
     result = _watchtower_request("GET", "/watchtower/status")
     return {"bridge": "api_to_watchtower", "watchtower_url": WATCHTOWER_URL,
             "reachable": "error" not in result, "watchtower": result, "timestamp": utc_now()}
@@ -1489,8 +1506,8 @@ def compat_api_rules() -> dict[str, Any]:
     return rules_root()
 
 @api_router.get("/watchtower/status")
-def compat_api_watchtower_status() -> dict[str, Any]:
-    return api_watchtower_status()
+def compat_api_watchtower_status(request: Request) -> dict[str, Any]:
+    return api_watchtower_status(request)
 
 @api_router.get("/watchtower/health")
 def compat_api_watchtower_health() -> dict[str, Any]:
@@ -1518,7 +1535,6 @@ app.include_router(system_router)
 app.include_router(fenrir_router)
 app.include_router(api_router)
 app.include_router(audit_router)
-app.include_router(proxy_events_router)      # /events/proxy
 
 # =============================================================================
 # Error handler
