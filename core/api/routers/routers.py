@@ -19,7 +19,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
-from core.api.deps import get_engine, get_store
+from core.api.deps import get_engine, get_store, require_operator
 from core.api.models import (
     ActionDecision,
     ActionListResponse,
@@ -53,7 +53,7 @@ logger = logging.getLogger("sentinel43.watchgate.api")
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 
 router = APIRouter()
-v1 = APIRouter(prefix="/v1")
+v1 = APIRouter(prefix="/v1", dependencies=[Depends(require_operator)])
 
 
 def dep_engine(engine: Any = Depends(get_engine)) -> Any:
