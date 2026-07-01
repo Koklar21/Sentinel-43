@@ -421,7 +421,12 @@ class SqliteActionStore:
         with self._schema_lock, _db_conn() as conn:
             conn.execute("BEGIN IMMEDIATE;")
             try:
-                conn.executescript("""
+                # Individual execute() calls keep the BEGIN IMMEDIATE transaction
+                # alive. executescript() silently commits any open transaction
+                # before running, which breaks the explicit BEGIN/COMMIT/ROLLBACK
+                # contract we rely on here.
+                conn.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS event_logs (
                         id           INTEGER PRIMARY KEY AUTOINCREMENT,
                         ts_ms        INTEGER NOT NULL,
@@ -429,10 +434,14 @@ class SqliteActionStore:
                         module       TEXT    NOT NULL,
                         message      TEXT    NOT NULL,
                         context_json TEXT
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_event_logs_ts
-                        ON event_logs(ts_ms);
-
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_event_logs_ts ON event_logs(ts_ms)"
+                )
+                conn.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS pending_actions (
                         action_id       TEXT PRIMARY KEY,
                         created_at_ms   INTEGER NOT NULL,
@@ -451,34 +460,52 @@ class SqliteActionStore:
                         system_id       TEXT    NOT NULL,
                         operator_id     TEXT,
                         operator_reason TEXT
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_actions_status_exec
-                        ON pending_actions(status, execute_at_ms);
-                    CREATE INDEX IF NOT EXISTS idx_actions_created
-                        ON pending_actions(created_at_ms);
-
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_actions_status_exec "
+                    "ON pending_actions(status, execute_at_ms)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_actions_created "
+                    "ON pending_actions(created_at_ms)"
+                )
+                conn.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS action_dedupe (
                         dedupe_key    TEXT    PRIMARY KEY,
                         expires_at_ms INTEGER NOT NULL
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_dedupe_exp
-                        ON action_dedupe(expires_at_ms);
-
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_dedupe_exp "
+                    "ON action_dedupe(expires_at_ms)"
+                )
+                conn.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS audit_chain (
                         id        INTEGER PRIMARY KEY CHECK (id = 1),
                         prev_hash TEXT    NOT NULL
-                    );
-
+                    )
+                    """
+                )
+                conn.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS audit_events (
                         ts_ms        INTEGER NOT NULL,
                         event_type   TEXT    NOT NULL,
                         payload_json TEXT    NOT NULL,
                         prev_hash    TEXT    NOT NULL,
                         hash         TEXT    NOT NULL
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_audit_events_ts
-                        ON audit_events(ts_ms);
-                """)
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_audit_events_ts "
+                    "ON audit_events(ts_ms)"
+                )
 
                 if not conn.execute("SELECT 1 FROM audit_chain WHERE id=1").fetchone():
                     conn.execute(
