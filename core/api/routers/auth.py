@@ -39,7 +39,7 @@
 #   S43_OPERATOR_PASSWORD_HASH  — sha256(password).hexdigest() — NOT sha256 of hash
 #
 # Optional .env variables:
-#   S43_JWT_ALGORITHM     — HS256 | HS384 | HS512 (default: HS256)
+#   S43_JWT_ALGORITHM     — HS256 only (default: HS256)
 #   S43_JWT_ISSUER        — default: sentinel-43
 #   S43_JWT_AUDIENCE      — default: sentinel-43-dashboard
 #   S43_JWT_TTL_SECONDS   — default: 28800 (8 hours), clamped 60–86400
@@ -83,12 +83,13 @@ MAX_USERNAME_LEN = 128
 MAX_PASSWORD_LEN = 1024
 MAX_TOKEN_LEN    = 4096
 
-# Only HMAC-family algorithms are permitted. Asymmetric algorithms and
-# "none" are never allowed regardless of what S43_JWT_ALGORITHM contains.
-_ALLOWED_JWT_ALGORITHMS: frozenset[str] = frozenset({"HS256", "HS384", "HS512"})
+# Only HS256 is permitted for now. This keeps /auth/login and /auth/verify
+# aligned with the Batch 1/2 JWT consumers instead of issuing tokens that
+# one path accepts while another rejects.
+_ALLOWED_JWT_ALGORITHMS: frozenset[str] = frozenset({"HS256"})
 
 # Approved operator roles. If a decoded JWT's "role" claim is missing or
-# outside this set, verify_jwt_token() raises 401.
+# outside this set, verify_jwt_token() raises 403 to match route authorization.
 _APPROVED_ROLES: frozenset[str] = frozenset({"operator", "admin"})
 
 # Three-segment base64url shape. Validated before pyjwt.decode() to reject
@@ -125,7 +126,7 @@ def _jwt_algorithm() -> str:
     Return the configured JWT algorithm, enforcing the HMAC allowlist.
 
     Raises HTTP 503 if S43_JWT_ALGORITHM is set to anything outside
-    {HS256, HS384, HS512}. Fails loudly at the route rather than at import,
+    {HS256}. Fails loudly at the route rather than at import,
     so app startup and pytest collection are not broken by missing config.
     """
     alg = _e("S43_JWT_ALGORITHM", "HS256").upper()
@@ -307,9 +308,9 @@ def verify_jwt_token(token: str) -> dict[str, Any]:
     Validates:
       - Input type, length, and three-segment base64url shape
       - HMAC signature against S43_JWT_SECRET
-      - Required claims: sub, exp, iss, aud, iat, nbf
+      - Required claims: sub, exp, iss, aud
       - Issuer and audience match configured values
-      - Clock leeway: 30 seconds
+      - Clock leeway: none; align with main.py route/WebSocket verification
       - Role claim is present and in _APPROVED_ROLES
 
     Exported so callers outside this router can reuse the same verifier.
@@ -351,8 +352,7 @@ def verify_jwt_token(token: str) -> dict[str, Any]:
             algorithms=[_jwt_algorithm()],
             issuer=_e("S43_JWT_ISSUER",   "sentinel-43"),
             audience=_e("S43_JWT_AUDIENCE", "sentinel-43-dashboard"),
-            options={"require": ["sub", "exp", "iss", "aud", "iat", "nbf"]},
-            leeway=30,
+            options={"require": ["sub", "exp", "iss", "aud"]},
         )
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(
@@ -374,14 +374,14 @@ def verify_jwt_token(token: str) -> dict[str, Any]:
             detail="Invalid token.",
         )
 
-    # Role validation: missing or unapproved role is a hard 401.
-    # This is the same check main.py's _get_operator() applies to HTTP
-    # routes and the WebSocket auth path applies to connections.
+    # Role validation: the token may be cryptographically valid but not
+    # authorized for operator routes. Match main.py route protection by
+    # returning 403 instead of treating this as a malformed token.
     role = str(claims.get("role") or "").strip()
     if role not in _APPROVED_ROLES:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Operator role required.",
         )
 
     return claims
