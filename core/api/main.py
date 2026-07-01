@@ -1,4 +1,4 @@
-# =============================================================================
+﻿# =============================================================================
 # Sentinel-43
 #
 # Copyright (c) 2026 Justin Armstrong
@@ -29,7 +29,7 @@
 # Commercial Licensing:
 # Contact the copyright holder for commercial licensing terms.
 #
-# Sentinel-43™
+# Sentinel-43â„¢
 # Original Work and Protected Intellectual Property.
 # =============================================================================
 from __future__ import annotations
@@ -129,7 +129,7 @@ _ALLOWED_ORIGINS: frozenset[str] = _env_frozenset(
 
 MAX_WS_CLIENTS     = _env_int("S43_MAX_WS_CLIENTS", 50)
 MAX_WS_FRAME_BYTES = _env_int("S43_MAX_WS_FRAME_BYTES", 64 * 1024)
-WS_REQUIRE_AUTH = _env_bool("S43_WS_REQUIRE_AUTH", False)
+WS_REQUIRE_AUTH = _env_bool("S43_WS_REQUIRE_AUTH", True)
 
 JWT_SECRET    = _env_str("S43_JWT_SECRET")
 JWT_ALGORITHM = _env_str("S43_JWT_ALGORITHM", "HS256")
@@ -167,7 +167,7 @@ _sparta_instance: Any | None               = None
 _sparta_task:     asyncio.Task | None      = None  # type: ignore[type-arg]
 _fenrir_instance: Any | None               = None
 
-# _fenrir_task is no longer used — FenrirHunter manages its own internal task.
+# _fenrir_task is no longer used â€” FenrirHunter manages its own internal task.
 # Kept here for backward compatibility with any tooling that checks this name.
 _fenrir_task:     asyncio.Task | None      = None  # type: ignore[type-arg]
 
@@ -213,7 +213,11 @@ def _verify_jwt_token(token: str) -> dict[str, Any]:
         options={"require": ["exp", "iss", "aud", "sub"]},
     )
 
-def _get_operator(request: Request) -> str:
+def _get_operator(
+    request: Request,
+    *,
+    allow_local_fallback: bool = True,
+) -> str:
     auth = request.headers.get("Authorization", "").strip()
     if auth.startswith("Bearer "):
         token = auth[7:].strip()
@@ -232,14 +236,30 @@ def _get_operator(request: Request) -> str:
                 raise HTTPException(status_code=503, detail="JWT validation not configured")
             except pyjwt.PyJWTError:
                 raise HTTPException(status_code=401, detail="Invalid token")
+
             role = str(claims.get("role") or claims.get("scope") or "").strip()
             if role not in _APPROVED_ROLES:
                 raise HTTPException(status_code=403, detail="Operator role required")
+
             subject = str(claims.get("sub") or "").strip()
             return subject if subject else f"bearer:{token[:16]}"
-    if SENTINEL_ENV.lower() in LOCAL_TEST_ENVIRONMENTS:
+
+    if allow_local_fallback and SENTINEL_ENV.lower() in LOCAL_TEST_ENVIRONMENTS:
         return "dev-operator"
+
     raise HTTPException(status_code=401, detail="Authentication required")
+
+
+def _require_operator(request: Request) -> str:
+    """
+    Require explicit operator authentication.
+
+    Unlike _get_operator(), this does not allow the development/local/test
+    fallback. Use this for endpoints that must never become unauthenticated
+    just because SENTINEL_ENV is permissive.
+    """
+    return _get_operator(request, allow_local_fallback=False)
+
 
 # =============================================================================
 # Validation helpers
@@ -752,7 +772,7 @@ def dashboard_vault_stats() -> dict[str, Any]:
 
 @root_router.post("/actions/test-inject")
 async def dashboard_test_inject() -> dict[str, Any]:
-    """Synthetic incident injection — dev/test only."""
+    """Synthetic incident injection â€” dev/test only."""
     if SENTINEL_ENV.lower() not in LOCAL_TEST_ENVIRONMENTS or not TEST_INJECTION_ENABLED:
         raise HTTPException(status_code=403, detail="test injection is disabled")
     action = _store_action(_create_synthetic_action())
@@ -1069,12 +1089,12 @@ async def internal_broadcast_event(
     """
     Broadcast a structured event to connected WebSocket dashboard clients.
     Called by FenrirHunter when it has a finding to report.
-    Requires operator auth — Fenrir uses S43_FENRIR_API_TOKEN for this.
+    Requires operator auth â€” Fenrir uses S43_FENRIR_API_TOKEN for this.
 
     Body:
-      event_type: str  — WebSocket event type (e.g. "fenrir_finding")
-      channel:    str  — optional channel filter (e.g. "security")
-      data:       dict — event payload forwarded to dashboard clients
+      event_type: str  â€” WebSocket event type (e.g. "fenrir_finding")
+      channel:    str  â€” optional channel filter (e.g. "security")
+      data:       dict â€” event payload forwarded to dashboard clients
     """
     _get_operator(request)
 
@@ -1117,6 +1137,8 @@ async def ingest_proxy_event(
     - broadcasts it to WebSocket clients subscribed to the "proxy" channel
     """
 
+    _require_operator(request)
+
     event = {
         "type": "proxy_event",
         "source": str(body.get("source") or "local_proxy")[:64],
@@ -1157,10 +1179,12 @@ def api_watchtower_health() -> dict[str, Any]:
     return watchtower_health_check()
 
 @watchtower_router.get("/status")
-def api_watchtower_status() -> dict[str, Any]:
+def api_watchtower_status(request: Request) -> dict[str, Any]:
+    _require_operator(request)
     result = _watchtower_request("GET", "/watchtower/status")
     return {"bridge": "api_to_watchtower", "watchtower_url": WATCHTOWER_URL,
             "reachable": "error" not in result, "watchtower": result, "timestamp": utc_now()}
+
 
 @watchtower_router.get("/ready")
 def api_watchtower_ready() -> dict[str, Any]:
@@ -1489,8 +1513,9 @@ def compat_api_rules() -> dict[str, Any]:
     return rules_root()
 
 @api_router.get("/watchtower/status")
-def compat_api_watchtower_status() -> dict[str, Any]:
-    return api_watchtower_status()
+def compat_api_watchtower_status(request: Request) -> dict[str, Any]:
+    return api_watchtower_status(request)
+
 
 @api_router.get("/watchtower/health")
 def compat_api_watchtower_health() -> dict[str, Any]:
@@ -1518,7 +1543,6 @@ app.include_router(system_router)
 app.include_router(fenrir_router)
 app.include_router(api_router)
 app.include_router(audit_router)
-app.include_router(proxy_events_router)      # /events/proxy
 
 # =============================================================================
 # Error handler
@@ -1534,3 +1558,4 @@ async def not_found_handler(request: Request, exc: Exception) -> JSONResponse:
             "timestamp": utc_now(),
         },
     )
+
