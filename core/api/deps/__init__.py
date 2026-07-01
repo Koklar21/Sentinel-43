@@ -459,3 +459,26 @@ __all__ = [
     "dev_engine_factory",
     "dev_store_factory",
 ]
+
+from .deps import require_operator
+
+# -----------------------------------------------------------------------------
+# Batch 2 canonical dependency exports
+# -----------------------------------------------------------------------------
+# Keep package-level imports aligned with core.api.deps.deps so routers using:
+#   from core.api.deps import get_engine, get_store, require_operator
+# receive the guarded implementations.
+
+from .deps import (
+    DevEngine,
+    DevStore,
+    clear_factory_caches,
+    deps_status,
+    dev_engine_factory,
+    dev_store_factory,
+    get_engine,
+    get_store,
+    require_operator,
+    reset_dev_store_state,
+)
+
