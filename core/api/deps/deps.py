@@ -19,6 +19,9 @@ import json
 import os
 import urllib.error
 import urllib.request
+
+import jwt as pyjwt
+from fastapi import HTTPException, Request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -40,6 +43,17 @@ DEPS_MODULE_ID = os.getenv("S43_DEPS_MODULE_ID", "sentinel43-api-deps")
 DEPS_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
 WATCHTOWER_URL = os.getenv("S43_WATCHTOWER_URL", "http://s43-watchtower:9100").rstrip("/")
 WATCHTOWER_TIMEOUT = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
+
+ENV_DEV_ENGINE_ENABLED = "S43_ENABLE_DEV_ENGINE"
+ENV_DEV_STORE_ENABLED = "S43_ENABLE_DEV_STORE"
+
+JWT_SECRET = os.getenv("S43_JWT_SECRET", "").strip()
+JWT_ALGORITHM = os.getenv("S43_JWT_ALGORITHM", "HS256").strip()
+JWT_ISSUER = os.getenv("S43_JWT_ISSUER", "sentinel-43").strip()
+JWT_AUDIENCE = os.getenv("S43_JWT_AUDIENCE", "sentinel-43-dashboard").strip()
+
+_APPROVED_ALGORITHMS = frozenset({"HS256"})
+_APPROVED_ROLES = frozenset({"operator", "admin"})
 
 
 # -----------------------------------------------------------------------------
@@ -161,6 +175,125 @@ def _report_deps_event(
     }
 
     _watchtower_request("POST", "/watchtower/analyze", payload)
+
+
+
+# -----------------------------------------------------------------------------
+# Auth dependency
+# -----------------------------------------------------------------------------
+
+_TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
+_FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    value = raw.strip().lower()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+
+    return default
+
+
+def _verify_operator_jwt(token: str) -> dict[str, Any]:
+    if JWT_ALGORITHM not in _APPROVED_ALGORITHMS:
+        raise HTTPException(status_code=503, detail="JWT algorithm is not approved")
+
+    if not JWT_SECRET:
+        raise HTTPException(status_code=503, detail="JWT validation not configured")
+
+    try:
+        return pyjwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+            issuer=JWT_ISSUER,
+            audience=JWT_AUDIENCE,
+            options={"require": ["exp", "iss", "aud", "sub"]},
+        )
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except pyjwt.InvalidIssuerError:
+        raise HTTPException(status_code=401, detail="Invalid token issuer")
+    except pyjwt.InvalidAudienceError:
+        raise HTTPException(status_code=401, detail="Invalid token audience")
+    except pyjwt.MissingRequiredClaimError as exc:
+        raise HTTPException(status_code=401, detail=f"Missing required claim: {exc}")
+    except pyjwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def require_operator(request: Request) -> str:
+    auth = request.headers.get("Authorization", "").strip()
+
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    token = auth[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    claims = _verify_operator_jwt(token)
+
+    roles: set[str] = set()
+
+    role_claim = claims.get("role")
+    if role_claim:
+        roles.add(str(role_claim).strip())
+
+    scope_claim = claims.get("scope")
+    if isinstance(scope_claim, str):
+        roles.update(part.strip() for part in scope_claim.split() if part.strip())
+    elif isinstance(scope_claim, (list, tuple, set)):
+        roles.update(str(part).strip() for part in scope_claim if str(part).strip())
+
+    if not roles.intersection(_APPROVED_ROLES):
+        raise HTTPException(status_code=403, detail="Operator role required")
+
+    subject = str(claims.get("sub") or "").strip()
+    return subject if subject else f"bearer:{token[:16]}"
+
+
+def _ensure_dev_factory_allowed(
+    *,
+    kind: str,
+    spec: str,
+    default_spec: str,
+    flag_name: str,
+) -> None:
+    if spec != default_spec:
+        return
+
+    if _env_bool(flag_name, False):
+        return
+
+    _report_deps_status(
+        status="failed",
+        event="dev_dependency_disabled",
+        details={
+            "kind": kind,
+            "factory_spec": spec,
+            "enable_with": flag_name,
+        },
+    )
+
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "error": f"S43_{kind.upper()}_DEV_FACTORY_DISABLED",
+            "message": (
+                f"{kind} is using the development factory, but {flag_name}=true "
+                "is not set."
+            ),
+            "factory_spec": spec,
+            "enable_with": flag_name,
+        },
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -363,6 +496,27 @@ def reset_dev_store_state() -> None:
 
 
 def dev_engine_factory() -> Any:
+    if not _env_bool(ENV_DEV_ENGINE_ENABLED, False):
+        _report_deps_status(
+            status="failed",
+            event="dev_engine_factory_disabled",
+            details={
+                "factory": "dev_engine_factory",
+                "enable_with": ENV_DEV_ENGINE_ENABLED,
+            },
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "S43_ENGINE_DEV_FACTORY_DISABLED",
+                "message": (
+                    "DevEngine is disabled. Set S43_ENABLE_DEV_ENGINE=true "
+                    "only for local development, or configure SENTINEL_ENGINE_FACTORY."
+                ),
+                "enable_with": ENV_DEV_ENGINE_ENABLED,
+            },
+        )
+
     _report_deps_event(
         status="online",
         event="dev_engine_created",
@@ -372,6 +526,27 @@ def dev_engine_factory() -> Any:
 
 
 def dev_store_factory() -> Any:
+    if not _env_bool(ENV_DEV_STORE_ENABLED, False):
+        _report_deps_status(
+            status="failed",
+            event="dev_store_factory_disabled",
+            details={
+                "factory": "dev_store_factory",
+                "enable_with": ENV_DEV_STORE_ENABLED,
+            },
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "S43_STORE_DEV_FACTORY_DISABLED",
+                "message": (
+                    "DevStore is disabled. Set S43_ENABLE_DEV_STORE=true "
+                    "only for local development, or configure SENTINEL_STORE_FACTORY."
+                ),
+                "enable_with": ENV_DEV_STORE_ENABLED,
+            },
+        )
+
     _report_deps_event(
         status="online",
         event="dev_store_returned",
@@ -386,6 +561,13 @@ def dev_store_factory() -> Any:
 
 def get_engine() -> Any:
     spec = os.getenv(ENV_ENGINE_FACTORY, DEFAULT_ENGINE_FACTORY)
+
+    _ensure_dev_factory_allowed(
+        kind="engine",
+        spec=spec,
+        default_spec=DEFAULT_ENGINE_FACTORY,
+        flag_name=ENV_DEV_ENGINE_ENABLED,
+    )
 
     try:
         factory = _cached_factory(spec)
@@ -412,6 +594,13 @@ def get_engine() -> Any:
 
 def get_store() -> Any:
     spec = os.getenv(ENV_STORE_FACTORY, DEFAULT_STORE_FACTORY)
+
+    _ensure_dev_factory_allowed(
+        kind="store",
+        spec=spec,
+        default_spec=DEFAULT_STORE_FACTORY,
+        flag_name=ENV_DEV_STORE_ENABLED,
+    )
 
     try:
         factory = _cached_factory(spec)
@@ -451,6 +640,7 @@ def deps_status() -> dict[str, Any]:
 __all__ = [
     "get_engine",
     "get_store",
+    "require_operator",
     "deps_status",
     "clear_factory_caches",
     "reset_dev_store_state",
