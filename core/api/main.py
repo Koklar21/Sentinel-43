@@ -1136,6 +1136,7 @@ async def ingest_proxy_event(
     - normalizes the event
     - broadcasts it to WebSocket clients subscribed to the "proxy" channel
     """
+    _require_operator(request)
 
     _require_operator(request)
 
