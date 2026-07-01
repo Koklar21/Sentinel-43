@@ -94,6 +94,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -641,6 +642,11 @@ def _record_auth_failure(client_id: str) -> None:
         _AUTH_FAILURES.setdefault(client_id, deque()).append(time.monotonic())
 
 
+def _token_digest(value: str) -> bytes:
+    """Return a fixed-width digest for timing-safe token comparison."""
+    return hashlib.sha256(value.encode("utf-8")).digest()
+
+
 def _resolve_operator_role(authorization: str | None) -> OperatorRole:
     """
     Resolve the operator role from a bearer token.
@@ -660,16 +666,30 @@ def _resolve_operator_role(authorization: str | None) -> OperatorRole:
             ),
         )
 
-    if authorization is None or not authorization.startswith("Bearer "):
+    if authorization is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or malformed Authorization header.",
         )
 
-    token = authorization.removeprefix("Bearer ")
+    parts = authorization.strip().split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or malformed Authorization header.",
+        )
+
+    token = parts[1].strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or malformed Authorization header.",
+        )
+
+    token_digest = _token_digest(token)
 
     for candidate, role in config.operator_tokens.items():
-        if secrets.compare_digest(token, candidate):
+        if secrets.compare_digest(token_digest, _token_digest(candidate)):
             return role
 
     raise HTTPException(
@@ -799,7 +819,13 @@ def clear_dispatch_handlers() -> None:
 # =============================================================================
 
 @router.get("/health", response_model=RemoteHealthResponse)
-async def remote_gateway_health() -> RemoteHealthResponse:
+async def remote_gateway_health(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> RemoteHealthResponse:
+    _require_gateway_enabled()
+    await _authenticate(request, authorization)
+
     config = get_config()
 
     return RemoteHealthResponse(
