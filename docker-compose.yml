@@ -1,20 +1,43 @@
 # =============================================================================
 # Sentinel-43 — Docker Compose
 #
-# Required .env variables:
+# Required .env variables
+# -----------------------
+# Infrastructure:
 #   POSTGRES_PASSWORD          strong random password for Postgres
 #   REDIS_PASSWORD             strong random password for Redis
 #   DATABASE_URL               postgresql+asyncpg://s43:<POSTGRES_PASSWORD>@s43-db:5432/s43
-#   S43_AUTH_PEPPER            cryptographic pepper for credential hashing
-#   SENTINEL_LOG_SALT          salt for masking sensitive fields in audit logs
 #
-# For production, also set in .env:
-#   SENTINEL_ENV               production
+# Auth / JWT:
 #   S43_JWT_SECRET             output of: python -c "import secrets; print(secrets.token_urlsafe(32))"
 #   S43_JWT_ALGORITHM          HS256
 #   S43_JWT_ISSUER             sentinel-43
 #   S43_JWT_AUDIENCE           sentinel-43-dashboard
+#   S43_AUTH_PEPPER            output of: python -c "import secrets; print(secrets.token_hex(32))"
 #   S43_WS_REQUIRE_AUTH        true
+#   S43_OPERATOR_USERNAME      operator  (or your chosen username)
+#   S43_OPERATOR_PASSWORD_HASH output of: python scripts/generate_secrets.py --password-hash
+#
+# Log pseudonymization:
+#   SENTINEL_LOG_SALT          output of: python -c "import secrets; print(secrets.token_hex(32))"
+#
+# Remote gateway:
+#   SENTINEL_REMOTE_TOKEN_OWNER    output of: python -c "import secrets; print(secrets.token_urlsafe(32))"
+#   SENTINEL_REMOTE_TOKEN_ADMIN    (same)
+#   SENTINEL_REMOTE_TOKEN_AUDITOR  (same)
+#
+# Fenrir (required when S43_FENRIR_ENABLED=true):
+#   S43_FENRIR_API_TOKEN       output of: python -c "import secrets; print(secrets.token_urlsafe(32))"
+#
+# Generate all of the above in one step:
+#   python scripts/generate_secrets.py --write .env
+#   python scripts/generate_secrets.py --password-hash   (then paste the output into .env)
+#
+# Or via Docker (no Python required on host):
+#   docker compose --profile setup run --rm s43-setup --write /app/.env
+#
+# Production — also set in .env:
+#   SENTINEL_ENV               production
 #   S43_ALLOWED_ORIGINS        https://yourdomain.com
 #   S43_ENABLE_TEST_INJECTION  false  (or omit entirely)
 # =============================================================================
@@ -60,6 +83,7 @@ services:
 
   # ---------------------------------------------------------------------------
   # Watchtower (core monitoring node)
+  # Runs the same image as s43-api but with the Watchtower entrypoint.
   # ---------------------------------------------------------------------------
   s43-core:
     build:
@@ -71,15 +95,22 @@ services:
     ports:
       - "9100:9100"
     environment:
-      S43_WATCHTOWER_HOST: 0.0.0.0
-      S43_WATCHTOWER_PORT: 9100
-      S43_EXPOSE_BIND_HOST: "true"
-      SENTINEL_ENV: ${SENTINEL_ENV}
-      S43_LOG_LEVEL: INFO
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: redis://:${REDIS_PASSWORD}@s43-redis:6379/0
-      S43_AUTH_PEPPER: ${S43_AUTH_PEPPER}
-      SENTINEL_LOG_SALT: ${SENTINEL_LOG_SALT}
+      # --- Runtime ---
+      SENTINEL_ENV:       ${SENTINEL_ENV}
+      S43_LOG_LEVEL:      INFO
+
+      # --- Watchtower bind ---
+      S43_WATCHTOWER_HOST:    0.0.0.0
+      S43_WATCHTOWER_PORT:    9100
+      S43_EXPOSE_BIND_HOST:   "true"
+
+      # --- Storage ---
+      DATABASE_URL:       ${DATABASE_URL}
+      REDIS_URL:          redis://:${REDIS_PASSWORD}@s43-redis:6379/0
+
+      # --- Hardening ---
+      S43_AUTH_PEPPER:    ${S43_AUTH_PEPPER}
+      SENTINEL_LOG_SALT:  ${SENTINEL_LOG_SALT}
     volumes:
       - ./logs:/app/logs
     depends_on:
@@ -103,39 +134,68 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # --- Runtime environment -------------------------------------------
+      # --- Runtime environment ---
       SENTINEL_ENV:              ${SENTINEL_ENV}
+      S43_ENV:                   ${SENTINEL_ENV}
       S43_LOG_LEVEL:             INFO
 
-      # --- Service endpoints ---------------------------------------------
+      # --- Service endpoints ---
       S43_WATCHTOWER_URL:        http://s43-core:9100
       DATABASE_URL:              ${DATABASE_URL}
       REDIS_URL:                 redis://:${REDIS_PASSWORD}@s43-redis:6379/0
 
-      # --- JWT authentication -------------------------------------------
+      # --- JWT authentication ---
       S43_JWT_SECRET:            ${S43_JWT_SECRET}
-      S43_JWT_ALGORITHM:         ${S43_JWT_ALGORITHM}
-      S43_JWT_ISSUER:            ${S43_JWT_ISSUER}
-      S43_JWT_AUDIENCE:          ${S43_JWT_AUDIENCE}
+      S43_JWT_ALGORITHM:         ${S43_JWT_ALGORITHM:-HS256}
+      S43_JWT_ISSUER:            ${S43_JWT_ISSUER:-sentinel-43}
+      S43_JWT_AUDIENCE:          ${S43_JWT_AUDIENCE:-sentinel-43-dashboard}
+      S43_JWT_TTL_SECONDS:       ${S43_JWT_TTL_SECONDS:-28800}
 
-      # --- Auth key-store pepper ----------------------------------------
+      # --- Operator credentials ---
+      S43_OPERATOR_USERNAME:     ${S43_OPERATOR_USERNAME:-operator}
+      S43_OPERATOR_PASSWORD_HASH: ${S43_OPERATOR_PASSWORD_HASH}
+
+      # --- Auth key-store hardening ---
       S43_AUTH_PEPPER:           ${S43_AUTH_PEPPER}
 
-      # --- Log redaction / audit salt -----------------------------------
+      # --- Log pseudonymization ---
       SENTINEL_LOG_SALT:         ${SENTINEL_LOG_SALT}
 
-      # --- WebSocket auth -----------------------------------------------
-      S43_WS_REQUIRE_AUTH:       ${S43_WS_REQUIRE_AUTH}
+      # --- WebSocket auth ---
+      S43_WS_REQUIRE_AUTH:       ${S43_WS_REQUIRE_AUTH:-true}
 
-      # --- CORS origins -------------------------------------------------
+      # --- CORS ---
       S43_ALLOWED_ORIGINS:       ${S43_ALLOWED_ORIGINS}
 
-      # --- Test injection -----------------------------------------------
-      S43_ENABLE_TEST_INJECTION: ${S43_ENABLE_TEST_INJECTION}
+      # --- Remote gateway operator tokens ---
+      SENTINEL_REMOTE_TOKEN_OWNER:    ${SENTINEL_REMOTE_TOKEN_OWNER}
+      SENTINEL_REMOTE_TOKEN_ADMIN:    ${SENTINEL_REMOTE_TOKEN_ADMIN}
+      SENTINEL_REMOTE_TOKEN_AUDITOR:  ${SENTINEL_REMOTE_TOKEN_AUDITOR}
 
-      # --- Storage paths ------------------------------------------------
-      SENTINEL43_DATA_DIR:       /app/sentinel43_state
-      SENTINEL43_DB_PATH:        /app/sentinel43_state/sentinel43.sqlite3
+      # --- Fenrir threat detection ---
+      S43_FENRIR_ENABLED:            ${S43_FENRIR_ENABLED:-true}
+      SENTINEL_FENRIR_ENABLED:       ${SENTINEL_FENRIR_ENABLED:-true}
+      FENRIR_ENABLED:                ${FENRIR_ENABLED:-true}
+      S43_FENRIR_NODE_ID:            ${S43_FENRIR_NODE_ID:-sentinel-43-primary}
+      S43_FENRIR_MIN_SEVERITY:       ${S43_FENRIR_MIN_SEVERITY:-MEDIUM}
+      S43_FENRIR_ANOMALY_ZSCORE:     ${S43_FENRIR_ANOMALY_ZSCORE:-2.5}
+      S43_FENRIR_ANOMALY_DECAY:      ${S43_FENRIR_ANOMALY_DECAY:-0.002}
+      S43_FENRIR_MAX_HONEYPOT_EVENTS: ${S43_FENRIR_MAX_HONEYPOT_EVENTS:-500}
+      S43_FENRIR_WATCHTOWER_URL:     http://s43-core:9100/watchtower/events
+      S43_FENRIR_BROADCAST_URL:      http://s43-api:8000/internal/events/broadcast
+      S43_FENRIR_REPORT_TIMEOUT:     ${S43_FENRIR_REPORT_TIMEOUT:-2.0}
+      S43_FENRIR_API_TOKEN:          ${S43_FENRIR_API_TOKEN}
+
+      # --- Feature flags ---
+      S43_ENABLE_TEST_INJECTION: ${S43_ENABLE_TEST_INJECTION:-false}
+      S43_GOVERNANCE_ENABLED:    ${S43_GOVERNANCE_ENABLED:-false}
+      S43_SPARTA_ENABLED:        ${S43_SPARTA_ENABLED:-false}
+      S43_JORM_ENABLED:          ${S43_JORM_ENABLED:-false}
+
+      # --- Persistent state ---
+      # Fix: was SENTINEL43_DB_PATH (not read by the app).
+      # core/cli code reads SENTINEL_DB_PATH via _env("SENTINEL_DB_PATH", ...).
+      SENTINEL_DB_PATH:          /app/sentinel43_state/sentinel43.sqlite3
 
     volumes:
       - sentinel43_state:/app/sentinel43_state
@@ -149,6 +209,59 @@ services:
         condition: service_healthy
     networks:
       - s43_net
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Setup (one-shot secret generator)
+  #
+  # Runs only when the "setup" profile is requested.
+  # Never starts during a normal `docker compose up`.
+  #
+  # Usage:
+  #   Print secrets to stdout (review before writing):
+  #     docker compose --profile setup run --rm s43-setup
+  #
+  #   Write missing secrets to .env:
+  #     docker compose --profile setup run --rm s43-setup --write /app/.env
+  #
+  #   Rotate all generated secrets:
+  #     docker compose --profile setup run --rm s43-setup --write /app/.env --force
+  #
+  #   Validate .env for missing or placeholder values:
+  #     docker compose --profile setup run --rm s43-setup --check /app/.env
+  #
+  #   Generate operator password hash interactively:
+  #     docker compose --profile setup run --rm -it s43-setup --password-hash
+  # ---------------------------------------------------------------------------
+  s43-setup:
+    build:
+      context: .
+      dockerfile: core/api/Dockerfile
+    container_name: s43_setup
+    # Override uvicorn — this container runs the generator and exits.
+    entrypoint: ["python", "scripts/generate_secrets.py"]
+    # Default: print to stdout. Override with --write /app/.env on the command line.
+    command: []
+    volumes:
+      # Bind-mount the repo root so --write can update the host .env file.
+      - type: bind
+        source: .
+        target: /app
+    profiles:
+      - setup
+    environment:
+      # Development mode prevents bootstrap_expectations() from demanding
+      # production secrets that don't exist yet — that's the whole point
+      # of running setup first.
+      SENTINEL_ENV: development
+    # No network access. The generator is pure filesystem I/O.
+    network_mode: none
+    restart: "no"
 
 # -----------------------------------------------------------------------------
 # Volumes and Networks
