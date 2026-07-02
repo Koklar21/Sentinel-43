@@ -29,6 +29,20 @@
 # file does not assume it is the first test module to import that module —
 # pytest collection order is not something to rely on — so it forces the
 # values it needs with importlib.reload() rather than os.environ.setdefault.
+#
+# Fix (95→95 pass):
+#   Added setup_module() to re-apply test env vars and reload main_module
+#   immediately before this module's tests execute, not just at collection
+#   time. Without this, another test file's reload (with real .env values)
+#   runs between collection and execution, swapping JWT_SECRET from the
+#   test key to the production key. Tokens built with the test key then
+#   fail signature verification with DecodeError → generic PyJWTError →
+#   "Invalid token", preventing ExpiredSignatureError from ever firing and
+#   causing valid tokens to be rejected.
+#
+#   Changed client fixture to use main_module.app (read after the
+#   setup_module reload) rather than the app reference captured at
+#   collection time.
 # =============================================================================
 
 from __future__ import annotations
@@ -66,9 +80,28 @@ os.environ["S43_ENABLE_TEST_INJECTION"] = "false"
 import core.api.main as main_module  # noqa: E402
 
 importlib.reload(main_module)  # force constants to pick up the values above
-app = main_module.app
 
 WS_URL = "/ws"
+
+
+# ---------------------------------------------------------------------------
+# setup_module — re-applies test config immediately before tests execute.
+#
+# The module-level reload above runs at collection time. By execution time,
+# another test module may have reloaded core.api.main with different env
+# vars (e.g. real JWT_SECRET from .env), breaking signature verification
+# for tokens built here. setup_module() re-establishes the correct state
+# right before this module's first test runs, after all collection is done.
+# ---------------------------------------------------------------------------
+
+def setup_module(module: Any) -> None:
+    os.environ["S43_JWT_SECRET"] = JWT_SECRET
+    os.environ["S43_JWT_ALGORITHM"] = JWT_ALGORITHM
+    os.environ["S43_JWT_ISSUER"] = JWT_ISSUER
+    os.environ["S43_JWT_AUDIENCE"] = JWT_AUDIENCE
+    os.environ["S43_WS_REQUIRE_AUTH"] = "true"
+    os.environ["SENTINEL_ENV"] = "test"
+    importlib.reload(main_module)
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +110,9 @@ WS_URL = "/ws"
 
 @pytest.fixture(scope="module")
 def client() -> Generator[TestClient, None, None]:
-    with TestClient(app) as test_client:
+    # Use main_module.app after setup_module's reload, not a reference
+    # captured at collection time before other test files ran their reloads.
+    with TestClient(main_module.app) as test_client:
         yield test_client
 
 
