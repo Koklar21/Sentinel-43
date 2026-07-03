@@ -731,6 +731,9 @@
   ══════════════════════════════════════════════════════════
 -->
 
-<!-- websocket.js must load before dashboard.js -->
+<!-- auth.js must load before websocket.js; websocket.js gates on window.SentinelAuthReady -->
+<script src="assets/js/auth.js" type="module"></script>
 <script src="assets/js/websocket.js" type="module"></script>
 <script src="assets/js/dashboard.js" type="module"></script>
+</body>
+</html>
