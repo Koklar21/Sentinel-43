@@ -1,47 +1,46 @@
-"""CLI utilities for secret generation.
+"""CLI utilities for generating secure random secrets."""
 
-Provides simple functions to generate secure random tokens and a small
-command-line interface for quick use.
-"""
 from __future__ import annotations
 
 import argparse
 import secrets
-from typing import Iterator
+from collections.abc import Iterator
 
 __all__ = ["generate_secret", "generate_secrets", "main"]
 
+MIN_SECRET_BYTES = 32
 
-def generate_secret(length: int = 32) -> str:
-    """Generate a URL-safe secret token.
 
-    Args:
-        length: number of random bytes to use (default 32). The returned
-            string length will be larger because it's base64-like.
-
-    Returns:
-        A URL-safe text token.
-    """
+def generate_secret(length: int = MIN_SECRET_BYTES) -> str:
+    """Generate a URL-safe cryptographic secret."""
+    length = int(length)
+    if length < MIN_SECRET_BYTES:
+        raise ValueError(f"length must be at least {MIN_SECRET_BYTES} bytes")
     return secrets.token_urlsafe(length)
 
 
-def generate_secrets(count: int = 1, length: int = 32) -> Iterator[str]:
-    """Yield `count` secrets of given byte length.
+def generate_secrets(count: int = 1, length: int = MIN_SECRET_BYTES) -> Iterator[str]:
+    """Yield count secure random secrets."""
+    count = int(count)
+    if count < 1:
+        raise ValueError("count must be at least 1")
 
-    Useful for programmatic consumption.
-    """
-    for _ in range(max(0, int(count))):
+    for _ in range(count):
         yield generate_secret(length)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Generate secure random secrets")
-    parser.add_argument("-n", "--count", type=int, default=1, help="number of secrets to generate")
-    parser.add_argument("-l", "--length", type=int, default=32, help="number of random bytes per secret")
+    parser.add_argument("-n", "--count", type=int, default=1)
+    parser.add_argument("-l", "--length", type=int, default=MIN_SECRET_BYTES)
+
     args = parser.parse_args(argv)
 
-    for s in generate_secrets(args.count, args.length):
-        print(s)
+    try:
+        for secret in generate_secrets(args.count, args.length):
+            print(secret)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     return 0
 
