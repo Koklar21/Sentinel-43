@@ -1240,11 +1240,13 @@ def api_watchtower_ready() -> dict[str, Any]:
             "reachable": "error" not in result, "watchtower": result, "timestamp": utc_now()}
 
 @watchtower_router.post("/register")
-def api_register_watchtower() -> dict[str, Any]:
+def api_register_watchtower(request: Request) -> dict[str, Any]:
+    _require_operator(request)
     return register_api_with_watchtower()
 
 @watchtower_router.post("/heartbeat")
-def api_heartbeat_watchtower() -> dict[str, Any]:
+def api_heartbeat_watchtower(request: Request) -> dict[str, Any]:
+    _require_operator(request)
     return send_api_heartbeat()
 
 @watchtower_router.get("/modules")
@@ -1384,7 +1386,9 @@ def report_dependency(name: str, state: str, request: Request) -> dict[str, Any]
 system_router = APIRouter(prefix="/system", tags=["system"])
 
 @system_router.get("/status")
-def system_status() -> dict[str, Any]:
+def system_status(request: Request) -> dict[str, Any]:
+    _require_operator(request)
+
     wt = _watchtower_request("GET", "/watchtower/status")
     return {
         "system":         "sentinel-43",
@@ -1424,7 +1428,9 @@ def system_routes(request: Request) -> dict[str, Any]:
             "routes": route_list, "timestamp": utc_now()}
 
 @system_router.get("/intercom/status")
-def intercom_status() -> dict[str, Any]:
+def intercom_status(request: Request) -> dict[str, Any]:
+    _require_operator(request)
+
     wt_health  = watchtower_health_check()
     wt_modules = _watchtower_request("GET", "/watchtower/modules")
     return {
