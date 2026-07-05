@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # Sentinel-43
 #
 # Copyright (c) 2026 Justin Armstrong
@@ -202,12 +202,20 @@ def uptime_seconds() -> float:
 # Auth helpers
 # =============================================================================
 def _verify_jwt_token(token: str) -> dict[str, Any]:
+    algorithm = JWT_ALGORITHM.strip()
+
+    if algorithm not in _APPROVED_ALGORITHMS:
+        raise pyjwt.InvalidAlgorithmError(
+            f"JWT algorithm {algorithm!r} is not approved for Sentinel-43"
+        )
+
     if not JWT_SECRET:
         raise pyjwt.InvalidKeyError("JWT signing key is not configured on this server")
+
     return pyjwt.decode(
         token,
         JWT_SECRET,
-        algorithms=[JWT_ALGORITHM],
+        algorithms=[algorithm],
         issuer=JWT_ISSUER,
         audience=JWT_AUDIENCE,
         options={"require": ["exp", "iss", "aud", "sub"]},
@@ -259,6 +267,42 @@ def _require_operator(request: Request) -> str:
     just because SENTINEL_ENV is permissive.
     """
     return _get_operator(request, allow_local_fallback=False)
+
+
+def _is_local_environment() -> bool:
+    return SENTINEL_ENV.lower() in LOCAL_TEST_ENVIRONMENTS
+
+
+def _validate_security_config() -> None:
+    """
+    Fail closed when auth is misconfigured.
+
+    Public/release environments must not start without JWT validation and
+    WebSocket auth enabled. Local development can still run with explicit
+    development/local/test environment settings.
+    """
+    algorithm = JWT_ALGORITHM.strip()
+
+    if algorithm not in _APPROVED_ALGORITHMS:
+        raise RuntimeError(
+            f"S43_JWT_ALGORITHM={algorithm!r} is not approved; "
+            f"allowed={sorted(_APPROVED_ALGORITHMS)}"
+        )
+
+    if WS_REQUIRE_AUTH and not JWT_SECRET:
+        raise RuntimeError(
+            "S43_WS_REQUIRE_AUTH=true but S43_JWT_SECRET is not configured"
+        )
+
+    if not _is_local_environment():
+        if not JWT_SECRET:
+            raise RuntimeError(
+                "Production Sentinel-43 API requires S43_JWT_SECRET"
+            )
+        if not WS_REQUIRE_AUTH:
+            raise RuntimeError(
+                "Production Sentinel-43 API requires S43_WS_REQUIRE_AUTH=true"
+            )
 
 
 # =============================================================================
@@ -550,6 +594,7 @@ async def lifespan(api: FastAPI):
     global _orchestrator, _sparta_instance, _sparta_task
     global _fenrir_instance
 
+    _validate_security_config()
     bootstrap_expectations()
 
     # --- MonitoringManager ---
@@ -763,11 +808,13 @@ def root() -> dict[str, Any]:
     }
 
 @root_router.get("/actions")
-def dashboard_actions(limit: int = 250) -> list[dict[str, Any]]:
+def dashboard_actions(request: Request, limit: int = 250) -> list[dict[str, Any]]:
+    _require_operator(request)
     return _list_actions(limit)
 
 @root_router.get("/vault/stats")
-def dashboard_vault_stats() -> dict[str, Any]:
+def dashboard_vault_stats(request: Request) -> dict[str, Any]:
+    _require_operator(request)
     return {"records": _vault_records(), "timestamp": utc_now()}
 
 @root_router.post("/actions/test-inject")
@@ -785,7 +832,7 @@ async def dashboard_approve_action(
     action_id: str, body: dict[str, Any], request: Request,
 ) -> dict[str, Any]:
     reason   = _require_reason(body)
-    operator = _get_operator(request)
+    operator = _require_operator(request)
     action = _update_action_status(
         action_id,
         allowed_statuses={"STAGED"},
@@ -814,7 +861,7 @@ async def dashboard_veto_action(
     action_id: str, body: dict[str, Any], request: Request,
 ) -> dict[str, Any]:
     reason   = _require_reason(body)
-    operator = _get_operator(request)
+    operator = _require_operator(request)
     action = _update_action_status(
         action_id,
         allowed_statuses={"PENDING", "STAGED"},
@@ -840,7 +887,7 @@ async def dashboard_veto_action(
 
 @root_router.get("/governance/pending")
 def governance_pending_reviews(request: Request) -> dict[str, Any]:
-    _get_operator(request)
+    _require_operator(request)
     if _orchestrator is None:
         return {"enabled": False, "pending": [], "timestamp": utc_now()}
     return {
@@ -937,6 +984,7 @@ async def _ws_safe_close(websocket: WebSocket, code: int = 1008) -> None:
 async def dashboard_websocket(websocket: WebSocket) -> None:
     origin = websocket.headers.get("origin", "")
     if _ALLOWED_ORIGINS and origin and origin not in _ALLOWED_ORIGINS:
+        await _ws_safe_close(websocket)
         return
 
     if len(_dashboard_ws_clients) >= MAX_WS_CLIENTS:
@@ -1096,7 +1144,7 @@ async def internal_broadcast_event(
       channel:    str  â€” optional channel filter (e.g. "security")
       data:       dict â€” event payload forwarded to dashboard clients
     """
-    _get_operator(request)
+    _require_operator(request)
 
     event_type = str(body.get("event_type") or "event")[:64]
     channel    = str(body.get("channel") or "") or None
@@ -1136,8 +1184,6 @@ async def ingest_proxy_event(
     - normalizes the event
     - broadcasts it to WebSocket clients subscribed to the "proxy" channel
     """
-    _require_operator(request)
-
     _require_operator(request)
 
     event = {
@@ -1240,7 +1286,7 @@ async def watchtower_ingest_event(
     and forward it to the Watchtower core. Also broadcasts to dashboard
     clients subscribed to the "watchtower" channel.
     """
-    _get_operator(request)
+    _require_operator(request)
     result = await asyncio.to_thread(_watchtower_request, "POST", "/watchtower/events", body)
     await _broadcast_dashboard_event(
         "watchtower_event",
@@ -1326,7 +1372,9 @@ def dependencies_status() -> dict[str, Any]:
     }
 
 @dependencies_router.post("/report/{name}/{state}")
-def report_dependency(name: str, state: str) -> dict[str, Any]:
+def report_dependency(name: str, state: str, request: Request) -> dict[str, Any]:
+    _require_operator(request)
+
     result = report_dependency_to_watchtower(
         name, state, {"source": "api-dependency-report-route"}
     )
@@ -1361,7 +1409,9 @@ def system_status() -> dict[str, Any]:
     }
 
 @system_router.get("/routes")
-def system_routes() -> dict[str, Any]:
+def system_routes(request: Request) -> dict[str, Any]:
+    _require_operator(request)
+
     route_list = [
         {
             "path":    getattr(r, "path", None),
@@ -1418,18 +1468,18 @@ def _fenrir_snapshot() -> dict[str, Any]:
 
 @fenrir_router.get("/status")
 def fenrir_status(request: Request) -> dict[str, Any]:
-    _get_operator(request)
+    _require_operator(request)
     return _fenrir_snapshot()
 
 @fenrir_router.get("/health")
 def fenrir_health(request: Request) -> dict[str, Any]:
-    _get_operator(request)
+    _require_operator(request)
     snap = _fenrir_snapshot()
     return {"service": "fenrir", **snap}
 
 @fenrir_router.get("/metrics")
 def fenrir_metrics(request: Request) -> dict[str, Any]:
-    _get_operator(request)
+    _require_operator(request)
     snap = _fenrir_snapshot()
     return {
         "service":       "fenrir",
@@ -1559,4 +1609,3 @@ async def not_found_handler(request: Request, exc: Exception) -> JSONResponse:
             "timestamp": utc_now(),
         },
     )
-
