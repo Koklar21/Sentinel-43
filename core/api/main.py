@@ -48,6 +48,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 import jwt as pyjwt
+from ..security.jwt_constants import APPROVED_JWT_ALGORITHMS
 from fastapi import (
     APIRouter,
     FastAPI,
@@ -62,6 +63,12 @@ from fastapi.staticfiles import StaticFiles
 from ..bootstrap import bootstrap_expectations
 from .routers.audit import router as audit_router
 from .routers.auth import router as auth_router
+# core/api/routers/bootstrap.py is a THIRD, unrelated module also named
+# bootstrap — see the naming note in core/bootstrap.py. This one is the
+# first-run admin account setup router (GET /bootstrap/status,
+# POST /bootstrap/admin), not startup expectations. Aliased to avoid
+# colliding with bootstrap_expectations imported above.
+from .routers.bootstrap import router as bootstrap_router
 from .routers.remote_gateway import router as remote_gateway_router
 from .routers.routers import router as watchgate_router
 
@@ -136,7 +143,7 @@ JWT_ALGORITHM = _env_str("S43_JWT_ALGORITHM", "HS256")
 JWT_ISSUER    = _env_str("S43_JWT_ISSUER", "sentinel-43")
 JWT_AUDIENCE  = _env_str("S43_JWT_AUDIENCE", "sentinel-43-dashboard")
 
-_APPROVED_ALGORITHMS: frozenset[str] = frozenset({"HS256"})
+_APPROVED_ALGORITHMS: frozenset[str] = APPROVED_JWT_ALGORITHMS
 _APPROVED_ROLES: frozenset[str]      = frozenset({"operator", "admin"})
 
 START_TIME: float = time.time()
@@ -1587,6 +1594,7 @@ def compat_api_watchtower_ready() -> dict[str, Any]:
 # =============================================================================
 app.include_router(root_router)
 app.include_router(auth_router)             # /auth/login, /auth/verify
+app.include_router(bootstrap_router)        # /bootstrap/status, /bootstrap/admin
 app.include_router(remote_gateway_router)
 app.include_router(watchgate_router)        # /health, /v1/assess, /v1/actions
 app.include_router(internal_router)         # /internal/events/broadcast
