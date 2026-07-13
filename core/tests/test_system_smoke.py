@@ -46,8 +46,6 @@ SMOKE_ENDPOINTS = [
     "/health",
     "/ready",
     "/status",
-    "/system/status",
-    "/system/routes",
     "/watchtower/health",
 ]
 
@@ -69,25 +67,6 @@ def test_health_reports_api_ok() -> None:
     data = response.json()
     assert data.get("status") == "ok"
     assert data.get("service") == "sentinel-43-api"
-
-
-def test_system_routes_returns_route_list() -> None:
-    """
-    Verify /system/routes returns a non-empty route list with valid structure.
-    Does NOT assert specific paths — the parametrized smoke tests above already
-    prove each endpoint responds. Route introspection is brittle across
-    sub-router registration order and is not worth asserting here.
-    """
-    response = requests.get(f"{API_URL}/system/routes", timeout=5)
-    assert response.status_code == 200
-    data = response.json()
-    assert isinstance(data, dict)
-    routes = data.get("routes")
-    assert isinstance(routes, list), "routes field must be a list"
-    assert len(routes) > 0, "routes list must not be empty"
-    route_count = data.get("route_count")
-    assert isinstance(route_count, int), "route_count must be an integer"
-    assert route_count > 0, "route_count must be greater than zero"
 
 
 def test_watchtower_bridge_reports_reachable() -> None:
@@ -196,3 +175,55 @@ def test_live_protected_route_rejects_missing_token() -> None:
         f"if this is 200, the live deployment is not enforcing auth on "
         f"this route: {response.text[:300]}"
     )
+
+
+@pytest.mark.skipif(
+    not (_LIVE_USERNAME and _LIVE_PASSWORD),
+    reason=_skip_reason,
+)
+def test_live_system_status_and_routes_require_auth() -> None:
+    """
+    /system/status and /system/routes are gated with _require_operator() in
+    main.py — confirm both reject an unauthenticated request and accept a
+    live operator token, and that /system/routes returns a well-formed
+    route list once authenticated.
+    """
+    for endpoint in ("/system/status", "/system/routes"):
+        response = requests.get(f"{API_URL}{endpoint}", timeout=5)
+        assert response.status_code == 401, (
+            f"Expected 401 with no token for {endpoint}, got "
+            f"{response.status_code}: {response.text[:300]}"
+        )
+
+    login_response = requests.post(
+        f"{API_URL}/auth/login",
+        json={"username": _LIVE_USERNAME, "password": _LIVE_PASSWORD},
+        timeout=5,
+    )
+    assert login_response.status_code == 200, (
+        f"Live login failed against {API_URL}: "
+        f"{login_response.status_code} {login_response.text[:300]}"
+    )
+    token = login_response.json().get("token")
+    assert token, "Live login returned 200 but no token field"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    status_response = requests.get(f"{API_URL}/system/status", headers=headers, timeout=5)
+    assert status_response.status_code == 200, (
+        f"/system/status rejected a valid operator token: "
+        f"{status_response.status_code} {status_response.text[:300]}"
+    )
+
+    routes_response = requests.get(f"{API_URL}/system/routes", headers=headers, timeout=5)
+    assert routes_response.status_code == 200, (
+        f"/system/routes rejected a valid operator token: "
+        f"{routes_response.status_code} {routes_response.text[:300]}"
+    )
+    data = routes_response.json()
+    assert isinstance(data, dict)
+    routes = data.get("routes")
+    assert isinstance(routes, list), "routes field must be a list"
+    assert len(routes) > 0, "routes list must not be empty"
+    route_count = data.get("route_count")
+    assert isinstance(route_count, int), "route_count must be an integer"
+    assert route_count > 0, "route_count must be greater than zero"
