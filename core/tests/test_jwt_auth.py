@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib
 import os
 import time
+from datetime import datetime, timezone
 
 import jwt as pyjwt
 import pytest
@@ -524,6 +525,10 @@ class TestBootstrapExpectations:
         monkeypatch.setenv("S43_WS_REQUIRE_AUTH", "true")
         monkeypatch.setenv("S43_ENABLE_TEST_INJECTION", "false")
         monkeypatch.setenv("S43_AUTH_PEPPER", "a" * 64)  # FIX: pepper required in production
+        monkeypatch.setenv(
+            "S43_SECRETS_ROTATED_AT",
+            datetime.now(timezone.utc).isoformat(),
+        )
 
         from core.bootstrap import bootstrap_expectations
         bootstrap_expectations()  # must not raise
