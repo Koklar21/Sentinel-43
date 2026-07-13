@@ -22,6 +22,7 @@ import urllib.request
 
 import jwt as pyjwt
 from fastapi import HTTPException, Request
+from ...security.jwt_constants import APPROVED_JWT_ALGORITHMS
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -52,7 +53,7 @@ JWT_ALGORITHM = os.getenv("S43_JWT_ALGORITHM", "HS256").strip()
 JWT_ISSUER = os.getenv("S43_JWT_ISSUER", "sentinel-43").strip()
 JWT_AUDIENCE = os.getenv("S43_JWT_AUDIENCE", "sentinel-43-dashboard").strip()
 
-_APPROVED_ALGORITHMS = frozenset({"HS256"})
+_APPROVED_ALGORITHMS = APPROVED_JWT_ALGORITHMS
 _APPROVED_ROLES = frozenset({"operator", "admin"})
 
 
