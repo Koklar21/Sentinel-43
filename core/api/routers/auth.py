@@ -61,6 +61,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import secrets
@@ -71,6 +72,10 @@ from typing import Any
 import jwt as pyjwt
 from fastapi import APIRouter, Header, HTTPException, status
 from pydantic import BaseModel, Field
+
+from ...security.jwt_constants import APPROVED_JWT_ALGORITHMS
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -86,7 +91,7 @@ MAX_TOKEN_LEN    = 4096
 # Only HS256 is permitted for now. This keeps /auth/login and /auth/verify
 # aligned with the Batch 1/2 JWT consumers instead of issuing tokens that
 # one path accepts while another rejects.
-_ALLOWED_JWT_ALGORITHMS: frozenset[str] = frozenset({"HS256"})
+_ALLOWED_JWT_ALGORITHMS: frozenset[str] = APPROVED_JWT_ALGORITHMS
 
 # Approved operator roles. If a decoded JWT's "role" claim is missing or
 # outside this set, verify_jwt_token() raises 403 to match route authorization.
@@ -186,7 +191,7 @@ def _sha256_digest(value: str) -> bytes:
     return hashlib.sha256(value.encode("utf-8")).digest()
 
 
-def _validate_credentials(username: str, password: str) -> str:
+def _validate_env_credentials(username: str, password: str) -> str:
     """
     Validate operator credentials against env-configured values.
 
@@ -248,7 +253,42 @@ def _validate_credentials(username: str, password: str) -> str:
     return expected_username
 
 
-def _issue_token(subject: str, role: str = "operator") -> tuple[str, datetime]:
+async def _validate_credentials(username: str, password: str) -> tuple[str, str, str | None]:
+    """
+    Resolve operator credentials to (subject, role, user_id).
+
+    Checks the DB-backed account system (core.auth.users) first. Falls
+    back to the legacy S43_OPERATOR_USERNAME / S43_OPERATOR_PASSWORD_HASH
+    single-account check if DATABASE_URL is unset, the DB is unreachable,
+    or no DB user matches — this is deliberate so existing deployments and
+    the env-var-based test suite (test_auth_login.py) keep working
+    unmodified during the migration to DB-backed accounts. user_id is None
+    on the fallback path since env-var operators have no DB row.
+
+    Both paths still run the fallback's constant-time comparison when
+    reached, so a DB miss doesn't skip straight to a faster-failing check.
+    """
+    normalized = username.strip()
+
+    try:
+        from ...auth.users import authenticate_user, get_sessionmaker
+
+        sessionmaker = get_sessionmaker()
+        async with sessionmaker() as session:
+            user = await authenticate_user(session, normalized, password)
+            if user is not None:
+                return user.username, user.role, str(user.user_id)
+    except Exception as exc:
+        # DATABASE_URL unset, DB unreachable, or table not created yet.
+        # Not fatal — fall through to the env-var check below.
+        logger.debug("DB-backed login unavailable, falling back to env-var credentials: %s", exc)
+
+    return _validate_env_credentials(normalized, password), "operator", None
+
+
+def _issue_token(
+    subject: str, role: str = "operator", user_id: str | None = None
+) -> tuple[str, datetime]:
     """
     Sign and return a JWT for the given subject.
 
@@ -257,6 +297,10 @@ def _issue_token(subject: str, role: str = "operator") -> tuple[str, datetime]:
       - main.py _get_operator()     (checks claims["role"] against _APPROVED_ROLES)
       - main.py WebSocket auth path (same role check)
       - auth.js /auth/verify        (checks res.ok)
+
+    user_id is only present for DB-backed accounts (see
+    _validate_credentials) — env-var fallback logins omit it rather than
+    fabricate one, since main.py and existing tests never require it.
     """
     secret = _e("S43_JWT_SECRET")
     if not secret:
@@ -281,6 +325,8 @@ def _issue_token(subject: str, role: str = "operator") -> tuple[str, datetime]:
         # check against _APPROVED_ROLES = {"operator", "admin"}.
         "role": role,
     }
+    if user_id is not None:
+        payload["user_id"] = user_id
 
     token: Any = pyjwt.encode(
         payload,
@@ -399,8 +445,8 @@ async def login(body: LoginRequest) -> LoginResponse:
     The JWT is consumed by auth.js (stored in sessionStorage) and then sent
     by websocket.js during the WebSocket authentication handshake.
     """
-    subject       = _validate_credentials(body.username, body.password)
-    token, exp_dt = _issue_token(subject=subject, role="operator")
+    subject, role, user_id = await _validate_credentials(body.username, body.password)
+    token, exp_dt = _issue_token(subject=subject, role=role, user_id=user_id)
 
     return LoginResponse(
         token=token,
