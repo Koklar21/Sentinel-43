@@ -25,6 +25,11 @@ Safety contract:
   - Never prints raw secret values except to stdout on explicit request.
   - Does not start background threads, open ports, or write outside the
     target .env file.
+  - Never silently leaves a derived value (DATABASE_URL) out of sync with
+    the secret it's derived from (POSTGRES_PASSWORD) — see
+    _warn_stale_database_url below. It still won't auto-edit DATABASE_URL
+    (that would mean parsing/rewriting a connection string this tool
+    doesn't own the shape of), but it will refuse to stay quiet about it.
 
 Usage:
   python scripts/generate_secrets.py                  print to stdout
@@ -47,18 +52,32 @@ from typing import Final
 
 
 # =============================================================================
-# Bootstrap constants — imported from core.bootstrap when available.
-# Fallback values match bootstrap.py so the tool stays correct when run
-# before the package is installed (e.g. first-time setup from a fresh clone).
+# Bootstrap constants — imported from their canonical source modules when
+# available. Fallback values match those modules so the tool stays correct
+# when run before the package is installed (e.g. first-time setup from a
+# fresh clone).
+#
+# APPROVED_JWT_ALGORITHMS lives in core.security.jwt_constants, NOT
+# core.bootstrap. core/bootstrap.py imports it from there too — importing
+# it from core.bootstrap here would only work as a side effect of that
+# module's own import, not because core.bootstrap actually owns the value.
+# Depend on the real source directly.
 # =============================================================================
 
 try:
-    from core.bootstrap import APPROVED_JWT_ALGORITHMS, _MIN_PEPPER_BYTES  # type: ignore[import]
+    from core.bootstrap import _MIN_PEPPER_BYTES, _MIN_JWT_SECRET_BYTES  # type: ignore[import]
+    from core.security.jwt_constants import APPROVED_JWT_ALGORITHMS  # type: ignore[import]
     _BOOTSTRAP_IMPORTED = True
 except ImportError:
     APPROVED_JWT_ALGORITHMS: frozenset[str] = frozenset({"HS256"})  # type: ignore[assignment]
     _MIN_PEPPER_BYTES: int = 32                                       # type: ignore[assignment]
+    _MIN_JWT_SECRET_BYTES: int = 32                                   # type: ignore[assignment]
     _BOOTSTRAP_IMPORTED = False
+
+# Single entropy floor for this tool, derived from whichever bootstrap
+# constant is stricter. Both are 32 today; if one changes, this stays
+# correct without a second hardcoded literal to forget about.
+_MIN_ENTROPY_BYTES: Final[int] = max(_MIN_PEPPER_BYTES, _MIN_JWT_SECRET_BYTES)
 
 
 # =============================================================================
@@ -69,7 +88,10 @@ except ImportError:
 #
 # Keys excluded from this registry (managed separately):
 #   S43_OPERATOR_PASSWORD_HASH  — derived from user password, use --password-hash
-#   DATABASE_URL                — derived from POSTGRES_PASSWORD, not random
+#   DATABASE_URL                — derived from POSTGRES_PASSWORD, not random.
+#                                 NOT auto-edited by this tool, but checked
+#                                 for staleness after a POSTGRES_PASSWORD
+#                                 rotation — see _warn_stale_database_url.
 #   S43_JORM_ROOT_KEY           — only needed when S43_JORM_ENABLED=true
 #   S43_SPARTA_TOKEN_SECRET     — only needed when S43_SPARTA_ENABLED=true
 #   S43_SPARTA_NODE_TOKEN       — only needed when S43_SPARTA_ENABLED=true
@@ -107,7 +129,7 @@ _PLACEHOLDERS: Final[frozenset[str]] = frozenset({
     "your-secret-here", "replace-me",
 })
 
-DEFAULT_BYTES: Final[int] = 32
+DEFAULT_BYTES: Final[int] = _MIN_ENTROPY_BYTES
 
 
 # =============================================================================
@@ -116,8 +138,8 @@ DEFAULT_BYTES: Final[int] = 32
 
 def generate_env_values(*, num_bytes: int = DEFAULT_BYTES) -> dict[str, str]:
     """Generate a fresh value for every key in SECRET_KEYS."""
-    if num_bytes < 32:
-        raise ValueError("num_bytes must be >= 32")
+    if num_bytes < _MIN_ENTROPY_BYTES:
+        raise ValueError(f"num_bytes must be >= {_MIN_ENTROPY_BYTES}")
     return {key: gen(num_bytes) for key, gen, _ in _REGISTRY}
 
 
@@ -203,6 +225,13 @@ def write_env_file(
 
     Writes LF line endings (newline="\\n") regardless of OS to ensure
     Docker containers read the file correctly on Windows hosts.
+
+    NOTE: this function intentionally never touches DATABASE_URL, even
+    though it embeds the same password as POSTGRES_PASSWORD. See
+    _warn_stale_database_url, called from main() after this function
+    returns, which detects and loudly reports the resulting staleness
+    instead of silently leaving it or silently rewriting a connection
+    string this function doesn't parse.
     """
     if not path.exists():
         path.write_text(render_env_block(values), encoding="utf-8", newline="\n")
@@ -250,6 +279,45 @@ def write_env_file(
     return written
 
 
+def _warn_stale_database_url(path: Path, values: dict[str, str], written: list[str]) -> None:
+    """
+    POSTGRES_PASSWORD and DATABASE_URL both encode the same password as two
+    independent lines in .env. This tool deliberately never auto-edits
+    DATABASE_URL — see the module docstring and write_env_file's note above
+    — because rewriting a connection string this tool doesn't own the exact
+    shape of (custom host, port, SSL params, etc.) is riskier than just
+    telling the operator to fix it.
+
+    But staying silent about the resulting mismatch is worse: if
+    POSTGRES_PASSWORD was just rotated, check whether the existing
+    DATABASE_URL line still contains the new password, and if not, surface
+    it loudly with the exact line to paste, rather than leaving a stale,
+    easy-to-miss credential mismatch that only shows up as a connection
+    failure after restart.
+    """
+    if "POSTGRES_PASSWORD" not in written:
+        return
+
+    existing = parse_env_file(path)
+    database_url = existing.get("DATABASE_URL", "")
+    new_password = values["POSTGRES_PASSWORD"]
+
+    if database_url and new_password not in database_url:
+        print(
+            "\n"
+            "WARNING: POSTGRES_PASSWORD was rotated but the existing "
+            "DATABASE_URL line does not contain the new password.\n"
+            "DATABASE_URL is intentionally never auto-edited by this tool "
+            "(see module docstring) — update it manually to:\n"
+            f"  DATABASE_URL=postgresql+asyncpg://s43:{new_password}@s43-db:5432/s43\n"
+            "Also update the actual Postgres role password to match, or the\n"
+            "new value above won't authenticate against the live database:\n"
+            "  ALTER ROLE s43 WITH PASSWORD '<new POSTGRES_PASSWORD>';\n"
+            "Do this before restarting the app.",
+            file=sys.stderr,
+        )
+
+
 def check_env_file(path: Path) -> tuple[list[str], list[str], list[str]]:
     """
     Validate an existing .env file against SECRET_KEYS.
@@ -287,8 +355,8 @@ def _warn_if_bootstrap_mismatch() -> None:
     """
     if not _BOOTSTRAP_IMPORTED:
         print(
-            "Warning: core.bootstrap could not be imported. "
-            "Using hardcoded fallback constants. "
+            "Warning: core.bootstrap / core.security.jwt_constants could not "
+            "be imported. Using hardcoded fallback constants. "
             "Run from the repo root or install the package for full validation.",
             file=sys.stderr,
         )
@@ -296,8 +364,16 @@ def _warn_if_bootstrap_mismatch() -> None:
 
 def _validate_jwt_algorithm(algorithm: str) -> None:
     """
-    Warn if S43_JWT_ALGORITHM in the environment is not in the approved set.
+    Warn if S43_JWT_ALGORITHM is not in the approved set.
     This is advisory — the generator does not refuse to run.
+
+    Callers should pass the algorithm value from whichever .env file is
+    actually the target of the current operation (--write or --check), not
+    the ambient shell environment. In the primary use case for this tool —
+    first-time setup from a fresh clone — the shell almost never has
+    S43_JWT_ALGORITHM set, so checking os.environ alone made this check
+    effectively dead code. Fall back to the ambient environment only when
+    there's no target file to read from (default stdout-print mode).
     """
     if algorithm and algorithm not in APPROVED_JWT_ALGORITHMS:
         print(
@@ -414,7 +490,7 @@ Examples:
         type=int,
         default=DEFAULT_BYTES,
         metavar="N",
-        help=f"Entropy bytes per secret (default: {DEFAULT_BYTES}, minimum: 32).",
+        help=f"Entropy bytes per secret (default: {DEFAULT_BYTES}, minimum: {_MIN_ENTROPY_BYTES}).",
     )
 
     return parser
@@ -436,6 +512,8 @@ def main(argv: list[str] | None = None) -> int:
         if not env_path.exists():
             print(f"ERROR: {env_path} does not exist.", file=sys.stderr)
             return 1
+
+        _validate_jwt_algorithm(parse_env_file(env_path).get("S43_JWT_ALGORITHM", ""))
 
         present, missing, placeholder = check_env_file(env_path)
         width = max(len(k) for k in SECRET_KEYS)
@@ -466,19 +544,22 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     # --- entropy validation ---
-    if args.bytes < 32:
-        print("ERROR: --bytes must be >= 32.", file=sys.stderr)
+    if args.bytes < _MIN_ENTROPY_BYTES:
+        print(f"ERROR: --bytes must be >= {_MIN_ENTROPY_BYTES}.", file=sys.stderr)
         return 2
-
-    # --- advisory algorithm check ---
-    _validate_jwt_algorithm(os.getenv("S43_JWT_ALGORITHM", ""))
 
     values = generate_env_values(num_bytes=args.bytes)
 
     # --- --write ---
     if args.write:
         env_path = Path(args.write)
+
+        _validate_jwt_algorithm(
+            parse_env_file(env_path).get("S43_JWT_ALGORITHM", os.getenv("S43_JWT_ALGORITHM", ""))
+        )
+
         written = write_env_file(env_path, values, force=args.force)
+        _warn_stale_database_url(env_path, values, written)
 
         if written:
             action = "Rotated" if args.force else "Wrote"
@@ -498,6 +579,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # --- default: print to stdout ---
+    _validate_jwt_algorithm(os.getenv("S43_JWT_ALGORITHM", ""))
     print(render_env_block(values), end="")
     return 0
 
