@@ -37,7 +37,19 @@
 Expectations bootstrap for the Sentinel-43 guards system.
 
 File:
-    core/guards/exceptions/bootstrap.py
+    core/guards/expectations/bootstrap.py
+
+CORRECTION: a previous revision of this docstring listed the path as
+core/guards/exceptions/bootstrap.py — that was stale/wrong. The relative
+import below (`from .expectations import ...`) confirms this file lives
+in core/guards/expectations/, not core/guards/exceptions/. Fix the docstring
+whenever this file moves; don't let it drift again.
+
+NAMING NOTE: there is a second, unrelated module also named bootstrap.py at
+core/bootstrap.py (production startup-config validation: JWT secrets, WS
+auth enforcement, etc). They do different jobs and are not interchangeable.
+If both are ever imported in the same file, alias at least one explicitly —
+do not rely on import order to keep them apart.
 
 Changes from previous version:
   - Fix (CRITICAL): expectation generators were consumed by
