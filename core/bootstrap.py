@@ -34,7 +34,17 @@
 # =============================================================================
 
 """
+File: core/bootstrap.py
+
 Sentinel-43 startup expectations.
+
+NAMING NOTE: there is a second, unrelated module also named bootstrap.py at
+core/guards/expectations/bootstrap.py (Watchtower expectation registration).
+They do different jobs and are not interchangeable. If both are ever imported
+in the same file, alias at least one explicitly
+(e.g. `from core.guards.expectations.bootstrap import bootstrap_expectations
+as bootstrap_watchtower_expectations`) — do not rely on import order to keep
+them apart.
 
 Responsibilities:
   - Fail closed in production when security-critical configuration is missing.
@@ -44,6 +54,8 @@ Responsibilities:
   - Verify test injection is disabled in production.
   - Verify auth pepper exists and meets minimum length before the first
     auth-key verification call.
+  - Verify the JWT algorithm allowlist is identical across every module that
+    hardcodes it (see _verify_jwt_algorithm_sync below).
 """
 
 from __future__ import annotations
@@ -64,6 +76,13 @@ from typing import Final
 #   - core/api/main.py         (_APPROVED_ALGORITHMS)
 #   - core/api/routers/auth.py (_ALLOWED_JWT_ALGORITHMS)
 # Update all locations together when adding RS256 support.
+#
+# This is now enforced, not just documented — see _verify_jwt_algorithm_sync().
+# That function does a deferred (function-scope) import of the other two
+# modules, which is safe because by the time bootstrap_expectations() runs,
+# all three modules have finished loading. It would NOT be safe as a
+# module-level import here, which is exactly the circular-import problem this
+# constant duplication exists to avoid in the first place.
 # =============================================================================
 
 APPROVED_JWT_ALGORITHMS: Final[frozenset[str]] = frozenset({"HS256"})
@@ -75,6 +94,12 @@ LOCAL_TEST_ENVIRONMENTS: Final[frozenset[str]] = frozenset(
 # Minimum pepper length enforced at startup. Must match or exceed the
 # effective entropy floor used by AuthKeyStore._hash_token().
 _MIN_PEPPER_BYTES: Final[int] = 32
+
+# Minimum JWT signing secret length enforced at startup. Kept as a named
+# constant rather than an inline literal so it can't silently drift out of
+# sync with _MIN_PEPPER_BYTES — both represent the same 32-byte entropy floor
+# and should be changed together if that floor ever changes.
+_MIN_JWT_SECRET_BYTES: Final[int] = 32
 
 
 # =============================================================================
@@ -93,6 +118,47 @@ def _env_text(name: str, default: str = "") -> str:
 
 
 # =============================================================================
+# Cross-module JWT algorithm consistency check
+# =============================================================================
+
+def _verify_jwt_algorithm_sync() -> None:
+    """
+    Confirm APPROVED_JWT_ALGORITHMS here matches the allowlists hardcoded in
+    core.api.main and core.api.routers.auth.
+
+    Deferred (function-scope) import is deliberate: this function is only
+    ever called from bootstrap_expectations(), which runs during app
+    startup after core.api.main and core.api.routers.auth have already
+    loaded. A module-level import of either would recreate the exact
+    circular-import failure that caused this constant to be duplicated in
+    the first place.
+
+    Runs regardless of environment (dev/test included) because a drifted
+    allowlist is a code-correctness bug, not a missing-secret problem — it
+    should be caught immediately, not only in production.
+    """
+    try:
+        from core.api.main import _APPROVED_ALGORITHMS as main_algorithms
+        from core.api.routers.auth import _ALLOWED_JWT_ALGORITHMS as auth_algorithms
+    except ImportError:
+        # Either module hasn't finished loading yet — e.g. this is being
+        # called from a narrow unit test harness that only imports
+        # core.bootstrap in isolation. Skip rather than fail startup on an
+        # import-ordering artifact unrelated to the actual check.
+        return
+
+    if main_algorithms != APPROVED_JWT_ALGORITHMS or auth_algorithms != APPROVED_JWT_ALGORITHMS:
+        raise RuntimeError(
+            "JWT algorithm allowlist mismatch across modules — all three "
+            "copies must be identical:\n"
+            f"  - core/bootstrap.py                = {sorted(APPROVED_JWT_ALGORITHMS)}\n"
+            f"  - core/api/main.py                  = {sorted(main_algorithms)}\n"
+            f"  - core/api/routers/auth.py          = {sorted(auth_algorithms)}\n"
+            "Update all three locations together when changing the allowlist."
+        )
+
+
+# =============================================================================
 # Bootstrap gate
 # =============================================================================
 
@@ -100,7 +166,10 @@ def bootstrap_expectations() -> None:
     """
     Validate Sentinel-43 startup expectations.
 
-    Local/test environments are permissive so development stays usable.
+    Local/test environments are permissive so development stays usable,
+    EXCEPT for the JWT algorithm sync check, which always runs — it's a
+    code-drift bug check, not a deployment-secret check.
+
     Production environments fail closed when security-sensitive configuration
     is missing or unsafe.
 
@@ -119,6 +188,9 @@ def bootstrap_expectations() -> None:
 
     Store in deployment environment. Never commit secrets to version control.
     """
+    # Runs in every environment, including dev/test — see docstring above.
+    _verify_jwt_algorithm_sync()
+
     sentinel_env = _env_text("SENTINEL_ENV", "production").lower()
     if sentinel_env in LOCAL_TEST_ENVIRONMENTS:
         return
@@ -141,10 +213,10 @@ def bootstrap_expectations() -> None:
         )
     else:
         secret_bytes = jwt_secret.encode("utf-8")
-        if len(secret_bytes) < 32:
+        if len(secret_bytes) < _MIN_JWT_SECRET_BYTES:
             errors.append(
-                "S43_JWT_SECRET must be at least 32 bytes when encoded as UTF-8 "
-                f"(current: {len(secret_bytes)} bytes)."
+                f"S43_JWT_SECRET must be at least {_MIN_JWT_SECRET_BYTES} bytes "
+                f"when encoded as UTF-8 (current: {len(secret_bytes)} bytes)."
             )
 
     # JWT algorithm
