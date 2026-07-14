@@ -74,6 +74,9 @@ def jwt_env(monkeypatch):
     import core.api.main as main_module
     importlib.reload(main_module)
 
+    import core.api.routers.auth as auth_module
+    monkeypatch.setattr(auth_module, "reverify_password", _fake_reverify_password)
+
     yield main_module
 
     # Reload again after the test so later test modules don't inherit
@@ -98,6 +101,9 @@ def prod_env(monkeypatch):
 
     import core.api.main as main_module
     importlib.reload(main_module)
+
+    import core.api.routers.auth as auth_module
+    monkeypatch.setattr(auth_module, "reverify_password", _fake_reverify_password)
 
     yield main_module
 
