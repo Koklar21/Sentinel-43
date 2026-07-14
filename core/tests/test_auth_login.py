@@ -120,8 +120,16 @@ def login_user(
     )
 
 
-def bearer(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
+def bearer(token: str, password: str | None = None) -> dict[str, str]:
+    """
+    Build request headers for a protected route. Every protected route now
+    also requires X-S43-Password alongside the JWT — pass password to
+    include it (typically VALID_PASSWORD for the "should succeed" case).
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    if password is not None:
+        headers["X-S43-Password"] = password
+    return headers
 
 
 def _build_token(
@@ -274,10 +282,39 @@ def test_protected_route_accepts_valid_token(client: TestClient):
 
     response = client.get(
         PROTECTED_URL,
-        headers=bearer(token),
+        headers=bearer(token, VALID_PASSWORD),
     )
 
     assert response.status_code == 200, response.text
+
+
+def test_protected_route_rejects_valid_token_without_password(client: TestClient):
+    """A valid JWT with no X-S43-Password header must still be rejected."""
+    login_response = login_user(client)
+    assert login_response.status_code == 200, login_response.text
+
+    token = login_response.json()["token"]
+
+    response = client.get(
+        PROTECTED_URL,
+        headers=bearer(token),
+    )
+
+    assert response.status_code == 401
+
+
+def test_protected_route_rejects_valid_token_wrong_password(client: TestClient):
+    login_response = login_user(client)
+    assert login_response.status_code == 200, login_response.text
+
+    token = login_response.json()["token"]
+
+    response = client.get(
+        PROTECTED_URL,
+        headers=bearer(token, "definitely-not-the-password"),
+    )
+
+    assert response.status_code == 401
 
 
 # ---------------------------------------------------------------------------
