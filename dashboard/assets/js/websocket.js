@@ -1,7 +1,13 @@
 /* =============================================================================
    Sentinel-43 Dashboard
    websocket.js — Hardened WebSocket bridge
-   v1.5.7
+   v1.5.8
+   Changes from v1.5.7:
+     - Added: the auth frame now also carries the operator's password
+       (read via window.SentinelAuth.getPassword()), matching the backend's
+       new per-request password re-verification. A JWT with no stored
+       password fails the same way a missing JWT does — auth_failed is
+       dispatched and the socket closes without reconnecting.
    Changes from v1.5.6:
      - Fix: the real session token written by auth.js to
        sessionStorage["SENTINEL_JWT"] after a successful login was being
@@ -416,6 +422,17 @@ function _sendRaw(type, payload = {}) {
     }
 }
 
+// Password lookup — mirrors _getAuthToken() but reads the credential
+// auth.js stores alongside the JWT. The server now requires both on every
+// WS auth frame (see main.py dashboard_websocket()); a JWT alone 401s.
+function _getAuthPassword() {
+    try {
+        return window.SentinelAuth?.getPassword?.() ?? null;
+    } catch {
+        return null;
+    }
+}
+
 function _sendAuthFrame(token) {
     if (!token) {
         _dispatch("sentinel:ws:auth_failed", {
@@ -432,6 +449,18 @@ function _sendAuthFrame(token) {
         }
         return false;
     }
+    const password = _getAuthPassword();
+    if (!password) {
+        _dispatch("sentinel:ws:auth_failed", {
+            error: "WebSocket authentication required, but no password was found.",
+            timestamp: _nowIso(),
+        });
+        _manuallyClosed = true;
+        if (_ws) {
+            try { _ws.close(); } catch {}
+        }
+        return false;
+    }
     if (_authSent) {
         // Already sent an auth frame this connection (proactive-on-open path
         // and the server's auth_required handler can both reach this point
@@ -441,7 +470,7 @@ function _sendAuthFrame(token) {
         // and confusing in logs. See v1.5.7 changelog.
         return true;
     }
-    const ok = _sendRaw("auth", { token });
+    const ok = _sendRaw("auth", { token, password });
     if (ok) {
         _authSent = true;
         _dispatch("sentinel:ws:auth_sent", { timestamp: _nowIso() });
