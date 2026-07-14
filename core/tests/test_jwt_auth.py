@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import importlib
 import os
 import time
@@ -25,6 +27,11 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 
+def _run(coro):
+    """Run an async dependency call synchronously for test assertions."""
+    return asyncio.run(coro)
+
+
 # =============================================================================
 # Test Configuration
 # =============================================================================
@@ -34,6 +41,16 @@ WRONG_SECRET  = "a-completely-different-secret-also-32-bytes!!"
 TEST_ALGORITHM = "HS256"
 TEST_ISSUER    = "sentinel-43-test"
 TEST_AUDIENCE  = "sentinel-43-dashboard-test"
+
+# Password used by _bearer_request()'s default X-S43-Password header. The
+# jwt_env / prod_env fixtures monkeypatch reverify_password() to accept
+# exactly this value, so these tests exercise JWT/claim logic without
+# depending on real DB/env credential configuration.
+TEST_PASSWORD = "correct-horse-battery-staple"
+
+
+async def _fake_reverify_password(username: str, password: str) -> bool:
+    return bool(username) and password == TEST_PASSWORD
 
 
 @pytest.fixture
