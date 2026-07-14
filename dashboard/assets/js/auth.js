@@ -1,7 +1,16 @@
 /* =============================================================================
    Sentinel-43 Dashboard
    auth.js — Operator login flow and JWT lifecycle
-   v1.4.0
+   v1.5.0
+
+   Changes from v1.4.0:
+     - Added: the backend now re-verifies the operator's password on every
+       protected request (X-S43-Password header) — a valid JWT is no longer
+       sufficient by itself. The password is now stored alongside the JWT
+       (SENTINEL_PW) and exposed via getPassword() for dashboard.js and
+       websocket.js to attach to every call. A stored token with no stored
+       password is treated as invalid on init() rather than left to 401 on
+       the first real request.
 
    Changes from v1.3.0:
      - Fix: SentinelAuthReady lifecycle was broken after logout or WebSocket
@@ -65,6 +74,12 @@ window.SentinelAuth = (() => {
     const LOGIN_ENDPOINT    = "/auth/login";
     const VERIFY_ENDPOINT   = "/auth/verify";
     const TOKEN_KEY         = "SENTINEL_JWT";
+    // The backend now re-verifies the operator's password on every
+    // protected request (X-S43-Password header) — a valid JWT alone is no
+    // longer sufficient. The password is stored alongside the token so
+    // dashboard.js/websocket.js can attach it to every call, same
+    // storage/threat-model tradeoff already accepted for the JWT itself.
+    const PASSWORD_KEY      = "SENTINEL_PW";
     const TOKEN_MIN_LEN     = 20;
     const TOKEN_MAX_LEN     = 4096;   // Matches backend DEFAULT_MAX_TOKEN_CHARS.
     const USERNAME_MAX_LEN  = 128;
@@ -127,8 +142,19 @@ window.SentinelAuth = (() => {
         try { sessionStorage.setItem(TOKEN_KEY, token); return true; } catch { return false; }
     }
 
+    function getPassword() {
+        try { return sessionStorage.getItem(PASSWORD_KEY) || null; } catch { return null; }
+    }
+
+    function setPassword(password) {
+        try { sessionStorage.setItem(PASSWORD_KEY, password); return true; } catch { return false; }
+    }
+
     function clearToken() {
-        try { sessionStorage.removeItem(TOKEN_KEY); } catch {}
+        try {
+            sessionStorage.removeItem(TOKEN_KEY);
+            sessionStorage.removeItem(PASSWORD_KEY);
+        } catch {}
     }
 
     /* =========================================================================
@@ -338,8 +364,8 @@ window.SentinelAuth = (() => {
             try {
                 const result = await attemptLogin(username, password);
 
-                if (!setToken(result.token)) {
-                    throw new Error("Unable to store session token. Check browser storage settings.");
+                if (!setToken(result.token) || !setPassword(password)) {
+                    throw new Error("Unable to store session credentials. Check browser storage settings.");
                 }
 
                 // Resolve SentinelAuthReady BEFORE calling SentinelWS so that
@@ -466,13 +492,19 @@ window.SentinelAuth = (() => {
 
         const token = getToken();
 
-        if (token) {
+        // A stored token with no stored password can't drive any protected
+        // route anymore (the backend requires both). Treat it as invalid
+        // rather than letting websocket.js/dashboard.js unlock with a token
+        // that will just 401 on the first real request.
+        if (token && getPassword()) {
             const valid = await verifyStoredToken(token);
             if (valid) {
                 // Valid token confirmed — unblock websocket.js.
                 _markAuthReady();
                 return;
             }
+        }
+        if (token) {
             clearToken();
         }
 
@@ -503,6 +535,7 @@ window.SentinelAuth = (() => {
             showOverlay("You have been logged out.");
         },
         hasToken: () => !!getToken(),
+        getPassword,
     });
 
 })();
