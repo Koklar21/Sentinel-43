@@ -228,7 +228,7 @@ def _verify_jwt_token(token: str) -> dict[str, Any]:
         options={"require": ["exp", "iss", "aud", "sub"]},
     )
 
-def _get_operator(
+async def _get_operator(
     request: Request,
     *,
     allow_local_fallback: bool = True,
@@ -257,7 +257,19 @@ def _get_operator(
                 raise HTTPException(status_code=403, detail="Operator role required")
 
             subject = str(claims.get("sub") or "").strip()
-            return subject if subject else f"bearer:{token[:16]}"
+            subject = subject if subject else f"bearer:{token[:16]}"
+
+            # A valid JWT is no longer sufficient by itself — every protected
+            # request must also re-supply the operator's password.
+            from .routers.auth import PASSWORD_HEADER_NAME, reverify_password
+
+            password = request.headers.get(PASSWORD_HEADER_NAME, "")
+            if not password:
+                raise HTTPException(status_code=401, detail="Password required")
+            if not await reverify_password(subject, password):
+                raise HTTPException(status_code=401, detail="Invalid password")
+
+            return subject
 
     if allow_local_fallback and SENTINEL_ENV.lower() in LOCAL_TEST_ENVIRONMENTS:
         return "dev-operator"
@@ -265,7 +277,7 @@ def _get_operator(
     raise HTTPException(status_code=401, detail="Authentication required")
 
 
-def _require_operator(request: Request) -> str:
+async def _require_operator(request: Request) -> str:
     """
     Require explicit operator authentication.
 
@@ -273,7 +285,7 @@ def _require_operator(request: Request) -> str:
     fallback. Use this for endpoints that must never become unauthenticated
     just because SENTINEL_ENV is permissive.
     """
-    return _get_operator(request, allow_local_fallback=False)
+    return await _get_operator(request, allow_local_fallback=False)
 
 
 def _is_local_environment() -> bool:
@@ -815,13 +827,13 @@ def root() -> dict[str, Any]:
     }
 
 @root_router.get("/actions")
-def dashboard_actions(request: Request, limit: int = 250) -> list[dict[str, Any]]:
-    _require_operator(request)
+async def dashboard_actions(request: Request, limit: int = 250) -> list[dict[str, Any]]:
+    await _require_operator(request)
     return _list_actions(limit)
 
 @root_router.get("/vault/stats")
-def dashboard_vault_stats(request: Request) -> dict[str, Any]:
-    _require_operator(request)
+async def dashboard_vault_stats(request: Request) -> dict[str, Any]:
+    await _require_operator(request)
     return {"records": _vault_records(), "timestamp": utc_now()}
 
 @root_router.post("/actions/test-inject")
@@ -839,7 +851,7 @@ async def dashboard_approve_action(
     action_id: str, body: dict[str, Any], request: Request,
 ) -> dict[str, Any]:
     reason   = _require_reason(body)
-    operator = _require_operator(request)
+    operator = await _require_operator(request)
     action = _update_action_status(
         action_id,
         allowed_statuses={"STAGED"},
@@ -868,7 +880,7 @@ async def dashboard_veto_action(
     action_id: str, body: dict[str, Any], request: Request,
 ) -> dict[str, Any]:
     reason   = _require_reason(body)
-    operator = _require_operator(request)
+    operator = await _require_operator(request)
     action = _update_action_status(
         action_id,
         allowed_statuses={"PENDING", "STAGED"},
@@ -893,8 +905,8 @@ async def dashboard_veto_action(
     return {"ok": True, "action": action, "timestamp": utc_now()}
 
 @root_router.get("/governance/pending")
-def governance_pending_reviews(request: Request) -> dict[str, Any]:
-    _require_operator(request)
+async def governance_pending_reviews(request: Request) -> dict[str, Any]:
+    await _require_operator(request)
     if _orchestrator is None:
         return {"enabled": False, "pending": [], "timestamp": utc_now()}
     return {
@@ -1062,6 +1074,22 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
             await _ws_safe_close(websocket)
             return
 
+        # A valid JWT is no longer sufficient by itself — the auth frame must
+        # also carry the operator's password, re-verified against storage.
+        ws_subject = str(ws_claims.get("sub") or "").strip()
+        ws_password = str(auth_msg.get("payload", {}).get("password") or "").strip()
+        if not ws_password:
+            await websocket.send_json({"type": "error", "payload": {"error": "Password missing"}})
+            await _ws_safe_close(websocket)
+            return
+
+        from .routers.auth import reverify_password
+
+        if not await reverify_password(ws_subject, ws_password):
+            await websocket.send_json({"type": "error", "payload": {"error": "Invalid password"}})
+            await _ws_safe_close(websocket)
+            return
+
     _dashboard_ws_clients[websocket] = set()
 
     try:
@@ -1151,7 +1179,7 @@ async def internal_broadcast_event(
       channel:    str  â€” optional channel filter (e.g. "security")
       data:       dict â€” event payload forwarded to dashboard clients
     """
-    _require_operator(request)
+    await _require_operator(request)
 
     event_type = str(body.get("event_type") or "event")[:64]
     channel    = str(body.get("channel") or "") or None
@@ -1191,7 +1219,7 @@ async def ingest_proxy_event(
     - normalizes the event
     - broadcasts it to WebSocket clients subscribed to the "proxy" channel
     """
-    _require_operator(request)
+    await _require_operator(request)
 
     event = {
         "type": "proxy_event",
@@ -1233,8 +1261,8 @@ def api_watchtower_health() -> dict[str, Any]:
     return watchtower_health_check()
 
 @watchtower_router.get("/status")
-def api_watchtower_status(request: Request) -> dict[str, Any]:
-    _require_operator(request)
+async def api_watchtower_status(request: Request) -> dict[str, Any]:
+    await _require_operator(request)
     result = _watchtower_request("GET", "/watchtower/status")
     return {"bridge": "api_to_watchtower", "watchtower_url": WATCHTOWER_URL,
             "reachable": "error" not in result, "watchtower": result, "timestamp": utc_now()}
@@ -1247,13 +1275,13 @@ def api_watchtower_ready() -> dict[str, Any]:
             "reachable": "error" not in result, "watchtower": result, "timestamp": utc_now()}
 
 @watchtower_router.post("/register")
-def api_register_watchtower(request: Request) -> dict[str, Any]:
-    _require_operator(request)
+async def api_register_watchtower(request: Request) -> dict[str, Any]:
+    await _require_operator(request)
     return register_api_with_watchtower()
 
 @watchtower_router.post("/heartbeat")
-def api_heartbeat_watchtower(request: Request) -> dict[str, Any]:
-    _require_operator(request)
+async def api_heartbeat_watchtower(request: Request) -> dict[str, Any]:
+    await _require_operator(request)
     return send_api_heartbeat()
 
 @watchtower_router.get("/modules")
@@ -1295,7 +1323,7 @@ async def watchtower_ingest_event(
     and forward it to the Watchtower core. Also broadcasts to dashboard
     clients subscribed to the "watchtower" channel.
     """
-    _require_operator(request)
+    await _require_operator(request)
     result = await asyncio.to_thread(_watchtower_request, "POST", "/watchtower/events", body)
     await _broadcast_dashboard_event(
         "watchtower_event",
@@ -1381,8 +1409,8 @@ def dependencies_status() -> dict[str, Any]:
     }
 
 @dependencies_router.post("/report/{name}/{state}")
-def report_dependency(name: str, state: str, request: Request) -> dict[str, Any]:
-    _require_operator(request)
+async def report_dependency(name: str, state: str, request: Request) -> dict[str, Any]:
+    await _require_operator(request)
 
     result = report_dependency_to_watchtower(
         name, state, {"source": "api-dependency-report-route"}
@@ -1393,8 +1421,8 @@ def report_dependency(name: str, state: str, request: Request) -> dict[str, Any]
 system_router = APIRouter(prefix="/system", tags=["system"])
 
 @system_router.get("/status")
-def system_status(request: Request) -> dict[str, Any]:
-    _require_operator(request)
+async def system_status(request: Request) -> dict[str, Any]:
+    await _require_operator(request)
 
     wt = _watchtower_request("GET", "/watchtower/status")
     return {
@@ -1420,8 +1448,8 @@ def system_status(request: Request) -> dict[str, Any]:
     }
 
 @system_router.get("/routes")
-def system_routes(request: Request) -> dict[str, Any]:
-    _require_operator(request)
+async def system_routes(request: Request) -> dict[str, Any]:
+    await _require_operator(request)
 
     route_list = [
         {
@@ -1435,8 +1463,8 @@ def system_routes(request: Request) -> dict[str, Any]:
             "routes": route_list, "timestamp": utc_now()}
 
 @system_router.get("/intercom/status")
-def intercom_status(request: Request) -> dict[str, Any]:
-    _require_operator(request)
+async def intercom_status(request: Request) -> dict[str, Any]:
+    await _require_operator(request)
 
     wt_health  = watchtower_health_check()
     wt_modules = _watchtower_request("GET", "/watchtower/modules")
@@ -1480,19 +1508,19 @@ def _fenrir_snapshot() -> dict[str, Any]:
         }
 
 @fenrir_router.get("/status")
-def fenrir_status(request: Request) -> dict[str, Any]:
-    _require_operator(request)
+async def fenrir_status(request: Request) -> dict[str, Any]:
+    await _require_operator(request)
     return _fenrir_snapshot()
 
 @fenrir_router.get("/health")
-def fenrir_health(request: Request) -> dict[str, Any]:
-    _require_operator(request)
+async def fenrir_health(request: Request) -> dict[str, Any]:
+    await _require_operator(request)
     snap = _fenrir_snapshot()
     return {"service": "fenrir", **snap}
 
 @fenrir_router.get("/metrics")
-def fenrir_metrics(request: Request) -> dict[str, Any]:
-    _require_operator(request)
+async def fenrir_metrics(request: Request) -> dict[str, Any]:
+    await _require_operator(request)
     snap = _fenrir_snapshot()
     return {
         "service":       "fenrir",
@@ -1577,8 +1605,8 @@ def compat_api_rules() -> dict[str, Any]:
     return rules_root()
 
 @api_router.get("/watchtower/status")
-def compat_api_watchtower_status(request: Request) -> dict[str, Any]:
-    return api_watchtower_status(request)
+async def compat_api_watchtower_status(request: Request) -> dict[str, Any]:
+    return await api_watchtower_status(request)
 
 
 @api_router.get("/watchtower/health")
