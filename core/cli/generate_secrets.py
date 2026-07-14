@@ -557,7 +557,26 @@ Examples:
     return parser
 
 
+def _ensure_utf8_stdio() -> None:
+    """
+    --check prints unicode markers (checkmark/cross/bang). Windows consoles
+    default stdout/stderr to the system codepage (cp1252 etc.), which raises
+    UnicodeEncodeError on those characters — this tool would crash on plain
+    `python core/cli/generate_secrets.py --check .env` in an ordinary
+    Windows terminal, not just in some unusual environment. Reconfigure to
+    UTF-8 with a replace fallback so it never crashes on encoding alone,
+    regardless of the host console's default codepage.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _ensure_utf8_stdio()
+
     parser = _build_parser()
     args = parser.parse_args(argv)
 
