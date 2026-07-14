@@ -88,6 +88,11 @@ MAX_USERNAME_LEN = 128
 MAX_PASSWORD_LEN = 1024
 MAX_TOKEN_LEN    = 4096
 
+# Header carrying the operator's password on every protected request, in
+# addition to the JWT bearer token. A valid JWT alone no longer grants
+# backend access — see reverify_password().
+PASSWORD_HEADER_NAME = "X-S43-Password"
+
 # Only HS256 is permitted for now. This keeps /auth/login and /auth/verify
 # aligned with the Batch 1/2 JWT consumers instead of issuing tokens that
 # one path accepts while another rejects.
@@ -251,6 +256,40 @@ def _validate_env_credentials(username: str, password: str) -> str:
     # Return the canonical configured username, not the operator's typed
     # casing. The JWT sub claim will always reflect the config value.
     return expected_username
+
+
+async def reverify_password(username: str, password: str) -> bool:
+    """
+    Re-validate a password for a subject that has already passed JWT
+    verification. Used by the per-request password gate (X-S43-Password
+    header): a valid JWT alone is no longer sufficient to reach protected
+    routes — the operator's password must accompany every request.
+
+    Checks the DB-backed account system first (matching _validate_credentials),
+    then falls back to the env-var operator check. Returns False rather than
+    raising on any mismatch/misconfiguration reachable this way; callers are
+    responsible for turning a False into the appropriate HTTP error.
+    """
+    normalized = username.strip()
+    if not normalized or not password:
+        return False
+
+    try:
+        from ...auth.users import authenticate_user, get_sessionmaker
+
+        sessionmaker = get_sessionmaker()
+        async with sessionmaker() as session:
+            user = await authenticate_user(session, normalized, password)
+            if user is not None:
+                return True
+    except Exception as exc:
+        logger.debug("DB-backed password reverify unavailable, falling back to env-var: %s", exc)
+
+    try:
+        _validate_env_credentials(normalized, password)
+        return True
+    except HTTPException:
+        return False
 
 
 async def _validate_credentials(username: str, password: str) -> tuple[str, str, str | None]:
