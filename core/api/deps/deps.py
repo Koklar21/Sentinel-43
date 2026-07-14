@@ -229,7 +229,7 @@ def _verify_operator_jwt(token: str) -> dict[str, Any]:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
-def require_operator(request: Request) -> str:
+async def require_operator(request: Request) -> str:
     auth = request.headers.get("Authorization", "").strip()
 
     if not auth.startswith("Bearer "):
@@ -257,7 +257,19 @@ def require_operator(request: Request) -> str:
         raise HTTPException(status_code=403, detail="Operator role required")
 
     subject = str(claims.get("sub") or "").strip()
-    return subject if subject else f"bearer:{token[:16]}"
+    subject = subject if subject else f"bearer:{token[:16]}"
+
+    # A valid JWT is no longer sufficient on its own — every protected
+    # request must also re-supply the operator's password.
+    from ..routers.auth import PASSWORD_HEADER_NAME, reverify_password
+
+    password = request.headers.get(PASSWORD_HEADER_NAME, "")
+    if not password:
+        raise HTTPException(status_code=401, detail="Password required")
+    if not await reverify_password(subject, password):
+        raise HTTPException(status_code=401, detail="Invalid password")
+
+    return subject
 
 
 def _ensure_dev_factory_allowed(
