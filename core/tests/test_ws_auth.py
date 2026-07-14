@@ -78,14 +78,30 @@ os.environ["S43_WS_REQUIRE_AUTH"] = "true"
 os.environ["S43_ENABLE_TEST_INJECTION"] = "false"
 
 import core.api.main as main_module  # noqa: E402
+import core.api.routers.auth as auth_module  # noqa: E402
 
 importlib.reload(main_module)  # force constants to pick up the values above
 
 WS_URL = "/ws"
 
+# Every WS auth frame now also carries a password (see main.py's auth frame
+# handling: reverify_password() must accept it). No DB/env credentials are
+# configured in this module, so reverify_password is monkeypatched to
+# accept exactly this value for any non-empty subject.
+TEST_PASSWORD = "ws-boundary-test-password"
+
+
+async def _fake_reverify_password(username: str, password: str) -> bool:
+    return bool(username) and password == TEST_PASSWORD
+
+
+_real_reverify_password = auth_module.reverify_password
+
 
 # ---------------------------------------------------------------------------
-# setup_module — re-applies test config immediately before tests execute.
+# setup_module / teardown_module — re-applies test config immediately before
+# tests execute, and restores auth_module.reverify_password afterward so the
+# fake doesn't leak into other test modules sharing this process.
 #
 # The module-level reload above runs at collection time. By execution time,
 # another test module may have reloaded core.api.main with different env
@@ -102,6 +118,11 @@ def setup_module(module: Any) -> None:
     os.environ["S43_WS_REQUIRE_AUTH"] = "true"
     os.environ["SENTINEL_ENV"] = "test"
     importlib.reload(main_module)
+    auth_module.reverify_password = _fake_reverify_password
+
+
+def teardown_module(module: Any) -> None:
+    auth_module.reverify_password = _real_reverify_password
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +260,25 @@ def test_ws_rejects_expired_token(client: TestClient):
         _expect_rejection(ws, expected_error_substring="expired")
 
 
+def test_ws_rejects_valid_token_missing_password(client: TestClient):
+    """A structurally valid, correctly-signed token is not enough on its
+    own — the auth frame must also carry the operator's password."""
+    with client.websocket_connect(WS_URL) as ws:
+        _consume_auth_required(ws)
+        ws.send_json({"type": "auth", "payload": {"token": make_valid_token()}})
+        _expect_rejection(ws, expected_error_substring="password missing")
+
+
+def test_ws_rejects_valid_token_wrong_password(client: TestClient):
+    with client.websocket_connect(WS_URL) as ws:
+        _consume_auth_required(ws)
+        ws.send_json({
+            "type": "auth",
+            "payload": {"token": make_valid_token(), "password": "not-the-right-password"},
+        })
+        _expect_rejection(ws, expected_error_substring="invalid password")
+
+
 # ---------------------------------------------------------------------------
 # Acceptance Test
 # ---------------------------------------------------------------------------
@@ -246,7 +286,10 @@ def test_ws_rejects_expired_token(client: TestClient):
 def test_ws_accepts_valid_token(client: TestClient):
     with client.websocket_connect(WS_URL) as ws:
         _consume_auth_required(ws)
-        ws.send_json({"type": "auth", "payload": {"token": make_valid_token()}})
+        ws.send_json({
+            "type": "auth",
+            "payload": {"token": make_valid_token(), "password": TEST_PASSWORD},
+        })
 
         frame = ws.receive_json()
         assert frame["type"] == "connected"
