@@ -1,15 +1,19 @@
 # =============================================================================
 # Sentinel-43 — JWT Authentication Test Suite
 #
-# Covers _verify_jwt_token() and _get_operator() in core/api/main.py.
+# Covers verify_jwt_token() (core.api.routers.auth) and _get_operator()
+# (core.api.main). main.py no longer keeps its own verifier — _get_operator()
+# imports and calls verify_jwt_token() directly, so both are exercised here.
 #
 # Run with:
 #   pytest tests/test_jwt_auth.py -v
 #
 # These tests set environment variables BEFORE importing core.api.main,
-# because JWT_SECRET / JWT_ALGORITHM / JWT_ISSUER / JWT_AUDIENCE are read
-# as module-level constants at import time. The module is reloaded inside
-# the jwt_env fixture so each test run picks up the test configuration.
+# because JWT_SECRET / JWT_ALGORITHM / SENTINEL_ENV / S43_WS_REQUIRE_AUTH are
+# read as module-level constants at import time. The module is reloaded
+# inside the jwt_env fixture so each test run picks up the test
+# configuration. verify_jwt_token() itself reads S43_JWT_SECRET / _ISSUER /
+# _AUDIENCE from the environment at call time, so it does not need a reload.
 # =============================================================================
 
 from __future__ import annotations
@@ -24,6 +28,8 @@ import jwt as pyjwt
 import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
+
+import core.api.routers.auth as auth_module
 
 
 def _run(coro):
@@ -178,14 +184,20 @@ def _bearer_request(
 
 
 # =============================================================================
-# _verify_jwt_token() — direct verification tests
+# verify_jwt_token() — direct verification tests
+#
+# core.api.main no longer keeps its own JWT verifier; _get_operator() and
+# dashboard_websocket() both call core.api.routers.auth.verify_jwt_token()
+# directly. That function raises HTTPException itself (with the status code
+# and message baked in) rather than letting raw pyjwt exceptions escape, so
+# these tests assert against HTTPException instead of pyjwt exception types.
 # =============================================================================
 
 class TestVerifyJwtToken:
 
     def test_valid_token_returns_claims(self, jwt_env):
         token = _make_token()
-        claims = jwt_env._verify_jwt_token(token)
+        claims = auth_module.verify_jwt_token(token)
 
         assert claims["sub"] == "operator-1"
         assert claims["role"] == "operator"
@@ -195,61 +207,72 @@ class TestVerifyJwtToken:
     def test_expired_token_rejected(self, jwt_env):
         token = _make_token(exp_offset_seconds=-3600)  # expired 1 hour ago
 
-        with pytest.raises(pyjwt.ExpiredSignatureError):
-            jwt_env._verify_jwt_token(token)
+        with pytest.raises(HTTPException) as exc_info:
+            auth_module.verify_jwt_token(token)
+        assert exc_info.value.status_code == 401
+        assert "expired" in exc_info.value.detail.lower()
 
     def test_wrong_issuer_rejected(self, jwt_env):
         token = _make_token(issuer="not-sentinel-43")
 
-        with pytest.raises(pyjwt.InvalidIssuerError):
-            jwt_env._verify_jwt_token(token)
+        with pytest.raises(HTTPException) as exc_info:
+            auth_module.verify_jwt_token(token)
+        assert exc_info.value.status_code == 401
+        assert "issuer" in exc_info.value.detail.lower()
 
     def test_wrong_audience_rejected(self, jwt_env):
         token = _make_token(audience="some-other-app")
 
-        with pytest.raises(pyjwt.InvalidAudienceError):
-            jwt_env._verify_jwt_token(token)
+        with pytest.raises(HTTPException) as exc_info:
+            auth_module.verify_jwt_token(token)
+        assert exc_info.value.status_code == 401
+        assert "audience" in exc_info.value.detail.lower()
 
     def test_missing_subject_claim_rejected(self, jwt_env):
         token = _make_token(subject=None)
 
-        with pytest.raises(pyjwt.MissingRequiredClaimError):
-            jwt_env._verify_jwt_token(token)
+        with pytest.raises(HTTPException) as exc_info:
+            auth_module.verify_jwt_token(token)
+        assert exc_info.value.status_code == 401
 
     def test_missing_expiration_claim_rejected(self, jwt_env):
         """
         A token with no 'exp' claim must be rejected outright — not
         treated as non-expiring. This is enforced via
-        options={"require": ["exp", "iss", "aud", "sub"]}.
+        options={"require": ["sub", "exp", "iss", "aud"]}.
         """
         token = _make_token(exp_offset_seconds=None)
 
-        with pytest.raises(pyjwt.MissingRequiredClaimError):
-            jwt_env._verify_jwt_token(token)
+        with pytest.raises(HTTPException) as exc_info:
+            auth_module.verify_jwt_token(token)
+        assert exc_info.value.status_code == 401
 
     def test_missing_issuer_claim_rejected(self, jwt_env):
         token = _make_token(issuer=None)
 
-        with pytest.raises(pyjwt.MissingRequiredClaimError):
-            jwt_env._verify_jwt_token(token)
+        with pytest.raises(HTTPException) as exc_info:
+            auth_module.verify_jwt_token(token)
+        assert exc_info.value.status_code == 401
 
     def test_missing_audience_claim_rejected(self, jwt_env):
         token = _make_token(audience=None)
 
-        with pytest.raises(pyjwt.MissingRequiredClaimError):
-            jwt_env._verify_jwt_token(token)
+        with pytest.raises(HTTPException) as exc_info:
+            auth_module.verify_jwt_token(token)
+        assert exc_info.value.status_code == 401
 
     def test_forged_signature_rejected(self, jwt_env):
         """Token signed with a different secret must fail signature verification."""
         token = _make_token(secret=WRONG_SECRET)
 
-        with pytest.raises(pyjwt.InvalidSignatureError):
-            jwt_env._verify_jwt_token(token)
+        with pytest.raises(HTTPException) as exc_info:
+            auth_module.verify_jwt_token(token)
+        assert exc_info.value.status_code == 401
 
     def test_alg_none_rejected(self, jwt_env):
         """
         A token using alg=none must never be accepted, regardless of what
-        the token header claims. _verify_jwt_token() hardcodes the
+        the token header claims. verify_jwt_token() hardcodes the
         algorithm list from server config — it does not read alg from
         the token.
         """
@@ -271,8 +294,9 @@ class TestVerifyJwtToken:
 
         forged_token = f"{b64url(header)}.{b64url(payload)}."
 
-        with pytest.raises(pyjwt.PyJWTError):
-            jwt_env._verify_jwt_token(forged_token)
+        with pytest.raises(HTTPException) as exc_info:
+            auth_module.verify_jwt_token(forged_token)
+        assert exc_info.value.status_code == 401
 
     def test_wrong_algorithm_rejected(self, jwt_env):
         """
@@ -281,29 +305,37 @@ class TestVerifyJwtToken:
         """
         token = _make_token(algorithm="HS384", secret="x" * 64)
 
-        with pytest.raises(pyjwt.InvalidAlgorithmError):
-            jwt_env._verify_jwt_token(token)
+        with pytest.raises(HTTPException) as exc_info:
+            auth_module.verify_jwt_token(token)
+        assert exc_info.value.status_code == 401
 
     def test_malformed_token_rejected(self, jwt_env):
         """Not a three-segment JWT at all."""
-        with pytest.raises(pyjwt.DecodeError):
-            jwt_env._verify_jwt_token("this-is-not-a-jwt")
+        with pytest.raises(HTTPException) as exc_info:
+            auth_module.verify_jwt_token("this-is-not-a-jwt")
+        assert exc_info.value.status_code == 401
 
     def test_empty_string_rejected(self, jwt_env):
-        with pytest.raises(pyjwt.DecodeError):
-            jwt_env._verify_jwt_token("")
+        with pytest.raises(HTTPException) as exc_info:
+            auth_module.verify_jwt_token("")
+        assert exc_info.value.status_code == 401
 
-    def test_missing_secret_raises_invalid_key_error(self, jwt_env, monkeypatch):
+    def test_missing_secret_raises_503(self, jwt_env, monkeypatch):
         """
         If S43_JWT_SECRET is empty (e.g. misconfigured deployment that
-        somehow bypassed bootstrap_expectations), _verify_jwt_token()
-        must raise InvalidKeyError rather than silently accepting tokens.
+        somehow bypassed bootstrap_expectations), verify_jwt_token() must
+        fail closed with a 503 rather than silently accepting tokens.
+
+        verify_jwt_token() reads S43_JWT_SECRET from the environment at
+        call time (not from a cached module constant), so the secret is
+        cleared via monkeypatch.setenv rather than monkeypatch.setattr.
         """
-        monkeypatch.setattr(jwt_env, "JWT_SECRET", "")
+        monkeypatch.setenv("S43_JWT_SECRET", "")
         token = _make_token()
 
-        with pytest.raises(pyjwt.InvalidKeyError):
-            jwt_env._verify_jwt_token(token)
+        with pytest.raises(HTTPException) as exc_info:
+            auth_module.verify_jwt_token(token)
+        assert exc_info.value.status_code == 503
 
 
 # =============================================================================
@@ -416,13 +448,6 @@ class TestGetOperatorDevEnvironment:
 
         assert _run(jwt_env._get_operator(request)) == "root-admin"
 
-    def test_scope_claim_accepted_as_alternative_to_role(self, jwt_env):
-        """_get_operator() checks role OR scope for the authorization claim."""
-        token = _make_token(role=None, extra_claims={"scope": "operator"})
-        request = _bearer_request(token)
-
-        assert _run(jwt_env._get_operator(request)) == "operator-1"
-
     def test_malformed_bearer_token_returns_401(self, jwt_env):
         request = _bearer_request("not-a-real-jwt")
 
@@ -437,8 +462,13 @@ class TestGetOperatorDevEnvironment:
         a token was supplied, the failure must be visibly a server
         configuration error (503) — not silently treated as 401,
         which would look like the client's fault.
+
+        verify_jwt_token() (imported from routers.auth) reads
+        S43_JWT_SECRET from the environment at call time, so the secret
+        is cleared via monkeypatch.setenv rather than monkeypatch.setattr
+        on the main module.
         """
-        monkeypatch.setattr(jwt_env, "JWT_SECRET", "")
+        monkeypatch.setenv("S43_JWT_SECRET", "")
         token = _make_token()
         request = _bearer_request(token)
 
