@@ -69,6 +69,25 @@ JWT_ISSUER = "sentinel-43-test"
 JWT_AUDIENCE = "sentinel-43-dashboard-test"
 WRONG_SECRET = "a-completely-different-secret-for-ws-tests"
 
+# Snapshot pre-existing values (None if unset) so teardown_module() can put
+# the environment back exactly as it found it. Without this, the hard
+# os.environ[...] = ... assignments below leak this module's test secret
+# into every test module that runs afterward in the same pytest process —
+# auth.py's verify_jwt_token() reads S43_JWT_SECRET at call time, so any
+# later module that builds a token with a *different* secret captured at
+# its own import time will fail signature verification against this
+# module's leftover secret.
+_ENV_KEYS_MUTATED = (
+    "SENTINEL_ENV",
+    "S43_JWT_SECRET",
+    "S43_JWT_ALGORITHM",
+    "S43_JWT_ISSUER",
+    "S43_JWT_AUDIENCE",
+    "S43_WS_REQUIRE_AUTH",
+    "S43_ENABLE_TEST_INJECTION",
+)
+_ORIGINAL_ENV = {key: os.environ.get(key) for key in _ENV_KEYS_MUTATED}
+
 os.environ["SENTINEL_ENV"] = "test"
 os.environ["S43_JWT_SECRET"] = JWT_SECRET
 os.environ["S43_JWT_ALGORITHM"] = JWT_ALGORITHM
@@ -124,6 +143,16 @@ def setup_module(module: Any) -> None:
 def teardown_module(module: Any) -> None:
     auth_module.reverify_password = _real_reverify_password
 
+    # Restore the environment to what it was before this module's collection
+    # -time mutations, so later test modules in the same pytest process don't
+    # silently inherit this module's test JWT secret/config.
+    for key, original_value in _ORIGINAL_ENV.items():
+        if original_value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = original_value
+    importlib.reload(main_module)
+
 
 # ---------------------------------------------------------------------------
 # Pytest Fixtures
@@ -178,6 +207,20 @@ def make_expired_token() -> str:
 
 def make_forged_token() -> str:
     return _build_token(secret=WRONG_SECRET)
+
+
+def make_wrong_algorithm_token() -> str:
+    """Signed with HS384 — a legitimate HMAC algorithm, but not the one
+    this server is configured to accept (HS256-only policy)."""
+    return _build_token(algorithm="HS384", secret="x" * 64)
+
+
+def make_no_role_token() -> str:
+    return _build_token(role=None)
+
+
+def make_unapproved_role_token() -> str:
+    return _build_token(role="guest")
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +322,63 @@ def test_ws_rejects_valid_token_wrong_password(client: TestClient):
         _expect_rejection(ws, expected_error_substring="invalid password")
 
 
+def test_ws_rejects_unsupported_algorithm(client: TestClient):
+    """
+    A token signed with HS384 must be rejected even though HS384 is a
+    legitimate HMAC algorithm — the server only accepts HS256
+    (core.security.jwt_constants.APPROVED_JWT_ALGORITHMS), and
+    verify_jwt_token() must reject it before ever reaching pyjwt.decode
+    with an algorithm list that includes it.
+    """
+    with client.websocket_connect(WS_URL) as ws:
+        _consume_auth_required(ws)
+        ws.send_json({
+            "type": "auth",
+            "payload": {"token": make_wrong_algorithm_token(), "password": TEST_PASSWORD},
+        })
+        _expect_rejection(ws, expected_error_substring="invalid token")
+
+
+def test_ws_rejects_missing_role_claim(client: TestClient):
+    """A structurally valid, correctly signed token with no role claim at
+    all must still be rejected — authentication succeeded, authorization
+    did not."""
+    with client.websocket_connect(WS_URL) as ws:
+        _consume_auth_required(ws)
+        ws.send_json({
+            "type": "auth",
+            "payload": {"token": make_no_role_token(), "password": TEST_PASSWORD},
+        })
+        _expect_rejection(ws, expected_error_substring="role")
+
+
+def test_ws_rejects_unapproved_role(client: TestClient):
+    """A role outside {operator, admin} must be rejected the same way."""
+    with client.websocket_connect(WS_URL) as ws:
+        _consume_auth_required(ws)
+        ws.send_json({
+            "type": "auth",
+            "payload": {"token": make_unapproved_role_token(), "password": TEST_PASSWORD},
+        })
+        _expect_rejection(ws, expected_error_substring="role")
+
+
+def test_ws_rejects_invalid_origin(client: TestClient):
+    """
+    A WebSocket handshake carrying an Origin header outside
+    S43_ALLOWED_ORIGINS must be rejected before the auth handshake ever
+    starts — no auth_required frame, connection closes immediately.
+    """
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(
+            WS_URL, headers={"origin": "https://evil.example.com"}
+        ) as ws:
+            # If the origin check somehow didn't reject the connection,
+            # this receive_text() surfaces whatever the server actually
+            # sent so the failure is easy to diagnose instead of hanging.
+            ws.receive_text()
+
+
 # ---------------------------------------------------------------------------
 # Acceptance Test
 # ---------------------------------------------------------------------------
@@ -297,6 +397,38 @@ def test_ws_accepts_valid_token(client: TestClient):
 
         # Confirm the session is actually live post-auth, not just that the
         # connect frame was sent before an immediate drop.
+        ws.send_json({"type": "ping", "payload": {}})
+        pong = ws.receive_json()
+        assert pong["type"] == "pong"
+
+
+def test_ws_ignores_duplicate_auth_frame_after_connect(client: TestClient):
+    """
+    Authentication happens exactly once — on the first message after
+    auth_required. A second {"type":"auth",...} frame sent after the
+    session is already connected is not a second authentication attempt;
+    it falls through to the generic "unsupported event" handling like any
+    other unrecognized frame type, and must not tear down or re-privilege
+    the existing session.
+    """
+    with client.websocket_connect(WS_URL) as ws:
+        _consume_auth_required(ws)
+        ws.send_json({
+            "type": "auth",
+            "payload": {"token": make_valid_token(), "password": TEST_PASSWORD},
+        })
+        connected = ws.receive_json()
+        assert connected["type"] == "connected"
+
+        ws.send_json({
+            "type": "auth",
+            "payload": {"token": make_valid_token(), "password": TEST_PASSWORD},
+        })
+        second = ws.receive_json()
+        assert second["type"] == "error"
+        assert "unsupported event" in second["payload"]["error"].lower()
+
+        # Session must still be alive and usable afterward.
         ws.send_json({"type": "ping", "payload": {}})
         pong = ws.receive_json()
         assert pong["type"] == "pong"
