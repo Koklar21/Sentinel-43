@@ -4,8 +4,13 @@
 // UI logic module. WebSocket transport is handled by websocket.js which
 // dispatches sentinel:ws:* events consumed here.
 //
-// v1.6.3
+// v1.6.4
 // Changes:
+// - Added: getAuthHeaders() now also attaches X-S43-Password (read via
+//   SentinelAuth.getPassword()) on every request. The backend re-verifies
+//   the operator's password on every protected route in addition to the
+//   JWT — see auth.js v1.5.0 changelog.
+// Changes from v1.6.3:
 // - Fix: getDevToken() was gating ALL token lookup — including
 //   SENTINEL_JWT, the real session token written by auth.js on login —
 //   behind ALLOW_DEV_JWT_STORAGE (local-hostname-only). Any beta tester
@@ -380,6 +385,13 @@ function getAuthHeaders() {
     const headers = {"Content-Type": "application/json"};
     const token = getDevToken();
     if (token) headers.Authorization = `Bearer ${token}`;
+    // Every protected route now also requires the operator's password
+    // alongside the JWT (see auth.js SentinelAuth.getPassword()). Only set
+    // for a real logged-in session — dev/legacy tokens have no associated
+    // password and will 401 on protected routes, same as before this change
+    // for routes that were already gated.
+    const password = window.SentinelAuth?.getPassword?.();
+    if (password) headers["X-S43-Password"] = password;
     return headers;
 }
 function buildApiUrl(path) {
@@ -566,7 +578,11 @@ const api = {
     dashboardSummary: () =>
         CONFIG.DEMO_MODE
             ? Promise.resolve({...DEMO_SUMMARY})
-            : fetchJson("/dashboard/summary").catch(() => null),
+            // /dashboard/summary does not exist on the backend (see
+            // docs/security/endpoint_access_matrix.md) -- this used to poll
+            // it anyway and silently swallow the resulting 404 on every
+            // call. No-op until the endpoint is actually implemented.
+            : Promise.resolve(null),
 };
 // =============================================================================
 // Action Normalization
