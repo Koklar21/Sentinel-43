@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import importlib
 import os
 import time
@@ -150,11 +149,20 @@ def _make_token(
     return pyjwt.encode(claims, secret, algorithm=algorithm)
 
 
-def _bearer_request(token: str | None) -> Request:
-    """Build a minimal Starlette Request with an optional Authorization header."""
+def _bearer_request(
+    token: str | None, *, password: str | None = TEST_PASSWORD
+) -> Request:
+    """
+    Build a minimal Starlette Request with an optional Authorization header
+    and an optional X-S43-Password header. password=None omits the header
+    entirely (used to test the "password missing" case); it defaults to
+    TEST_PASSWORD, which the fixture-patched reverify_password() accepts.
+    """
     headers = []
     if token is not None:
         headers.append((b"authorization", f"Bearer {token}".encode()))
+    if password is not None:
+        headers.append((b"x-s43-password", password.encode()))
 
     scope = {
         "type": "http",
@@ -309,19 +317,41 @@ class TestGetOperatorDevEnvironment:
         token = _make_token(subject="alice")
         request = _bearer_request(token)
 
-        assert jwt_env._get_operator(request) == "alice"
+        assert _run(jwt_env._get_operator(request)) == "alice"
 
     def test_no_token_returns_dev_operator(self, jwt_env):
         request = _bearer_request(None)
 
-        assert jwt_env._get_operator(request) == "dev-operator"
+        assert _run(jwt_env._get_operator(request)) == "dev-operator"
+
+    def test_valid_token_missing_password_returns_401(self, jwt_env):
+        """A valid, correctly-scoped JWT with no X-S43-Password header must
+        still be rejected — the JWT alone is no longer sufficient."""
+        token = _make_token(subject="alice")
+        request = _bearer_request(token, password=None)
+
+        with pytest.raises(HTTPException) as exc_info:
+            _run(jwt_env._get_operator(request))
+
+        assert exc_info.value.status_code == 401
+        assert "password" in exc_info.value.detail.lower()
+
+    def test_valid_token_wrong_password_returns_401(self, jwt_env):
+        token = _make_token(subject="alice")
+        request = _bearer_request(token, password="not-the-right-password")
+
+        with pytest.raises(HTTPException) as exc_info:
+            _run(jwt_env._get_operator(request))
+
+        assert exc_info.value.status_code == 401
+        assert "password" in exc_info.value.detail.lower()
 
     def test_expired_token_returns_401(self, jwt_env):
         token = _make_token(exp_offset_seconds=-60)
         request = _bearer_request(token)
 
         with pytest.raises(HTTPException) as exc_info:
-            jwt_env._get_operator(request)
+            _run(jwt_env._get_operator(request))
 
         assert exc_info.value.status_code == 401
         assert "expired" in exc_info.value.detail.lower()
@@ -331,7 +361,7 @@ class TestGetOperatorDevEnvironment:
         request = _bearer_request(token)
 
         with pytest.raises(HTTPException) as exc_info:
-            jwt_env._get_operator(request)
+            _run(jwt_env._get_operator(request))
 
         assert exc_info.value.status_code == 401
 
@@ -340,7 +370,7 @@ class TestGetOperatorDevEnvironment:
         request = _bearer_request(token)
 
         with pytest.raises(HTTPException) as exc_info:
-            jwt_env._get_operator(request)
+            _run(jwt_env._get_operator(request))
 
         assert exc_info.value.status_code == 401
         assert "issuer" in exc_info.value.detail.lower()
@@ -350,7 +380,7 @@ class TestGetOperatorDevEnvironment:
         request = _bearer_request(token)
 
         with pytest.raises(HTTPException) as exc_info:
-            jwt_env._get_operator(request)
+            _run(jwt_env._get_operator(request))
 
         assert exc_info.value.status_code == 401
         assert "audience" in exc_info.value.detail.lower()
@@ -365,7 +395,7 @@ class TestGetOperatorDevEnvironment:
         request = _bearer_request(token)
 
         with pytest.raises(HTTPException) as exc_info:
-            jwt_env._get_operator(request)
+            _run(jwt_env._get_operator(request))
 
         assert exc_info.value.status_code == 403
         assert "role" in exc_info.value.detail.lower()
@@ -376,7 +406,7 @@ class TestGetOperatorDevEnvironment:
         request = _bearer_request(token)
 
         with pytest.raises(HTTPException) as exc_info:
-            jwt_env._get_operator(request)
+            _run(jwt_env._get_operator(request))
 
         assert exc_info.value.status_code == 403
 
@@ -384,20 +414,20 @@ class TestGetOperatorDevEnvironment:
         token = _make_token(subject="root-admin", role="admin")
         request = _bearer_request(token)
 
-        assert jwt_env._get_operator(request) == "root-admin"
+        assert _run(jwt_env._get_operator(request)) == "root-admin"
 
     def test_scope_claim_accepted_as_alternative_to_role(self, jwt_env):
         """_get_operator() checks role OR scope for the authorization claim."""
         token = _make_token(role=None, extra_claims={"scope": "operator"})
         request = _bearer_request(token)
 
-        assert jwt_env._get_operator(request) == "operator-1"
+        assert _run(jwt_env._get_operator(request)) == "operator-1"
 
     def test_malformed_bearer_token_returns_401(self, jwt_env):
         request = _bearer_request("not-a-real-jwt")
 
         with pytest.raises(HTTPException) as exc_info:
-            jwt_env._get_operator(request)
+            _run(jwt_env._get_operator(request))
 
         assert exc_info.value.status_code == 401
 
@@ -413,7 +443,7 @@ class TestGetOperatorDevEnvironment:
         request = _bearer_request(token)
 
         with pytest.raises(HTTPException) as exc_info:
-            jwt_env._get_operator(request)
+            _run(jwt_env._get_operator(request))
 
         assert exc_info.value.status_code == 503
 
@@ -425,7 +455,7 @@ class TestGetOperatorProductionEnvironment:
         request = _bearer_request(None)
 
         with pytest.raises(HTTPException) as exc_info:
-            prod_env._get_operator(request)
+            _run(prod_env._get_operator(request))
 
         assert exc_info.value.status_code == 401
         assert "authentication required" in exc_info.value.detail.lower()
@@ -434,13 +464,13 @@ class TestGetOperatorProductionEnvironment:
         token = _make_token(subject="prod-operator")
         request = _bearer_request(token)
 
-        assert prod_env._get_operator(request) == "prod-operator"
+        assert _run(prod_env._get_operator(request)) == "prod-operator"
 
     def test_empty_bearer_returns_401_in_production(self, prod_env):
         request = _bearer_request("")
 
         with pytest.raises(HTTPException) as exc_info:
-            prod_env._get_operator(request)
+            _run(prod_env._get_operator(request))
 
         assert exc_info.value.status_code == 401
 
