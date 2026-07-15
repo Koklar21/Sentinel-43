@@ -4,84 +4,54 @@
 // UI logic module. WebSocket transport is handled by websocket.js which
 // dispatches sentinel:ws:* events consumed here.
 //
-// v1.6.4
+// v1.7.0
 // Changes:
-// - Added: getAuthHeaders() now also attaches X-S43-Password (read via
-//   SentinelAuth.getPassword()) on every request. The backend re-verifies
-//   the operator's password on every protected route in addition to the
-//   JWT — see auth.js v1.5.0 changelog.
-// Changes from v1.6.3:
-// - Fix: getDevToken() was gating ALL token lookup — including
-//   SENTINEL_JWT, the real session token written by auth.js on login —
-//   behind ALLOW_DEV_JWT_STORAGE (local-hostname-only). Any beta tester
-//   not on localhost/127.0.0.1/::1 could log in successfully, see the
-//   dashboard populate (listActions/vaultStats aren't protected routes),
-//   and then get silent 401s the moment they hit Approve or Veto, since
-//   getAuthHeaders() never attached a real Authorization header. Same
-//   root cause and same fix as websocket.js v1.5.7's _getDevToken() bug.
-//   Split into a dedicated SESSION_TOKEN_KEY check (always read,
-//   regardless of hostname) followed by the local-only legacy key scan.
-//   DEV_JWT_KEYS no longer contains SENTINEL_JWT — it has its own
-//   always-on check now, consistent with websocket.js's _DEV_JWT_KEYS.
-// - Knock-on fix: authStateText / jwtRiskBadge in updateStaticConfig()
-//   read getDevToken()'s result to decide whether to show "DEV TOKEN
-//   PRESENT" and a risk badge. Now that the real session token is read
-//   unconditionally, a normal logged-in beta operator would otherwise be
-//   mislabeled as running a risky dev token. Distinguished real session
-//   tokens from legacy/dev tokens for that display only — does not change
-//   any auth behavior, just what the operator sees in the config panel.
-//
-// v1.6.2 (prior):
-// - normalizeWatchtowerResponse(): expanded state alias set.
-//   Previously only "ACTIVE" mapped to "ok" and "DEGRADED" to "degraded".
-//   Now accepts the full alias matrix emitted by known Watchtower backends:
-//     ok      ← ACTIVE | ONLINE | OK | READY | HEALTHY | RUNNING
-//     degraded ← DEGRADED | WARN | WARNING
-//     offline ← anything else
-//   Also adds raw.status as a secondary field lookup so callers that surface
-//   top-level `status` instead of `watchtower.state` are handled without a
-//   separate code path.
-// - fetchWatchtower(): added console.debug("[S43 Watchtower raw]", raw)
-//   immediately after the HTTP response so the raw bridge payload is visible
-//   in DevTools during diagnostics without touching the prod log console.
-//
-// v1.6.1 (prior):
-// - normalizeWatchtowerResponse() added: maps the main.py bridge response
-//   shape (GET /watchtower/status returns { bridge, reachable, watchtower:
-//   { state, towers: [...8 Octagon segments...] } }) into the standard
-//   { overall, subsystems } format renderWatchtower() expects.
-//   Root cause of "No subsystem data returned" on first deployment: the
-//   bridge wrapper was passed directly to renderWatchtower(), which found
-//   neither `overall` nor `subsystems` keys and hit the empty branch.
-//   Tower status derived from tower.enabled + tower.alert_count (no explicit
-//   status field exists on Octagon segments). latencyMs is null (not
-//   available per-tower). Tower type labels mapped to human-readable detail.
-// - fetchWatchtower() now calls normalizeWatchtowerResponse(raw) before
-//   renderWatchtower(data).
-//
-// v1.6.0 (prior):
-// - Watchtower subsystem health integration (renderWatchtower, fetchWatchtower,
-//   startWatchtowerPolling, MODE_ALIASES, setGovernanceMode,
-//   updateAssessmentMetrics, api.watchtowerStatus, api.dashboardSummary).
-//
-// v1.5.2 (prior):
-// - Removed sendWebSocketAuthFrame(). websocket.js owns the auth exchange.
-// - sentinel:ws:auth_required listener now logs only.
-// - auth_required removed from sentinel:ws:message switch (dead code).
-//
-// v1.5.1-authfix (prior):
-// - Uses a wider dev JWT lookup path matching websocket.js.
-// - Treats authenticated/auth_ok/connected as successful live state.
+// - RECONSTRUCTION NOTE: this file was recovered from a paste that had
+//   stripped the backticks from every template literal. Backticks have
+//   been restored based on context. Diff against your real working copy
+//   and run the linter/test suite before trusting this in production —
+//   this note exists so nobody assumes byte-for-byte fidelity with
+//   whatever is actually on disk.
+// - Added: fetchJson() no longer attaches Authorization/X-S43-Password to
+//   cross-origin requests. `credentials` was already gated to same-origin;
+//   the auth headers were not, which meant a misconfigured API_BASE could
+//   leak the raw operator password (not just a revocable JWT) to the
+//   wrong origin.
+// - Added: JWT injection modal (authBtn/jwtClear/jwtConfirm) now reads and
+//   writes a password field alongside the token, routed through
+//   window.SentinelAuth.applyManualCredentials() instead of writing
+//   sessionStorage["SENTINEL_JWT"] directly. The old code bypassed
+//   password storage entirely, leaving a token that looked valid in the
+//   UI but 401'd on the first real request once the backend started
+//   requiring both.
+// - Added: updateStaticConfig()'s auth-state indicator now reflects
+//   password presence too, not just token presence, so it can't tell the
+//   operator they're authenticated when a real request would 401.
+// - Added: stopProtectedActivity()/startProtectedActivity(), gated on
+//   sentinel:auth:locked / sentinel:auth:ready (dispatched by auth.js
+//   v1.6.0). Protected polling (actions/vault/watchtower) no longer fires
+//   before login completes or continues after auth is lost.
+// - Added: sentinel:ws:policy_error / sentinel:ws:protocol_error listeners
+//   to surface websocket.js's split 1008/1011 close-code classification
+//   in the operator-visible log console.
+// - Changed: bottom initialization block replaced with async
+//   initializeDashboard(), which awaits window.SentinelAuthReady before
+//   starting any protected activity (demo mode is exempt — no real auth
+//   applies there).
 // =============================================================================
 "use strict";
+
 // =============================================================================
 // Config
 // =============================================================================
 const _readMeta = name =>
     document.querySelector(`meta[name="${name}"]`)?.content?.trim() ?? "";
+
 const _runtime = window.SENTINEL_RUNTIME_CONFIG ?? {};
+
 const _locationIsLocal = ["", "localhost", "127.0.0.1", "::1"]
     .includes(location.hostname);
+
 const CONFIG = Object.freeze({
     API_BASE: String(
         _runtime.apiBase
@@ -89,18 +59,19 @@ const CONFIG = Object.freeze({
         ?? _readMeta("sentinel-api-base")
         ?? "http://localhost:8000"
     ).replace(/\/+$/, ""),
-    FALLBACK_POLL_MS:  15_000,
-    DATA_STALE_MS:     60_000,
-    REASON_MIN:        10,
-    REASON_MAX:        500,
-    MAX_LOG_LINES:     500,
-    MAX_DEMO_ACTIONS:  500,
+    FALLBACK_POLL_MS: 15_000,
+    DATA_STALE_MS:    60_000,
+    REASON_MIN:       10,
+    REASON_MAX:       500,
+    MAX_LOG_LINES:    500,
+    MAX_DEMO_ACTIONS: 500,
     DEMO_MODE: new URLSearchParams(location.search).get("demo") === "1",
     LIVE_TEST_MODE:
         _locationIsLocal &&
         new URLSearchParams(location.search).get("test") === "1",
     ALLOW_DEV_JWT_STORAGE: _locationIsLocal,
 });
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -113,15 +84,9 @@ const STATUS_CLASSES = Object.freeze({
     EXPIRED:  "expired",
     UNKNOWN:  "unknown",
 });
-// Canonical session token key — written by auth.js on successful login.
-// Always read regardless of hostname; this is the production auth path,
-// not a dev convenience. See getDevToken() below and the v1.5.7 fix note
-// in websocket.js (same bug, same fix, same root cause).
+
 const SESSION_TOKEN_KEY = "SENTINEL_JWT";
 
-// Legacy/dev fallback keys only — local-hostname-gated. Must stay in sync
-// with websocket.js _DEV_JWT_KEYS (minus SESSION_TOKEN_KEY, which has its
-// own always-on check).
 const DEV_JWT_KEYS = Object.freeze([
     "S43_JWT",
     "S43_TOKEN",
@@ -131,16 +96,14 @@ const DEV_JWT_KEYS = Object.freeze([
     "jwt",
     "token",
 ]);
-// Governance mode → interface alias mapping.
-// HUMAN_GATED has no alias (same name); omitted intentionally so the alias
-// span stays hidden rather than showing a redundant label.
+
 const MODE_ALIASES = Object.freeze({
     SHADOW:          "ADVISORY",
     AUTONOMOUS_VETO: "ACTIVE_PLANNING",
 });
-// Watchtower probe interval — kept separate from FALLBACK_POLL_MS so the two
-// timers never compete. 30 s is conservative; probes are lightweight.
+
 const WT_PROBE_MS = 30_000;
+
 // =============================================================================
 // Demo stubs (used when ?demo=1 is active)
 // =============================================================================
@@ -155,6 +118,7 @@ const DEMO_WATCHTOWER = Object.freeze({
         { name: "Database",             status: "online",   latencyMs: 14, detail: "PostgreSQL persistence" },
     ]),
 });
+
 const DEMO_SUMMARY = Object.freeze({
     totalAssessments: 142,
     criticalThreats:  3,
@@ -162,6 +126,7 @@ const DEMO_SUMMARY = Object.freeze({
     fenrirSignals:    7,
     mode:             "HUMAN_GATED",
 });
+
 // =============================================================================
 // Element References
 // =============================================================================
@@ -232,6 +197,7 @@ const el = {
     injectConfirm: $("injectConfirm"),
     kbToast: $("kbToast"),
 };
+
 // =============================================================================
 // State
 // =============================================================================
@@ -242,7 +208,7 @@ let allActions       = [];
 let selectedIds      = new Set();
 let focusedRowIndex  = -1;
 let focusedActionId  = null;
-let prevCounts       = {pending: null, staged: null, approved: null};
+let prevCounts       = { pending: null, staged: null, approved: null };
 let lastDataSyncAt   = null;
 let refreshPromise   = null;
 let pollTimer        = null;
@@ -252,6 +218,7 @@ let kbToastTimer     = null;
 let injectInFlight   = false;
 let wsConnected      = false;
 let isLight          = false;
+
 // =============================================================================
 // Utilities
 // =============================================================================
@@ -261,15 +228,18 @@ const nowStamp = () =>
         minute: "2-digit",
         second: "2-digit",
     });
+
 const escHtml = value =>
     String(value ?? "")
-        .replaceAll("&",  "&amp;")
-        .replaceAll("<",  "&lt;")
-        .replaceAll(">",  "&gt;")
-        .replaceAll('"',  "&quot;")
-        .replaceAll("'",  "&#039;");
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+
 const normalizeString = (value, fallback = "") =>
     typeof value === "string" ? value : value == null ? fallback : String(value);
+
 // =============================================================================
 // Logging
 // =============================================================================
@@ -301,6 +271,7 @@ function log(message, type = "info") {
     }
     el.logConsole.scrollTop = el.logConsole.scrollHeight;
 }
+
 // =============================================================================
 // Status / UI Helpers
 // =============================================================================
@@ -312,25 +283,30 @@ function setStatus(state) {
     if (["online", "live"].includes(normalized)) el.statusDot.classList.add("online");
     if (normalized === "offline") el.statusDot.classList.add("offline");
 }
+
 function flashPoll() {
     if (!el.pollFlash) return;
     el.pollFlash.classList.add("flash");
     setTimeout(() => el.pollFlash?.classList.remove("flash"), 600);
 }
+
 function bumpStat(node) {
     if (!node) return;
     node.classList.add("bump");
     setTimeout(() => node.classList.remove("bump"), 250);
 }
+
 function markDataSync(source) {
     lastDataSyncAt = new Date();
     if (el.lastSync) el.lastSync.textContent = `${source} ${nowStamp()}`;
     flashPoll();
 }
+
 function dataIsStale() {
     return !lastDataSyncAt ||
         Date.now() - lastDataSyncAt.getTime() > CONFIG.DATA_STALE_MS;
 }
+
 // =============================================================================
 // Auth / API Helpers
 // =============================================================================
@@ -342,12 +318,7 @@ function _readStoredToken(storage, key) {
         return null;
     }
 }
-// Always reads the real session token first, regardless of hostname — this
-// is the production login path, not a dev convenience (see v1.6.3 changelog
-// above). Only the legacy/dev fallback scan below stays gated to local
-// hostnames. Returns { token, isRealSession } so callers that care about the
-// distinction (currently just updateStaticConfig()'s risk-badge display) can
-// avoid mislabeling a real logged-in operator as running a dev token.
+
 function getDevTokenInfo() {
     const sessionToken = _readStoredToken(sessionStorage, SESSION_TOKEN_KEY);
     if (sessionToken) return { token: sessionToken, isRealSession: true };
@@ -377,23 +348,20 @@ function getDevTokenInfo() {
     }
     return { token: null, isRealSession: false };
 }
-// Back-compat wrapper — most call sites only need the token value.
+
 function getDevToken() {
     return getDevTokenInfo().token;
 }
+
 function getAuthHeaders() {
-    const headers = {"Content-Type": "application/json"};
+    const headers = { "Content-Type": "application/json" };
     const token = getDevToken();
     if (token) headers.Authorization = `Bearer ${token}`;
-    // Every protected route now also requires the operator's password
-    // alongside the JWT (see auth.js SentinelAuth.getPassword()). Only set
-    // for a real logged-in session — dev/legacy tokens have no associated
-    // password and will 401 on protected routes, same as before this change
-    // for routes that were already gated.
     const password = window.SentinelAuth?.getPassword?.();
     if (password) headers["X-S43-Password"] = password;
     return headers;
 }
+
 function buildApiUrl(path) {
     if (typeof path !== "string" || !path.startsWith("/")) {
         throw new Error("API path must be relative");
@@ -403,19 +371,26 @@ function buildApiUrl(path) {
     }
     return new URL(`${CONFIG.API_BASE}${path}`, location.href);
 }
+
 async function fetchJson(path, opts = {}) {
     const url = buildApiUrl(path);
     const sameOrigin = url.origin === location.origin;
+
+    const authHeaders = sameOrigin
+        ? getAuthHeaders()
+        : { "Content-Type": "application/json" };
+
     const response = await fetch(url.toString(), {
         ...opts,
         cache: "no-store",
         credentials: sameOrigin ? "include" : "omit",
         headers: {
-            ...getAuthHeaders(),
+            ...authHeaders,
             "Cache-Control": "no-cache",
             ...(opts.headers ?? {}),
         },
     });
+
     const contentType = response.headers.get("content-type") ?? "";
     const isJson = contentType.includes("application/json");
     if (!response.ok) {
@@ -434,21 +409,25 @@ async function fetchJson(path, opts = {}) {
     }
     return isJson ? response.json() : null;
 }
+
 function unwrapData(value) {
     return value && typeof value === "object" && !Array.isArray(value) && "data" in value
         ? value.data
         : value;
 }
+
 function extractActionList(value) {
     const u = unwrapData(value);
     if (Array.isArray(u)) return u;
     if (u && typeof u === "object" && Array.isArray(u.actions)) return u.actions;
     throw new Error("Action endpoint returned an invalid payload shape");
 }
+
 function extractVaultRecords(value) {
     const u = unwrapData(value);
     return u && typeof u.records === "number" ? u.records : null;
 }
+
 // =============================================================================
 // WebSocket Live State
 // =============================================================================
@@ -457,6 +436,7 @@ function markWebSocketLive(type = "connected") {
     setStatus("Live");
     log("WebSocket live. Queue updates active.", "ok");
 }
+
 // =============================================================================
 // Demo Backend (?demo=1 only)
 // =============================================================================
@@ -464,11 +444,13 @@ const demoBackend = (() => {
     const store = new Map();
     const genId = () =>
         `ACT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`.toUpperCase();
+
     function trimStore() {
         while (store.size > CONFIG.MAX_DEMO_ACTIONS) {
             store.delete(store.keys().next().value);
         }
     }
+
     function make(opts = {}) {
         const item = {
             id:              genId(),
@@ -478,17 +460,18 @@ const demoBackend = (() => {
             decision_reason: opts.decision_reason ?? "",
             operator:        opts.operator        ?? "",
             payload: {
-                ip:         opts.ip     ?? "203.0.113.10",
-                source_ip:  opts.ip     ?? "203.0.113.10",
-                threat:     opts.threat ?? "Suspicious activity",
+                ip:        opts.ip     ?? "203.0.113.10",
+                source_ip: opts.ip     ?? "203.0.113.10",
+                threat:    opts.threat ?? "Suspicious activity",
             },
         };
         store.set(item.id, item);
         trimStore();
         return item;
     }
-    make({threat: "SQL injection pattern",         ip: "198.51.100.22", status: "PENDING"});
-    make({threat: "Credential stuffing detected", ip: "203.0.113.77",  status: "STAGED"});
+
+    make({ threat: "SQL injection pattern",         ip: "198.51.100.22", status: "PENDING" });
+    make({ threat: "Credential stuffing detected",   ip: "203.0.113.77",  status: "STAGED" });
     make({
         threat: "High-rate port probe",
         ip: "192.0.2.41",
@@ -496,7 +479,7 @@ const demoBackend = (() => {
         decision_reason: "Confirmed scanner - allowlisted",
         operator: "ops@sentinel",
     });
-    make({threat: "XSS payload in user-agent",    ip: "198.51.100.9", status: "PENDING"});
+    make({ threat: "XSS payload in user-agent", ip: "198.51.100.9", status: "PENDING" });
     make({
         threat: "Tor exit-node connection",
         ip: "10.0.0.7",
@@ -504,6 +487,7 @@ const demoBackend = (() => {
         decision_reason: "Internal test - false positive",
         operator: "sec@sentinel",
     });
+
     return {
         listActions: async () =>
             Array.from(store.values())
@@ -515,7 +499,7 @@ const demoBackend = (() => {
             item.status = "APPROVED";
             item.decision_reason = reason;
             item.operator = "operator";
-            return {ok: true};
+            return { ok: true };
         },
         veto: async (id, reason) => {
             const item = store.get(id);
@@ -526,7 +510,7 @@ const demoBackend = (() => {
             item.status = "VETOED";
             item.decision_reason = reason;
             item.operator = "operator";
-            return {ok: true};
+            return { ok: true };
         },
         inject: async () => {
             make({
@@ -534,11 +518,12 @@ const demoBackend = (() => {
                 ip: "203.0.113.88",
                 status: Math.random() > 0.5 ? "PENDING" : "STAGED",
             });
-            return {ok: true};
+            return { ok: true };
         },
-        vaultStats: async () => ({records: 12487}),
+        vaultStats: async () => ({ records: 12487 }),
     };
 })();
+
 // =============================================================================
 // API
 // =============================================================================
@@ -556,34 +541,31 @@ const api = {
             ? demoBackend.approve(id, reason)
             : fetchJson(`/actions/${encodeURIComponent(id)}/approve`, {
                 method: "POST",
-                body: JSON.stringify({reason}),
+                body: JSON.stringify({ reason }),
             }),
     veto: (id, reason) =>
         CONFIG.DEMO_MODE
             ? demoBackend.veto(id, reason)
             : fetchJson(`/actions/${encodeURIComponent(id)}/veto`, {
                 method: "POST",
-                body: JSON.stringify({reason}),
+                body: JSON.stringify({ reason }),
             }),
     inject: () =>
         CONFIG.DEMO_MODE
             ? demoBackend.inject()
             : CONFIG.LIVE_TEST_MODE
-                ? fetchJson("/actions/test-inject", {method: "POST"})
+                ? fetchJson("/actions/test-inject", { method: "POST" })
                 : Promise.reject(new Error("Inject requires demo or local test mode")),
     watchtowerStatus: () =>
         CONFIG.DEMO_MODE
-            ? Promise.resolve({...DEMO_WATCHTOWER, subsystems: [...DEMO_WATCHTOWER.subsystems]})
+            ? Promise.resolve({ ...DEMO_WATCHTOWER, subsystems: [...DEMO_WATCHTOWER.subsystems] })
             : fetchJson("/watchtower/status"),
     dashboardSummary: () =>
         CONFIG.DEMO_MODE
-            ? Promise.resolve({...DEMO_SUMMARY})
-            // /dashboard/summary does not exist on the backend (see
-            // docs/security/endpoint_access_matrix.md) -- this used to poll
-            // it anyway and silently swallow the resulting 404 on every
-            // call. No-op until the endpoint is actually implemented.
+            ? Promise.resolve({ ...DEMO_SUMMARY })
             : Promise.resolve(null),
 };
+
 // =============================================================================
 // Action Normalization
 // =============================================================================
@@ -613,7 +595,9 @@ function normalizeAction(raw) {
         payload,
     };
 }
+
 const actionTimeValue = a => a.createdAt ? Date.parse(a.createdAt) : 0;
+
 // =============================================================================
 // Action Store Operations
 // =============================================================================
@@ -625,6 +609,7 @@ function reconcileSelectedIds() {
         log("Removed stale selections no longer in the live queue.", "info");
     }
 }
+
 function replaceActions(rawActions, source) {
     allActions = extractActionList(rawActions)
         .map(normalizeAction)
@@ -634,6 +619,7 @@ function replaceActions(rawActions, source) {
     renderActions();
     markDataSync(source);
 }
+
 function upsertAction(rawAction, source = "ws-sync") {
     const action = normalizeAction(rawAction);
     if (!action.id) return;
@@ -646,6 +632,7 @@ function upsertAction(rawAction, source = "ws-sync") {
     renderActions();
     markDataSync(source);
 }
+
 function removeAction(actionId, source = "ws-sync") {
     const cleaned = normalizeString(actionId, "").trim();
     if (!cleaned) return;
@@ -655,6 +642,7 @@ function removeAction(actionId, source = "ws-sync") {
     renderActions();
     markDataSync(source);
 }
+
 // =============================================================================
 // Filters
 // =============================================================================
@@ -672,9 +660,11 @@ function applyFilters(actions) {
     }
     return out;
 }
+
 function visibleActionIds() {
     return new Set(applyFilters(allActions).map(a => a.id));
 }
+
 // =============================================================================
 // Stats
 // =============================================================================
@@ -683,6 +673,7 @@ function updateStats() {
     const staged   = allActions.filter(a => a.status === "STAGED").length;
     const approved = allActions.filter(a =>
         ["APPROVED", "EXECUTED"].includes(a.status)).length;
+
     if (pending !== prevCounts.pending && el.pendingCount) {
         bumpStat(el.pendingCount);
         el.pendingCount.textContent = pending;
@@ -695,8 +686,9 @@ function updateStats() {
         bumpStat(el.approvedCount);
         el.approvedCount.textContent = approved;
     }
-    prevCounts = {pending, staged, approved};
+    prevCounts = { pending, staged, approved };
     if (el.queueCount) el.queueCount.textContent = pending + staged;
+
     for (const [key, value] of Object.entries({
         ALL:      allActions.length,
         PENDING:  pending,
@@ -708,6 +700,7 @@ function updateStats() {
         if (target) target.textContent = value > 0 ? ` (${value})` : "";
     }
 }
+
 // =============================================================================
 // Selection Management
 // =============================================================================
@@ -719,6 +712,7 @@ function updateSelectAllState() {
         el.selectAll.indeterminate = checked > 0 && checked < boxes.length;
     }
 }
+
 function updateBulkBar() {
     const count = selectedIds.size;
     const visibleIds = visibleActionIds();
@@ -741,6 +735,7 @@ function updateBulkBar() {
     }
     updateSelectAllState();
 }
+
 function clearSelection() {
     selectedIds.clear();
     document.querySelectorAll(".row-cb").forEach(b => {
@@ -753,6 +748,7 @@ function clearSelection() {
     }
     updateBulkBar();
 }
+
 // =============================================================================
 // Row Focus Navigation
 // =============================================================================
@@ -761,9 +757,11 @@ function resetFocus() {
     focusedActionId = null;
     document.querySelectorAll("tr.focused").forEach(r => r.classList.remove("focused"));
 }
+
 function visibleRows() {
     return Array.from(el.actionsBody?.querySelectorAll("tr[data-id]:not(.expand-row)") ?? []);
 }
+
 function setFocusedRow(index) {
     const rows = visibleRows();
     rows.forEach(r => r.classList.remove("focused"));
@@ -775,8 +773,9 @@ function setFocusedRow(index) {
     const row = rows[focusedRowIndex];
     focusedActionId = row.dataset.id ?? null;
     row.classList.add("focused");
-    row.scrollIntoView({block: "nearest"});
+    row.scrollIntoView({ block: "nearest" });
 }
+
 function restoreFocus(previousId) {
     if (!previousId) {
         resetFocus();
@@ -790,6 +789,7 @@ function restoreFocus(previousId) {
     }
     setFocusedRow(idx);
 }
+
 // =============================================================================
 // Render
 // =============================================================================
@@ -811,7 +811,7 @@ function renderActions() {
         if (selectedIds.has(action.id)) row.classList.add("selected");
         const statusClass = STATUS_CLASSES[action.status] ?? "unknown";
         const created = action.createdAt
-            ? new Date(action.createdAt).toLocaleString([], {dateStyle: "short", timeStyle: "short"})
+            ? new Date(action.createdAt).toLocaleString([], { dateStyle: "short", timeStyle: "short" })
             : "MISSING";
         const createdStyle = action.createdBad
             ? "color:var(--red);font-size:10px;"
@@ -821,35 +821,29 @@ function renderActions() {
         const controls = canApprove || canVeto
             ? `<div class="act-btns">` +
               (canApprove
-                  ? `<button class="btn green" type="button" style="padding:3px 7px"` +
-                    ` data-approve="${escHtml(action.id)}"` +
-                    ` aria-label="Approve ${escHtml(action.id)}" title="Approve (A)">✓</button>`
+                  ? `<button class="btn green" type="button" style="padding:3px 7px" data-approve="${escHtml(action.id)}" aria-label="Approve ${escHtml(action.id)}" title="Approve (A)">✓</button>`
                   : "") +
               (canVeto
-                  ? `<button class="btn red" type="button" style="padding:3px 7px"` +
-                    ` data-veto="${escHtml(action.id)}"` +
-                    ` aria-label="Veto ${escHtml(action.id)}" title="Veto (V)">✕</button>`
+                  ? `<button class="btn red" type="button" style="padding:3px 7px" data-veto="${escHtml(action.id)}" aria-label="Veto ${escHtml(action.id)}" title="Veto (V)">✕</button>`
                   : "") +
               `</div>`
-            : `<span style="color:var(--muted);font-size:10px;font-family:var(--font-mono);">` +
-              `${escHtml(action.operator) || "—"}</span>`;
+            : `<span style="color:var(--muted);font-size:10px;font-family:var(--font-mono);">${escHtml(action.operator) || "—"}</span>`;
         row.innerHTML =
-            `<td><input type="checkbox" class="row-cb" data-id="${escHtml(action.id)}"` +
-            `${selectedIds.has(action.id) ? " checked" : ""} aria-label="Select ${escHtml(action.id)}"></td>` +
+            `<td><input type="checkbox" class="row-cb" data-id="${escHtml(action.id)}"${selectedIds.has(action.id) ? " checked" : ""} aria-label="Select ${escHtml(action.id)}"></td>` +
             `<td><button class="expand-btn" type="button" data-expand="${escHtml(action.id)}" aria-label="Expand ${escHtml(action.id)}">▶</button></td>` +
             `<td class="mono" style="color:var(--cyan)">${escHtml(action.id || "<missing>")}</td>` +
             `<td>${escHtml(action.threat)}</td>` +
             `<td class="mono" style="color:var(--muted)">${escHtml(action.source)}</td>` +
             `<td><span class="tag ${statusClass}">${escHtml(action.status)}</span></td>` +
             `<td class="mono" style="${createdStyle}">${escHtml(created)}</td>` +
-            `<td class="reason-cell" title="${escHtml(action.decisionReason)}">` +
-            `${action.decisionReason ? escHtml(action.decisionReason) : '<span style="color:var(--muted)">—</span>'}</td>` +
+            `<td class="reason-cell" title="${escHtml(action.decisionReason)}">${action.decisionReason ? escHtml(action.decisionReason) : '<span style="color:var(--muted)">—</span>'}</td>` +
             `<td class="sticky-actions">${controls}</td>`;
         el.actionsBody.appendChild(row);
     }
     restoreFocus(previousFocusId);
     updateBulkBar();
 }
+
 // =============================================================================
 // Expand Rows
 // =============================================================================
@@ -880,6 +874,7 @@ function toggleExpand(actionId) {
     row.after(expansion);
     if (button) button.textContent = "▼";
 }
+
 // =============================================================================
 // Reason Modal
 // =============================================================================
@@ -890,7 +885,8 @@ function validateReason(value) {
     if (cleaned.length > CONFIG.REASON_MAX) return `Maximum ${CONFIG.REASON_MAX} characters.`;
     return null;
 }
-function openReasonModal({title, subtitle, confirmText, confirmClass = "green"}) {
+
+function openReasonModal({ title, subtitle, confirmText, confirmClass = "green" }) {
     return new Promise(resolve => {
         if (!el.reasonModal) {
             resolve(null);
@@ -906,6 +902,7 @@ function openReasonModal({title, subtitle, confirmText, confirmClass = "green"})
         el.reasonModal.hidden = false;
         el.reasonModal.setAttribute("aria-hidden", "false");
         setTimeout(() => el.modalInput.focus(), 0);
+
         const close = result => {
             cleanup();
             el.reasonModal.hidden = true;
@@ -947,6 +944,7 @@ function openReasonModal({title, subtitle, confirmText, confirmClass = "green"})
         document.addEventListener("keydown", onKey);
     });
 }
+
 // =============================================================================
 // Governance Mode
 // =============================================================================
@@ -959,6 +957,7 @@ function setGovernanceMode(mode) {
         el.modeAlias.classList.toggle("visible", alias !== null);
     }
 }
+
 // =============================================================================
 // Assessment Metrics
 // =============================================================================
@@ -977,6 +976,7 @@ function updateAssessmentMetrics(data) {
     }
     if (data.mode) setGovernanceMode(data.mode);
 }
+
 // =============================================================================
 // Watchtower
 // =============================================================================
@@ -986,9 +986,9 @@ function renderWatchtower(data) {
     if (el.wtOverall) {
         el.wtOverall.textContent = overall.toUpperCase();
         el.wtOverall.className =
-            overall === "ok"       ? "chip ok"      :
+            overall === "ok"       ? "chip ok"       :
             overall === "degraded" ? "chip degraded" :
-                                     "chip offline";
+            "chip offline";
     }
     if (el.wtHeaderChip) el.wtHeaderChip.hidden = false;
     if (el.wtHeaderStatus) el.wtHeaderStatus.textContent = overall.toUpperCase();
@@ -999,10 +999,7 @@ function renderWatchtower(data) {
     const subsystems = Array.isArray(data?.subsystems) ? data.subsystems : [];
     if (!subsystems.length) {
         el.wtGrid.innerHTML =
-            `<div style="grid-column:1/-1;padding:18px;text-align:center;` +
-            `font-family:var(--font-mono);font-size:10px;color:var(--muted);` +
-            `text-transform:uppercase;letter-spacing:.1em;">` +
-            `No subsystem data returned.</div>`;
+            `<div style="grid-column:1/-1;padding:18px;text-align:center;font-family:var(--font-mono);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.1em;">No subsystem data returned.</div>`;
     } else {
         el.wtGrid.innerHTML = subsystems.map(s => {
             const status = normalizeString(s.status, "unknown").toLowerCase();
@@ -1010,15 +1007,13 @@ function renderWatchtower(data) {
                 ? `${escHtml(String(s.latencyMs))}ms`
                 : "—";
             return (
-                `<div class="wt-card ${escHtml(status)}" role="status"` +
-                ` aria-label="${escHtml(normalizeString(s.name, "Unknown"))}: ${escHtml(status)}">` +
+                `<div class="wt-card ${escHtml(status)}" role="status" aria-label="${escHtml(normalizeString(s.name, "Unknown"))}: ${escHtml(status)}">` +
                 `<div class="wt-card-name">${escHtml(normalizeString(s.name, "Unknown"))}</div>` +
                 `<div class="wt-card-detail">${escHtml(normalizeString(s.detail, ""))}</div>` +
                 `<div class="wt-card-footer">` +
                 `<span class="wt-latency">${latency}</span>` +
                 `<span class="wt-badge ${escHtml(status)}">${escHtml(status)}</span>` +
-                `</div>` +
-                `</div>`
+                `</div></div>`
             );
         }).join("");
     }
@@ -1026,31 +1021,32 @@ function renderWatchtower(data) {
         el.wtProbeTime.textContent = `Last probe: ${nowStamp()}`;
     }
 }
+
 function normalizeWatchtowerResponse(raw) {
     if (!raw || typeof raw !== "object") return raw;
     if ("subsystems" in raw) return raw;
     if ("watchtower" in raw) {
         const reachable = raw.reachable !== false;
         if (!reachable) {
-            return {overall: "offline", subsystems: []};
+            return { overall: "offline", subsystems: [] };
         }
         const wt = raw.watchtower ?? {};
         const state = normalizeString(wt.state ?? raw.status, "UNKNOWN").toUpperCase();
         const overall =
             ["ACTIVE", "ONLINE", "OK", "READY", "HEALTHY", "RUNNING"].includes(state)
                 ? "ok"
-            : ["DEGRADED", "WARN", "WARNING"].includes(state)
-                ? "degraded"
-            : "offline";
+                : ["DEGRADED", "WARN", "WARNING"].includes(state)
+                    ? "degraded"
+                    : "offline";
         const TOWER_TYPE_LABELS = Object.freeze({
-            API_HEALTH:         "api health monitoring",
-            EXPECTATION_GUARD:  "expectation & contract guard",
-            CONFIG_DRIFT:       "configuration drift detection",
-            LOGGING_AUDIT:      "audit chain integrity",
-            ERROR_RATE:         "runtime error rate",
-            DEPENDENCY_HEALTH:  "dependency health",
-            RESOURCE_PRESSURE:  "resource pressure",
-            SECURITY_BASELINE:  "security baseline",
+            API_HEALTH:        "api health monitoring",
+            EXPECTATION_GUARD: "expectation & contract guard",
+            CONFIG_DRIFT:      "configuration drift detection",
+            LOGGING_AUDIT:     "audit chain integrity",
+            ERROR_RATE:        "runtime error rate",
+            DEPENDENCY_HEALTH: "dependency health",
+            RESOURCE_PRESSURE: "resource pressure",
+            SECURITY_BASELINE: "security baseline",
         });
         const towers = Array.isArray(wt.towers) ? wt.towers : [];
         const subsystems = towers.map(t => {
@@ -1070,16 +1066,17 @@ function normalizeWatchtowerResponse(raw) {
                 detail,
             };
         });
-        return {overall, subsystems};
+        return { overall, subsystems };
     }
     return raw;
 }
+
 async function fetchWatchtower() {
     if (watchtowerProbeInFlight) return;
     watchtowerProbeInFlight = true;
     if (el.wtRefreshBtn) el.wtRefreshBtn.disabled = true;
     try {
-        const raw  = await api.watchtowerStatus();
+        const raw = await api.watchtowerStatus();
         console.debug("[S43 Watchtower raw]", raw);
         const data = normalizeWatchtowerResponse(raw);
         renderWatchtower(data);
@@ -1101,10 +1098,12 @@ async function fetchWatchtower() {
         if (el.wtRefreshBtn) el.wtRefreshBtn.disabled = false;
     }
 }
+
 function startWatchtowerPolling() {
     if (watchtowerTimer) clearInterval(watchtowerTimer);
     watchtowerTimer = setInterval(fetchWatchtower, WT_PROBE_MS);
 }
+
 // =============================================================================
 // Refresh / Data Sync
 // =============================================================================
@@ -1139,7 +1138,8 @@ async function performRefresh(manual = false) {
         document.body.removeAttribute("aria-busy");
     }
 }
-async function refreshDashboard(manual = false, {force = false} = {}) {
+
+async function refreshDashboard(manual = false, { force = false } = {}) {
     if (refreshPromise) {
         const prior = await refreshPromise;
         if (!force) return prior;
@@ -1149,11 +1149,12 @@ async function refreshDashboard(manual = false, {force = false} = {}) {
     });
     return refreshPromise;
 }
+
 // =============================================================================
 // Revalidation (TOCTOU guard before approve/veto)
 // =============================================================================
 async function revalidateAction(actionId, expectedStatuses) {
-    const refreshed = await refreshDashboard(false, {force: true});
+    const refreshed = await refreshDashboard(false, { force: true });
     if (!refreshed) throw new Error("Unable to refresh live state before submit");
     const latest = allActions.find(a => a.id === actionId);
     if (!latest) throw new Error("Action disappeared before submit");
@@ -1161,6 +1162,7 @@ async function revalidateAction(actionId, expectedStatuses) {
         throw new Error(`Action status changed to ${latest.status}`);
     }
 }
+
 // =============================================================================
 // Approve / Veto
 // =============================================================================
@@ -1188,6 +1190,7 @@ async function doApprove(actionId, button) {
         if (button) button.disabled = false;
     }
 }
+
 async function doVeto(actionId, button) {
     const reason = await openReasonModal({
         title: `Veto ${actionId}`,
@@ -1212,6 +1215,7 @@ async function doVeto(actionId, button) {
         if (button) button.disabled = false;
     }
 }
+
 // =============================================================================
 // Bulk Actions
 // =============================================================================
@@ -1226,7 +1230,7 @@ async function runBulkAction(kind) {
         confirmClass: isApprove ? "green" : "red",
     });
     if (!reason) return;
-    const refreshed = await refreshDashboard(false, {force: true});
+    const refreshed = await refreshDashboard(false, { force: true });
     if (!refreshed) {
         log(`Bulk ${kind} aborted: live state could not be refreshed.`, "err");
         return;
@@ -1262,14 +1266,16 @@ async function runBulkAction(kind) {
         );
     } finally {
         clearSelection();
-        await refreshDashboard(true, {force: true});
+        await refreshDashboard(true, { force: true });
         if (btn) btn.disabled = false;
     }
 }
+
 // =============================================================================
 // Inject
 // =============================================================================
 let _injectModalOpen = false;
+
 function openInjectModal() {
     if ((!CONFIG.DEMO_MODE && !CONFIG.LIVE_TEST_MODE) || injectInFlight) {
         log("Inject blocked: demo/local-test mode disabled or inject in flight.", "warn");
@@ -1282,6 +1288,7 @@ function openInjectModal() {
         el.injectModal.setAttribute("aria-hidden", "false");
     }
 }
+
 function closeInjectModal() {
     if (!_injectModalOpen) return;
     _injectModalOpen = false;
@@ -1291,6 +1298,7 @@ function closeInjectModal() {
     }
     updateStaticConfig();
 }
+
 el.injectCancel?.addEventListener("click", closeInjectModal);
 el.injectModal?.addEventListener("click", e => {
     if (e.target.hasAttribute("data-close-inject")) closeInjectModal();
@@ -1303,7 +1311,7 @@ el.injectConfirm?.addEventListener("click", async () => {
     try {
         await api.inject();
         log("Test action injected.", "info");
-        await refreshDashboard(true, {force: true});
+        await refreshDashboard(true, { force: true });
     } catch (err) {
         log(`Inject failed: ${err.message ?? err}`, "err");
     } finally {
@@ -1311,6 +1319,7 @@ el.injectConfirm?.addEventListener("click", async () => {
         updateStaticConfig();
     }
 });
+
 // =============================================================================
 // Export
 // =============================================================================
@@ -1336,7 +1345,7 @@ function exportVisibleActions() {
             operator: a.operator,
         })),
     };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], {type: "application/json"});
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
@@ -1348,6 +1357,7 @@ function exportVisibleActions() {
         stale ? "warn" : "ok"
     );
 }
+
 // =============================================================================
 // Static Config Display
 // =============================================================================
@@ -1366,24 +1376,27 @@ function updateStaticConfig() {
     }
     if (el.demoBadge) el.demoBadge.hidden = !CONFIG.DEMO_MODE;
     if (el.injectBtn) el.injectBtn.disabled = (!demoActive) || injectInFlight;
-    // v1.6.3: distinguish a real logged-in session token from a legacy/dev
-    // fallback token for display purposes only. A real session no longer
-    // shows "DEV TOKEN PRESENT" / the risk badge — those are reserved for
-    // actual legacy-key or window-global tokens, which remain a real risk
-    // (visible in DevTools, copy-pasted around) in a way a normal login
-    // session is not.
+
     const { token, isRealSession } = getDevTokenInfo();
+    const hasPassword = !!(window.SentinelAuth?.getPassword?.());
+    const trulyAuthenticated = token && hasPassword;
+
     if (el.authStateText) {
-        el.authStateText.textContent = token
+        el.authStateText.textContent = trulyAuthenticated
             ? (isRealSession ? "SESSION TOKEN PRESENT" : "DEV TOKEN PRESENT")
-            : CONFIG.ALLOW_DEV_JWT_STORAGE ? "COOKIE / MISSING" : "COOKIE ONLY";
-        el.authStateText.style.color = token
+            : token && !hasPassword
+                ? "TOKEN PRESENT, PASSWORD MISSING"
+                : CONFIG.ALLOW_DEV_JWT_STORAGE ? "COOKIE / MISSING" : "COOKIE ONLY";
+        el.authStateText.style.color = trulyAuthenticated
             ? (isRealSession ? "var(--green)" : "var(--amber)")
-            : "var(--green)";
+            : token && !hasPassword
+                ? "var(--red)"
+                : "var(--green)";
     }
     if (el.jwtRiskBadge) el.jwtRiskBadge.hidden = !(token && !isRealSession);
     if (el.authBtn) el.authBtn.disabled = !CONFIG.ALLOW_DEV_JWT_STORAGE;
 }
+
 // =============================================================================
 // Theme
 // =============================================================================
@@ -1395,6 +1408,7 @@ function applyTheme(light) {
         localStorage.setItem("s43-theme", light ? "light" : "dark");
     } catch {}
 }
+
 function initTheme() {
     try {
         const stored = localStorage.getItem("s43-theme");
@@ -1405,36 +1419,65 @@ function initTheme() {
         window.matchMedia?.("(prefers-color-scheme: light)").matches ?? false
     );
 }
+
 // =============================================================================
-// JWT Modal
+// JWT Modal (dev-only credential injection)
 // =============================================================================
 function closeJwtModal() {
     if (!el.jwtModal || el.jwtModal.hidden) return;
     el.jwtModal.hidden = true;
     el.jwtModal.setAttribute("aria-hidden", "true");
 }
+
 async function handleAuthChanged() {
     updateStaticConfig();
     if (!CONFIG.DEMO_MODE) {
         window.SentinelWS?.disconnect();
         window.SentinelWS?.connect();
     }
-    await refreshDashboard(true, {force: true});
+    await refreshDashboard(true, { force: true });
 }
+
+function _ensureJwtPasswordField() {
+    if (el.jwtPasswordInput) return el.jwtPasswordInput;
+    const existing = document.getElementById("s43-jwt-password");
+    if (existing) {
+        el.jwtPasswordInput = existing;
+        return existing;
+    }
+    if (!el.jwtInput || !el.jwtInput.parentElement) return null;
+    const input = document.createElement("input");
+    input.type = "password";
+    input.id = "s43-jwt-password";
+    input.placeholder = "Password (required — backend re-verifies on every request)";
+    input.autocomplete = "off";
+    input.style.cssText = el.jwtInput.style.cssText || "";
+    input.style.marginTop = "8px";
+    input.style.width = "100%";
+    input.style.boxSizing = "border-box";
+    el.jwtInput.insertAdjacentElement("afterend", input);
+    el.jwtPasswordInput = input;
+    return input;
+}
+
 el.authBtn?.addEventListener("click", () => {
     if (!CONFIG.ALLOW_DEV_JWT_STORAGE || !el.jwtModal) {
         log("Browser JWT storage is disabled outside local development.", "warn");
         return;
     }
     if (el.jwtInput) el.jwtInput.value = getDevToken() ?? "";
+    const pwField = _ensureJwtPasswordField();
+    if (pwField) pwField.value = window.SentinelAuth?.getPassword?.() ?? "";
     el.jwtModal.hidden = false;
     el.jwtModal.setAttribute("aria-hidden", "false");
     setTimeout(() => el.jwtInput?.focus(), 0);
 });
+
 el.jwtCancel?.addEventListener("click", closeJwtModal);
 el.jwtModal?.addEventListener("click", e => {
     if (e.target.hasAttribute("data-close-jwt")) closeJwtModal();
 });
+
 el.jwtClear?.addEventListener("click", async () => {
     try {
         for (const key of DEV_JWT_KEYS) {
@@ -1442,27 +1485,69 @@ el.jwtClear?.addEventListener("click", async () => {
             localStorage.removeItem(key);
         }
     } catch {}
+    const pwField = _ensureJwtPasswordField();
+    if (pwField) pwField.value = "";
     log("Development JWT cleared.", "warn");
     closeJwtModal();
     await handleAuthChanged();
 });
+
 el.jwtConfirm?.addEventListener("click", async () => {
     if (!CONFIG.ALLOW_DEV_JWT_STORAGE) return;
     const token = el.jwtInput?.value.trim() ?? "";
-    try {
-        if (token) {
-            sessionStorage.setItem("SENTINEL_JWT", token);
-            log("Development JWT stored in sessionStorage. Local use only.", "warn");
-        } else {
-            sessionStorage.removeItem("SENTINEL_JWT");
-            log("Development JWT cleared.", "warn");
-        }
-    } catch {
-        log("Unable to update sessionStorage JWT.", "err");
-    }
+    const pwField = _ensureJwtPasswordField();
+    const password = pwField?.value ?? "";
+
+    const applied = token
+        ? window.SentinelAuth?.applyManualCredentials?.(token, password)
+        : window.SentinelAuth?.applyManualCredentials?.("", "");
+
+    log(
+        applied
+            ? "Development session token + password stored. Local use only."
+            : "Rejected: token/password invalid or missing. Nothing was stored.",
+        applied ? "warn" : "err"
+    );
     closeJwtModal();
     await handleAuthChanged();
 });
+
+// =============================================================================
+// Protected-activity lifecycle
+// =============================================================================
+function stopProtectedActivity() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    if (watchtowerTimer) { clearInterval(watchtowerTimer); watchtowerTimer = null; }
+    wsConnected = false;
+    setStatus("Locked");
+}
+
+let authenticatedStartupInFlight = false;
+
+async function startProtectedActivity() {
+    if (authenticatedStartupInFlight || CONFIG.DEMO_MODE) return;
+    authenticatedStartupInFlight = true;
+    try {
+        startPollingFallback();
+        startWatchtowerPolling();
+        await Promise.allSettled([
+            fetchWatchtower(),
+            refreshDashboard(true, { force: true }),
+        ]);
+    } finally {
+        authenticatedStartupInFlight = false;
+    }
+}
+
+window.addEventListener("sentinel:auth:locked", () => {
+    stopProtectedActivity();
+});
+
+window.addEventListener("sentinel:auth:ready", () => {
+    updateStaticConfig();
+    startProtectedActivity();
+});
+
 // =============================================================================
 // Polling Fallback
 // =============================================================================
@@ -1472,6 +1557,7 @@ function startPollingFallback() {
         if (!wsConnected || dataIsStale()) refreshDashboard(false);
     }, CONFIG.FALLBACK_POLL_MS);
 }
+
 // =============================================================================
 // WebSocket Event Listeners
 // =============================================================================
@@ -1525,11 +1611,17 @@ window.addEventListener("sentinel:ws:auth_failed", event => {
         "err"
     );
 });
+window.addEventListener("sentinel:ws:policy_error", event => {
+    log(`WebSocket policy rejection: ${event.detail?.reason ?? "unknown"}`, "err");
+});
+window.addEventListener("sentinel:ws:protocol_error", event => {
+    log(`WebSocket protocol rejection: ${event.detail?.reason ?? "unknown"}`, "err");
+});
 window.addEventListener("sentinel:ws:stale", () => {
     log("WebSocket connection stale — forcing reconnect.", "warn");
 });
 window.addEventListener("sentinel:ws:message", event => {
-    const {type, payload} = event.detail;
+    const { type, payload } = event.detail;
     switch (type) {
         case "authenticated":
         case "auth_ok":
@@ -1605,10 +1697,11 @@ window.addEventListener("sentinel:ws:message", event => {
             log(`Ignored unhandled WebSocket event type: ${type}`, "info");
     }
 });
+
 // =============================================================================
 // DOM Event Wiring
 // =============================================================================
-el.refreshBtn?.addEventListener("click", () => refreshDashboard(true, {force: true}));
+el.refreshBtn?.addEventListener("click", () => refreshDashboard(true, { force: true }));
 el.exportBtn?.addEventListener("click", exportVisibleActions);
 el.injectBtn?.addEventListener("click", openInjectModal);
 el.themeBtn?.addEventListener("click", () => applyTheme(!isLight));
@@ -1686,15 +1779,16 @@ document.addEventListener("click", async e => {
     const approveBtn = e.target.closest?.("[data-approve]");
     if (approveBtn) {
         const ok = await doApprove(approveBtn.dataset.approve, approveBtn);
-        if (ok) await refreshDashboard(true, {force: true});
+        if (ok) await refreshDashboard(true, { force: true });
         return;
     }
     const vetoBtn = e.target.closest?.("[data-veto]");
     if (vetoBtn) {
         const ok = await doVeto(vetoBtn.dataset.veto, vetoBtn);
-        if (ok) await refreshDashboard(true, {force: true});
+        if (ok) await refreshDashboard(true, { force: true });
     }
 });
+
 // =============================================================================
 // Keyboard Shortcuts
 // =============================================================================
@@ -1720,7 +1814,7 @@ document.addEventListener("keydown", e => {
         return;
     }
     if (e.key.toLowerCase() === "r" && !inInput) {
-        refreshDashboard(true, {force: true});
+        refreshDashboard(true, { force: true });
         return;
     }
     if (inInput) return;
@@ -1740,7 +1834,7 @@ document.addEventListener("keydown", e => {
         const id = rows[focusedRowIndex].dataset.id;
         const action = allActions.find(a => a.id === id);
         if (action?.status === "STAGED") {
-            doApprove(id).then(ok => { if (ok) refreshDashboard(true, {force: true}); });
+            doApprove(id).then(ok => { if (ok) refreshDashboard(true, { force: true }); });
         }
         return;
     }
@@ -1748,10 +1842,11 @@ document.addEventListener("keydown", e => {
         const id = rows[focusedRowIndex].dataset.id;
         const action = allActions.find(a => a.id === id);
         if (action && ["PENDING", "STAGED"].includes(action.status)) {
-            doVeto(id).then(ok => { if (ok) refreshDashboard(true, {force: true}); });
+            doVeto(id).then(ok => { if (ok) refreshDashboard(true, { force: true }); });
         }
     }
 });
+
 // =============================================================================
 // Unload Cleanup
 // =============================================================================
@@ -1759,20 +1854,37 @@ window.addEventListener("beforeunload", () => {
     if (pollTimer)       clearInterval(pollTimer);
     if (watchtowerTimer) clearInterval(watchtowerTimer);
 });
+
 // =============================================================================
 // Initialization
 // =============================================================================
-log("Dashboard initializing…", "info");
-if (CONFIG.DEMO_MODE) {
-    window.SentinelWS?.disconnect();
-    log("Demo mode active. WebSocket disconnected. Use ?demo=1 for local testing only.", "warn");
-} else if (!CONFIG.LIVE_TEST_MODE) {
-    log("Demo mode disabled. Live API mode active.", "info");
+async function initializeDashboard() {
+    log("Dashboard initializing…", "info");
+    initTheme();
+    updateStaticConfig();
+    setStatus("Booting");
+
+    if (CONFIG.DEMO_MODE) {
+        window.SentinelWS?.disconnect();
+        log("Demo mode active. WebSocket disconnected. Use ?demo=1 for local testing only.", "warn");
+        startPollingFallback();
+        startWatchtowerPolling();
+        await Promise.allSettled([fetchWatchtower(), refreshDashboard(true, { force: true })]);
+        return;
+    }
+
+    if (!CONFIG.LIVE_TEST_MODE) {
+        log("Demo mode disabled. Live API mode active.", "info");
+    }
+
+    try {
+        await window.SentinelAuthReady;
+    } catch {
+        setStatus("Locked");
+        return;
+    }
+
+    await startProtectedActivity();
 }
-initTheme();
-updateStaticConfig();
-setStatus("Booting");
-startPollingFallback();
-startWatchtowerPolling();
-fetchWatchtower();
-refreshDashboard(true, {force: true});
+
+initializeDashboard();
