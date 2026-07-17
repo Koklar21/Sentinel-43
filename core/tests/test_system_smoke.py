@@ -206,7 +206,7 @@ def test_live_system_status_and_routes_require_auth() -> None:
     )
     token = login_response.json().get("token")
     assert token, "Live login returned 200 but no token field"
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": f"Bearer {token}", "X-S43-Password": _LIVE_PASSWORD}
 
     status_response = requests.get(f"{API_URL}/system/status", headers=headers, timeout=5)
     assert status_response.status_code == 200, (
