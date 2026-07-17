@@ -27,11 +27,17 @@
 #
 # The returned JWT is stored by auth.js in sessionStorage["SENTINEL_JWT"].
 # websocket.js reads that key and sends it in the WebSocket auth frame.
-# main.py's _verify_jwt_token() and _get_operator() consume the same JWT.
+# main.py's _get_operator() and dashboard_websocket() import verify_jwt_token()
+# from this module rather than maintaining a second verifier.
 #
-# Note: main.py currently maintains its own _verify_jwt_token(). Both paths
-# use identical config so they behave the same. Future cleanup should import
-# verify_jwt_token() from here instead of maintaining two paths.
+# Per-request password re-verification:
+#   A valid JWT is no longer sufficient on its own to reach protected
+#   routes. Every protected HTTP request must also carry the operator's
+#   plaintext password in the X-S43-Password header (PASSWORD_HEADER_NAME
+#   below), and every WebSocket auth frame must include a "password" field
+#   alongside "token". Both are checked with reverify_password(), defined
+#   here and consumed by core/api/deps/deps.py's require_operator() and
+#   main.py's _get_operator() / dashboard_websocket().
 #
 # Required .env variables:
 #   S43_JWT_SECRET              — HMAC signing key
@@ -332,10 +338,9 @@ def _issue_token(
     Sign and return a JWT for the given subject.
 
     Token claims are designed to satisfy:
-      - main.py _verify_jwt_token() (requires sub, exp, iss, aud)
-      - main.py _get_operator()     (checks claims["role"] against _APPROVED_ROLES)
-      - main.py WebSocket auth path (same role check)
-      - auth.js /auth/verify        (checks res.ok)
+      - verify_jwt_token()      (requires sub, exp, iss, aud; checks role)
+      - main.py _get_operator() and WebSocket auth path (call verify_jwt_token())
+      - auth.js /auth/verify    (checks res.ok)
 
     user_id is only present for DB-backed accounts (see
     _validate_credentials) — env-var fallback logins omit it rather than
@@ -354,15 +359,16 @@ def _issue_token(
     exp_dt = datetime.fromtimestamp(exp, tz=timezone.utc)
 
     payload: dict[str, Any] = {
-        "sub":  subject,
-        "iss":  _e("S43_JWT_ISSUER",   "sentinel-43"),
-        "aud":  _e("S43_JWT_AUDIENCE", "sentinel-43-dashboard"),
-        "iat":  now,
-        "nbf":  now,
-        "exp":  exp,
+        "sub":      subject,
+        "username": subject,
+        "iss":      _e("S43_JWT_ISSUER",   "sentinel-43"),
+        "aud":      _e("S43_JWT_AUDIENCE", "sentinel-43-dashboard"),
+        "iat":      now,
+        "nbf":      now,
+        "exp":      exp,
         # "role" is what main.py _get_operator() and the WebSocket auth path
         # check against _APPROVED_ROLES = {"operator", "admin"}.
-        "role": role,
+        "role":     role,
     }
     if user_id is not None:
         payload["user_id"] = user_id
@@ -398,9 +404,9 @@ def verify_jwt_token(token: str) -> dict[str, Any]:
       - Clock leeway: none; align with main.py route/WebSocket verification
       - Role claim is present and in _APPROVED_ROLES
 
-    Exported so callers outside this router can reuse the same verifier.
-    main.py currently maintains its own _verify_jwt_token(); both use
-    identical config. Future cleanup should consolidate to this function.
+    This is the single JWT verifier for the whole API — main.py's
+    _get_operator() and dashboard_websocket() both import and call this
+    function directly rather than keeping their own copy.
     """
     secret = _e("S43_JWT_SECRET")
     if not secret:
@@ -442,7 +448,25 @@ def verify_jwt_token(token: str) -> dict[str, Any]:
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token expired.",
+            detail="Token has expired.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except pyjwt.InvalidIssuerError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token issuer.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except pyjwt.InvalidAudienceError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token audience.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except pyjwt.MissingRequiredClaimError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Missing required claim: {exc}",
             headers={"WWW-Authenticate": "Bearer"},
         )
     except pyjwt.PyJWTError:
