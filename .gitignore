@@ -279,3 +279,4 @@ sentinel43_state/
 
 # Docker
 docker-data/
+.tools/
