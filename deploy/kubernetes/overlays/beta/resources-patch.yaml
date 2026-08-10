@@ -1,0 +1,30 @@
+# Real beta sizing for s43-api: 2 replicas (paired with
+# poddisruptionbudget.yaml) and higher resource requests/limits than base's
+# conservative defaults. Treat these numbers as a starting point, not a
+# load-tested recommendation — tune against your actual traffic.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s43-api
+  namespace: sentinel43
+spec:
+  replicas: 2
+  template:
+    spec:
+      # Soft preference only (not required) — on a single-node test cluster
+      # this has no effect and both replicas still schedule fine; on a
+      # real multi-node beta cluster it spreads the 2 replicas across nodes
+      # so a single node failure doesn't take the whole API down.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {app: s43-api}
+      containers:
+        - name: s43-api
+          resources:
+            requests: {cpu: 250m, memory: 384Mi}
+            limits: {cpu: 1500m, memory: 768Mi}
