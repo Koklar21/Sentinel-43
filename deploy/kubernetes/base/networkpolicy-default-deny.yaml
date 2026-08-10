@@ -1,0 +1,25 @@
+# Default-deny for every pod in the namespace, both directions. Everything
+# else in this directory is an explicit allow layered on top — NetworkPolicy
+# rules for the same pod are additive (OR'd together), so this can never be
+# accidentally widened by another policy; it only ever gets narrower gaps
+# filled in.
+#
+# IMPORTANT: this is only enforced if the cluster's CNI actually implements
+# NetworkPolicy (Calico, Cilium, and several others do; some CNIs — notably
+# the default kindnet on a plain `kind create cluster` — do NOT, and will
+# silently allow all traffic while `kubectl get networkpolicy` still shows
+# these objects as "present"). Verifying enforcement, not just presence, is
+# part of this deployment's integration test suite — see
+# deploy/kubernetes/README.md's "Required network-policy-capable CNI"
+# section for how that's confirmed in kind and what's required in a real
+# cluster.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: sentinel43
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
