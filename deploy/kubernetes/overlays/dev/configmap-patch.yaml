@@ -1,0 +1,12 @@
+# Local dev only: enables the LOCAL_TEST_ENVIRONMENTS auth fallback path
+# (core/api/main.py's _get_operator()) the same way .env.example's
+# SENTINEL_ENV=development default does for docker-compose. Never applied
+# in the beta overlay.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinel43-config
+  namespace: sentinel43
+data:
+  SENTINEL_ENV: "development"
+  S43_ENV: "development"
