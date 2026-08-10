@@ -1,0 +1,54 @@
+# Prerequisites (see deploy/kubernetes/README.md): ingress-nginx and
+# cert-manager installed cluster-wide (neither is installed by this repo —
+# they're documented operator prerequisites), plus a ClusterIssuer named
+# "letsencrypt-prod" (or change the annotation below to match yours).
+#
+# CHANGEME: replace beta.example.invalid with your real public hostname
+# before applying — example.invalid is deliberately non-resolvable
+# (RFC 2606) so this manifest can't be mistaken for a working config.
+#
+# Only routes "/" (the whole s43-api Service, port 8000) — the same single
+# FastAPI app docker-compose.yml exposes on host port 8000. Most
+# admin/internal routes on it already require an operator JWT (see
+# docs/security/endpoint_access_matrix.md), but /docs, /redoc, and
+# /openapi.json are PUBLIC AND UNAUTHENTICATED (FastAPI defaults) — that
+# doc already flags this as an open decision pending the app owner's call
+# before a public beta, and this Ingress does not resolve it either way.
+# If you decide to close it, the standard options are disabling those
+# routes at the FastAPI level (docs_url=None etc.) or adding an
+# nginx.ingress.kubernetes.io/server-snippet location block here — neither
+# is done by default.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: s43-api
+  namespace: sentinel43
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # Ingress-nginx sets its own X-Forwarded-For based on the real client
+    # connection; use-forwarded-headers here means it also respects an
+    # upstream CDN/LB's X-Forwarded-For if you're behind one. Pairs with
+    # S43_TRUSTED_PROXIES below — the app only trusts XFF from this
+    # namespace's pod network in turn. See
+    # docs/security/trusted_proxy_handling.md.
+    nginx.ingress.kubernetes.io/use-forwarded-headers: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"  # matches FirewallConfig.max_content_length_bytes default
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "30"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["beta.example.invalid"]
+      secretName: s43-api-tls
+  rules:
+    - host: beta.example.invalid
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: s43-api
+                port: {number: 8000}
