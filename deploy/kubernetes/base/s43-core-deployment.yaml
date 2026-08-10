@@ -1,0 +1,101 @@
+# Watchtower (core/monitoring/watchtower.py), built from the same image as
+# s43-api — only the command differs, mirroring docker-compose.yml exactly.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s43-core
+  namespace: sentinel43
+  labels: {app: s43-core}
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  selector:
+    matchLabels: {app: s43-core}
+  template:
+    metadata:
+      labels:
+        app: s43-core
+        # Lets it reach db/redis under networkpolicy-db.yaml /
+        # networkpolicy-redis.yaml's client-label-based ingress rules.
+        network/s43-db-client: "true"
+        network/s43-redis-client: "true"
+    spec:
+      serviceAccountName: s43-core
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: s43-core
+          image: sentinel43-api:base-placeholder  # overridden by every overlay
+          imagePullPolicy: IfNotPresent
+          command: ["uvicorn", "core.monitoring.watchtower:app", "--host", "0.0.0.0", "--port", "9100"]
+          ports:
+            - {containerPort: 9100, name: http}
+          envFrom:
+            - configMapRef: {name: sentinel43-config}
+            - secretRef: {name: sentinel43-secrets}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities: {drop: ["ALL"]}
+            seccompProfile: {type: RuntimeDefault}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+            - {name: logs, mountPath: /app/logs}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 384Mi}
+          # Liveness/readiness/startup all use /watchtower/health here,
+          # deliberately NOT /watchtower/ready — this was discovered during
+          # kind integration testing, not assumed. /watchtower/ready
+          # (WatchtowerNode.readiness()) reports whether every OTHER
+          # registered module/dependency (e.g. s43-api) is actively
+          # heartbeating within its staleness window; it's a system-wide
+          # convergence signal, not "is this pod healthy." Using it for
+          # this pod's readinessProbe would remove s43-core from its own
+          # Service's endpoints whenever a CLIENT (like s43-api) is
+          # unhealthy or still starting — the exact circular coupling a
+          # readiness probe must not create. /watchtower/health
+          # (WatchtowerNode.state) only reflects this node's own local
+          # state and is the correct signal for all three probes here. api
+          # still differentiates /health vs /ready (see
+          # s43-api-deployment.yaml) because api's /ready is a trivial,
+          # self-contained "process is serving" check with no such
+          # cross-service coupling.
+          startupProbe:
+            httpGet: {path: /watchtower/health, port: 9100}
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet: {path: /watchtower/health, port: 9100}
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: {path: /watchtower/health, port: 9100}
+            periodSeconds: 15
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s43-core
+  namespace: sentinel43
+  labels: {app: s43-core}
+spec:
+  type: ClusterIP
+  selector: {app: s43-core}
+  ports:
+    - {port: 9100, targetPort: 9100, name: http}
