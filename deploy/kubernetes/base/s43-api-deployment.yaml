@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s43-api
+  namespace: sentinel43
+  labels: {app: s43-api}
+spec:
+  replicas: 1  # beta overlay patches this to 2 and adds a PodDisruptionBudget
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  selector:
+    matchLabels: {app: s43-api}
+  template:
+    metadata:
+      labels:
+        app: s43-api
+        network/s43-db-client: "true"
+        network/s43-redis-client: "true"
+        network/s43-core-client: "true"
+    spec:
+      serviceAccountName: s43-api
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: s43-api
+          image: sentinel43-api:base-placeholder  # overridden by every overlay
+          imagePullPolicy: IfNotPresent
+          command: ["uvicorn", "core.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - {containerPort: 8000, name: http}
+          envFrom:
+            - configMapRef: {name: sentinel43-config}
+            - secretRef: {name: sentinel43-secrets}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities: {drop: ["ALL"]}
+            seccompProfile: {type: RuntimeDefault}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+            - {name: state, mountPath: /app/sentinel43_state}
+            - {name: logs, mountPath: /app/logs}
+          resources:
+            requests: {cpu: 100m, memory: 192Mi}
+            limits: {cpu: 1000m, memory: 512Mi}
+          # See s43-core-deployment.yaml's comment: liveness/readiness use
+          # different endpoints (/health vs /ready), but neither one in this
+          # app actually checks Postgres/Redis connectivity today — a
+          # pre-existing gap (dependencies_status() hardcodes both as
+          # "unknown"), documented in README's "Known limitations" rather
+          # than silently patched as part of this deployment.
+          startupProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet: {path: /ready, port: 8000}
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 15
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
+        - name: state
+          persistentVolumeClaim: {claimName: s43-api-state}
+---
+# Provisioned for parity with docker-compose.yml's sentinel43_state volume.
+# Note (README's "Known limitations"): nothing in core/api or
+# core/monitoring currently writes here — core/sentinel43_core_db.py is the
+# only reader of SENTINEL_DB_PATH-style config and isn't imported by the
+# live app (verified: no import of it anywhere else in core/). Kept for
+# forward-compatibility and Compose parity, not because it's load-bearing
+# today.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: s43-api-state
+  namespace: sentinel43
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests: {storage: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s43-api
+  namespace: sentinel43
+  labels: {app: s43-api}
+spec:
+  type: ClusterIP
+  selector: {app: s43-api}
+  ports:
+    - {port: 8000, targetPort: 8000, name: http}
