@@ -1,0 +1,90 @@
+# Controlled, single-execution schema initialization.
+#
+# This repo has no Alembic (or any other) migration system — the schema is
+# created via core/auth/users.py's init_models() (SQLAlchemy
+# Base.metadata.create_all(), idempotent/checkfirst), which today is only
+# ever called lazily from inside the /bootstrap/status and /bootstrap/admin
+# request handlers (core/api/routers/bootstrap.py). That's fine for a single
+# Compose container, but with multiple API replicas (the beta overlay runs
+# 2), concurrent first-requests could race the same CREATE TABLE calls
+# against a cold database.
+#
+# This Job wraps that exact same existing function in a single controlled
+# run instead of inventing a new migration system. Apply it and wait for
+# Complete BEFORE the API Deployment's pods are expected to serve traffic
+# on a fresh database — see deploy/kubernetes/README.md's "Migration
+# process" section for the exact command and ordering.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: s43-migration
+  namespace: sentinel43
+  labels: {app: s43-migration}
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app: s43-migration
+        network/s43-db-client: "true"
+    spec:
+      serviceAccountName: s43-migration
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: migrate
+          image: sentinel43-api:base-placeholder  # overridden by every overlay, same image as s43-api
+          imagePullPolicy: IfNotPresent
+          command:
+            - "python"
+            - "-c"
+            - "import asyncio; from core.auth.users import init_models; asyncio.run(init_models()); print('init_models() complete')"
+          envFrom:
+            - configMapRef: {name: sentinel43-config}
+            - secretRef: {name: sentinel43-secrets}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities: {drop: ["ALL"]}
+            seccompProfile: {type: RuntimeDefault}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# Grants the migration Job's own pods egress to Postgres + DNS. It also
+# carries network/s43-db-client: "true" (see the pod template above), which
+# is what actually gets it past networkpolicy-db.yaml's ingress rule on the
+# Postgres side — this policy is the other half, opening egress from the Job
+# itself (default-deny-all blocks all egress otherwise).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: s43-migration-egress
+  namespace: sentinel43
+spec:
+  podSelector:
+    matchLabels:
+      app: s43-migration
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: s43-db
+      ports:
+        - {protocol: TCP, port: 5432}
