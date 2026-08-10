@@ -1,0 +1,113 @@
+# Single-instance Postgres, not a managed/HA database. See
+# deploy/kubernetes/README.md's "Known limitations" and "Backup / restore"
+# sections — this is intentional and documented, not an oversight: real
+# production use should sit behind a managed database service or a proper
+# HA operator. A StatefulSet (not a Deployment) is used for stable network
+# identity and PVC lifecycle semantics even at one replica, matching
+# standard practice for stateful workloads.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: s43-db
+  namespace: sentinel43
+  labels: {app: s43-db}
+spec:
+  serviceName: s43-db
+  replicas: 1
+  # Never run two Postgres pods against the same PVC concurrently.
+  updateStrategy: {type: RollingUpdate}
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels: {app: s43-db}
+  template:
+    metadata:
+      labels: {app: s43-db}
+    spec:
+      serviceAccountName: s43-db
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: postgres
+          image: postgres:16.3
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {containerPort: 5432, name: postgres}
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_DB
+              valueFrom: {configMapKeyRef: {name: sentinel43-config, key: POSTGRES_DB}}
+            - name: POSTGRES_USER
+              valueFrom: {configMapKeyRef: {name: sentinel43-config, key: POSTGRES_USER}}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: sentinel43-secrets, key: POSTGRES_PASSWORD}}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities: {drop: ["ALL"]}
+            seccompProfile: {type: RuntimeDefault}
+          volumeMounts:
+            - {name: pgdata, mountPath: /var/lib/postgresql/data}
+            - {name: tmp, mountPath: /tmp}
+            # Postgres wants a writable /run/postgresql for its unix socket.
+            - {name: run, mountPath: /run/postgresql}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: 1000m, memory: 512Mi}
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "s43", "-d", "s43", "-h", "127.0.0.1"]}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            # Deliberately more tolerant than readiness: a slow query or
+            # brief I/O stall shouldn't cause the kubelet to kill and
+            # restart the database.
+            exec: {command: ["pg_isready", "-U", "s43", "-d", "s43", "-h", "127.0.0.1"]}
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 6
+          startupProbe:
+            exec: {command: ["pg_isready", "-U", "s43", "-d", "s43", "-h", "127.0.0.1"]}
+            periodSeconds: 5
+            failureThreshold: 30  # up to 150s for first-run initdb
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+        labels: {app: s43-db}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # No storageClassName here on purpose — base must not assume a
+        # cluster's default StorageClass name or capabilities. Overlays may
+        # patch this if a specific class is required (e.g. beta pointing at
+        # a durable/backed-up class in a real cluster).
+        resources:
+          requests: {storage: 5Gi}
+---
+# Headless (ClusterIP: None) — StatefulSet-appropriate stable DNS identity.
+# No externally reachable type (no NodePort/LoadBalancer) anywhere in this
+# file: Postgres is never publicly exposed, enforced independently by
+# networkpolicy-db.yaml regardless of Service type.
+apiVersion: v1
+kind: Service
+metadata:
+  name: s43-db
+  namespace: sentinel43
+  labels: {app: s43-db}
+spec:
+  clusterIP: None
+  selector: {app: s43-db}
+  ports:
+    - {port: 5432, targetPort: 5432, name: postgres}
