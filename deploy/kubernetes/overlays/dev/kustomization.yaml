@@ -1,0 +1,34 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: sentinel43
+
+resources:
+  - ../../base
+
+patches:
+  - path: configmap-patch.yaml
+  # imagePullPolicy: Never — the image is built locally
+  # (docker build -t sentinel43-api:dev ...) and loaded directly into the
+  # cluster (kind load docker-image / Docker Desktop's shared image store);
+  # there is no registry in dev, so IfNotPresent (the base default) would
+  # otherwise let the kubelet attempt (and fail) a registry pull.
+  - target: {kind: Deployment, name: s43-api}
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Never
+  - target: {kind: Deployment, name: s43-core}
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Never
+  - target: {kind: Job, name: s43-migration}
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Never
+
+images:
+  - name: sentinel43-api
+    newName: sentinel43-api
+    newTag: dev
