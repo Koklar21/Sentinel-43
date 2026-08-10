@@ -1,0 +1,15 @@
+# s43-api only. Postgres/Redis/Watchtower stay single-replica everywhere
+# (see README's "Known limitations") — a PDB on a 1-replica workload would
+# just block every voluntary eviction/drain with no availability benefit,
+# which is exactly the "don't fake HA at 1 replica" rule this deployment
+# follows. s43-api is the only workload this overlay scales to 2 replicas
+# (see replicas-patch.yaml), so it's the only one where a PDB means anything.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: s43-api
+  namespace: sentinel43
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: s43-api}
