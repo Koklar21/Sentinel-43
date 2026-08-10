@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: sentinel43
+
+resources:
+  - ../../base
+  - ingress.yaml
+  - networkpolicy-ingress.yaml
+  - poddisruptionbudget.yaml
+
+patches:
+  - path: configmap-patch.yaml
+  - path: resources-patch.yaml
+
+# CHANGEME: this placeholder is intentionally invalid (unresolvable digest)
+# so it can never be accidentally applied against a real cluster and pull
+# something unintended — kubectl/kubelet will fail loudly on it instead. Real
+# CI (.github/workflows/k8s.yml) overwrites this at deploy time with
+# `kustomize edit set image sentinel43-api=<registry>/sentinel43-api@sha256:<digest>`
+# after building and pushing the image. There is no registry configured in
+# this repo today; provisioning one (GHCR, ECR, etc.) is an operator
+# decision documented in deploy/kubernetes/README.md, not something this
+# repo can supply on your behalf.
+images:
+  - name: sentinel43-api
+    newName: REGISTRY_PLACEHOLDER/sentinel43-api
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000
