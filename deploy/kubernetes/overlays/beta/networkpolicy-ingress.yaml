@@ -1,0 +1,25 @@
+# Adds to (does not replace) base's networkpolicy-api.yaml, which only
+# defines egress for s43-api — this is the ingress half, allowing traffic
+# only from the ingress controller's namespace. Assumes the ingress
+# controller runs in a namespace literally named "ingress-nginx" (true for
+# the standard ingress-nginx installation methods); if yours differs, change
+# the namespaceSelector value below to match. See
+# deploy/kubernetes/README.md's "Required ingress controller" section.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: s43-api-allow-ingress
+  namespace: sentinel43
+spec:
+  podSelector:
+    matchLabels:
+      app: s43-api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - {protocol: TCP, port: 8000}
