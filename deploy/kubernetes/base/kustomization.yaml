@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: sentinel43
+resources:
+  - namespace.yaml
+  - serviceaccounts.yaml
+  - configmap.yaml
+  - networkpolicy-default-deny.yaml
+  - networkpolicy-dns.yaml
+  - networkpolicy-api.yaml
+  - networkpolicy-core.yaml
+  - networkpolicy-db.yaml
+  - networkpolicy-redis.yaml
+  - postgres-statefulset.yaml
+  - redis-statefulset.yaml
+  - s43-core-deployment.yaml
+  - s43-api-deployment.yaml
+  - migration-job.yaml
+# sentinel43-secrets is intentionally NOT a resource here. secret.example.yaml
+# is a template only (documented as never applied); real secrets are created
+# imperatively at deploy time from .env, the same way scripts/k8s-deploy.ps1
+# did it before — piped straight into kubectl, never written to a YAML file
+# on disk. See deploy/kubernetes/README.md's "Secret provisioning" section.
+images:
+  - name: sentinel43-api
+    newName: sentinel43-api
+    newTag: base-placeholder  # every overlay must override this
