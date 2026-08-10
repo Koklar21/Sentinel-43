@@ -1,0 +1,18 @@
+# CHANGEME: S43_TRUSTED_PROXIES must be the real ingress-nginx pod CIDR (or
+# Service ClusterIP range, if you route through the Service instead of pod
+# IPs) for YOUR cluster — pod CIDRs vary by cloud provider/CNI and cannot be
+# guessed generically here. Find yours with, e.g.:
+#   kubectl get pods -n ingress-nginx -o wide   # note the pod IPs' /16 or /24
+#   kubectl cluster-info dump | grep -m1 cluster-cidr
+# Leaving this as the placeholder below is safe (fails closed — XFF is
+# simply never trusted, every request appears to come from the ingress) but
+# means the firewall/rate-limiter/audit trail will attribute every request
+# to the ingress controller's IP instead of the real client. See
+# docs/security/trusted_proxy_handling.md.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinel43-config
+  namespace: sentinel43
+data:
+  S43_TRUSTED_PROXIES: "CHANGEME_SET_TO_YOUR_INGRESS_CONTROLLER_POD_CIDR"
