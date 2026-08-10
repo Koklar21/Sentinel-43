@@ -1,0 +1,21 @@
+# Same pattern as networkpolicy-db.yaml: Redis's Service is ClusterIP-only,
+# and only network/s43-redis-client: "true" pods may reach it. No egress
+# beyond DNS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: s43-redis-allow-clients
+  namespace: sentinel43
+spec:
+  podSelector:
+    matchLabels:
+      app: s43-redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              network/s43-redis-client: "true"
+      ports:
+        - {protocol: TCP, port: 6379}
