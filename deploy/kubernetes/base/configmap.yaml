@@ -1,0 +1,56 @@
+# Non-secret configuration only. Sensitive values live in the
+# sentinel43-secrets Secret (see secret.example.yaml — never applied as-is;
+# real values are supplied at deploy time, see deploy/kubernetes/README.md).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinel43-config
+  namespace: sentinel43
+data:
+  SENTINEL_ENV: "production"
+  S43_ENV: "production"
+  S43_LOG_LEVEL: "INFO"
+
+  POSTGRES_DB: "s43"
+  POSTGRES_USER: "s43"
+
+  S43_WATCHTOWER_HOST: "0.0.0.0"
+  S43_WATCHTOWER_PORT: "9100"
+  S43_EXPOSE_BIND_HOST: "true"
+  S43_WATCHTOWER_URL: "http://s43-core:9100"
+
+  S43_JWT_ALGORITHM: "HS256"
+  S43_JWT_ISSUER: "sentinel-43"
+  S43_JWT_AUDIENCE: "sentinel-43-dashboard"
+  S43_JWT_TTL_SECONDS: "28800"
+
+  S43_OPERATOR_USERNAME: "operator"
+
+  S43_WS_REQUIRE_AUTH: "true"
+
+  # Empty by default: the firewall trusts NO X-Forwarded-For source unless
+  # explicitly configured (fail-safe — see
+  # docs/security/trusted_proxy_handling.md). The beta overlay sets this to
+  # the real ingress-controller network; dev overlay leaves it empty (no
+  # ingress in dev, access is via kubectl port-forward).
+  S43_TRUSTED_PROXIES: ""
+
+  S43_FENRIR_ENABLED: "true"
+  SENTINEL_FENRIR_ENABLED: "true"
+  FENRIR_ENABLED: "true"
+  S43_FENRIR_NODE_ID: "sentinel-43-primary"
+  S43_FENRIR_MIN_SEVERITY: "MEDIUM"
+  S43_FENRIR_ANOMALY_ZSCORE: "2.5"
+  S43_FENRIR_ANOMALY_DECAY: "0.002"
+  S43_FENRIR_MAX_HONEYPOT_EVENTS: "500"
+  S43_FENRIR_WATCHTOWER_URL: "http://s43-core:9100/watchtower/events"
+  S43_FENRIR_BROADCAST_URL: "http://s43-api:8000/internal/events/broadcast"
+  S43_FENRIR_REPORT_TIMEOUT: "2.0"
+
+  # Never true outside dev — same rule docker-compose.yml documents.
+  S43_ENABLE_TEST_INJECTION: "false"
+  S43_GOVERNANCE_ENABLED: "false"
+  S43_SPARTA_ENABLED: "false"
+  S43_JORM_ENABLED: "false"
+
+  SENTINEL_DB_PATH: "/app/sentinel43_state/sentinel43.sqlite3"
