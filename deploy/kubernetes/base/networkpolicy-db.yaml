@@ -1,0 +1,23 @@
+# Postgres is never publicly exposed (its Service is ClusterIP-only — see
+# postgres-statefulset.yaml) and, on top of that, only pods explicitly
+# labeled network/s43-db-client: "true" (api, core, and the migration Job —
+# see their pod templates) may even reach it on the network layer. No egress
+# beyond DNS: Postgres has no reason to call out anywhere.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: s43-db-allow-clients
+  namespace: sentinel43
+spec:
+  podSelector:
+    matchLabels:
+      app: s43-db
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              network/s43-db-client: "true"
+      ports:
+        - {protocol: TCP, port: 5432}
