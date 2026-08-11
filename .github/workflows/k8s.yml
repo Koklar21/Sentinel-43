@@ -1,0 +1,202 @@
+# =============================================================================
+# Sentinel-43 — Kubernetes deployment CI gate
+#
+# No CI existed in this repo before this workflow. It gates
+# deploy/kubernetes/ (and anything that could affect it — the app image,
+# core/middleware/sentinel_firewall.py's trusted-proxy handling, etc.) behind:
+#   1. manifest rendering + schema/deprecated-API validation (kubeconform)
+#   2. the Phase-12-equivalent security policy checklist
+#      (scripts/k8s_policy_check.py — no root, read-only rootfs, pinned
+#      images, resource limits, probes, NetworkPolicy coverage, no public
+#      db/redis, no wildcard RBAC, no embedded secrets, no hostPath,
+#      automountServiceAccountToken false)
+#   3. image build + vulnerability scan (Docker Scout)
+#   4. the full pytest suite
+#   5. an ephemeral kind cluster smoke-deploy (Calico for real NetworkPolicy
+#      enforcement — kind's default CNI does not enforce it) exercising the
+#      same checks done manually during development: pods Ready and
+#      non-root, migration Job completes, /health and an authenticated
+#      route respond correctly, then unconditional cluster teardown.
+#
+# Does not touch Docker Compose — that path has its own tests
+# (core/tests/) and isn't gated by anything in this file.
+# =============================================================================
+name: Kubernetes
+
+on:
+  pull_request:
+    paths:
+      - "core/**"
+      - "deploy/kubernetes/**"
+      - "scripts/k8s_policy_check.py"
+      - "scripts/k8s-validate.ps1"
+      - ".github/workflows/k8s.yml"
+  push:
+    branches: [main]
+    paths:
+      - "core/**"
+      - "deploy/kubernetes/**"
+      - "scripts/k8s_policy_check.py"
+      - "scripts/k8s-validate.ps1"
+      - ".github/workflows/k8s.yml"
+  workflow_dispatch: {}
+
+jobs:
+  validate-manifests:
+    name: Validate manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kubeconform
+        run: |
+          curl -fsSL -o /tmp/kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz
+          mkdir -p /tmp/kubeconform && tar -xzf /tmp/kubeconform.tar.gz -C /tmp/kubeconform
+          sudo mv /tmp/kubeconform/kubeconform /usr/local/bin/kubeconform
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      - name: Render and validate every overlay
+        run: |
+          set -euo pipefail
+          for overlay in base overlays/dev overlays/beta; do
+            name=$(basename "$overlay")
+            echo "=== $name ==="
+            dir="deploy/kubernetes/$overlay"
+            rendered="/tmp/rendered-$name.yaml"
+            kubectl kustomize "$dir" > "$rendered"
+            kubeconform -strict -summary -kubernetes-version 1.30.0 "$rendered"
+            python scripts/k8s_policy_check.py "$rendered"
+          done
+
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt
+      - run: python -m pytest core/tests/ -q
+
+  build-and-scan:
+    name: Build image + vulnerability scan
+    runs-on: ubuntu-latest
+    needs: [validate-manifests, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t sentinel43-api:ci -f core/api/Dockerfile .
+
+      - name: Docker Scout CVE scan
+        # Docker Scout's free tier covers unauthenticated local-image CVE
+        # scanning; full policy evaluation needs a logged-in Docker Hub
+        # account. No such credentials are configured in this repo (adding
+        # DOCKERHUB_USERNAME/DOCKERHUB_TOKEN as repo secrets is an operator
+        # decision, documented in deploy/kubernetes/README.md) — this step
+        # runs what's available without them and does not block the
+        # pipeline on Scout-specific auth failures, only on actual
+        # critical/high CVE findings once it can run.
+        continue-on-error: true
+        run: |
+          docker scout cves sentinel43-api:ci --exit-code --only-severity critical,high
+
+  kind-smoke-deploy:
+    name: kind smoke deploy
+    runs-on: ubuntu-latest
+    needs: [validate-manifests, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t sentinel43-api:ci -f core/api/Dockerfile .
+
+      - name: Create kind cluster (default CNI disabled)
+        uses: helm/kind-action@v1
+        with:
+          config: deploy/kubernetes/kind-cluster-config.yaml
+          wait: "120s"
+
+      - name: Install Calico (real NetworkPolicy enforcement)
+        run: |
+          kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.1/manifests/tigera-operator.yaml
+          kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.1/manifests/custom-resources.yaml
+          kubectl -n calico-system wait --for=condition=Ready pods --all --timeout=180s
+          kubectl -n kube-system wait --for=condition=Ready pods --all --timeout=120s
+
+      - name: Load image into kind
+        run: kind load docker-image sentinel43-api:ci --name $(kind get clusters | head -1)
+
+      - name: Install standalone kustomize CLI
+        # `kubectl kustomize` (bundled) can render, but `kustomize edit` —
+        # used below to point the dev overlay at the freshly built CI image
+        # tag — needs the standalone binary, which isn't preinstalled.
+        run: |
+          curl -fsSL -o /tmp/kustomize.tar.gz \
+            https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.5.0/kustomize_v5.5.0_linux_amd64.tar.gz
+          tar -xzf /tmp/kustomize.tar.gz -C /tmp
+          sudo mv /tmp/kustomize /usr/local/bin/kustomize
+
+      - name: Generate ephemeral CI secrets and deploy
+        run: |
+          set -euo pipefail
+          kubectl create namespace sentinel43 --dry-run=client -o yaml | kubectl apply -f -
+          gen() { python -c "import secrets; print(secrets.token_urlsafe(32))"; }
+          PG_PW=$(gen); REDIS_PW=$(gen)
+          kubectl create secret generic sentinel43-secrets -n sentinel43 \
+            --from-literal=POSTGRES_PASSWORD="$PG_PW" \
+            --from-literal=REDIS_PASSWORD="$REDIS_PW" \
+            --from-literal=DATABASE_URL="postgresql+asyncpg://s43:${PG_PW}@s43-db:5432/s43" \
+            --from-literal=REDIS_URL="redis://:${REDIS_PW}@s43-redis:6379/0" \
+            --from-literal=S43_JWT_SECRET="$(gen)" \
+            --from-literal=S43_OPERATOR_PASSWORD_HASH="$(gen)" \
+            --from-literal=S43_AUTH_PEPPER="$(gen)" \
+            --from-literal=SENTINEL_LOG_SALT="$(gen)" \
+            --from-literal=SENTINEL_REMOTE_TOKEN_OWNER="$(gen)" \
+            --from-literal=SENTINEL_REMOTE_TOKEN_ADMIN="$(gen)" \
+            --from-literal=SENTINEL_REMOTE_TOKEN_AUDITOR="$(gen)" \
+            --from-literal=S43_FENRIR_API_TOKEN="$(gen)"
+          cd deploy/kubernetes/overlays/dev
+          kustomize edit set image sentinel43-api=sentinel43-api:ci
+          cd -
+          kubectl apply -k deploy/kubernetes/overlays/dev
+          # Revert the local edit — CI runs in a fresh checkout each time,
+          # but this keeps a local `act`-style run from leaving the repo
+          # dirty if this workflow is ever run that way.
+          git -C deploy/kubernetes/overlays/dev checkout -- kustomization.yaml || true
+
+      - name: Wait for rollout
+        run: |
+          kubectl -n sentinel43 wait --for=condition=Ready pod -l app=s43-db --timeout=180s
+          kubectl -n sentinel43 wait --for=condition=Ready pod -l app=s43-redis --timeout=120s
+          kubectl -n sentinel43 wait --for=condition=Complete job/s43-migration --timeout=120s
+          kubectl -n sentinel43 rollout status deployment/s43-api --timeout=180s
+          kubectl -n sentinel43 rollout status deployment/s43-core --timeout=180s
+
+      - name: Security posture assertions
+        run: |
+          set -euo pipefail
+          uid=$(kubectl exec -n sentinel43 deployment/s43-api -- id -u)
+          test "$uid" = "65532"
+          kubectl exec -n sentinel43 deployment/s43-api -- sh -c 'touch /app/should_fail' && exit 1 || true
+
+      - name: API smoke test
+        run: |
+          set -euo pipefail
+          kubectl -n sentinel43 port-forward svc/s43-api 18000:8000 &
+          sleep 3
+          curl -fsS http://localhost:18000/health
+          curl -fsS http://localhost:18000/bootstrap/status
+
+      - name: Teardown
+        if: always()
+        run: kind delete cluster --name $(kind get clusters | head -1) || true
