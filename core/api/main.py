@@ -29,7 +29,7 @@
 # Commercial Licensing:
 # Contact the copyright holder for commercial licensing terms.
 #
-# Sentinel-43â„¢
+# Sentinel-43\u2122
 # Original Work and Protected Intellectual Property.
 # =============================================================================
 from __future__ import annotations
@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import urllib.error
@@ -47,7 +48,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
-import jwt as pyjwt
 from ..security.jwt_constants import APPROVED_JWT_ALGORITHMS
 from fastapi import (
     APIRouter,
@@ -61,10 +61,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from ..bootstrap import bootstrap_expectations
+from ..logging.health_check_filter import install_health_check_access_filter
 from .routers.audit import router as audit_router
 from .routers.auth import router as auth_router
 # core/api/routers/bootstrap.py is a THIRD, unrelated module also named
-# bootstrap — see the naming note in core/bootstrap.py. This one is the
+# bootstrap \u2014 see the naming note in core/bootstrap.py. This one is the
 # first-run admin account setup router (GET /bootstrap/status,
 # POST /bootstrap/admin), not startup expectations. Aliased to avoid
 # colliding with bootstrap_expectations imported above.
@@ -140,11 +141,8 @@ WS_REQUIRE_AUTH = _env_bool("S43_WS_REQUIRE_AUTH", True)
 
 JWT_SECRET    = _env_str("S43_JWT_SECRET")
 JWT_ALGORITHM = _env_str("S43_JWT_ALGORITHM", "HS256")
-JWT_ISSUER    = _env_str("S43_JWT_ISSUER", "sentinel-43")
-JWT_AUDIENCE  = _env_str("S43_JWT_AUDIENCE", "sentinel-43-dashboard")
 
 _APPROVED_ALGORITHMS: frozenset[str] = APPROVED_JWT_ALGORITHMS
-_APPROVED_ROLES: frozenset[str]      = frozenset({"operator", "admin"})
 
 START_TIME: float = time.time()
 
@@ -174,7 +172,7 @@ _sparta_instance: Any | None               = None
 _sparta_task:     asyncio.Task | None      = None  # type: ignore[type-arg]
 _fenrir_instance: Any | None               = None
 
-# _fenrir_task is no longer used â€” FenrirHunter manages its own internal task.
+# _fenrir_task is no longer used \u2014 FenrirHunter manages its own internal task.
 # Kept here for backward compatibility with any tooling that checks this name.
 _fenrir_task:     asyncio.Task | None      = None  # type: ignore[type-arg]
 
@@ -207,27 +205,11 @@ def uptime_seconds() -> float:
 
 # =============================================================================
 # Auth helpers
+#
+# JWT verification itself lives in core.api.routers.auth.verify_jwt_token() \u2014
+# this module no longer keeps its own copy. _get_operator() and
+# dashboard_websocket() both import and call that function directly.
 # =============================================================================
-def _verify_jwt_token(token: str) -> dict[str, Any]:
-    algorithm = JWT_ALGORITHM.strip()
-
-    if algorithm not in _APPROVED_ALGORITHMS:
-        raise pyjwt.InvalidAlgorithmError(
-            f"JWT algorithm {algorithm!r} is not approved for Sentinel-43"
-        )
-
-    if not JWT_SECRET:
-        raise pyjwt.InvalidKeyError("JWT signing key is not configured on this server")
-
-    return pyjwt.decode(
-        token,
-        JWT_SECRET,
-        algorithms=[algorithm],
-        issuer=JWT_ISSUER,
-        audience=JWT_AUDIENCE,
-        options={"require": ["exp", "iss", "aud", "sub"]},
-    )
-
 async def _get_operator(
     request: Request,
     *,
@@ -237,32 +219,17 @@ async def _get_operator(
     if auth.startswith("Bearer "):
         token = auth[7:].strip()
         if token:
-            try:
-                claims = _verify_jwt_token(token)
-            except pyjwt.ExpiredSignatureError:
-                raise HTTPException(status_code=401, detail="Token has expired")
-            except pyjwt.InvalidIssuerError:
-                raise HTTPException(status_code=401, detail="Invalid token issuer")
-            except pyjwt.InvalidAudienceError:
-                raise HTTPException(status_code=401, detail="Invalid token audience")
-            except pyjwt.MissingRequiredClaimError as exc:
-                raise HTTPException(status_code=401, detail=f"Missing required claim: {exc}")
-            except pyjwt.InvalidKeyError:
-                raise HTTPException(status_code=503, detail="JWT validation not configured")
-            except pyjwt.PyJWTError:
-                raise HTTPException(status_code=401, detail="Invalid token")
+            from .routers.auth import PASSWORD_HEADER_NAME, reverify_password, verify_jwt_token
 
-            role = str(claims.get("role") or claims.get("scope") or "").strip()
-            if role not in _APPROVED_ROLES:
-                raise HTTPException(status_code=403, detail="Operator role required")
+            # verify_jwt_token() validates signature, claims, and role, and
+            # raises the appropriate HTTPException (401/403/503) itself.
+            claims = verify_jwt_token(token)
 
             subject = str(claims.get("sub") or "").strip()
             subject = subject if subject else f"bearer:{token[:16]}"
 
-            # A valid JWT is no longer sufficient by itself — every protected
+            # A valid JWT is no longer sufficient by itself \u2014 every protected
             # request must also re-supply the operator's password.
-            from .routers.auth import PASSWORD_HEADER_NAME, reverify_password
-
             password = request.headers.get(PASSWORD_HEADER_NAME, "")
             if not password:
                 raise HTTPException(status_code=401, detail="Password required")
@@ -286,6 +253,38 @@ async def _require_operator(request: Request) -> str:
     just because SENTINEL_ENV is permissive.
     """
     return await _get_operator(request, allow_local_fallback=False)
+
+
+def _require_fenrir_service_token(request: Request) -> None:
+    """
+    Internal-service authentication for /internal/events/broadcast.
+
+    This route has exactly one caller: FenrirHunter
+    (core/detection/feniri_hunter.py), which sends
+    `Authorization: Bearer <S43_FENRIR_API_TOKEN>` and never an operator
+    JWT or X-S43-Password header \u2014 those belong to the dashboard's
+    human-operator auth model, not a machine caller. The route previously
+    called _require_operator() here, which meant every real call from
+    Fenrir was silently rejected with 401 (missing X-S43-Password) before
+    the bearer token was ever inspected \u2014 the dashboard-broadcast half of
+    Fenrir's reporting has effectively never worked. This checks the
+    dedicated shared-secret service token instead, with a constant-time
+    comparison, and fails closed if the token isn't configured at all.
+    """
+    expected = _env_str("S43_FENRIR_API_TOKEN")
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="Internal service authentication is not configured on this server.",
+        )
+
+    auth = request.headers.get("Authorization", "").strip()
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    token = auth[7:].strip()
+    if not token or not secrets.compare_digest(token, expected):
+        raise HTTPException(status_code=401, detail="Invalid service token")
 
 
 def _is_local_environment() -> bool:
@@ -837,10 +836,11 @@ async def dashboard_vault_stats(request: Request) -> dict[str, Any]:
     return {"records": _vault_records(), "timestamp": utc_now()}
 
 @root_router.post("/actions/test-inject")
-async def dashboard_test_inject() -> dict[str, Any]:
-    """Synthetic incident injection â€” dev/test only."""
+async def dashboard_test_inject(request: Request) -> dict[str, Any]:
+    """Synthetic incident injection \u2014 dev/test only, operator-gated."""
     if SENTINEL_ENV.lower() not in LOCAL_TEST_ENVIRONMENTS or not TEST_INJECTION_ENABLED:
         raise HTTPException(status_code=403, detail="test injection is disabled")
+    await _require_operator(request)
     action = _store_action(_create_synthetic_action())
     await _broadcast_dashboard_event("action_created", {"action": action})
     await _broadcast_dashboard_event("vault_stats", {"records": _vault_records()})
@@ -1053,28 +1053,18 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
             await _ws_safe_close(websocket)
             return
 
+        from .routers.auth import reverify_password, verify_jwt_token
+
         try:
-            ws_claims = _verify_jwt_token(token)
-        except pyjwt.ExpiredSignatureError:
-            await websocket.send_json({"type": "error", "payload": {"error": "Token has expired"}})
-            await _ws_safe_close(websocket)
-            return
-        except pyjwt.InvalidKeyError:
-            await websocket.send_json({"type": "error", "payload": {"error": "JWT not configured"}})
-            await _ws_safe_close(websocket)
-            return
-        except pyjwt.PyJWTError:
-            await websocket.send_json({"type": "error", "payload": {"error": "Invalid token"}})
+            # verify_jwt_token() validates signature, claims, and role, and
+            # raises HTTPException(401/403/503) itself on any failure.
+            ws_claims = verify_jwt_token(token)
+        except HTTPException as exc:
+            await websocket.send_json({"type": "error", "payload": {"error": str(exc.detail)}})
             await _ws_safe_close(websocket)
             return
 
-        role = str(ws_claims.get("role") or ws_claims.get("scope") or "").strip()
-        if role not in _APPROVED_ROLES:
-            await websocket.send_json({"type": "error", "payload": {"error": "Operator role required"}})
-            await _ws_safe_close(websocket)
-            return
-
-        # A valid JWT is no longer sufficient by itself — the auth frame must
+        # A valid JWT is no longer sufficient by itself \u2014 the auth frame must
         # also carry the operator's password, re-verified against storage.
         ws_subject = str(ws_claims.get("sub") or "").strip()
         ws_password = str(auth_msg.get("payload", {}).get("password") or "").strip()
@@ -1082,8 +1072,6 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
             await websocket.send_json({"type": "error", "payload": {"error": "Password missing"}})
             await _ws_safe_close(websocket)
             return
-
-        from .routers.auth import reverify_password
 
         if not await reverify_password(ws_subject, ws_password):
             await websocket.send_json({"type": "error", "payload": {"error": "Invalid password"}})
@@ -1172,14 +1160,17 @@ async def internal_broadcast_event(
     """
     Broadcast a structured event to connected WebSocket dashboard clients.
     Called by FenrirHunter when it has a finding to report.
-    Requires operator auth â€” Fenrir uses S43_FENRIR_API_TOKEN for this.
+
+    Authenticated with the dedicated S43_FENRIR_API_TOKEN service token
+    (see _require_fenrir_service_token) rather than operator JWT/password \u2014
+    this is a machine-to-machine call, not a dashboard operator action.
 
     Body:
-      event_type: str  â€” WebSocket event type (e.g. "fenrir_finding")
-      channel:    str  â€” optional channel filter (e.g. "security")
-      data:       dict â€” event payload forwarded to dashboard clients
+      event_type: str  \u2014 WebSocket event type (e.g. "fenrir_finding")
+      channel:    str  \u2014 optional channel filter (e.g. "security")
+      data:       dict \u2014 event payload forwarded to dashboard clients
     """
-    await _require_operator(request)
+    _require_fenrir_service_token(request)
 
     event_type = str(body.get("event_type") or "event")[:64]
     channel    = str(body.get("channel") or "") or None
@@ -1636,6 +1627,37 @@ app.include_router(system_router)
 app.include_router(fenrir_router)
 app.include_router(api_router)
 app.include_router(audit_router)
+
+# =============================================================================
+# Health-check access-log noise suppression
+#
+# Docker's healthcheck (core/api/Dockerfile), Watchtower, and the dashboard
+# all poll these unauthenticated liveness/readiness endpoints every few
+# seconds, and uvicorn's own access logger (never configured by this app --
+# see core/logging/setup.py and core/logging_init.py, neither of which is
+# imported here) logs every single one at INFO level. This does not change
+# any health check, its cadence, its status code, or what Watchtower sees --
+# it only quiets the repeated successful (2xx) access-log lines for exactly
+# these paths. Failures and the first success after a failure still print.
+# See core/logging/health_check_filter.py for the mechanism.
+#
+# Deliberately excludes /fenrir/health and /remote-gateway/health: both
+# require operator authentication (_require_operator/_authenticate), so
+# they're not routine anonymous polling targets and aren't the source of
+# this noise.
+# =============================================================================
+_HEALTH_CHECK_LOG_PATHS: frozenset[str] = frozenset({
+    "/health",
+    "/ready",
+    "/watchtower/health",
+    "/watchtower/ready",
+    "/core/health",
+    "/audit/health",
+    "/api/ready",
+    "/api/watchtower/health",
+    "/api/watchtower/ready",
+})
+install_health_check_access_filter(_HEALTH_CHECK_LOG_PATHS)
 
 # =============================================================================
 # Error handler
