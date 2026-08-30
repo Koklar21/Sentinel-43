@@ -1254,6 +1254,12 @@ def create_watchtower_router(node: WatchtowerNode) -> APIRouter:
     # service token (Pass 1). /health and /ready stay open for probes.
     _service_auth = [Depends(_require_service_token)]
 
+    # /health and /ready are the only unauthenticated routes (probe targets
+    # for Docker and Kubernetes). Their bodies are intentionally minimal —
+    # just a coarse status and the HTTP status code a probe actually reads
+    # (Pass 1, F-03). The full node state, version, module/dependency
+    # registry, stale-module names and recovery counters are on the
+    # service-token-gated /status endpoint, not here.
     @router.get("/health")
     def health_check() -> JSONResponse:
         state = node.state
@@ -1266,20 +1272,15 @@ def create_watchtower_router(node: WatchtowerNode) -> APIRouter:
         else:
             http_code, svc_status = status.HTTP_503_SERVICE_UNAVAILABLE, "initializing"
 
-        return JSONResponse(status_code=http_code, content={
-            "status": svc_status,
-            "version": VERSION,
-            "node_state": state.value,
-            "node_id": node.config.node_id,
-        })
+        return JSONResponse(status_code=http_code, content={"status": svc_status})
 
     @router.get("/ready")
     def ready_check() -> JSONResponse:
         result = node.readiness()
-        http_code = status.HTTP_200_OK if result["ready"] else status.HTTP_503_SERVICE_UNAVAILABLE
+        ready = bool(result["ready"])
+        http_code = status.HTTP_200_OK if ready else status.HTTP_503_SERVICE_UNAVAILABLE
         return JSONResponse(status_code=http_code, content={
-            **result,
-            "status": "ready" if result["ready"] else "not_ready",
+            "status": "ready" if ready else "not_ready",
         })
 
     @router.get("/status", dependencies=_service_auth)
@@ -1375,6 +1376,13 @@ def create_api_app(node: WatchtowerNode) -> FastAPI:
             "Sentinel-43 hardened monitoring, octagon correlation, "
             "module registry, dependency, and alert analysis node."
         ),
+        # Pass 1 (F-07): this is an internal-only service (no host port
+        # publication in Compose, ClusterIP + NetworkPolicy in Kubernetes).
+        # The interactive docs, schema, and OpenAPI JSON were served
+        # anonymously and enumerated the entire route surface — disable them.
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
 
     watchtower_router = create_watchtower_router(node)
@@ -1382,18 +1390,10 @@ def create_api_app(node: WatchtowerNode) -> FastAPI:
 
     @api.get("/")
     def root() -> dict[str, Any]:
-        return {
-            "service": "sentinel-43-watchtower",
-            "version": VERSION,
-            "status": "online",
-            "node_id": node.config.node_id,
-            "routes": sorted({
-                route.path  # type: ignore[attr-defined]
-                for route in api.routes
-                if hasattr(route, "path")
-                and route.path not in {"/", "/openapi.json", "/docs", "/redoc"}
-            }),
-        }
+        # Minimal banner only — no version (CVE-matching aid) and no route
+        # enumeration (that was a free map of the surface for an anonymous
+        # caller). Operational detail lives on the token-gated /status.
+        return {"service": "sentinel-43-watchtower", "status": "online"}
 
     return api
 
