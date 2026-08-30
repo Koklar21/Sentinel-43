@@ -268,4 +268,44 @@ def test_token_absent_from_503_body(wt_client_no_token: TestClient):
     assert SERVICE_TOKEN not in response.text
 
 
+# ---------------------------------------------------------------------------
+# F-03: the unauthenticated probe endpoints disclose only a coarse status
+# ---------------------------------------------------------------------------
+
+def test_health_body_is_minimal(wt_client: TestClient):
+    body = wt_client.get("/watchtower/health").json()
+    assert set(body) == {"status"}
+    assert body["status"] in {"ok", "degraded", "failed", "initializing"}
+    # None of the pre-Pass-1 disclosure leaks through.
+    for leaked in ("version", "node_id", "node_state", "config", "modules"):
+        assert leaked not in body
+
+
+def test_ready_body_is_minimal(wt_client: TestClient):
+    response = wt_client.get("/watchtower/ready")
+    body = response.json()
+    assert set(body) == {"status"}
+    assert body["status"] in {"ready", "not_ready"}
+    for leaked in ("stale_modules", "bad_modules", "stale_dependencies",
+                   "bad_dependencies", "recovery", "node_id", "last_decision"):
+        assert leaked not in body
+
+
+def test_root_banner_is_minimal(wt_client: TestClient):
+    body = wt_client.get("/").json()
+    assert set(body) == {"service", "status"}
+    assert "routes" not in body
+    assert "version" not in body
+    assert "node_id" not in body
+
+
+# ---------------------------------------------------------------------------
+# F-07: no interactive docs / schema on the internal-only service
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("path", ["/docs", "/redoc", "/openapi.json"])
+def test_api_docs_are_disabled(wt_client: TestClient, path: str):
+    assert wt_client.get(path).status_code == 404
+
+
 __all__: list[str] = []

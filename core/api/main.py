@@ -1257,7 +1257,11 @@ watchtower_router = APIRouter(prefix="/watchtower", tags=["watchtower"])
 
 @watchtower_router.get("/health")
 def api_watchtower_health() -> dict[str, Any]:
-    return watchtower_health_check()
+    # Anonymous route: report only whether the Watchtower bridge is
+    # reachable (Pass 1, F-03). watchtower_health_check() also returns the
+    # internal Watchtower URL and its raw response body — those stay
+    # internal, not on an unauthenticated endpoint.
+    return {"bridge": "api_to_watchtower", "reachable": watchtower_health_check()["reachable"]}
 
 @watchtower_router.get("/status")
 async def api_watchtower_status(request: Request) -> dict[str, Any]:
@@ -1269,9 +1273,12 @@ async def api_watchtower_status(request: Request) -> dict[str, Any]:
 
 @watchtower_router.get("/ready")
 def api_watchtower_ready() -> dict[str, Any]:
+    # Anonymous route (Pass 1, F-03): the upstream /watchtower/ready body
+    # (stale-module names, dependency names, recovery counters) and the
+    # internal Watchtower URL are not exposed here. Callers that need that
+    # detail use the operator-gated /watchtower/status.
     result = _watchtower_request("GET", "/watchtower/ready")
-    return {"bridge": "api_to_watchtower", "watchtower_url": WATCHTOWER_URL,
-            "reachable": "error" not in result, "watchtower": result, "timestamp": utc_now()}
+    return {"bridge": "api_to_watchtower", "reachable": "error" not in result}
 
 @watchtower_router.post("/register")
 async def api_register_watchtower(request: Request) -> dict[str, Any]:
