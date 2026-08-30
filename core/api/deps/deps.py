@@ -20,9 +20,7 @@ import os
 import urllib.error
 import urllib.request
 
-import jwt as pyjwt
 from fastapi import HTTPException, Request
-from ...security.jwt_constants import APPROVED_JWT_ALGORITHMS
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -47,14 +45,6 @@ WATCHTOWER_TIMEOUT = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
 
 ENV_DEV_ENGINE_ENABLED = "S43_ENABLE_DEV_ENGINE"
 ENV_DEV_STORE_ENABLED = "S43_ENABLE_DEV_STORE"
-
-JWT_SECRET = os.getenv("S43_JWT_SECRET", "").strip()
-JWT_ALGORITHM = os.getenv("S43_JWT_ALGORITHM", "HS256").strip()
-JWT_ISSUER = os.getenv("S43_JWT_ISSUER", "sentinel-43").strip()
-JWT_AUDIENCE = os.getenv("S43_JWT_AUDIENCE", "sentinel-43-dashboard").strip()
-
-_APPROVED_ALGORITHMS = APPROVED_JWT_ALGORITHMS
-_APPROVED_ROLES = frozenset({"operator", "admin"})
 
 
 # -----------------------------------------------------------------------------
@@ -201,35 +191,16 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return default
 
 
-def _verify_operator_jwt(token: str) -> dict[str, Any]:
-    if JWT_ALGORITHM not in _APPROVED_ALGORITHMS:
-        raise HTTPException(status_code=503, detail="JWT algorithm is not approved")
-
-    if not JWT_SECRET:
-        raise HTTPException(status_code=503, detail="JWT validation not configured")
-
-    try:
-        return pyjwt.decode(
-            token,
-            JWT_SECRET,
-            algorithms=[JWT_ALGORITHM],
-            issuer=JWT_ISSUER,
-            audience=JWT_AUDIENCE,
-            options={"require": ["exp", "iss", "aud", "sub"]},
-        )
-    except pyjwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token has expired")
-    except pyjwt.InvalidIssuerError:
-        raise HTTPException(status_code=401, detail="Invalid token issuer")
-    except pyjwt.InvalidAudienceError:
-        raise HTTPException(status_code=401, detail="Invalid token audience")
-    except pyjwt.MissingRequiredClaimError as exc:
-        raise HTTPException(status_code=401, detail=f"Missing required claim: {exc}")
-    except pyjwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-
 async def require_operator(request: Request) -> str:
+    """
+    Require operator authentication for /v1 routes.
+
+    Delegates JWT verification to core.api.routers.auth.verify_jwt_token() —
+    the single JWT verifier for the whole API — rather than keeping a second
+    copy here. That function only recognizes the "role" claim (no "scope"
+    fallback) and reads S43_JWT_SECRET/_ISSUER/_AUDIENCE from the environment
+    at call time, matching main.py's _get_operator()/_require_operator().
+    """
     auth = request.headers.get("Authorization", "").strip()
 
     if not auth.startswith("Bearer "):
@@ -239,30 +210,15 @@ async def require_operator(request: Request) -> str:
     if not token:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    claims = _verify_operator_jwt(token)
+    from ..routers.auth import PASSWORD_HEADER_NAME, reverify_password, verify_jwt_token
 
-    roles: set[str] = set()
-
-    role_claim = claims.get("role")
-    if role_claim:
-        roles.add(str(role_claim).strip())
-
-    scope_claim = claims.get("scope")
-    if isinstance(scope_claim, str):
-        roles.update(part.strip() for part in scope_claim.split() if part.strip())
-    elif isinstance(scope_claim, (list, tuple, set)):
-        roles.update(str(part).strip() for part in scope_claim if str(part).strip())
-
-    if not roles.intersection(_APPROVED_ROLES):
-        raise HTTPException(status_code=403, detail="Operator role required")
+    claims = verify_jwt_token(token)
 
     subject = str(claims.get("sub") or "").strip()
     subject = subject if subject else f"bearer:{token[:16]}"
 
     # A valid JWT is no longer sufficient on its own — every protected
     # request must also re-supply the operator's password.
-    from ..routers.auth import PASSWORD_HEADER_NAME, reverify_password
-
     password = request.headers.get(PASSWORD_HEADER_NAME, "")
     if not password:
         raise HTTPException(status_code=401, detail="Password required")
