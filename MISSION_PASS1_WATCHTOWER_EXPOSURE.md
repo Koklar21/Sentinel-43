@@ -1,11 +1,31 @@
 # Pass 1 — Direct Watchtower Exposure
 
 - Branch: `pass1/watchtower-exposure` (off `release/beta-production-hardening` @ `4e281bc4`)
-- Commit: `59e9a73`
+- Commits: `59e9a73` (auth + exposure), `6498299` (this doc), `a20e37c`
+  (F-03/F-07 disclosure), `ab19b14` (F-06 Fenrir path), `<this>` (doc update)
 - PR: none opened
-- Status: **complete**; regression tests pass; live acceptance green for the Pass 1 surface
+- Status: **complete**; full test suite 144 passed / 4 skipped; live acceptance
+  green (core auth, exposure, F-03, F-07, F-06 end-to-end)
 - Owner: session `sentinel-43-9d` (scope split with `sentinel-43-b8`, who owns
   operator-auth / `deps.py` / firewall-config / docs)
+
+## Extended fixes (same lane, same branch)
+
+After the initial Watchtower auth + exposure commit, the remaining
+Watchtower-surface findings were closed in this pass on the user's "do all the
+fixes that are needed" instruction:
+
+| ID | Fix | Commit |
+| --- | --- | --- |
+| F-03 | `/watchtower/health` → `{"status": ...}` only; `/watchtower/ready` → `{"status": "ready\|not_ready"}` only (no stale-module/dependency names, recovery counters, version, node_id); `/` banner → `{"service","status"}` (no route enumeration, no version); the API bridge's anonymous `/watchtower/health` + `/watchtower/ready` → `{"reachable": bool}` (no internal URL, no proxied body). HTTP status codes unchanged, so probes are unaffected. | `a20e37c` |
+| F-07 | `core/monitoring/watchtower.py` `create_api_app`: `docs_url=redoc_url=openapi_url=None` — no anonymous Swagger UI / ReDoc / OpenAPI schema on the internal-only service. | `a20e37c` |
+| F-06 | `watchtower_ingest_event` (`POST /watchtower/events` bridge) used `_require_operator` though its only caller (FenrirHunter) sends the Fenrir service token — silently 401'd forever; and forwarded to `/watchtower/events` on the core (404). Now: `_require_fenrir_service_token`, forwards to `/watchtower/analyze` as `{"event": body}`. `S43_FENRIR_WATCHTOWER_URL` corrected in `docker-compose.yml` + `configmap.yaml` (`s43-core:9100/watchtower/events` → `s43-api:8000/watchtower/events`). `feniri_hunter.py` unchanged. Live-verified end to end (anon → 401; Fenrir token → 200, forwarded to analyze, `decision: OBSERVE`). | `ab19b14` |
+
+Not changed (deferred): `core/monitoring/manager.py` `WATCHTOWER_URL` default
+`http://s43-watchtower:9100` (wrong host, but every deployment overrides it via
+`S43_WATCHTOWER_URL`); `core/s34_auth/watchtower.py` (dead — `NameError` on
+import, no importers — Pass 8 delete); `/state/{name}` still needs
+`S43_ADMIN_TOKEN` wired (fails closed today — Pass 6).
 
 ## Proven root cause / defects
 
