@@ -216,12 +216,19 @@ async def create_user(
 
 
 async def authenticate_user(
-    session: AsyncSession, username: str, password: str
+    session: AsyncSession, username: str, password: str, *, update_last_login: bool = True
 ) -> Optional[User]:
     """
     Returns the User on success, None on any failure (unknown username,
     inactive account, or wrong password) — callers must not distinguish
     these cases in the response they send to the client.
+
+    update_last_login=False skips the last_login_at write/commit. Used by
+    core.api.routers.auth.reverify_password(), which calls this on every
+    protected request (not just at login) to satisfy the per-request
+    password re-verification gate — without this flag, that would mean an
+    Argon2 verify plus a DB write on every single request, and
+    "last_login_at" would stop meaning "last login".
     """
     user = await get_user_by_username(session, username)
     if user is None or not user.is_active:
@@ -229,8 +236,9 @@ async def authenticate_user(
     if not verify_password(password, user.password_hash):
         return None
 
-    user.last_login_at = datetime.now(timezone.utc)
-    await session.commit()
+    if update_last_login:
+        user.last_login_at = datetime.now(timezone.utc)
+        await session.commit()
     return user
 
 
