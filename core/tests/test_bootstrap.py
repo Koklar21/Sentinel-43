@@ -39,6 +39,13 @@
 # test is skipped, but status/validation coverage still runs — this mirrors
 # how test_system_smoke.py's live-auth tests skip without live credentials
 # rather than failing the whole run.
+#
+# See also test_bootstrap_isolated.py: once a deployment is initialized,
+# the "creates the first admin" test below skips permanently on that
+# deployment (there's nothing left to bootstrap). test_bootstrap_isolated.py
+# covers the same create-admin -> login -> protected-route flow against an
+# in-memory fake user store instead of the live DB, so that path keeps
+# getting exercised on every test run regardless of this deployment's state.
 # =============================================================================
 
 from __future__ import annotations
@@ -177,7 +184,7 @@ def test_first_run_bootstrap_flow_creates_admin() -> None:
 
     protected_response = requests.get(
         f"{API_URL}/watchtower/status",
-        headers={"Authorization": f"Bearer {token}"},
+        headers={"Authorization": f"Bearer {token}", "X-S43-Password": password},
         timeout=5,
     )
     assert protected_response.status_code == 200, (
