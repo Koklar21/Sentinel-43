@@ -1332,12 +1332,26 @@ async def watchtower_ingest_event(
     body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
     """
-    Ingest a structured event from an internal service (e.g. FenrirHunter)
-    and forward it to the Watchtower core. Also broadcasts to dashboard
-    clients subscribed to the "watchtower" channel.
+    Ingest a structured event from an internal service (FenrirHunter) and
+    forward it to the Watchtower core for analysis. Also broadcasts it to
+    dashboard clients subscribed to the "watchtower" channel.
+
+    Pass 1 (F-06): this route's only caller is FenrirHunter
+    (core/detection/feniri_hunter.py), which sends
+    `Authorization: Bearer <S43_FENRIR_API_TOKEN>` and never an operator
+    JWT + X-S43-Password. It previously called `_require_operator`, so every
+    real Fenrir report was silently rejected with 401 before the token was
+    inspected — the identical bug already fixed on the sibling route
+    /internal/events/broadcast. It also forwarded to `/watchtower/events` on
+    the Watchtower core, which has no such route (404). Both are fixed here:
+    the dedicated service-token check, and a forward to the real ingestion
+    route `/watchtower/analyze` (the API attaches S43_WATCHTOWER_SERVICE_TOKEN
+    to that call itself).
     """
-    await _require_operator(request)
-    result = await asyncio.to_thread(_watchtower_request, "POST", "/watchtower/events", body)
+    _require_fenrir_service_token(request)
+    result = await asyncio.to_thread(
+        _watchtower_request, "POST", "/watchtower/analyze", {"event": body}
+    )
     await _broadcast_dashboard_event(
         "watchtower_event",
         {"event": body, "watchtower_response": result, "timestamp": utc_now()},

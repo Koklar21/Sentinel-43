@@ -43,7 +43,10 @@ data:
   S43_FENRIR_ANOMALY_ZSCORE: "2.5"
   S43_FENRIR_ANOMALY_DECAY: "0.002"
   S43_FENRIR_MAX_HONEYPOT_EVENTS: "500"
-  S43_FENRIR_WATCHTOWER_URL: "http://s43-core:9100/watchtower/events"
+  # Fenrir reports through the API bridge (s43-api authenticates with the
+  # Fenrir service token and forwards to the Watchtower's /watchtower/analyze).
+  # Not s43-core:9100/watchtower/events — no such route on the Watchtower (F-06).
+  S43_FENRIR_WATCHTOWER_URL: "http://s43-api:8000/watchtower/events"
   S43_FENRIR_BROADCAST_URL: "http://s43-api:8000/internal/events/broadcast"
   S43_FENRIR_REPORT_TIMEOUT: "2.0"
 

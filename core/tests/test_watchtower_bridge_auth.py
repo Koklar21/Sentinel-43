@@ -144,4 +144,66 @@ def test_bridge_route_reaches_watchtower_only_after_auth(allow_operator_and_trac
     assert isinstance(result, dict)
 
 
+# ---------------------------------------------------------------------------
+# F-06: POST /watchtower/events is a service-token route (its only caller is
+# FenrirHunter), not an operator route, and it forwards to the real
+# Watchtower ingestion endpoint /watchtower/analyze.
+# ---------------------------------------------------------------------------
+
+FENRIR_TOKEN = "test-fenrir-service-token-for-events-route"
+
+
+@pytest.fixture
+def fenrir_events_env(monkeypatch):
+    monkeypatch.setenv("S43_FENRIR_API_TOKEN", FENRIR_TOKEN)
+    forwarded: list[tuple] = []
+
+    def _traced_request(method, path, payload=None):  # noqa: ANN001, ANN202
+        forwarded.append((method, path, payload))
+        return {"accepted": True, "status_code": 200}
+
+    async def _noop_broadcast(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        return None
+
+    monkeypatch.setattr(main_module, "_watchtower_request", _traced_request)
+    monkeypatch.setattr(main_module, "_broadcast_dashboard_event", _noop_broadcast)
+    return forwarded
+
+
+def test_events_route_rejects_anonymous(fenrir_events_env):
+    with pytest.raises(HTTPException) as exc:
+        _run(main_module.watchtower_ingest_event({"kind": "test"}, _request()))
+    assert exc.value.status_code == 401
+
+
+def test_events_route_rejects_operator_style_bearer(fenrir_events_env):
+    # An operator JWT that is not the configured Fenrir token must not pass.
+    with pytest.raises(HTTPException) as exc:
+        _run(main_module.watchtower_ingest_event(
+            {"kind": "test"}, _request(authorization="Bearer eyJhbGciOiJIUzI1NiJ9.fake.jwt")
+        ))
+    assert exc.value.status_code == 401
+
+
+def test_events_route_fails_closed_when_token_unconfigured(monkeypatch):
+    monkeypatch.delenv("S43_FENRIR_API_TOKEN", raising=False)
+    with pytest.raises(HTTPException) as exc:
+        _run(main_module.watchtower_ingest_event(
+            {"kind": "test"}, _request(authorization=f"Bearer {FENRIR_TOKEN}")
+        ))
+    assert exc.value.status_code == 503
+
+
+def test_events_route_accepts_fenrir_token_and_forwards_to_analyze(fenrir_events_env):
+    result = _run(main_module.watchtower_ingest_event(
+        {"kind": "security", "score": 91},
+        _request(authorization=f"Bearer {FENRIR_TOKEN}"),
+    ))
+    assert result["ok"] is True
+    assert fenrir_events_env, "handler never forwarded to the Watchtower"
+    method, path, payload = fenrir_events_env[0]
+    assert (method, path) == ("POST", "/watchtower/analyze")
+    assert payload == {"event": {"kind": "security", "score": 91}}
+
+
 __all__: list[str] = []
