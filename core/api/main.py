@@ -128,6 +128,7 @@ SENTINEL_ENV = _env_str("SENTINEL_ENV", "production")
 WATCHTOWER_URL               = _env_str("S43_WATCHTOWER_URL", "http://s43-core:9100").rstrip("/")
 WATCHTOWER_TIMEOUT           = _env_float("S43_WATCHTOWER_TIMEOUT", 2.0)
 WATCHTOWER_HEARTBEAT_SECONDS = _env_int("S43_WATCHTOWER_HEARTBEAT_SECONDS", 15)
+WATCHTOWER_SERVICE_TOKEN_ENV = "S43_WATCHTOWER_SERVICE_TOKEN"
 
 _ALLOWED_ORIGINS: frozenset[str] = _env_frozenset(
     "S43_ALLOWED_ORIGINS",
@@ -467,6 +468,13 @@ def _watchtower_request(
     url = f"{WATCHTOWER_URL}{path}"
     data = None
     headers = {"Content-Type": "application/json"}
+    # Pass 1: the Watchtower core now requires an internal-service token on
+    # every operational/mutation route. Attach it when configured. Read at
+    # call time so a rotation or a test override takes effect without a
+    # module reload. /watchtower/health and /watchtower/ready ignore it.
+    _wt_token = os.getenv(WATCHTOWER_SERVICE_TOKEN_ENV, "").strip()
+    if _wt_token:
+        headers["Authorization"] = f"Bearer {_wt_token}"
     if payload is not None:
         try:
             data = json.dumps(payload).encode("utf-8")
@@ -1276,13 +1284,20 @@ async def api_heartbeat_watchtower(request: Request) -> dict[str, Any]:
     return send_api_heartbeat()
 
 @watchtower_router.get("/modules")
-def api_watchtower_modules() -> dict[str, Any]:
+async def api_watchtower_modules(request: Request) -> dict[str, Any]:
+    # Pass 1 (F-01): this bridge route leaked the full Watchtower module
+    # registry anonymously — its sibling api_watchtower_status already
+    # required an operator; this one was missing the call.
+    await _require_operator(request)
     result = _watchtower_request("GET", "/watchtower/modules")
     return {"bridge": "api_to_watchtower", "reachable": "error" not in result,
             "watchtower": result, "timestamp": utc_now()}
 
 @watchtower_router.get("/check")
-def watchtower_check() -> dict[str, Any]:
+async def watchtower_check(request: Request) -> dict[str, Any]:
+    # Pass 1 (F-02): anonymous callers could read aggregated
+    # health/ready/status plus the local registration snapshot here.
+    await _require_operator(request)
     health_result = watchtower_health_check()
     ready_result  = _watchtower_request("GET", "/watchtower/ready")
     status_result = _watchtower_request("GET", "/watchtower/status")
