@@ -56,8 +56,16 @@ kubectl create secret generic sentinel43-secrets -n sentinel43 \
   --from-literal=SENTINEL_REMOTE_TOKEN_OWNER="$SENTINEL_REMOTE_TOKEN_OWNER" \
   --from-literal=SENTINEL_REMOTE_TOKEN_ADMIN="$SENTINEL_REMOTE_TOKEN_ADMIN" \
   --from-literal=SENTINEL_REMOTE_TOKEN_AUDITOR="$SENTINEL_REMOTE_TOKEN_AUDITOR" \
-  --from-literal=S43_FENRIR_API_TOKEN="$S43_FENRIR_API_TOKEN"
+  --from-literal=S43_FENRIR_API_TOKEN="$S43_FENRIR_API_TOKEN" \
+  --from-literal=S43_WATCHTOWER_SERVICE_TOKEN="$S43_WATCHTOWER_SERVICE_TOKEN"
 ```
+
+`S43_WATCHTOWER_SERVICE_TOKEN` is read by both `s43-api` and `s43-core` (both
+`envFrom` this Secret). The Watchtower core rejects every operational and
+mutation route without it and fails closed with 503 if it is unset —
+`/watchtower/health` and `/watchtower/ready` (the probe targets) stay open.
+It is defence-in-depth alongside `networkpolicy-core.yaml`, which already
+restricts `:9100` ingress to `s43-api` only.
 
 **Secrets-at-rest**: whether this Secret is encrypted at rest in etcd
 depends entirely on the cluster, not on anything in this repo — Kubernetes

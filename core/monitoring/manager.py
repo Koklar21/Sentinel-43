@@ -88,6 +88,13 @@ def _watchtower_request(
     url = f"{WATCHTOWER_URL}{path}"
     data = None
     headers = {"Content-Type": "application/json"}
+    # Pass 1: the Watchtower core now requires an internal-service token on
+    # every route the manager calls (/modules/register, /dependencies/report,
+    # /analyze). Read at call time so a rotation takes effect without a
+    # reload; harmless on the unauthenticated health/ready probes.
+    _wt_token = os.getenv("S43_WATCHTOWER_SERVICE_TOKEN", "").strip()
+    if _wt_token:
+        headers["Authorization"] = f"Bearer {_wt_token}"
 
     if payload is not None:
         try:
