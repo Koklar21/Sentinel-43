@@ -127,28 +127,57 @@ class _FakeUserStore:
         self.users[username] = user
         return user
 
+    async def create_first_admin(
+        self, session, *, username: str, password: str, email: str | None = None
+    ) -> _FakeUser:
+        # Mirrors core.auth.users.create_first_admin: gate on the count and
+        # the username, raise the same exceptions. The advisory lock is a
+        # no-op here (single-threaded dict store); the real cross-process
+        # behaviour is covered by test_bootstrap_concurrency.py.
+        if await self.count_active_admins(session) > 0:
+            raise users_module.FirstAdminExistsError()
+        if await self.get_user_by_username(session, username) is not None:
+            raise users_module.UsernameTakenError(username)
+        return await self.create_user(
+            session, username=username, password=password, role="admin", email=email
+        )
+
     async def authenticate_user(
-        self, session, username: str, password: str, *, update_last_login: bool = True
+        self, session, username: str, password: str
     ) -> _FakeUser | None:
         user = self.users.get(username)
         if user is None or not user.is_active:
             return None
         if not users_module.verify_password(password, user.password_hash):
             return None
-        if update_last_login:
-            user.last_login_at = datetime.now(timezone.utc)
         return user
 
+    async def record_login(self, session, user: _FakeUser) -> None:
+        user.last_login_at = datetime.now(timezone.utc)
 
-async def _fake_get_db_session() -> AsyncIterator[None]:
-    yield None
+
+class _FakeSession:
+    """No-op AsyncSession stand-in — the dict store has no real transaction."""
+
+    async def commit(self) -> None: ...
+    async def rollback(self) -> None: ...
+    async def flush(self) -> None: ...
+    async def refresh(self, _obj) -> None: ...
+
+    def get_bind(self):  # noqa: ANN201
+        raise RuntimeError("fake session has no bind")
+
+
+async def _fake_get_db_session() -> AsyncIterator[_FakeSession]:
+    yield _FakeSession()
 
 
 class _NullSession:
-    """Stands in for an AsyncSession that our fake store never touches."""
+    """Stands in for the sessionmaker context used by auth.py's
+    reverify_password() / _validate_credentials()."""
 
-    async def __aenter__(self) -> None:
-        return None
+    async def __aenter__(self) -> _FakeSession:
+        return _FakeSession()
 
     async def __aexit__(self, *exc_info: object) -> None:
         return None
@@ -180,10 +209,10 @@ def fresh_user_store(monkeypatch) -> _FakeUserStore:
     store = _FakeUserStore()
 
     monkeypatch.setattr(bootstrap_module, "count_active_admins", store.count_active_admins)
-    monkeypatch.setattr(bootstrap_module, "create_user", store.create_user)
-    monkeypatch.setattr(bootstrap_module, "get_user_by_username", store.get_user_by_username)
+    monkeypatch.setattr(bootstrap_module, "create_first_admin", store.create_first_admin)
     monkeypatch.setattr(bootstrap_module, "init_models", store.init_models)
     monkeypatch.setattr(users_module, "authenticate_user", store.authenticate_user)
+    monkeypatch.setattr(users_module, "record_login", store.record_login)
     monkeypatch.setattr(users_module, "get_sessionmaker", _fake_get_sessionmaker)
 
     app.dependency_overrides[auth_deps_module.get_db_session] = _fake_get_db_session
