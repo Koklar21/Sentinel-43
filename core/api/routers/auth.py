@@ -71,7 +71,9 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any
 
@@ -82,6 +84,86 @@ from pydantic import BaseModel, Field
 from ...security.jwt_constants import APPROVED_JWT_ALGORITHMS
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Login brute-force throttle (Pass 3, RELEASE_FINDINGS-adjacent)
+#
+# /auth/login had no per-credential rate limiting: the only backstop was the
+# firewall's coarse per-IP limiter (300/60s). A per-username sliding-window
+# lockout raises the cost of guessing a known operator's password. In-process
+# only — adequate for the single-replica beta; a multi-replica deployment
+# wants this in Redis (noted in PASS3_VALIDATION.md). reverify_password()'s
+# per-request path is not throttled here: it already sits behind a valid-JWT
+# gate and its Argon2 verify now runs off the event loop.
+# =============================================================================
+
+def _ei_raw(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def _login_throttle_config() -> tuple[int, int, int]:
+    """(max_failures, window_seconds, lockout_seconds), read at call time."""
+    return (
+        max(1, _ei_raw("S43_LOGIN_MAX_FAILURES", 10)),
+        max(1, _ei_raw("S43_LOGIN_FAIL_WINDOW_SECONDS", 300)),
+        max(1, _ei_raw("S43_LOGIN_LOCKOUT_SECONDS", 300)),
+    )
+
+
+_login_failures: dict[str, deque[float]] = {}
+_login_lock = threading.Lock()
+
+
+def _throttle_key(username: str) -> str:
+    return username.strip().lower()[:MAX_USERNAME_LEN]
+
+
+def _login_check_throttled(username: str) -> None:
+    max_fail, window, lockout = _login_throttle_config()
+    key = _throttle_key(username)
+    now = time.monotonic()
+    with _login_lock:
+        bucket = _login_failures.get(key)
+        if not bucket:
+            return
+        while bucket and bucket[0] < now - max(window, lockout):
+            bucket.popleft()
+        if not bucket:
+            _login_failures.pop(key, None)
+            return
+        recent = [t for t in bucket if t >= now - window]
+        if len(recent) >= max_fail and (now - bucket[-1]) < lockout:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many failed login attempts. Try again later.",
+                headers={"Retry-After": str(lockout)},
+            )
+
+
+def _login_record_failure(username: str) -> None:
+    _, window, lockout = _login_throttle_config()
+    key = _throttle_key(username)
+    now = time.monotonic()
+    with _login_lock:
+        bucket = _login_failures.setdefault(key, deque(maxlen=256))
+        bucket.append(now)
+        # opportunistic GC so the dict can't grow without bound
+        if len(_login_failures) > 4096:
+            cutoff = now - max(window, lockout)
+            for k in [k for k, b in _login_failures.items() if not b or b[-1] < cutoff]:
+                _login_failures.pop(k, None)
+
+
+def _login_clear(username: str) -> None:
+    with _login_lock:
+        _login_failures.pop(_throttle_key(username), None)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -285,7 +367,10 @@ async def reverify_password(username: str, password: str) -> bool:
 
         sessionmaker = get_sessionmaker()
         async with sessionmaker() as session:
-            user = await authenticate_user(session, normalized, password, update_last_login=False)
+            # Read-only: authenticate_user() no longer writes last_login_at on
+            # any path. reverify_password() runs on every protected request —
+            # it must never touch the DB beyond the SELECT + Argon2 verify.
+            user = await authenticate_user(session, normalized, password)
             if user is not None:
                 return True
     except Exception as exc:
@@ -316,13 +401,20 @@ async def _validate_credentials(username: str, password: str) -> tuple[str, str,
     normalized = username.strip()
 
     try:
-        from ...auth.users import authenticate_user, get_sessionmaker
+        from ...auth.users import authenticate_user, get_sessionmaker, record_login
 
         sessionmaker = get_sessionmaker()
         async with sessionmaker() as session:
             user = await authenticate_user(session, normalized, password)
             if user is not None:
-                return user.username, user.role, str(user.user_id)
+                # This IS a login — record it. authenticate_user() itself is
+                # read-only now; _validate_credentials owns this write and the
+                # commit. reverify_password()'s per-request path does not
+                # reach here, so last_login_at still means "last login".
+                subject, role, user_id = user.username, user.role, str(user.user_id)
+                await record_login(session, user)
+                await session.commit()
+                return subject, role, user_id
     except Exception as exc:
         # DATABASE_URL unset, DB unreachable, or table not created yet.
         # Not fatal — fall through to the env-var check below.
@@ -507,10 +599,21 @@ async def login(body: LoginRequest) -> LoginResponse:
 
     The JWT is consumed by auth.js (stored in sessionStorage) and then sent
     by websocket.js during the WebSocket authentication handshake.
-    """
-    subject, role, user_id = await _validate_credentials(body.username, body.password)
-    token, exp_dt = _issue_token(subject=subject, role=role, user_id=user_id)
 
+    Per-username brute-force throttle: after S43_LOGIN_MAX_FAILURES (10)
+    failures inside S43_LOGIN_FAIL_WINDOW_SECONDS (300), further attempts for
+    that username get 429 for S43_LOGIN_LOCKOUT_SECONDS (300).
+    """
+    _login_check_throttled(body.username)
+    try:
+        subject, role, user_id = await _validate_credentials(body.username, body.password)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+            _login_record_failure(body.username)
+        raise
+    _login_clear(body.username)
+
+    token, exp_dt = _issue_token(subject=subject, role=role, user_id=user_id)
     return LoginResponse(
         token=token,
         subject=subject,
