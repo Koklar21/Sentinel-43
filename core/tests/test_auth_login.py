@@ -22,15 +22,11 @@
 #     hex). The login endpoint hashes the typed password itself — send the
 #     plaintext password, not the hash, in the login request.
 #
-# KNOWN INCONSISTENCY (flagged, not silently worked around):
-#   auth.py's verify_jwt_token() requires sub/exp/iss/aud/iat/nbf and
-#   returns 401 for a missing/bad role claim. main.py's parallel
-#   _verify_jwt_token() (per test_jwt_auth.py) requires only sub/exp/iss/aud
-#   and returns 403 for the same case. These are NOT identical despite the
-#   docstring claim. Tokens here always include iat/nbf/role so they pass
-#   both paths — but this divergence should be fixed (consolidate to one
-#   verifier) before beta, since /watchtower/status and /auth/verify can
-#   currently disagree on status code for the same bad token.
+# Consolidated verifier:
+#   main.py no longer keeps its own JWT verifier. _get_operator() and
+#   dashboard_websocket() both import and call auth.py's verify_jwt_token()
+#   directly, so /watchtower/status, /auth/verify, and the WebSocket auth
+#   frame all agree on status codes for the same bad token.
 # =============================================================================
 
 from __future__ import annotations

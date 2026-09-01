@@ -94,27 +94,32 @@ def _build_config_kwargs(cls: type[Any]) -> dict[str, Any]:
     """
     kwargs: dict[str, Any] = {}
 
+    # Keys below are the *actual* FirewallConfig constructor parameter names
+    # (see core/api/middleware/sentinel_firewall_middleware.py). Earlier
+    # versions of this table guessed plausible-sounding names ("enable_firewall",
+    # "max_body_bytes", "allowed_hosts", "blocked_paths", "blocked_ips",
+    # "block_private_networks", "log_blocked", "strict_mode") that never
+    # matched the real dataclass fields, so _constructor_accepts() silently
+    # dropped 8 of 10 candidates below and those knobs did nothing — the same
+    # bug class that left trusted_proxy_cidrs permanently empty. "allowed_origins"
+    # was removed outright: it's a CORS setting (see S43_ALLOWED_ORIGINS in
+    # core/api/main.py), not a FirewallConfig field, and never belonged here.
     candidates: dict[str, Any] = {
-        # Common enable/disable field names.
         "enabled": _env_bool("S43_FIREWALL_ENABLED", True),
-        "enable_firewall": _env_bool("S43_FIREWALL_ENABLED", True),
 
-        # Common request/body limits.
-        "max_body_bytes": _env_int("S43_FIREWALL_MAX_BODY_BYTES", 1024 * 1024),
-        "max_request_bytes": _env_int("S43_FIREWALL_MAX_BODY_BYTES", 1024 * 1024),
-        "max_header_bytes": _env_int("S43_FIREWALL_MAX_HEADER_BYTES", 16 * 1024),
+        # Real field names: max_content_length_bytes / max_total_header_bytes.
+        # Defaults match FirewallConfig's own dataclass defaults so leaving
+        # these env vars unset preserves prior (unconfigurable) behavior.
+        "max_content_length_bytes": _env_int("S43_FIREWALL_MAX_BODY_BYTES", 10 * 1024 * 1024),
+        "max_total_header_bytes": _env_int("S43_FIREWALL_MAX_HEADER_BYTES", 32 * 1024),
 
-        # Common origin/path/IP style fields.
-        "allowed_origins": _env_csv("S43_ALLOWED_ORIGINS"),
-        "allowed_hosts": _env_csv("S43_ALLOWED_HOSTS"),
-        "blocked_paths": _env_csv("S43_FIREWALL_BLOCKED_PATHS"),
-        "blocked_ips": _env_csv("S43_FIREWALL_BLOCKED_IPS"),
-        "trusted_proxies": _env_csv("S43_TRUSTED_PROXIES"),
+        # Real field names: allowed_ip_cidrs / blocked_ip_cidrs / blocked_path_prefixes.
+        "allowed_ip_cidrs": _env_csv("S43_FIREWALL_ALLOWED_IP_CIDRS"),
+        "blocked_ip_cidrs": _env_csv("S43_FIREWALL_BLOCKED_IPS"),
+        "blocked_path_prefixes": _env_csv("S43_FIREWALL_BLOCKED_PATHS"),
 
-        # Common behavior toggles.
-        "block_private_networks": _env_bool("S43_FIREWALL_BLOCK_PRIVATE_NETWORKS", False),
-        "log_blocked": _env_bool("S43_FIREWALL_LOG_BLOCKED", True),
-        "strict_mode": _env_bool("S43_FIREWALL_STRICT_MODE", False),
+        # See docs/security/trusted_proxy_handling.md.
+        "trusted_proxy_cidrs": _env_csv("S43_TRUSTED_PROXIES"),
     }
 
     for field, value in candidates.items():
