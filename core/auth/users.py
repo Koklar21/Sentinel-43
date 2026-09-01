@@ -192,6 +192,18 @@ async def get_user_by_username(session: AsyncSession, username: str) -> Optional
     return result.scalar_one_or_none()
 
 
+async def get_user_by_id(session: AsyncSession, user_id: uuid.UUID) -> Optional[User]:
+    result = await session.execute(select(User).where(User.user_id == user_id))
+    return result.scalar_one_or_none()
+
+
+async def list_users(session: AsyncSession) -> list[User]:
+    """All user rows, oldest first. Small table (operators/admins for one
+    deployment), so no pagination — the admin UI shows the whole list."""
+    result = await session.execute(select(User).order_by(User.created_at))
+    return list(result.scalars().all())
+
+
 async def create_user(
     session: AsyncSession,
     *,
@@ -242,6 +254,39 @@ async def authenticate_user(
     return user
 
 
+async def set_user_active(
+    session: AsyncSession, user: User, *, is_active: bool
+) -> User:
+    """Deactivate (is_active=False) or reactivate an account. A deactivated
+    user cannot log in and cannot pass reverify_password() on subsequent
+    requests — authenticate_user() rejects `not user.is_active` before the
+    password is even checked."""
+    user.is_active = is_active
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
+async def set_user_role(session: AsyncSession, user: User, *, role: str) -> User:
+    if role not in APPROVED_ROLES:
+        raise ValueError(f"role must be one of {sorted(APPROVED_ROLES)}")
+    user.role = role
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
+async def set_user_password(
+    session: AsyncSession, user: User, *, password: str
+) -> User:
+    """Overwrite the stored Argon2id hash. Used by the admin password-reset
+    endpoint; there is no self-service "change my password" flow yet."""
+    user.password_hash = hash_password(password)
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
 __all__ = [
     "APPROVED_ROLES",
     "Base",
@@ -251,8 +296,13 @@ __all__ = [
     "create_user",
     "get_engine",
     "get_sessionmaker",
+    "get_user_by_id",
     "get_user_by_username",
     "hash_password",
     "init_models",
+    "list_users",
+    "set_user_active",
+    "set_user_password",
+    "set_user_role",
     "verify_password",
 ]
