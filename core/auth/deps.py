@@ -60,9 +60,20 @@ from .users import count_active_admins, get_sessionmaker
 
 
 async def get_db_session() -> AsyncIterator[AsyncSession]:
+    """
+    Yield a request-scoped AsyncSession. The route owns the transaction: it
+    commits on success. This dependency rolls the session back if the route
+    (or a downstream dependency) raises, so a failed logical operation never
+    leaves a partial write — the account helpers in core/auth/users.py flush
+    but do not commit, precisely so this boundary is the only commit point.
+    """
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
-        yield session
+        try:
+            yield session
+        except Exception:
+            await session.rollback()
+            raise
 
 
 async def require_initialized(
