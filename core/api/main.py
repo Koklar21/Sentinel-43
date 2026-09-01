@@ -937,6 +937,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# SentinelFirewall is a required security control. A failure to import,
+# configure (FirewallConfig.from_env()), or register it must NOT leave the
+# API silently serving requests unprotected. Outside an explicit
+# development/local/test environment (SENTINEL_ENV), this is a fatal,
+# fail-closed startup error -- the same posture as _validate_security_config().
+# In a local/test environment it degrades to a loud error and continues, so a
+# developer can still iterate without the firewall's config plumbing.
+# To run without the firewall on purpose, set S43_FIREWALL_ENABLED=false
+# (the middleware still mounts, as a pass-through) -- do not rely on this
+# exception path.
 try:
     from core.middleware import SentinelFirewall, FirewallConfig
     app.add_middleware(
@@ -945,10 +955,21 @@ try:
         monitoring_manager=_monitoring_manager,
     )
     logger.info("SentinelFirewall middleware registered")
-except ImportError:
-    logger.warning("core.middleware.SentinelFirewall not available -- no firewall middleware")
-except Exception as _fw_exc:
-    logger.error("SentinelFirewall middleware failed to register: %s", _fw_exc)
+except Exception as _fw_exc:  # noqa: BLE001 - deliberately broad; re-raised below outside local envs
+    if _is_local_environment():
+        logger.error(
+            "SentinelFirewall middleware failed to register (%s: %s) -- "
+            "continuing WITHOUT the firewall because SENTINEL_ENV=%r is a "
+            "local/test environment. This would be a fatal error in production.",
+            type(_fw_exc).__name__, _fw_exc, SENTINEL_ENV,
+        )
+    else:
+        raise RuntimeError(
+            f"SentinelFirewall middleware failed to register "
+            f"({type(_fw_exc).__name__}: {_fw_exc}). The firewall is a "
+            f"required security control outside development/local/test "
+            f"environments; refusing to start unprotected."
+        ) from _fw_exc
 
 try:
     from core.monitoring import SpartaCore as _SC, IntegrityConfig as _IC, create_node_router
