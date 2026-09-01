@@ -50,12 +50,14 @@
 # deploy and first setup. Deployments should complete /bootstrap/admin
 # immediately after bringing the stack up for exactly this reason.
 #
-# Known gap: two concurrent POST /bootstrap/admin requests during that
-# window could both pass the count_active_admins() == 0 check before
-# either commits, creating two admins instead of refusing the second.
-# Not fixed here (would need a DB-level advisory lock or a dedicated
-# single-row lock table) — low severity for a first-run-only endpoint,
-# but worth closing before this is exposed on a multi-replica deployment.
+# Concurrency (RELEASE_FINDINGS #12): two concurrent POST /bootstrap/admin
+# requests used to both pass the count_active_admins() == 0 check before
+# either committed, creating two "first" admins. Closed in Pass 3:
+# create_first_admin() takes a PostgreSQL transaction advisory lock
+# (ADMIN_INVARIANT_LOCK_KEY) before the count and holds it through the INSERT
+# and this route's commit, so the second contender blocks, then sees an admin
+# already exists and gets 409. Reproduced (7/8 contenders created an admin
+# pre-fix; 1/8 post-fix) — see PASS3_VALIDATION.md.
 # =============================================================================
 
 from __future__ import annotations
@@ -65,7 +67,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...auth.deps import get_db_session
-from ...auth.users import count_active_admins, create_user, get_user_by_username, init_models
+from ...auth.users import (
+    FirstAdminExistsError,
+    UsernameTakenError,
+    count_active_admins,
+    create_first_admin,
+    init_models,
+)
 
 router = APIRouter(prefix="/bootstrap", tags=["bootstrap"])
 
@@ -124,15 +132,10 @@ async def bootstrap_admin(
     """
     Create the first admin account. Refuses once any active admin exists —
     this is the only thing standing between this route and being an
-    unauthenticated privilege-escalation endpoint.
+    unauthenticated privilege-escalation endpoint. Serialized under
+    concurrency by create_first_admin()'s advisory lock (finding #12).
     """
     await init_models()
-
-    if await count_active_admins(session) > 0:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Sentinel-43 already has an active admin. /bootstrap/admin only works on first run.",
-        )
 
     username = body.username.strip()
     if not username:
@@ -141,21 +144,24 @@ async def bootstrap_admin(
             detail="username must not be blank.",
         )
 
-    if await get_user_by_username(session, username) is not None:
+    email = body.email.strip() if body.email else None
+
+    try:
+        user = await create_first_admin(
+            session, username=username, password=body.password, email=email
+        )
+    except FirstAdminExistsError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Sentinel-43 already has an active admin. /bootstrap/admin only works on first run.",
+        )
+    except UsernameTakenError:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Username already exists.",
         )
 
-    email = body.email.strip() if body.email else None
-    user = await create_user(
-        session,
-        username=username,
-        password=body.password,
-        role="admin",
-        email=email,
-    )
-
+    await session.commit()
     return BootstrapAdminResponse(username=user.username, role=user.role)
 
 

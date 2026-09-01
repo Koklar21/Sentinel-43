@@ -60,8 +60,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...auth.deps import get_db_session
 from ...auth.users import (
+    ADMIN_INVARIANT_LOCK_KEY,
     APPROVED_ROLES,
     User,
+    _pg_advisory_xact_lock,
     count_active_admins,
     create_user,
     get_user_by_id,
@@ -218,9 +220,10 @@ async def create_account(
             role=role,
             email=email,
         )
+        await session.commit()
     except IntegrityError:
-        # Unique-constraint race on username or email between the check
-        # above and the insert.
+        # Unique-constraint race on username or email between the check above
+        # and the flush inside create_user(). get_db_session() rolls back.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="An account with that username or email already exists.",
@@ -276,6 +279,19 @@ async def update_account(
             detail="You cannot deactivate your own account.",
         )
 
+    # If this change can move the active-admin count, serialize it against
+    # every other admin-count-moving operation (including POST /bootstrap/admin)
+    # with the same advisory lock, so the last-admin check below reads a count
+    # nobody else can change until we commit or roll back. Without this, two
+    # concurrent PATCHes each demoting a different one of the final two admins
+    # both see count==2 and both succeed, leaving zero admins.
+    touches_admin_count = (
+        (body.is_active is not None and target.role == "admin")
+        or (new_role is not None and (target.role == "admin" or new_role == "admin"))
+    )
+    if touches_admin_count:
+        await _pg_advisory_xact_lock(session, ADMIN_INVARIANT_LOCK_KEY)
+
     if await _would_orphan_admins(
         session, target, new_is_active=body.is_active, new_role=new_role
     ):
@@ -289,6 +305,7 @@ async def update_account(
     if body.is_active is not None and bool(body.is_active) != bool(target.is_active):
         target = await set_user_active(session, target, is_active=body.is_active)
 
+    await session.commit()
     return _serialize(target)
 
 
@@ -309,6 +326,7 @@ async def reset_account_password(
         )
 
     target = await set_user_password(session, target, password=body.new_password)
+    await session.commit()
     return _serialize(target)
 
 
