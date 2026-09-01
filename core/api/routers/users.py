@@ -41,12 +41,15 @@
 #     deployment can never be left with zero admins and no way back in
 #     short of raw SQL. Self-demotion IS allowed while another admin remains.
 #
-# Known gap (same shape as core/api/routers/bootstrap.py's): the last-admin
-# check reads count_active_admins() and then writes without a DB-level lock,
-# so two concurrent PATCHes each demoting a different one of the final two
-# admins could both pass the check before either commits. Low severity — a
-# deliberate multi-admin action on a single deployment — and closing it
-# needs an advisory lock; not done here.
+# Concurrency (Pass 3): the last-admin check (_would_orphan_admins) reads
+# count_active_admins() and then writes. Any PATCH that can move the
+# active-admin count now takes ADMIN_INVARIANT_LOCK_KEY (a PostgreSQL
+# transaction advisory lock, the same one POST /bootstrap/admin uses) before
+# the check, so two concurrent PATCHes each demoting a different one of the
+# final two admins are serialized: the first commits, the second re-reads
+# count==1 and gets 409. Reproduced against real PostgreSQL — see
+# PASS3_VALIDATION.md. Also: the route commits ONCE at the end (helpers only
+# flush), so a role+is_active change can't half-persist.
 # =============================================================================
 
 from __future__ import annotations
