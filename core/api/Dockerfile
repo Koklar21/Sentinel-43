@@ -43,4 +43,13 @@ USER 65532:65532
 
 EXPOSE 8000
 
-CMD ["python", "-m", "uvicorn", "core.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# --forwarded-allow-ips: pin uvicorn's own default (127.0.0.1) explicitly.
+# uvicorn's ProxyHeadersMiddleware would otherwise take its trust list from
+# $FORWARDED_ALLOW_IPS, and a FORWARDED_ALLOW_IPS=* (a common container
+# copy-paste) makes uvicorn rewrite scope["client"] from X-Forwarded-For for
+# ANY peer -- defeating SentinelFirewall's own trusted-proxy control before it
+# ever sees the request. An explicit CLI value overrides that env var. The
+# single authoritative proxy-trust knob is S43_TRUSTED_PROXIES (the firewall's
+# trusted_proxy_cidrs); a deployment behind a real reverse proxy should set
+# BOTH this flag and S43_TRUSTED_PROXIES to that proxy's address.
+CMD ["python", "-m", "uvicorn", "core.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--forwarded-allow-ips", "127.0.0.1"]

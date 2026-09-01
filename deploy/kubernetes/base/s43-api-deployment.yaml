@@ -32,7 +32,14 @@ spec:
         - name: s43-api
           image: sentinel43-api:base-placeholder  # overridden by every overlay
           imagePullPolicy: IfNotPresent
-          command: ["uvicorn", "core.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+          # --forwarded-allow-ips pins uvicorn's default (127.0.0.1) so a
+          # FORWARDED_ALLOW_IPS env cannot make uvicorn trust X-Forwarded-For
+          # from arbitrary peers and rewrite the client IP before
+          # SentinelFirewall sees it. S43_TRUSTED_PROXIES is the authoritative
+          # proxy-trust control (docs/security/trusted_proxy_handling.md).
+          # Behind an ingress, set this flag to the ingress controller's
+          # address AND S43_TRUSTED_PROXIES to the matching CIDR.
+          command: ["uvicorn", "core.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--forwarded-allow-ips", "127.0.0.1"]
           ports:
             - {containerPort: 8000, name: http}
           envFrom:

@@ -147,7 +147,12 @@ services:
       dockerfile: core/api/Dockerfile
     container_name: s43_api
     restart: unless-stopped
-    command: uvicorn core.api.main:app --host 0.0.0.0 --port 8000
+    # --forwarded-allow-ips pins uvicorn's own default (127.0.0.1) so a
+    # FORWARDED_ALLOW_IPS=* env can't make uvicorn rewrite the client IP from
+    # X-Forwarded-For for any peer and bypass SentinelFirewall. The real
+    # proxy-trust knob is S43_TRUSTED_PROXIES. See
+    # docs/security/trusted_proxy_handling.md.
+    command: uvicorn core.api.main:app --host 0.0.0.0 --port 8000 --forwarded-allow-ips 127.0.0.1
     ports:
       - "8000:8000"
     environment:
