@@ -262,14 +262,31 @@ def _parse_ip(value: str) -> Optional[ipaddress._BaseAddress]:
         return None
 
 
-def _parse_networks(values: Sequence[str]) -> tuple[ipaddress._BaseNetwork, ...]:
+def _parse_networks(
+    values: Sequence[str], *, field: str
+) -> tuple[ipaddress._BaseNetwork, ...]:
+    """
+    Parse a sequence of CIDR / IP strings into network objects.
+
+    Fail closed: a malformed entry raises instead of being silently dropped.
+    Silently discarding an invalid entry weakens security in every direction
+    this config is used — an intended blocked_ip_cidrs entry stops blocking,
+    an allowed_ip_cidrs list that loses all its entries stops allow-listing
+    (everyone passes), a trusted_proxy_cidrs typo changes whose
+    X-Forwarded-For is believed. The caller (SentinelFirewall.__init__) lets
+    this propagate; core/api/main.py turns it into a fail-closed startup
+    error outside local/test environments.
+    """
     networks: list[ipaddress._BaseNetwork] = []
 
     for value in values:
         try:
             networks.append(ipaddress.ip_network(value, strict=False))
-        except Exception:
-            logger.warning("Ignoring invalid CIDR in firewall config: %r", value)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"SentinelFirewall: invalid CIDR {value!r} in firewall "
+                f"config field {field!r}: {exc}"
+            ) from exc
 
     return tuple(networks)
 
@@ -308,9 +325,15 @@ class SentinelFirewall:
         self.config = config or FirewallConfig()
         self.monitoring_manager = monitoring_manager
 
-        self._trusted_proxy_networks = _parse_networks(self.config.trusted_proxy_cidrs)
-        self._allowed_networks = _parse_networks(self.config.allowed_ip_cidrs)
-        self._blocked_networks = _parse_networks(self.config.blocked_ip_cidrs)
+        self._trusted_proxy_networks = _parse_networks(
+            self.config.trusted_proxy_cidrs, field="trusted_proxy_cidrs"
+        )
+        self._allowed_networks = _parse_networks(
+            self.config.allowed_ip_cidrs, field="allowed_ip_cidrs"
+        )
+        self._blocked_networks = _parse_networks(
+            self.config.blocked_ip_cidrs, field="blocked_ip_cidrs"
+        )
 
         self._http_limiter = _RateLimiter(
             self.config.http_rate_limit_requests,
@@ -434,7 +457,19 @@ class SentinelFirewall:
         if direct_ip is None:
             return direct_host
 
-        if self._trusted_proxy_networks and not _ip_in_networks(direct_ip, self._trusted_proxy_networks):
+        # No trusted proxies configured => never believe a forwarded header.
+        # An empty trusted-proxy list means "trust nobody", NOT "trust
+        # everybody": without this guard the block below would happily take
+        # an X-Forwarded-For value from any direct caller and treat it as the
+        # client IP for IP allow/block, the rate-limiter key, and the
+        # monitoring source_ip. Every request is attributed to its direct
+        # TCP peer until S43_TRUSTED_PROXIES is set to the real proxy CIDR.
+        if not self._trusted_proxy_networks:
+            return direct_host
+
+        # The direct peer must itself be a configured trusted proxy before we
+        # believe anything it forwarded.
+        if not _ip_in_networks(direct_ip, self._trusted_proxy_networks):
             return direct_host
 
         xff = _first_header(headers, "x-forwarded-for")
@@ -445,9 +480,25 @@ class SentinelFirewall:
         if not candidates:
             return direct_host
 
-        first = candidates[0]
-        parsed_first = _parse_ip(first)
-        return str(parsed_first) if parsed_first is not None else direct_host
+        # Walk the chain right-to-left. The rightmost entry is what our
+        # trusted direct peer observed; peel off further trusted-proxy hops;
+        # the first address that is NOT a trusted proxy is the real client.
+        # (Leftmost-wins is wrong for multi-hop / mixed chains: a client can
+        # prepend arbitrary entries, and only the trusted segment on the
+        # right is verifiable.)
+        for candidate in reversed(candidates):
+            parsed = _parse_ip(candidate)
+            if parsed is None:
+                # Malformed entry inside the segment we would otherwise
+                # trust — bail to the direct peer rather than guess.
+                return direct_host
+            if _ip_in_networks(parsed, self._trusted_proxy_networks):
+                continue
+            return str(parsed)
+
+        # Whole chain was trusted proxies; nothing identifies an external
+        # client, so attribute to the direct peer.
+        return direct_host
 
     def _screen_ip(self, ip: Optional[ipaddress._BaseAddress]) -> FirewallDecision:
         if ip is None:

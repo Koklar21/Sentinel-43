@@ -25,6 +25,7 @@ rewiring unrelated middleware.
 from __future__ import annotations
 
 import inspect
+import ipaddress
 import logging
 import os
 from typing import Any
@@ -46,36 +47,65 @@ def _env_str(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-
+def _env_bool(name: str) -> bool:
+    """
+    Parse a set env var as a bool. Caller must only invoke this when the var
+    is actually present (os.getenv(name) is not None). A malformed value is a
+    hard error, not a silent fall-back to a default: this shim exists to stop
+    the firewall silently weakening, and "S43_FIREWALL_ENABLED=maybe quietly
+    becomes True" is exactly that failure mode. The error propagates through
+    FirewallConfig.from_env() to core/api/main.py, which fails startup closed
+    outside local/test environments.
+    """
+    raw = os.getenv(name, "")
     value = raw.strip().lower()
     if value in _TRUE_VALUES:
         return True
     if value in _FALSE_VALUES:
         return False
+    raise ValueError(
+        f"SentinelFirewall: {name}={raw!r} is not a valid boolean "
+        f"(expected one of {sorted(_TRUE_VALUES | _FALSE_VALUES)})"
+    )
 
-    logger.warning("Invalid bool for %s=%r; using default %r", name, raw, default)
-    return default
 
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-
+def _env_int(name: str) -> int:
+    """As _env_bool: only call when the var is set; malformed => hard error."""
+    raw = os.getenv(name, "")
     try:
         return int(raw.strip())
-    except ValueError:
-        logger.warning("Invalid int for %s=%r; using default %r", name, raw, default)
-        return default
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"SentinelFirewall: {name}={raw!r} is not a valid integer"
+        ) from exc
 
 
-def _env_csv(name: str, default: str = "") -> tuple[str, ...]:
-    raw = os.getenv(name, default)
+def _env_csv(name: str) -> tuple[str, ...]:
+    """Split a set env var on commas. '' -> (). Only call when the var is set."""
+    raw = os.getenv(name, "")
     return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _env_cidr_csv(name: str) -> tuple[str, ...]:
+    """
+    As _env_csv, but every entry must parse as an IP or CIDR now, at config
+    load time -- not silently later. A malformed entry in an IP allow/block or
+    trusted-proxy list changes security behavior in every direction; catching
+    it here means it surfaces as a fail-closed startup error (via
+    core/api/main.py) rather than a warning nobody reads. SentinelFirewall's
+    own _parse_networks() re-validates as defense-in-depth for callers that
+    build FirewallConfig directly.
+    """
+    values = _env_csv(name)
+    for value in values:
+        try:
+            ipaddress.ip_network(value, strict=False)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"SentinelFirewall: {name} contains an invalid IP/CIDR "
+                f"{value!r}: {exc}"
+            ) from exc
+    return values
 
 
 def _constructor_accepts(cls: type[Any], field: str) -> bool:
@@ -85,45 +115,73 @@ def _constructor_accepts(cls: type[Any], field: str) -> bool:
         return False
 
 
+# (FirewallConfig constructor field, env var, parser kind). The field names
+# are the *actual* dataclass parameters — see
+# core/api/middleware/sentinel_firewall_middleware.py. Earlier versions of
+# this table guessed plausible-sounding names ("enable_firewall",
+# "max_body_bytes", "blocked_paths", "trusted_proxies", ...) that never
+# matched the real fields; 3f65ca1 corrected the names. "allowed_origins" is
+# not here — it's a CORS setting (S43_ALLOWED_ORIGINS in core/api/main.py),
+# not a FirewallConfig field.
+# (FirewallConfig field, env var, parser kind, keep_default_when_blank).
+# keep_default_when_blank=True: a set-but-empty value ("", whitespace, ",")
+# is treated as "not configured" and FirewallConfig's built-in default is
+# kept, with a warning. Only blocked_path_prefixes needs this — its default
+# is a non-empty security baseline and there is no legitimate reason to want
+# zero path prefixes with the firewall otherwise on (use S43_FIREWALL_ENABLED
+# =false for that). For the other CSV fields an empty value == the default
+# (empty) anyway, so the flag is a no-op.
+_ENV_FIELD_MAP: tuple[tuple[str, str, str, bool], ...] = (
+    ("enabled", "S43_FIREWALL_ENABLED", "bool", False),
+    ("max_content_length_bytes", "S43_FIREWALL_MAX_BODY_BYTES", "int", False),
+    ("max_total_header_bytes", "S43_FIREWALL_MAX_HEADER_BYTES", "int", False),
+    ("allowed_ip_cidrs", "S43_FIREWALL_ALLOWED_IP_CIDRS", "cidr_csv", False),
+    ("blocked_ip_cidrs", "S43_FIREWALL_BLOCKED_IPS", "cidr_csv", False),
+    ("blocked_path_prefixes", "S43_FIREWALL_BLOCKED_PATHS", "csv", True),
+    ("trusted_proxy_cidrs", "S43_TRUSTED_PROXIES", "cidr_csv", False),
+)
+
+
 def _build_config_kwargs(cls: type[Any]) -> dict[str, Any]:
     """
-    Build kwargs only for constructor parameters that actually exist.
+    Build FirewallConfig kwargs ONLY for env vars that are actually set (and,
+    for blocked_path_prefixes, only when set to a non-empty value).
 
-    This keeps the shim compatible with the relocated FirewallConfig even if
-    that dataclass/class changes field names later.
+    Invariant: an absent or blank environment variable must never override a
+    FirewallConfig default. Previously every field was passed
+    unconditionally, so an unset S43_FIREWALL_BLOCKED_PATHS handed
+    FirewallConfig `blocked_path_prefixes=()` — silently replacing the
+    built-in list of dangerous path prefixes (/.git, /.env, /wp-admin,
+    /actuator, ...) with nothing. Now an absent var is skipped, a blank
+    blocked_path_prefixes is skipped with a warning, and a present-but-
+    malformed bool/int raises (see _env_bool / _env_int) rather than falling
+    back to a default.
+
+    _constructor_accepts() still guards each field so the shim tolerates the
+    relocated FirewallConfig renaming a field later.
     """
     kwargs: dict[str, Any] = {}
 
-    # Keys below are the *actual* FirewallConfig constructor parameter names
-    # (see core/api/middleware/sentinel_firewall_middleware.py). Earlier
-    # versions of this table guessed plausible-sounding names ("enable_firewall",
-    # "max_body_bytes", "allowed_hosts", "blocked_paths", "blocked_ips",
-    # "block_private_networks", "log_blocked", "strict_mode") that never
-    # matched the real dataclass fields, so _constructor_accepts() silently
-    # dropped 8 of 10 candidates below and those knobs did nothing — the same
-    # bug class that left trusted_proxy_cidrs permanently empty. "allowed_origins"
-    # was removed outright: it's a CORS setting (see S43_ALLOWED_ORIGINS in
-    # core/api/main.py), not a FirewallConfig field, and never belonged here.
-    candidates: dict[str, Any] = {
-        "enabled": _env_bool("S43_FIREWALL_ENABLED", True),
-
-        # Real field names: max_content_length_bytes / max_total_header_bytes.
-        # Defaults match FirewallConfig's own dataclass defaults so leaving
-        # these env vars unset preserves prior (unconfigurable) behavior.
-        "max_content_length_bytes": _env_int("S43_FIREWALL_MAX_BODY_BYTES", 10 * 1024 * 1024),
-        "max_total_header_bytes": _env_int("S43_FIREWALL_MAX_HEADER_BYTES", 32 * 1024),
-
-        # Real field names: allowed_ip_cidrs / blocked_ip_cidrs / blocked_path_prefixes.
-        "allowed_ip_cidrs": _env_csv("S43_FIREWALL_ALLOWED_IP_CIDRS"),
-        "blocked_ip_cidrs": _env_csv("S43_FIREWALL_BLOCKED_IPS"),
-        "blocked_path_prefixes": _env_csv("S43_FIREWALL_BLOCKED_PATHS"),
-
-        # See docs/security/trusted_proxy_handling.md.
-        "trusted_proxy_cidrs": _env_csv("S43_TRUSTED_PROXIES"),
-    }
-
-    for field, value in candidates.items():
-        if _constructor_accepts(cls, field):
+    for field, env_var, kind, keep_default_when_blank in _ENV_FIELD_MAP:
+        if os.getenv(env_var) is None:
+            continue
+        if not _constructor_accepts(cls, field):
+            continue
+        if kind == "bool":
+            kwargs[field] = _env_bool(env_var)
+        elif kind == "int":
+            kwargs[field] = _env_int(env_var)
+        else:
+            value = _env_cidr_csv(env_var) if kind == "cidr_csv" else _env_csv(env_var)
+            if not value and keep_default_when_blank:
+                logger.warning(
+                    "%s is set but empty -- keeping FirewallConfig's built-in "
+                    "%s default. Unset the variable to silence this, or give a "
+                    "real comma-separated value to replace the default list.",
+                    env_var,
+                    field,
+                )
+                continue
             kwargs[field] = value
 
     return kwargs
