@@ -124,6 +124,7 @@ _REGISTRY: tuple[tuple[str, object, str | None], ...] = (
     ("SENTINEL_REMOTE_TOKEN_ADMIN",  _url,  None),
     ("SENTINEL_REMOTE_TOKEN_AUDITOR",_url,  None),
     ("S43_FENRIR_API_TOKEN",         _url,  "Fenrir internal API token (required when S43_FENRIR_ENABLED=true)"),
+    ("S43_WATCHTOWER_SERVICE_TOKEN", _url,  "Watchtower internal-service token (required — shared by s43-api and s43-core; Watchtower fails closed without it)"),
     ("POSTGRES_PASSWORD",            _hex,  "Infrastructure"),
     ("REDIS_PASSWORD",               _hex,  None),
 )

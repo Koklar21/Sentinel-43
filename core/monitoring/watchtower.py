@@ -96,7 +96,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import uvicorn
-from fastapi import APIRouter, FastAPI, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -1187,12 +1187,79 @@ def _require_admin_token(token: str | None) -> None:
 
 
 # =============================================================================
+# Internal-service auth (Pass 1 — direct Watchtower exposure)
+# =============================================================================
+
+_SERVICE_TOKEN_ENV = "S43_WATCHTOWER_SERVICE_TOKEN"
+
+
+def _require_service_token(
+    authorization: str | None = Header(default=None),
+) -> None:
+    """
+    Authenticate an internal Sentinel-43 service on the Watchtower
+    operational and mutation routes.
+
+    Every legitimate caller of these routes is a service, never a browser or
+    a human operator: the API bridge (core/api/main.py's _watchtower_request),
+    FenrirHunter, and the s34_auth reporter. They authenticate with a shared
+    secret supplied as ``Authorization: Bearer <S43_WATCHTOWER_SERVICE_TOKEN>``,
+    compared in constant time.
+
+    Fails closed with 503 when the token is not configured on this server, so
+    a misconfigured deployment cannot silently fall back to accepting
+    anonymous callers — that anonymous-mutation gap is exactly what Pass 1
+    closes (see RELEASE_FINDINGS.md F-04). ``/watchtower/health`` and
+    ``/watchtower/ready`` are deliberately left unauthenticated: they are the
+    liveness/readiness probe targets for Docker and Kubernetes, carry no
+    credentials, and expose only this node's own state — not the module or
+    dependency registry, event ring buffer, or analysis surface.
+
+    The token value is never echoed into any response body or error detail.
+    """
+    expected = os.getenv(_SERVICE_TOKEN_ENV, "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Watchtower internal-service authentication is not configured on this server.",
+        )
+
+    header = (authorization or "").strip()
+    if not header.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required.",
+        )
+
+    token = header[len("Bearer "):].strip()
+    # Compare as bytes: secrets.compare_digest raises TypeError on a str with
+    # non-ASCII characters, which a client could send to force a 500.
+    if not token or not secrets.compare_digest(
+        token.encode("utf-8"), expected.encode("utf-8")
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid service token.",
+        )
+
+
+# =============================================================================
 # Router / App factory
 # =============================================================================
 
 def create_watchtower_router(node: WatchtowerNode) -> APIRouter:
     router = APIRouter(prefix="/watchtower")
 
+    # Every route below except /health and /ready requires the internal
+    # service token (Pass 1). /health and /ready stay open for probes.
+    _service_auth = [Depends(_require_service_token)]
+
+    # /health and /ready are the only unauthenticated routes (probe targets
+    # for Docker and Kubernetes). Their bodies are intentionally minimal —
+    # just a coarse status and the HTTP status code a probe actually reads
+    # (Pass 1, F-03). The full node state, version, module/dependency
+    # registry, stale-module names and recovery counters are on the
+    # service-token-gated /status endpoint, not here.
     @router.get("/health")
     def health_check() -> JSONResponse:
         state = node.state
@@ -1205,51 +1272,46 @@ def create_watchtower_router(node: WatchtowerNode) -> APIRouter:
         else:
             http_code, svc_status = status.HTTP_503_SERVICE_UNAVAILABLE, "initializing"
 
-        return JSONResponse(status_code=http_code, content={
-            "status": svc_status,
-            "version": VERSION,
-            "node_state": state.value,
-            "node_id": node.config.node_id,
-        })
+        return JSONResponse(status_code=http_code, content={"status": svc_status})
 
     @router.get("/ready")
     def ready_check() -> JSONResponse:
         result = node.readiness()
-        http_code = status.HTTP_200_OK if result["ready"] else status.HTTP_503_SERVICE_UNAVAILABLE
+        ready = bool(result["ready"])
+        http_code = status.HTTP_200_OK if ready else status.HTTP_503_SERVICE_UNAVAILABLE
         return JSONResponse(status_code=http_code, content={
-            **result,
-            "status": "ready" if result["ready"] else "not_ready",
+            "status": "ready" if ready else "not_ready",
         })
 
-    @router.get("/status")
+    @router.get("/status", dependencies=_service_auth)
     def node_status() -> dict[str, Any]:
         return node.get_status()
 
-    @router.get("/modules")
+    @router.get("/modules", dependencies=_service_auth)
     def modules_status() -> dict[str, Any]:
         return node.module_snapshot()
 
-    @router.post("/modules/register")
+    @router.post("/modules/register", dependencies=_service_auth)
     def register_module(payload: ModuleRegisterRequest) -> dict[str, Any]:
         return {"status": "registered", "module": node.register_module(payload)}
 
-    @router.post("/modules/heartbeat")
+    @router.post("/modules/heartbeat", dependencies=_service_auth)
     def module_heartbeat(payload: ModuleHeartbeatRequest) -> dict[str, Any]:
         return {"status": "heartbeat_accepted", "module": node.heartbeat_module(payload)}
 
-    @router.get("/dependencies")
+    @router.get("/dependencies", dependencies=_service_auth)
     def dependencies_status() -> dict[str, Any]:
         return node.dependency_snapshot()
 
-    @router.post("/dependencies/report")
+    @router.post("/dependencies/report", dependencies=_service_auth)
     def report_dependency(payload: DependencyReportRequest) -> dict[str, Any]:
         return {"status": "dependency_report_accepted", "dependency": node.report_dependency(payload)}
 
-    @router.get("/events/recent")
+    @router.get("/events/recent", dependencies=_service_auth)
     def recent_events(limit: int = Query(default=50, ge=1, le=500)) -> dict[str, Any]:
         return node.recent_event_snapshot(limit)
 
-    @router.post("/analyze")
+    @router.post("/analyze", dependencies=_service_auth)
     def analyze_event(payload: AnalyzeRequest) -> dict[str, Any]:
         try:
             result = node.scan_event(payload.event)
@@ -1264,11 +1326,13 @@ def create_watchtower_router(node: WatchtowerNode) -> APIRouter:
             logger.exception("Analyze failed: %s", exc)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @router.post("/state/{state_name}")
+    @router.post("/state/{state_name}", dependencies=_service_auth)
     def change_state(
         state_name: str,
         x_s43_admin_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
+        # Two gates: the service token (transport auth, same as every other
+        # route) plus the stricter admin token for the state change itself.
         _require_admin_token(x_s43_admin_token)
 
         try:
@@ -1312,6 +1376,13 @@ def create_api_app(node: WatchtowerNode) -> FastAPI:
             "Sentinel-43 hardened monitoring, octagon correlation, "
             "module registry, dependency, and alert analysis node."
         ),
+        # Pass 1 (F-07): this is an internal-only service (no host port
+        # publication in Compose, ClusterIP + NetworkPolicy in Kubernetes).
+        # The interactive docs, schema, and OpenAPI JSON were served
+        # anonymously and enumerated the entire route surface — disable them.
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
 
     watchtower_router = create_watchtower_router(node)
@@ -1319,18 +1390,10 @@ def create_api_app(node: WatchtowerNode) -> FastAPI:
 
     @api.get("/")
     def root() -> dict[str, Any]:
-        return {
-            "service": "sentinel-43-watchtower",
-            "version": VERSION,
-            "status": "online",
-            "node_id": node.config.node_id,
-            "routes": sorted({
-                route.path  # type: ignore[attr-defined]
-                for route in api.routes
-                if hasattr(route, "path")
-                and route.path not in {"/", "/openapi.json", "/docs", "/redoc"}
-            }),
-        }
+        # Minimal banner only — no version (CVE-matching aid) and no route
+        # enumeration (that was a free map of the surface for an anonymous
+        # caller). Operational detail lives on the token-gated /status.
+        return {"service": "sentinel-43-watchtower", "status": "online"}
 
     return api
 

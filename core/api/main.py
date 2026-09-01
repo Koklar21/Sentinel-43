@@ -128,6 +128,7 @@ SENTINEL_ENV = _env_str("SENTINEL_ENV", "production")
 WATCHTOWER_URL               = _env_str("S43_WATCHTOWER_URL", "http://s43-core:9100").rstrip("/")
 WATCHTOWER_TIMEOUT           = _env_float("S43_WATCHTOWER_TIMEOUT", 2.0)
 WATCHTOWER_HEARTBEAT_SECONDS = _env_int("S43_WATCHTOWER_HEARTBEAT_SECONDS", 15)
+WATCHTOWER_SERVICE_TOKEN_ENV = "S43_WATCHTOWER_SERVICE_TOKEN"
 
 _ALLOWED_ORIGINS: frozenset[str] = _env_frozenset(
     "S43_ALLOWED_ORIGINS",
@@ -467,6 +468,13 @@ def _watchtower_request(
     url = f"{WATCHTOWER_URL}{path}"
     data = None
     headers = {"Content-Type": "application/json"}
+    # Pass 1: the Watchtower core now requires an internal-service token on
+    # every operational/mutation route. Attach it when configured. Read at
+    # call time so a rotation or a test override takes effect without a
+    # module reload. /watchtower/health and /watchtower/ready ignore it.
+    _wt_token = os.getenv(WATCHTOWER_SERVICE_TOKEN_ENV, "").strip()
+    if _wt_token:
+        headers["Authorization"] = f"Bearer {_wt_token}"
     if payload is not None:
         try:
             data = json.dumps(payload).encode("utf-8")
@@ -1249,7 +1257,11 @@ watchtower_router = APIRouter(prefix="/watchtower", tags=["watchtower"])
 
 @watchtower_router.get("/health")
 def api_watchtower_health() -> dict[str, Any]:
-    return watchtower_health_check()
+    # Anonymous route: report only whether the Watchtower bridge is
+    # reachable (Pass 1, F-03). watchtower_health_check() also returns the
+    # internal Watchtower URL and its raw response body — those stay
+    # internal, not on an unauthenticated endpoint.
+    return {"bridge": "api_to_watchtower", "reachable": watchtower_health_check()["reachable"]}
 
 @watchtower_router.get("/status")
 async def api_watchtower_status(request: Request) -> dict[str, Any]:
@@ -1261,9 +1273,12 @@ async def api_watchtower_status(request: Request) -> dict[str, Any]:
 
 @watchtower_router.get("/ready")
 def api_watchtower_ready() -> dict[str, Any]:
+    # Anonymous route (Pass 1, F-03): the upstream /watchtower/ready body
+    # (stale-module names, dependency names, recovery counters) and the
+    # internal Watchtower URL are not exposed here. Callers that need that
+    # detail use the operator-gated /watchtower/status.
     result = _watchtower_request("GET", "/watchtower/ready")
-    return {"bridge": "api_to_watchtower", "watchtower_url": WATCHTOWER_URL,
-            "reachable": "error" not in result, "watchtower": result, "timestamp": utc_now()}
+    return {"bridge": "api_to_watchtower", "reachable": "error" not in result}
 
 @watchtower_router.post("/register")
 async def api_register_watchtower(request: Request) -> dict[str, Any]:
@@ -1276,13 +1291,20 @@ async def api_heartbeat_watchtower(request: Request) -> dict[str, Any]:
     return send_api_heartbeat()
 
 @watchtower_router.get("/modules")
-def api_watchtower_modules() -> dict[str, Any]:
+async def api_watchtower_modules(request: Request) -> dict[str, Any]:
+    # Pass 1 (F-01): this bridge route leaked the full Watchtower module
+    # registry anonymously — its sibling api_watchtower_status already
+    # required an operator; this one was missing the call.
+    await _require_operator(request)
     result = _watchtower_request("GET", "/watchtower/modules")
     return {"bridge": "api_to_watchtower", "reachable": "error" not in result,
             "watchtower": result, "timestamp": utc_now()}
 
 @watchtower_router.get("/check")
-def watchtower_check() -> dict[str, Any]:
+async def watchtower_check(request: Request) -> dict[str, Any]:
+    # Pass 1 (F-02): anonymous callers could read aggregated
+    # health/ready/status plus the local registration snapshot here.
+    await _require_operator(request)
     health_result = watchtower_health_check()
     ready_result  = _watchtower_request("GET", "/watchtower/ready")
     status_result = _watchtower_request("GET", "/watchtower/status")
@@ -1310,12 +1332,26 @@ async def watchtower_ingest_event(
     body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
     """
-    Ingest a structured event from an internal service (e.g. FenrirHunter)
-    and forward it to the Watchtower core. Also broadcasts to dashboard
-    clients subscribed to the "watchtower" channel.
+    Ingest a structured event from an internal service (FenrirHunter) and
+    forward it to the Watchtower core for analysis. Also broadcasts it to
+    dashboard clients subscribed to the "watchtower" channel.
+
+    Pass 1 (F-06): this route's only caller is FenrirHunter
+    (core/detection/feniri_hunter.py), which sends
+    `Authorization: Bearer <S43_FENRIR_API_TOKEN>` and never an operator
+    JWT + X-S43-Password. It previously called `_require_operator`, so every
+    real Fenrir report was silently rejected with 401 before the token was
+    inspected — the identical bug already fixed on the sibling route
+    /internal/events/broadcast. It also forwarded to `/watchtower/events` on
+    the Watchtower core, which has no such route (404). Both are fixed here:
+    the dedicated service-token check, and a forward to the real ingestion
+    route `/watchtower/analyze` (the API attaches S43_WATCHTOWER_SERVICE_TOKEN
+    to that call itself).
     """
-    await _require_operator(request)
-    result = await asyncio.to_thread(_watchtower_request, "POST", "/watchtower/events", body)
+    _require_fenrir_service_token(request)
+    result = await asyncio.to_thread(
+        _watchtower_request, "POST", "/watchtower/analyze", {"event": body}
+    )
     await _broadcast_dashboard_event(
         "watchtower_event",
         {"event": body, "watchtower_response": result, "timestamp": utc_now()},
