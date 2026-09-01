@@ -12,6 +12,12 @@ RUN python -m pip install --upgrade pip \
 
 COPY . /app
 
+RUN groupadd --gid 65532 s43 \
+    && useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin s43 \
+    && mkdir -p /app/logs /app/sentinel43_state \
+    && chown -R 65532:65532 /app/logs /app/sentinel43_state
+USER 65532:65532
+
 EXPOSE 8000
 
 CMD ["python", "-m", "uvicorn", "core.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
