@@ -64,14 +64,10 @@ from ..bootstrap import bootstrap_expectations
 from ..logging.health_check_filter import install_health_check_access_filter
 from .routers.audit import router as audit_router
 from .routers.auth import router as auth_router
-# core/api/routers/bootstrap.py is a THIRD, unrelated module also named
-# bootstrap \u2014 see the naming note in core/bootstrap.py. This one is the
-# first-run admin account setup router (GET /bootstrap/status,
-# POST /bootstrap/admin), not startup expectations. Aliased to avoid
-# colliding with bootstrap_expectations imported above.
 from .routers.bootstrap import router as bootstrap_router
 from .routers.remote_gateway import router as remote_gateway_router
 from .routers.routers import router as watchgate_router
+from .routers.users import router as users_router
 
 logger = logging.getLogger(__name__)
 
@@ -1627,6 +1623,7 @@ app.include_router(system_router)
 app.include_router(fenrir_router)
 app.include_router(api_router)
 app.include_router(audit_router)
+app.include_router(users_router)
 
 # =============================================================================
 # Health-check access-log noise suppression
