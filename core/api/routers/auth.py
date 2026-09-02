@@ -194,6 +194,49 @@ _APPROVED_ROLES: frozenset[str] = frozenset({"operator", "admin"})
 # obviously-malformed input without touching the decode path.
 JWT_SHAPE_RE = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
 
+# ---------------------------------------------------------------------------
+# New-style (session-bound) access-token claims — Pass 5A foundation.
+#
+# The browser-session redesign (AUTH_ARCHITECTURE_PASS4.md "Model B") issues
+# access tokens that additionally carry:
+#   sid  — the server-side session id (canonical UUID string)
+#   jti  — a unique token id
+# Legacy tokens (env-var operator, DB-account login as it works today, the
+# /v1 issuers, any already-minted token) carry NEITHER and are still accepted
+# unchanged — _issue_token() only adds them when a caller passes sid=..., and
+# verify_jwt_token() never *requires* them. Presence of a well-formed `sid`
+# is the explicit new-vs-legacy discriminator (see token_is_session_bound()).
+#
+# Pass 5A does NOT consult the sessions table on the request hot path (no
+# `sid` liveness lookup / LRU) — that is deferred (mission Pass 5A §6, §21).
+# ---------------------------------------------------------------------------
+_SESSION_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+_JTI_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _new_jti() -> str:
+    """A unique, opaque token id for the `jti` claim (128-bit URL-safe)."""
+    return secrets.token_urlsafe(16)
+
+
+def token_is_session_bound(claims: dict[str, Any]) -> bool:
+    """
+    True iff `claims` is a new-style, session-bound access token (carries a
+    well-formed `sid`). False for every legacy token. Never raises.
+
+    Not used on the request hot path in Pass 5A — provided so Pass 5B wiring
+    and tests have one canonical discriminator instead of ad-hoc `"sid" in`
+    checks scattered across call sites.
+    """
+    try:
+        sid = claims.get("sid")
+    except AttributeError:
+        return False
+    return isinstance(sid, str) and bool(_SESSION_ID_RE.match(sid))
+
 
 # =============================================================================
 # Env helpers — all read at call time so Docker env injection works correctly.
@@ -424,7 +467,12 @@ async def _validate_credentials(username: str, password: str) -> tuple[str, str,
 
 
 def _issue_token(
-    subject: str, role: str = "operator", user_id: str | None = None
+    subject: str,
+    role: str = "operator",
+    user_id: str | None = None,
+    *,
+    sid: str | None = None,
+    jti: str | None = None,
 ) -> tuple[str, datetime]:
     """
     Sign and return a JWT for the given subject.
@@ -437,6 +485,14 @@ def _issue_token(
     user_id is only present for DB-backed accounts (see
     _validate_credentials) — env-var fallback logins omit it rather than
     fabricate one, since main.py and existing tests never require it.
+
+    sid / jti — Pass 5A foundation. When ``sid`` is supplied (a server-side
+    session id) the token becomes a *new-style, session-bound* access token:
+    it gains a ``sid`` claim and a ``jti`` claim (generated if not passed).
+    When ``sid`` is None — every caller today, including /auth/login as it
+    currently works — the payload is byte-for-byte what it was before: no
+    ``sid``, no ``jti``. This keeps legacy token issuance unchanged while the
+    session layer is built out (mission Pass 5A §6).
     """
     secret = _e("S43_JWT_SECRET")
     if not secret:
@@ -464,6 +520,17 @@ def _issue_token(
     }
     if user_id is not None:
         payload["user_id"] = user_id
+
+    if sid is not None:
+        # New-style session-bound token. Validate the sid shape here so a
+        # malformed session id can never be minted into a token.
+        if not _SESSION_ID_RE.match(sid):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Token generation failed.",
+            )
+        payload["sid"] = sid
+        payload["jti"] = jti if (jti and _JTI_RE.match(jti)) else _new_jti()
 
     token: Any = pyjwt.encode(
         payload,
@@ -584,6 +651,29 @@ def verify_jwt_token(token: str) -> dict[str, Any]:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Operator role required.",
         )
+
+    # New-style session-bound claims (Pass 5A). NEITHER is required — a legacy
+    # token carries neither and verifies exactly as before. But if a token
+    # presents `sid` or `jti`, they must be well-formed: a malformed value is
+    # a crafted/corrupt token, so fail closed rather than pass it through.
+    # Pass 5A does NOT look `sid` up against the sessions table here (no hot-
+    # path session read — mission Pass 5A §6); it only shape-checks.
+    if "sid" in claims:
+        sid = claims.get("sid")
+        if not isinstance(sid, str) or not _SESSION_ID_RE.match(sid):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    if "jti" in claims:
+        jti = claims.get("jti")
+        if not isinstance(jti, str) or not _JTI_RE.match(jti):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
 
     return claims
 
