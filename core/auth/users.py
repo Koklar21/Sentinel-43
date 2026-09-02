@@ -60,10 +60,13 @@ import), matching core/security/jwt_constants.py's zero-dependency stance.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHash, VerificationError
@@ -202,12 +205,46 @@ def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
     return _sessionmaker
 
 
+_LOCAL_ENVIRONMENTS = frozenset({"development", "dev", "local", "test"})
+
+
+def _schema_is_alembic_managed() -> bool:
+    """
+    True when the production schema is owned by Alembic in this environment and
+    ``create_all()`` must NOT run (it would race the migration Job's DDL and
+    create a second, uncoordinated schema-evolution path —
+    MIGRATION_ARCHITECTURE_PASS5AM.md §11/§24).
+
+    Non-local environments are Alembic-managed. ``S43_SCHEMA_CREATE_ALL``
+    (true/false) overrides either way — an escape hatch, not a routine knob.
+    """
+    raw = os.getenv("S43_SCHEMA_CREATE_ALL")
+    if raw is not None:
+        return raw.strip().lower() not in {"1", "true", "yes", "on"}
+    env = os.getenv("SENTINEL_ENV", "production").strip().lower()
+    return env not in _LOCAL_ENVIRONMENTS
+
+
 async def init_models() -> None:
     """
-    Create the users table if it doesn't exist yet. Idempotent — safe to
-    call on every startup. There is no migration tool in this project yet;
-    this is create-if-missing, not a schema migration path.
+    Dev / test convenience: create the ``users`` table if it is missing
+    (idempotent ``Base.metadata.create_all``).
+
+    In a non-local environment the production PostgreSQL schema is owned by
+    **Alembic** — ``alembic upgrade head`` run as an explicit operator / one
+    -shot Job step, never by an API worker
+    (MIGRATION_ARCHITECTURE_PASS5AM.md §11 / §25). There this function is a
+    deliberate **no-op** so it can never race the migration Job's DDL. The
+    runtime schema-version check (``core.auth.schema_version``) is what keeps a
+    pod from serving against an un-migrated database.
     """
+    if _schema_is_alembic_managed():
+        logger.info(
+            "init_models(): schema is Alembic-managed in this environment "
+            "(SENTINEL_ENV=%s); skipping create_all — run `alembic upgrade head`",
+            os.getenv("SENTINEL_ENV", "production"),
+        )
+        return
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

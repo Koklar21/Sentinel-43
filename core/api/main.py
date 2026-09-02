@@ -323,6 +323,25 @@ def _validate_security_config() -> None:
             raise RuntimeError(
                 "Production Sentinel-43 API requires S43_WS_REQUIRE_AUTH=true"
             )
+        # F-TLS-1 (beta-execution Phase 2): a browser-facing CORS origin over
+        # plain http:// means the refresh cookie / access token cross the wire
+        # in cleartext. Loopback origins are exempt (browsers treat
+        # http://localhost as a secure context). Opt out for a TLS-terminating
+        # proxy on a trusted private network with S43_ALLOW_INSECURE_ORIGINS=true.
+        if not _env_bool("S43_ALLOW_INSECURE_ORIGINS"):
+            _loopback = re.compile(r"^http://(localhost|127\.0\.0\.1)(:\d+)?$")
+            insecure = sorted(
+                o for o in _ALLOWED_ORIGINS
+                if o.startswith("http://") and not _loopback.match(o)
+            )
+            if insecure:
+                raise RuntimeError(
+                    "Non-local Sentinel-43 API requires HTTPS origins in "
+                    f"S43_ALLOWED_ORIGINS; found plaintext: {insecure}. Put the "
+                    "API behind a TLS terminator and use https:// origins, or "
+                    "set S43_ALLOW_INSECURE_ORIGINS=true for a proxy on a "
+                    "trusted private network."
+                )
 
 
 # =============================================================================
@@ -971,6 +990,34 @@ except Exception as _fw_exc:  # noqa: BLE001 - deliberately broad; re-raised bel
             f"environments; refusing to start unprotected."
         ) from _fw_exc
 
+# --- Transport-security response headers (beta-execution Phase 2, F-TLS-1) ---
+# HSTS (only when the request actually arrived over HTTPS, or via a trusted
+# proxy that says so), plus static hardening headers. Cookies stay Secure
+# unconditionally regardless (AUTH_TLS_POSTURE_PASS5A §8). Added AFTER the
+# firewall so it also decorates the firewall's own block responses.
+from .middleware.security_headers import SecurityHeadersMiddleware
+app.add_middleware(SecurityHeadersMiddleware)
+
+# --- Explicit Host allow-list (beta-execution Phase 2) ---
+# S43_TRUSTED_HOSTS is a comma-separated list of the exact Host values this
+# deployment answers on (e.g. "beta.example.com,api.example.com"). Unset =>
+# no Host check (dev / behind a proxy that already validates Host). In a
+# non-local environment an unset value is logged loudly — the beta overlay
+# is expected to set it.
+_TRUSTED_HOSTS: list[str] = [
+    h.strip() for h in _env_str("S43_TRUSTED_HOSTS").split(",") if h.strip()
+]
+if _TRUSTED_HOSTS:
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=_TRUSTED_HOSTS)
+    logger.info("TrustedHostMiddleware active: %s", _TRUSTED_HOSTS)
+elif not _is_local_environment():
+    logger.warning(
+        "S43_TRUSTED_HOSTS is not set in a non-local environment — the API "
+        "will answer on any Host header. Set it to this deployment's public "
+        "hostname(s) for defence against Host-header attacks."
+    )
+
 try:
     from core.monitoring import SpartaCore as _SC, IntegrityConfig as _IC, create_node_router
     _node_router_sparta = _SC(
@@ -1585,6 +1632,9 @@ async def fenrir_metrics(request: Request) -> dict[str, Any]:
 # =============================================================================
 @app.get("/health")
 def health() -> dict[str, str]:
+    # LIVENESS. Deliberately does not touch the database or any dependency:
+    # a DB outage or a schema mismatch must not make Kubernetes kill every
+    # API pod. "Is this process serving HTTP?" — nothing more.
     return {
         "status":      "ok",
         "service":     APP_NAME,
@@ -1593,7 +1643,28 @@ def health() -> dict[str, str]:
     }
 
 @app.get("/ready")
-def ready() -> dict[str, str]:
+async def ready() -> Any:
+    # READINESS. "Should this pod receive traffic right now?" In a non-local
+    # environment this refuses (503) when the database it is pointed at is not
+    # at the Alembic revision this code expects — behind (migration Job not
+    # done), ahead (an old replica after a newer deploy migrated), or a
+    # pre-Alembic database that was never adopted. The API never runs the
+    # migration itself (MIGRATION_ARCHITECTURE_PASS5AM.md §25); it only checks.
+    # Local envs and a no-DATABASE_URL deployment are never gated.
+    from ..auth.schema_version import schema_report
+
+    report = await schema_report()
+    if report.serving_blocked:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status":       "not_ready",
+                "service":      APP_NAME,
+                "reason":       "schema_version",
+                "schema_state": report.state.value,
+                "detail":       report.detail,
+            },
+        )
     return {"status": "ready", "service": APP_NAME}
 
 # =============================================================================
@@ -1634,8 +1705,8 @@ def metrics() -> dict[str, Any]:
 api_router = APIRouter(prefix="/api", tags=["api-compat"])
 
 @api_router.get("/ready")
-def compat_api_ready() -> dict[str, str]:
-    return ready()
+async def compat_api_ready() -> Any:
+    return await ready()
 
 @api_router.get("/status")
 def compat_api_status() -> dict[str, Any]:

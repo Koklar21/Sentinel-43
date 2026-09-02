@@ -280,3 +280,11 @@ sentinel43_state/
 # Docker
 docker-data/
 .tools/
+docker-compose.override.yml
+docker-compose.override.yaml
+
+# TLS material for the Compose reverse proxy (env-specific, secret)
+deploy/proxy/certs/*.crt
+deploy/proxy/certs/*.key
+deploy/proxy/certs/*.pem
+deploy/proxy/certs/*.p12

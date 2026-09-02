@@ -58,12 +58,14 @@ spec:
           resources:
             requests: {cpu: 100m, memory: 192Mi}
             limits: {cpu: 1000m, memory: 512Mi}
-          # See s43-core-deployment.yaml's comment: liveness/readiness use
-          # different endpoints (/health vs /ready), but neither one in this
-          # app actually checks Postgres/Redis connectivity today — a
-          # pre-existing gap (dependencies_status() hardcodes both as
-          # "unknown"), documented in README's "Known limitations" rather
-          # than silently patched as part of this deployment.
+          # liveness = /health (process up; never touches the DB, so a DB
+          # outage or a schema mismatch cannot make k8s kill every pod).
+          # readiness = /ready, which connects to Postgres and returns 503
+          # while alembic_version is behind/ahead/missing (schema_version.py)
+          # -- so a pod pointed at an un-migrated database is kept out of the
+          # Service until the s43-migration Job completes. With
+          # maxUnavailable: 0 the previously-serving replica stays up
+          # throughout. readiness still does not check Redis (unused).
           startupProbe:
             httpGet: {path: /health, port: 8000}
             periodSeconds: 5

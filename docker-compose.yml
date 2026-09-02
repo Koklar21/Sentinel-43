@@ -16,7 +16,7 @@
 #   S43_AUTH_PEPPER            output of: python -c "import secrets; print(secrets.token_hex(32))"
 #   S43_WS_REQUIRE_AUTH        true
 #   S43_OPERATOR_USERNAME      operator  (or your chosen username)
-#   S43_OPERATOR_PASSWORD_HASH output of: python scripts/generate_secrets.py --password-hash
+#   S43_OPERATOR_PASSWORD_HASH output of: python core/scripts/generate_secrets.py --password-hash
 #
 # Internal service auth:
 #   S43_WATCHTOWER_SERVICE_TOKEN  output of: python -c "import secrets; print(secrets.token_urlsafe(32))"
@@ -35,8 +35,8 @@
 #   S43_FENRIR_API_TOKEN       output of: python -c "import secrets; print(secrets.token_urlsafe(32))"
 #
 # Generate all of the above in one step:
-#   python scripts/generate_secrets.py --write .env
-#   python scripts/generate_secrets.py --password-hash   (then paste the output into .env)
+#   python core/scripts/generate_secrets.py --write .env
+#   python core/scripts/generate_secrets.py --password-hash   (then paste the output into .env)
 #
 # Or via Docker (no Python required on host):
 #   docker compose --profile setup run --rm s43-setup --write /app/.env
@@ -139,6 +139,50 @@ services:
       - s43_net
 
   # ---------------------------------------------------------------------------
+  # Schema migration (one-shot)
+  #
+  # Alembic is Sentinel-43's authoritative production schema mechanism
+  # (MIGRATION_ARCHITECTURE_PASS5AM.md). This service runs `alembic upgrade
+  # head` once, to completion, BEFORE s43-api starts — s43-api's depends_on
+  # below waits for `service_completed_successfully`. `upgrade head` is
+  # idempotent: on a database already at head it is a no-op, so it is safe to
+  # leave in every `docker compose up`.
+  #
+  #   FRESH database (new s43_pgdata volume): 0001_baseline creates `users`,
+  #   then 0002_sessions creates `sessions`. Nothing else to do.
+  #
+  #   EXISTING pre-Alembic database (a volume whose `users` table was created
+  #   by the old init_models()/create_all path, before Alembic): this service
+  #   will FAIL — 0001_baseline refuses to CREATE an existing `users` table.
+  #   Adopt it once, then bring the stack up:
+  #     docker compose run --rm s43-migrate alembic stamp 0001_baseline
+  #       (env.py runs migrations/baseline.py's semantic compatibility check
+  #        first and refuses, exit 1, on any incompatibility — it never
+  #        blindly stamps)
+  #     docker compose up -d
+  #
+  # alembic.ini has no connection string; env.py reads DATABASE_URL from the
+  # environment below. The sqlalchemy.engine logger is pinned WARN so no
+  # connection string is echoed.
+  # ---------------------------------------------------------------------------
+  s43-migrate:
+    build:
+      context: .
+      dockerfile: core/api/Dockerfile
+    container_name: s43_migrate
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    environment:
+      SENTINEL_ENV: ${SENTINEL_ENV}
+      DATABASE_URL: ${DATABASE_URL}
+      S43_LOG_LEVEL: INFO
+    depends_on:
+      s43-db:
+        condition: service_healthy
+    networks:
+      - s43_net
+
+  # ---------------------------------------------------------------------------
   # API (FastAPI)
   # ---------------------------------------------------------------------------
   s43-api:
@@ -153,13 +197,30 @@ services:
     # proxy-trust knob is S43_TRUSTED_PROXIES. See
     # docs/security/trusted_proxy_handling.md.
     command: uvicorn core.api.main:app --host 0.0.0.0 --port 8000 --forwarded-allow-ips 127.0.0.1
-    ports:
-      - "8000:8000"
+    # NOT host-published. The only way in is through s43-proxy (TLS). For
+    # direct backend access while debugging, copy
+    # docker-compose.override.yml.example to docker-compose.override.yml.
+    expose:
+      - "8000"
     environment:
       # --- Runtime environment ---
       SENTINEL_ENV:              ${SENTINEL_ENV}
       S43_ENV:                   ${SENTINEL_ENV}
       S43_LOG_LEVEL:             INFO
+
+      # --- Reverse proxy / transport (beta-execution Phase 2, F-TLS-1) ---
+      # s43-proxy has a fixed IP on s43_net (see the networks section); the
+      # app trusts X-Forwarded-For / X-Forwarded-Proto only from it. uvicorn
+      # still ignores forwarded headers itself (--forwarded-allow-ips above).
+      S43_TRUSTED_PROXIES:       ${S43_TRUSTED_PROXIES:-172.28.0.2/32}
+      # Comma-separated exact Host values this deployment answers on. Set to
+      # your real hostname(s) for a public beta; the default covers local
+      # https://localhost testing through s43-proxy.
+      S43_TRUSTED_HOSTS:        ${S43_TRUSTED_HOSTS:-localhost,127.0.0.1}
+      # Set true ONLY for a TLS terminator on a trusted private network that
+      # keeps http:// origins. Normally leave unset -- non-local startup
+      # refuses a plaintext non-loopback origin.
+      S43_ALLOW_INSECURE_ORIGINS: ${S43_ALLOW_INSECURE_ORIGINS:-}
 
       # --- Service endpoints ---
       S43_WATCHTOWER_URL:        http://s43-core:9100
@@ -230,6 +291,8 @@ services:
       - sentinel43_state:/app/sentinel43_state
       - ./logs:/app/logs
     depends_on:
+      s43-migrate:
+        condition: service_completed_successfully
       s43-core:
         condition: service_started
       s43-db:
@@ -244,6 +307,36 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Reverse proxy / TLS terminator (beta-execution Phase 2, F-TLS-1)
+  #
+  # The ONLY host-published service. Terminates TLS on :443, 308-redirects
+  # :80 -> https, sets X-Forwarded-Proto/-For, sends HSTS, upgrades /ws, and
+  # forwards to the internal s43-api:8000. Compose counterpart of
+  # deploy/kubernetes/overlays/beta/ingress.yaml.
+  #
+  # Certs: mount a real PEM pair at deploy/proxy/certs/s43.{crt,key}. For
+  # local testing run deploy/proxy/generate-dev-cert.sh first (self-signed).
+  # See deploy/proxy/README.md.
+  # ---------------------------------------------------------------------------
+  s43-proxy:
+    image: nginx:1.27-alpine
+    container_name: s43_proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/proxy/certs:/etc/nginx/certs:ro
+    depends_on:
+      s43-api:
+        condition: service_started
+    networks:
+      s43_net:
+        # Fixed IP so s43-api's S43_TRUSTED_PROXIES can be a /32.
+        ipv4_address: 172.28.0.2
 
   # ---------------------------------------------------------------------------
   # Setup (one-shot secret generator)
@@ -273,7 +366,7 @@ services:
       dockerfile: core/api/Dockerfile
     container_name: s43_setup
     # Override uvicorn — this container runs the generator and exits.
-    entrypoint: ["python", "scripts/generate_secrets.py"]
+    entrypoint: ["python", "core/scripts/generate_secrets.py"]
     # Default: print to stdout. Override with --write /app/.env on the command line.
     command: []
     volumes:
@@ -302,3 +395,9 @@ volumes:
 networks:
   s43_net:
     driver: bridge
+    ipam:
+      config:
+        # Fixed subnet so s43-proxy can hold a stable IP (172.28.0.2) that
+        # s43-api trusts for X-Forwarded-* (S43_TRUSTED_PROXIES). Only
+        # Sentinel-43's own containers are ever on this network.
+        - subnet: 172.28.0.0/24
