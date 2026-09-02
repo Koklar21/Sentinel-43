@@ -16,8 +16,8 @@ New/changed files:
 |---|---|
 | `core/auth/sessions.py` | **new** — session model + all foundation primitives/logic |
 | `core/api/routers/auth.py` | `_issue_token()` gains keyword-only `sid`/`jti`; `verify_jwt_token()` shape-checks `sid`/`jti` when present; `token_is_session_bound()` helper added |
-| `core/tests/test_session_primitives.py` | **new** — 25 in-process tests |
-| `core/tests/test_session_layer_pg.py` | **new** — 17 disposable-PostgreSQL tests |
+| `core/tests/test_session_primitives.py` | **new** — 29 in-process tests |
+| `core/tests/test_session_layer_pg.py` | **new** — 19 disposable-PostgreSQL tests |
 | `core/tests/test_service_identity_separation.py` | **new** — 12 human/service boundary tests |
 | `AUTH_TLS_POSTURE_PASS5A.md` | **new** — Section 4 deliverable |
 
@@ -49,12 +49,16 @@ Not done, by authorization (mission Pass 5A §6, §14, §19–§21, §30):
 
 - **`sid is None`** (every caller today, including `/auth/login`): payload is
   exactly what it was — `{sub, username, iss, aud, iat, nbf, exp, role}` plus
-  `user_id` for DB accounts. **No `sid`, no `jti`.** Verified byte-shape-identical
-  in `test_session_primitives.py::test_legacy_issuance_is_byte_identical_shape`.
+  `user_id` for DB accounts. **No `sid`, no `jti`.** TTL is the legacy
+  `S43_JWT_TTL_SECONDS` (default 8h). Verified byte-shape-identical in
+  `test_session_primitives.py::test_legacy_issuance_is_byte_identical_shape`.
 - **`sid` supplied** (a server-side session id, canonical UUID): the token
   becomes *session-bound* — gains `sid` and a `jti` (generated with
-  `secrets.token_urlsafe(16)` unless a well-formed one is passed). A malformed
-  `sid` raises 500 at issue time (never mint a bad session id into a token).
+  `secrets.token_urlsafe(16)` unless a well-formed one is passed), **and its
+  TTL drops to the approved target 15 min** (`S43_SESSION_ACCESS_TTL_SECONDS`,
+  default 900, clamped 60s–1h). A malformed `sid` raises 500 at issue time
+  (never mint a bad session id into a token). The refresh session, not the
+  access token, is the durable credential (mission §3).
 
 ### 2.2 `verify_jwt_token()` — tolerant, never requiring
 
@@ -242,7 +246,7 @@ EvalPlanQual) — **not** SERIALIZABLE.
 | `refresh_hash` uniqueness | `test_refresh_hash_is_unique` | duplicate hash → `IntegrityError` at flush |
 | Transaction ownership | `test_create_session_does_not_commit`, `test_create_then_commit_persists…` | helper flush-only; caller commit required for persistence |
 
-Full: **17 passed** (`test_session_layer_pg.py`), **25 passed**
+Full: **19 passed** (`test_session_layer_pg.py`), **29 passed**
 (`test_session_primitives.py`), **12 passed**
 (`test_service_identity_separation.py`).
 
@@ -261,12 +265,17 @@ Full: **17 passed** (`test_session_layer_pg.py`), **25 passed**
   "session-delete-on-password-change" the revocation mechanism, so a
   `users.password_changed_at` column is **not** required — consistent with
   `AUTH_ARCHITECTURE_PASS4.md` §6.)
-- **Role change**: the access token's `role` claim is trusted for ≤ its TTL
-  (15 min target) on stateless routes — an explicit, documented trade
-  (`AUTH_THREAT_MODEL_PASS4.md`). `require_admin` already does a **live** DB
-  role check on `/users` (Pass 1, unchanged). Pass 5B additionally calls
+- **Role change**: `SessionRecord` deliberately has **no `role` column**, so a
+  `/auth/refresh` route that re-reads `users.role` after `rotate_refresh()`
+  naturally issues the **current** role — stale role is never perpetuated
+  through refresh. Covered:
+  `test_session_layer_pg.py::test_role_change_then_refresh_uses_current_role`.
+  The already-issued access token's `role` claim is still trusted for ≤ its
+  TTL (15 min for session-bound) on stateless routes — an explicit, documented
+  trade (`AUTH_THREAT_MODEL_PASS4.md`); `require_admin` already does a **live**
+  DB role check on `/users` (Pass 1, unchanged). Pass 5B additionally calls
   `revoke_all_user_sessions(user_id, reason="role_change")` on role changes so
-  the next refresh mints a token with the new role. Not wired in Pass 5A.
+  the next refresh is forced immediately. Helper exists; not wired in Pass 5A.
 
 Pass 5A does **not** change `core/auth/users.py` behaviour or
 `core/api/routers/users.py` — only adds the (unused) revoke helper it will
@@ -306,10 +315,25 @@ redesign must never erode:
   exception message. `SessionError` messages carry only the `sid` (a random
   UUID, not a secret). `RefreshReuseError`/`SessionExpiredError`/
   `SessionRevokedError`/`SessionOwnerInactiveError` expose `.sid` for the
-  route to log an audit event; they do not carry the credential.
+  route to log an audit event; they do not carry the credential. Asserted:
+  `test_session_primitives.py::test_session_exceptions_carry_only_the_sid`.
+- `core/auth/sessions.py` **has no `logger` and emits zero log records** — it
+  classifies failures with typed exceptions and leaves audit logging (with
+  redaction) to the Pass 5B route layer. So no session/CSRF/refresh secret
+  can leak through a stray log call in this module. Asserted:
+  `test_session_primitives.py::test_rotate_module_emits_no_log_records_on_failure_paths`.
 - `SessionView` (the only object intended to reach a response body) has no
   hash field.
 - `client_ip` / `user_agent` are truncated (45 / 256) before store.
+- **§24 error semantics** — every failure mode maps to a typed
+  `SessionError` (`RefreshInvalidError` / `RefreshReuseError` /
+  `SessionExpiredError` / `SessionRevokedError` / `SessionOwnerInactiveError`)
+  or a `bool` (`logout_by_refresh`, `revoke_session`); a `ValueError` for a
+  structurally impossible secret; DB-unavailable / transaction failure
+  propagates for the caller to roll back (helpers never swallow). The route
+  layer collapses reuse/invalid/expired/revoked to a single generic `401 +
+  clear cookie` so no new account/session **enumeration channel** is created.
+  Malformed CSRF data → `csrf_tokens_match` returns `False` (fail closed).
 
 ---
 

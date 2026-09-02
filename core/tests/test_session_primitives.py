@@ -23,7 +23,9 @@
 
 from __future__ import annotations
 
+import re
 import time
+import uuid as uuid_mod
 
 import jwt as pyjwt
 import pytest
@@ -256,6 +258,67 @@ class TestTokenIssuanceBackCompat:
         claims = auth_module.verify_jwt_token(ok)
         assert claims["jti"] == "abc_DEF-123"
         assert auth_module.token_is_session_bound(claims) is False
+
+    def test_session_bound_token_has_short_ttl(self, jwt_env, monkeypatch):
+        """Approved target: session-bound access token TTL = 15 min (default
+        900s). Legacy tokens keep the 8h default."""
+        monkeypatch.delenv("S43_SESSION_ACCESS_TTL_SECONDS", raising=False)
+        monkeypatch.delenv("S43_JWT_TTL_SECONDS", raising=False)
+        legacy, legacy_exp = auth_module._issue_token("operator", "operator")
+        bound, bound_exp = auth_module._issue_token(
+            "operator", "operator", sid=S.new_sid()
+        )
+        now = time.time()
+        assert 840 <= (bound_exp.timestamp() - now) <= 900
+        assert (legacy_exp.timestamp() - now) > 3600  # still the long default
+
+    def test_session_access_ttl_env_clamped(self, jwt_env, monkeypatch):
+        monkeypatch.setenv("S43_SESSION_ACCESS_TTL_SECONDS", "5")
+        _, exp = auth_module._issue_token("operator", "operator", sid=S.new_sid())
+        assert exp.timestamp() - time.time() >= 55        # 60s floor
+        monkeypatch.setenv("S43_SESSION_ACCESS_TTL_SECONDS", "999999")
+        _, exp = auth_module._issue_token("operator", "operator", sid=S.new_sid())
+        assert exp.timestamp() - time.time() <= 3600      # 1h ceiling
+
+
+class TestNoCredentialLeak:
+    """§23 — the session module must not put a refresh secret into a log
+    record or an exception message on any failure path."""
+
+    def test_session_exceptions_carry_only_the_sid(self):
+        sid = uuid_mod.uuid4()
+        for exc in (
+            S.RefreshReuseError(sid),
+            S.SessionExpiredError(sid),
+            S.SessionRevokedError(sid),
+            S.SessionOwnerInactiveError(sid),
+        ):
+            text = str(exc)
+            assert str(sid) in text
+            assert exc.sid == sid
+            # once the (safe, random) sid is removed, nothing that looks like
+            # an opaque 32+ char credential remains
+            residue = text.replace(str(sid), "")
+            assert not re.search(r"[A-Za-z0-9_-]{32,}", residue)
+
+    def test_rotate_module_emits_no_log_records_on_failure_paths(self, caplog):
+        """core.auth.sessions itself does no logging — failure classification
+        is via typed exceptions, and the route layer (Pass 5B) owns audit
+        logging with redaction. Assert the module stays silent so a secret
+        can't leak through a stray log call here."""
+        import logging as _logging
+
+        secret = S.generate_refresh_secret()
+        # verify_refresh_hash / csrf / hash helpers on bad input: no logging,
+        # no secret echoed
+        with caplog.at_level(_logging.DEBUG, logger="core.auth.sessions"):
+            assert S.verify_refresh_hash(secret, "not-a-hash") is False
+            assert S.csrf_tokens_match(secret, None) is False
+            try:
+                S.hash_refresh_secret("")
+            except ValueError as e:
+                assert secret not in str(e)
+        assert caplog.records == []
 
 
 __all__: list[str] = []

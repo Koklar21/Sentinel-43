@@ -356,6 +356,89 @@ async def test_disabled_owner_cannot_refresh_and_session_is_revoked():
 
 
 # ---------------------------------------------------------------------------
+# role change (mission Pass 5A §18)
+# ---------------------------------------------------------------------------
+
+@_t
+async def test_role_change_then_refresh_uses_current_role():
+    """The session row stores NO role — so a /auth/refresh route that re-reads
+    users.role after rotate_refresh() naturally issues the NEW role. Stale
+    role is not perpetuated through refresh."""
+    async with _db() as sm:
+        from core.auth.users import get_user_by_id, set_user_role
+        uid = await _mk_user(sm, "promoteme")            # starts operator
+        secret = S.generate_refresh_secret()
+        async with sm() as s:
+            await S.create_session(s, user_id=uid, refresh_secret=secret)
+            await s.commit()
+
+        # SessionRecord carries no role at all
+        assert not hasattr(S.SessionRecord, "role")
+
+        async with sm() as s:
+            u = await get_user_by_id(s, uid)
+            await set_user_role(s, u, role="admin")
+            await s.commit()
+
+        s2 = S.generate_refresh_secret()
+        async with sm() as s:
+            row, _ = await S.rotate_refresh(
+                s, presented_secret=secret, new_refresh_secret=s2,
+            )
+            # what a route would do next: re-read the live role
+            u = await get_user_by_id(s, row.user_id)
+            assert u.role == "admin"
+            await s.commit()
+
+        # and revoke_all_user_sessions(reason="role_change") is the hook a
+        # route calls to force a fresh token immediately
+        async with sm() as s:
+            n = await S.revoke_all_user_sessions(s, uid, reason="role_change")
+            assert n == 1
+            await s.commit()
+        async with sm() as s:
+            with pytest.raises(S.SessionRevokedError):
+                await S.rotate_refresh(
+                    s, presented_secret=s2,
+                    new_refresh_secret=S.generate_refresh_secret(),
+                )
+
+
+# ---------------------------------------------------------------------------
+# service identity separation at the session layer (mission Pass 5A §22)
+# ---------------------------------------------------------------------------
+
+@_t
+async def test_service_token_cannot_drive_the_session_layer():
+    """An opaque service shared-secret is not a refresh credential: it can't
+    rotate or log out a human session, and it hashes to something unrelated."""
+    async with _db() as sm:
+        uid = await _mk_user(sm)
+        real = S.generate_refresh_secret()
+        async with sm() as s:
+            await S.create_session(s, user_id=uid, refresh_secret=real)
+            await s.commit()
+
+        service_token = "svc-" + "z" * 40
+        async with sm() as s:
+            with pytest.raises(S.RefreshInvalidError):
+                await S.rotate_refresh(
+                    s, presented_secret=service_token,
+                    new_refresh_secret=S.generate_refresh_secret(),
+                )
+            assert await S.logout_by_refresh(s, presented_secret=service_token) is False
+            await s.rollback()
+        # the real session is untouched
+        async with sm() as s:
+            row, _ = await S.rotate_refresh(
+                s, presented_secret=real,
+                new_refresh_secret=S.generate_refresh_secret(),
+            )
+            assert row.refresh_generation == 1
+            await s.commit()
+
+
+# ---------------------------------------------------------------------------
 # unique constraint
 # ---------------------------------------------------------------------------
 

@@ -488,11 +488,14 @@ def _issue_token(
 
     sid / jti — Pass 5A foundation. When ``sid`` is supplied (a server-side
     session id) the token becomes a *new-style, session-bound* access token:
-    it gains a ``sid`` claim and a ``jti`` claim (generated if not passed).
-    When ``sid`` is None — every caller today, including /auth/login as it
-    currently works — the payload is byte-for-byte what it was before: no
-    ``sid``, no ``jti``. This keeps legacy token issuance unchanged while the
-    session layer is built out (mission Pass 5A §6).
+    it gains a ``sid`` claim and a ``jti`` claim (generated if not passed),
+    and its TTL drops to the short session-access TTL (approved target
+    15 min; ``S43_SESSION_ACCESS_TTL_SECONDS``, default 900, clamped
+    60s..1h). When ``sid`` is None — every caller today, including /auth/login
+    as it currently works — the payload is byte-for-byte what it was before
+    (no ``sid``, no ``jti``) and the TTL is the legacy
+    ``S43_JWT_TTL_SECONDS`` (default 8h). This keeps legacy token issuance
+    unchanged while the session layer is built out (mission Pass 5A §3, §6).
     """
     secret = _e("S43_JWT_SECRET")
     if not secret:
@@ -502,7 +505,14 @@ def _issue_token(
         )
 
     now    = int(time.time())
-    ttl    = _ei("S43_JWT_TTL_SECONDS", 28800, lo=60, hi=86400)
+    if sid is not None:
+        # New-style session-bound access token: short TTL (approved target =
+        # 15 min). The refresh session, not the access token, is the durable
+        # credential. Clamped 60s..1h; env-overridable for tuning during the
+        # Pass 5B rollout. Legacy tokens (sid is None) keep the 8h default.
+        ttl = _ei("S43_SESSION_ACCESS_TTL_SECONDS", 900, lo=60, hi=3600)
+    else:
+        ttl = _ei("S43_JWT_TTL_SECONDS", 28800, lo=60, hi=86400)
     exp    = now + ttl
     exp_dt = datetime.fromtimestamp(exp, tz=timezone.utc)
 

@@ -34,33 +34,22 @@ that line requires explicit authorization (see §6).
 
 ## 2. Options evaluated (Section 13)
 
-### Option A — Alembic
+Evaluated against every criterion the authorization (§13) names:
 
-| | |
-|---|---|
-| Dependency | `alembic` (pulls in `Mako`; SQLAlchemy already present) |
-| Files added | `alembic.ini`, `migrations/env.py`, `migrations/script.py.mako`, `migrations/versions/*.py` |
-| Up/down | first-class `upgrade()` / `downgrade()` per revision |
-| Ordering | revision graph with `down_revision`; handles branches/merges |
-| Autogenerate | `alembic revision --autogenerate` diffs models vs DB — a safety net that catches "you changed the model but forgot the migration" |
-| Async | `alembic init -t async` — supported, matches `create_async_engine` |
-| Operational | `alembic upgrade head` (swap into `migration-job.yaml`; one-shot Compose service) |
-| Cost | one-time setup; contributors must learn the revision workflow; a "stamp baseline" step for the existing implicit `users` schema |
-| Risk | low and well-understood; large community; the failure modes are documented everywhere |
-
-### Option B — minimal project-native runner
-
-| | |
-|---|---|
-| Dependency | none |
-| Files added | `core/db/migrations/0001_*.sql …`, a `schema_migrations(version text pk, applied_at timestamptz)` table, a ~120-line runner (`core/db/migrate.py`) that: takes `pg_advisory_lock`, reads applied versions, applies each pending file inside one transaction, records it |
-| Up/down | forward-only unless you hand-write `*.down.sql` and a `downgrade` command too |
-| Ordering | lexical filename order; no dependency graph, no branch/merge handling |
-| Autogenerate | none — every change is hand-written SQL; model/DB drift is undetected until it bites |
-| Async | trivial (raw `asyncpg`/SQLAlchemy `text()`) |
-| Operational | `python -m core.db.migrate` (swap into `migration-job.yaml`; Compose service) |
-| Cost | low now; **you are maintaining a migration tool** — checksum/tamper detection, partial-failure recovery, "applied but file changed", dry-run, and squash are all now your problem |
-| Risk | low at n=1–2 migrations; grows with every migration and every new contributor; bespoke tooling has no external documentation |
+| criterion | A — Alembic | B — minimal project-native runner |
+|---|---|---|
+| **SQLAlchemy compatibility** | purpose-built for SQLAlchemy; `target_metadata` wired to `users.Base` + `SessionBase` | agnostic — you run raw `text()` / `asyncpg`; the ORM models and the SQL can silently drift |
+| **PostgreSQL support** | native; `inet`, partial indexes, `ON DELETE CASCADE`, `op.execute()` for anything Alembic doesn't model | native (it's your SQL) |
+| **Forward migration** | `alembic upgrade head` / `+1` | `python -m core.db.migrate` applies pending files in order |
+| **Rollback** | first-class `downgrade()` per revision; `alembic downgrade -1` | forward-only unless you also hand-write `*.down.sql` + a downgrade command |
+| **Migration ordering** | revision graph (`down_revision`); detects + refuses divergent heads; supports explicit merges | lexical filename order only; two branches that both add `0003_*` collide silently |
+| **State tracking** | `alembic_version` table (single current revision), managed for you | you build + maintain `schema_migrations(version, applied_at)` and decide checksum / tamper policy yourself |
+| **CI / testing** | `alembic upgrade head` + `alembic check` (autogenerate drift) in CI catches "model changed, migration missing"; round-trip `upgrade`→`downgrade`→`upgrade` is a standard test | you write every check; no drift detection exists unless you build it |
+| **Production deployment** | `alembic upgrade head` slots into the existing `migration-job.yaml` Job pattern + a one-shot Compose service; well-documented failure/retry behaviour | same shape (`python -m core.db.migrate`), but the failure/partial-apply/lock semantics are yours to get right |
+| **Operational complexity** | one-time setup (`alembic.ini`, `env.py`, baseline stamp) + contributors learn the revision workflow; after that it's a solved problem | trivial today; every added migration and every new contributor grows the maintenance surface of *your* tool (checksums, partial-failure recovery, "applied but file edited", dry-run, squash) |
+| **Dependency** | adds `alembic` (+ `Mako`); SQLAlchemy already present | none |
+| **Autogenerate** | `alembic revision --autogenerate` diffs models vs DB | none — every change is hand-written SQL |
+| **Async** | `alembic init -t async` — matches `create_async_engine` | trivial |
 
 ### Option C — status quo (`create_all` only)
 
