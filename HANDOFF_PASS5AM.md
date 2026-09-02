@@ -183,6 +183,12 @@ least-destructive; fails closed if deletion is added later without
 revisiting this). Not Case 3, no STOP. Full reasoning:
 `MIGRATION_ARCHITECTURE_PASS5AM.md §7`.
 
+**This supersedes** the `ON DELETE CASCADE` sketched in
+`SESSION_MODEL_PASS5A.md` / `SESSION_MIGRATION_DECISION_PASS5A.md` (written
+before the §15 procedure). Those Pass 5A files are kept as historical record
+(§37); the migration, the `core/auth/sessions.py` comment, and the tests are
+the authority. Pass 5B follows RESTRICT.
+
 ## N. Downgrade semantics
 
 | command | effect | data safety |
@@ -345,6 +351,11 @@ scoped break-glass; implementation not authorized.
    §F); a `login_attempts` table can ride a future migration.
 9. Carried: P3-7 `role` CHECK constraint, P3-8 case-insensitive
    username/email uniqueness (both need a live-data collision inventory).
+10. **Cosmetic:** `core/auth/users.py::init_models()`'s docstring still says
+    "There is no migration tool in this project yet". Left untouched this
+    pass because the mission tracked `init_models()` as byte-unchanged
+    (§7/§30) and the line is a comment, not behaviour. The deployment pass
+    that gates/removes `init_models()` (§O) should correct it then.
 
 **None of #1–#9 are marked RESOLVED** (§37). Migration-specific behaviour
 (baseline adoption, drift refusal, downgrade safety, shape-B constraint,

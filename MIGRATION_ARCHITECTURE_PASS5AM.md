@@ -296,6 +296,14 @@ triggered (mission §15).
 `user_id` insert → `IntegrityError`), `test_sessions_fk_is_restrict_not_cascade`
 (reflects `ondelete == "RESTRICT"`).
 
+**Supersedes the Pass 5A sketch.** `SESSION_MODEL_PASS5A.md` and
+`SESSION_MIGRATION_DECISION_PASS5A.md` sketched this FK as `ON DELETE
+CASCADE`, before the mission §15 decision procedure was run. Pass 5AM ran
+the procedure and landed on RESTRICT; the migration + ORM comment + tests
+are the authority. The two Pass 5A markdown files are left as historical
+record (§37 — Pass 5A deliverables are not rewritten). A Pass 5B
+implementer follows this section, not the CASCADE sketch.
+
 ---
 
 ## 8. Indexes on `sessions` — each justified (§16)
