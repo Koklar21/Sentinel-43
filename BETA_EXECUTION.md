@@ -97,8 +97,30 @@ by reading the ORM.
 
 ## 5. Current checkpoint
 
-**PHASE: P1 — migration deployment.** Status: implemented + phase tests green;
-full-suite verification running; commit pending its result.
+**PHASE: P4 — service & docker integration.** P1+P2 = `d529f04`; P3 done
+(commit pending). Full isolated suite **449 passed / 0 failed / 0 skipped**.
+Next: route inventory map, container-network exercise, WS close-helper
+`reason` (done in P3), P3-7 + P3-8 migrations, dependency-outage tests.
+
+### P3 done (browser session end to end)
+- `/auth/refresh`, `/auth/logout`; login creates a session + sets HttpOnly
+  refresh cookie + JS-readable CSRF cookie + sid-bound 15-min token for DB
+  accounts (env operator → legacy token, no cookie).
+- Phase-B dual contract in all 4 enforcement points: a live session-bound
+  token skips `X-S43-Password`; old-style token still requires it.
+  `resolve_session_subject()` = 1 read-only PK lookup/request →
+  **immediate** revocation (logout / disable / role / password / replay).
+- WS: `{token}`-only frame for session tokens; `S43_WS_SESSION_RECHECK_
+  SECONDS` mid-stream re-check; `_ws_safe_close(reason=...)` (finding #6).
+- `revoke_all_user_sessions` wired into PATCH/password routes (same txn).
+- #11: `_env_operator_allowed()` — env operator is break-glass only
+  (no admin / DB down / `S43_BREAK_GLASS_ARMED`).
+- `legacy_auth_request_total` counter (on `/metrics`); `S43_REJECT_LEGACY_
+  AUTH` cutover flag (default off).
+- `auth.js` v1.7.0 / `websocket.js` v1.7.0 — refresh-on-load, logout
+  endpoint, `{token}` WS frame. **Not browser-verified** (no browser here).
+- Tests: `test_auth_session_pg` (12), `test_ws_session_pg` (4),
+  `test_break_glass_pg` (4). `AUTH_SESSION_BETA.md`.
 
 ### P0 completed
 - Repo state verified (§1). Commit-count discrepancy (7 vs 6) resolved: 7.
@@ -108,25 +130,29 @@ full-suite verification running; commit pending its result.
   no runtime code changed between `8614f9b` and the start of this session).
   SI 13/13 inherited.
 
-### P1 completed (uncommitted)
-- `core/auth/schema_version.py` — new runtime schema-revision gate.
-- `GET /ready` → 503 in non-local when DB not at head; `GET /health`
-  untouched (never hits the DB). `/api/ready` compat updated.
-- `core/auth/users.py::init_models()` — no-op in non-local
-  (`_schema_is_alembic_managed()`); `S43_SCHEMA_CREATE_ALL` override.
-- `docker-compose.yml` — `s43-migrate` one-shot service
-  (`alembic upgrade head`), `s43-api` waits `service_completed_successfully`.
-  `s43-setup` `generate_secrets.py` path fixed (A5).
-- `deploy/kubernetes/base/migration-job.yaml` — command → `alembic upgrade head`.
-- `deploy/kubernetes/README.md` + `s43-api-deployment.yaml` comments updated.
-- `MIGRATION_DEPLOYMENT_BETA.md` — new phase doc.
-- Tests (all green on disposable PG 55441):
-  `test_schema_version_pg.py` (12), `test_schema_authority.py` (8),
-  `test_deploy_migration_wiring.py` (6), `test_backup_restore_pg.py` (2 —
-  real `pg_dump` → restore into a separate DB; revoked session stays revoked).
+### P1 + P2 done — commit `d529f04`
+- P1: `core/auth/schema_version.py`; `/ready` 503 gate (non-local, DB not at
+  head); `init_models()` no-op in non-local; `s43-migrate` compose one-shot;
+  k8s Job → `alembic upgrade head`; A5 fix; `MIGRATION_DEPLOYMENT_BETA.md`.
+- P2: `deploy/proxy/` nginx TLS terminator + dev-cert helpers;
+  `SecurityHeadersMiddleware` (HSTS gated on real HTTPS); `TrustedHostMiddleware`
+  (`S43_TRUSTED_HOSTS`); non-local plaintext-origin startup refusal;
+  backend no longer host-published; k8s beta ingress HSTS.
+- Recovery proof: `test_backup_restore_pg.py` — real `pg_dump` → restore into
+  a separate DB; a pre-backup-revoked session restores revoked.
+- Full isolated suite **429 passed / 0 failed / 0 skipped** (191s, fast-
+  watchtower env). k8s dev+beta overlays render + policy-pass.
 
 ### Remaining
-P1 commit + full-suite verify · P2 → P7 per §4.
+P3 (auth end-to-end) → P7 per §4.
+
+### P2 — still open on F-TLS-1
+The Compose proxy + k8s ingress are the mechanism; a **local self-signed
+cert** proves the integration only. F-TLS-1 stays OPEN until edge TLS is
+verified against a real hostname + CA on a named target (see
+`deploy/proxy/README.md`). Live HTTPS integration test (forged XFF, HTTP
+handling, secure-cookie, WSS through the proxy) is a P3/P6 stack test —
+not yet run.
 
 ### Environment note (test-run speed)
 The user's OWN Docker Compose stack (from the OneDrive repo, project

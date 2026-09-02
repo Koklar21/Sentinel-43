@@ -221,7 +221,14 @@ async def _get_operator(
     if auth.startswith("Bearer "):
         token = auth[7:].strip()
         if token:
-            from .routers.auth import PASSWORD_HEADER_NAME, reverify_password, verify_jwt_token
+            from .routers.auth import (
+                PASSWORD_HEADER_NAME,
+                legacy_auth_is_rejected,
+                note_legacy_auth,
+                resolve_session_subject,
+                reverify_password,
+                verify_jwt_token,
+            )
 
             # verify_jwt_token() validates signature, claims, and role, and
             # raises the appropriate HTTPException (401/403/503) itself.
@@ -230,8 +237,20 @@ async def _get_operator(
             subject = str(claims.get("sub") or "").strip()
             subject = subject if subject else f"bearer:{token[:16]}"
 
-            # A valid JWT is no longer sufficient by itself \u2014 every protected
-            # request must also re-supply the operator's password.
+            # Phase B (beta-execution): a session-bound token whose sid names a
+            # live session authenticates by itself. resolve_session_subject()
+            # raises 401 if the session is dead / owner disabled.
+            resolved = await resolve_session_subject(claims)
+            if resolved is not None:
+                return resolved[0]
+
+            # Legacy path: old-style token still needs the per-request password.
+            if legacy_auth_is_rejected():
+                raise HTTPException(
+                    status_code=401,
+                    detail="Legacy authentication is no longer accepted. Log in again.",
+                )
+            note_legacy_auth("dashboard")
             password = request.headers.get(PASSWORD_HEADER_NAME, "")
             if not password:
                 raise HTTPException(status_code=401, detail="Password required")
@@ -1064,23 +1083,42 @@ def serve_dashboard_html() -> FileResponse:
 # =============================================================================
 # WebSocket endpoint
 # =============================================================================
-async def _ws_safe_close(websocket: WebSocket, code: int = 1008) -> None:
+async def _ws_safe_close(
+    websocket: WebSocket, code: int = 1008, reason: str = ""
+) -> None:
     """
     Close a WebSocket, swallowing RuntimeError if already closed.
     Starlette/uvicorn raises RuntimeError when close() is attempted on a
     connection that was rejected before accept(), or when the client
     already disconnected. This helper guards every auth-rejection path.
+
+    ``reason`` is a short machine string (e.g. "invalid_token",
+    "invalid_password", "session_revoked", "token_expired",
+    "origin_rejected", "capacity"). dashboard/assets/js/websocket.js
+    classifies a 1008 close as an auth failure vs a generic policy error by
+    matching this string (finding #6) \u2014 auth-related reasons contain one of
+    auth|token|password|credential|session|login.
     """
     try:
-        await websocket.close(code=code)
+        await websocket.close(code=code, reason=reason)
     except RuntimeError:
         pass
+    except TypeError:  # very old starlette: close() had no reason kwarg
+        try:
+            await websocket.close(code=code)
+        except RuntimeError:
+            pass
+
+
+def _ws_session_recheck_seconds() -> int:
+    return _env_int("S43_WS_SESSION_RECHECK_SECONDS", 60)
+
 
 @app.websocket("/ws")
 async def dashboard_websocket(websocket: WebSocket) -> None:
     origin = websocket.headers.get("origin", "")
     if _ALLOWED_ORIGINS and origin and origin not in _ALLOWED_ORIGINS:
-        await _ws_safe_close(websocket)
+        await _ws_safe_close(websocket, reason="origin_rejected")
         return
 
     if len(_dashboard_ws_clients) >= MAX_WS_CLIENTS:
@@ -1089,10 +1127,16 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
             "type": "error",
             "payload": {"error": "Server is at maximum dashboard capacity"},
         })
-        await _ws_safe_close(websocket)
+        await _ws_safe_close(websocket, reason="capacity")
         return
 
     await websocket.accept()
+
+    # Session-bound WS connections carry these so the message loop can drop
+    # the connection when the access token expires or the session is revoked
+    # mid-stream (beta-execution Phase B: "no infinite WS session").
+    ws_sid: str | None = None
+    ws_exp: float | None = None
 
     if WS_REQUIRE_AUTH:
         await websocket.send_json({
@@ -1110,7 +1154,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
         except WebSocketDisconnect:
             return
         except (asyncio.TimeoutError, ValueError):
-            await _ws_safe_close(websocket)
+            await _ws_safe_close(websocket, reason="auth_timeout")
             return
 
         if auth_msg.get("type") != "auth":
@@ -1118,7 +1162,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 "type": "error",
                 "payload": {"error": "First message must be an auth frame"},
             })
-            await _ws_safe_close(websocket)
+            await _ws_safe_close(websocket, reason="invalid_auth_frame")
             return
 
         token = str(auth_msg.get("payload", {}).get("token") or "").strip()
@@ -1127,10 +1171,16 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 "type": "error",
                 "payload": {"error": "Token missing"},
             })
-            await _ws_safe_close(websocket)
+            await _ws_safe_close(websocket, reason="invalid_token")
             return
 
-        from .routers.auth import reverify_password, verify_jwt_token
+        from .routers.auth import (
+            legacy_auth_is_rejected,
+            note_legacy_auth,
+            resolve_session_subject,
+            reverify_password,
+            verify_jwt_token,
+        )
 
         try:
             # verify_jwt_token() validates signature, claims, and role, and
@@ -1138,24 +1188,56 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
             ws_claims = verify_jwt_token(token)
         except HTTPException as exc:
             await websocket.send_json({"type": "error", "payload": {"error": str(exc.detail)}})
-            await _ws_safe_close(websocket)
+            await _ws_safe_close(websocket, reason="invalid_token")
             return
 
-        # A valid JWT is no longer sufficient by itself \u2014 the auth frame must
-        # also carry the operator's password, re-verified against storage.
         ws_subject = str(ws_claims.get("sub") or "").strip()
-        ws_password = str(auth_msg.get("payload", {}).get("password") or "").strip()
-        if not ws_password:
-            await websocket.send_json({"type": "error", "payload": {"error": "Password missing"}})
-            await _ws_safe_close(websocket)
+
+        # Phase B: a live session-bound token needs NO password frame.
+        try:
+            resolved = await resolve_session_subject(ws_claims)
+        except HTTPException:
+            await websocket.send_json({"type": "error", "payload": {"error": "Session is no longer valid"}})
+            await _ws_safe_close(websocket, reason="session_revoked")
             return
 
-        if not await reverify_password(ws_subject, ws_password):
-            await websocket.send_json({"type": "error", "payload": {"error": "Invalid password"}})
-            await _ws_safe_close(websocket)
-            return
+        if resolved is not None:
+            ws_sid = str(ws_claims.get("sid"))
+            _exp = ws_claims.get("exp")
+            ws_exp = float(_exp) if isinstance(_exp, (int, float)) else None
+        else:
+            # Legacy frame: {token, password}, password re-verified.
+            if legacy_auth_is_rejected():
+                await websocket.send_json({"type": "error", "payload": {"error": "Legacy authentication is no longer accepted. Log in again."}})
+                await _ws_safe_close(websocket, reason="legacy_auth_rejected")
+                return
+            note_legacy_auth("websocket")
+            ws_password = str(auth_msg.get("payload", {}).get("password") or "").strip()
+            if not ws_password:
+                await websocket.send_json({"type": "error", "payload": {"error": "Password missing"}})
+                await _ws_safe_close(websocket, reason="invalid_password")
+                return
+            if not await reverify_password(ws_subject, ws_password):
+                await websocket.send_json({"type": "error", "payload": {"error": "Invalid password"}})
+                await _ws_safe_close(websocket, reason="invalid_password")
+                return
 
     _dashboard_ws_clients[websocket] = set()
+
+    async def _session_still_valid() -> tuple[bool, str]:
+        """(ok, reason). Cheap re-check for a session-bound connection."""
+        if ws_exp is not None and time.time() >= ws_exp:
+            return False, "token_expired"
+        if ws_sid is None:
+            return True, ""
+        try:
+            from .routers.auth import resolve_session_subject as _rss
+            ok = await _rss({"sid": ws_sid, "sub": "x", "role": "operator"})
+            return (ok is not None), ("" if ok is not None else "session_revoked")
+        except HTTPException:
+            return False, "session_revoked"
+        except Exception:
+            return True, ""  # transient DB error \u2014 don't drop the operator
 
     try:
         await websocket.send_json({
@@ -1165,10 +1247,26 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
 
         while True:
             try:
-                message = await _receive_ws_message(websocket)
+                message = await asyncio.wait_for(
+                    _receive_ws_message(websocket),
+                    timeout=float(_ws_session_recheck_seconds()),
+                )
+            except asyncio.TimeoutError:
+                ok, why = await _session_still_valid()
+                if not ok:
+                    await websocket.send_json({"type": "error", "payload": {"error": why}})
+                    await _ws_safe_close(websocket, reason=why)
+                    return
+                continue
             except ValueError as exc:
                 await websocket.send_json({"type": "error", "payload": {"error": str(exc)}})
                 continue
+
+            ok, why = await _session_still_valid()
+            if not ok:
+                await websocket.send_json({"type": "error", "payload": {"error": why}})
+                await _ws_safe_close(websocket, reason=why)
+                return
 
             event_type = message.get("type")
             payload    = message.get("payload")
@@ -1691,11 +1789,19 @@ def version() -> dict[str, Any]:
 
 @root_router.get("/metrics")
 def metrics() -> dict[str, Any]:
+    # legacy_auth_request_total — Phase D observability for the X-S43-Password
+    # / old-style-token retirement. Per route + `_all`. Credential-free.
+    try:
+        from .routers.auth import legacy_auth_request_total
+        legacy_auth = legacy_auth_request_total()
+    except Exception:
+        legacy_auth = {}
     return {
         "service":                      APP_NAME,
         "uptime_seconds":               uptime_seconds(),
         "status":                       "online",
         "watchtower_heartbeat_seconds": WATCHTOWER_HEARTBEAT_SECONDS,
+        "legacy_auth_request_total":    legacy_auth,
         "timestamp":                    utc_now(),
     }
 

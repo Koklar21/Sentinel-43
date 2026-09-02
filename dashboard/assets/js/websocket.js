@@ -1,7 +1,18 @@
 /* =============================================================================
    Sentinel-43 Dashboard
    websocket.js — Hardened WebSocket bridge
-   v1.6.0
+   v1.7.0
+
+   Changes from v1.6.0 (beta-execution Phase 3):
+   - The auth frame is {token} only when auth.js holds no in-memory password
+     (the session-bound / refresh-on-reload path). {token,password} is still
+     sent when a password IS held (legacy env-operator / dual contract). A
+     missing password is no longer a hard failure.
+   - The backend now passes a meaningful `reason` on every 1008 close
+     (invalid_token / invalid_password / session_revoked / token_expired /
+     origin_rejected / capacity), so _reasonIndicatesAuthFailure() actually
+     classifies auth failures — the backend companion change this file's
+     v1.6.0 changelog asked for has landed.
 
    RECONSTRUCTION NOTE: this file was recovered from a paste that had
    stripped the backticks from every template literal. Backticks have been
@@ -418,22 +429,16 @@ function _sendAuthFrame(token) {
         return false;
     }
 
-    const password = _getAuthPassword();
-    if (!password) {
-        _dispatch("sentinel:ws:auth_failed", {
-            error: "WebSocket authentication required, but no password was found.",
-            timestamp: _nowIso(),
-        });
-        _manuallyClosed = true;
-        if (_ws) {
-            try { _ws.close(); } catch {}
-        }
-        return false;
-    }
     if (_authSent) {
         return true;
     }
-    const ok = _sendRaw("auth", { token, password });
+    // Session-bound access tokens (the browser-session redesign) authenticate
+    // on their own — the auth frame is {token} only. The password is included
+    // only when auth.js still holds one (the legacy env-operator / dual
+    // contract path); a session-bound connection never needs it.
+    const password = _getAuthPassword();
+    const frame = password ? { token, password } : { token };
+    const ok = _sendRaw("auth", frame);
     if (ok) {
         _authSent = true;
         _dispatch("sentinel:ws:auth_sent", { timestamp: _nowIso() });

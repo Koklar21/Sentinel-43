@@ -212,15 +212,36 @@ async def require_operator(request: Request) -> str:
     if not token:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    from ..routers.auth import PASSWORD_HEADER_NAME, reverify_password, verify_jwt_token
+    from ..routers.auth import (
+        PASSWORD_HEADER_NAME,
+        legacy_auth_is_rejected,
+        note_legacy_auth,
+        resolve_session_subject,
+        reverify_password,
+        verify_jwt_token,
+    )
 
     claims = verify_jwt_token(token)
 
     subject = str(claims.get("sub") or "").strip()
     subject = subject if subject else f"bearer:{token[:16]}"
 
-    # A valid JWT is no longer sufficient on its own — every protected
-    # request must also re-supply the operator's password.
+    # Phase B (beta-execution): a session-bound access token whose sid names a
+    # live session (owner still active) authenticates on its own — no
+    # X-S43-Password. resolve_session_subject() raises 401 if the session is
+    # dead / the owner is disabled.
+    resolved = await resolve_session_subject(claims)
+    if resolved is not None:
+        return resolved[0]
+
+    # Legacy path: old-style (sid-less) token still requires the per-request
+    # password, exactly as before.
+    if legacy_auth_is_rejected():
+        raise HTTPException(
+            status_code=401,
+            detail="Legacy authentication is no longer accepted. Log in again.",
+        )
+    note_legacy_auth("/v1")
     password = request.headers.get(PASSWORD_HEADER_NAME, "")
     if not password:
         raise HTTPException(status_code=401, detail="Password required")
@@ -257,6 +278,9 @@ async def require_admin(
     """
     from ..routers.auth import (
         PASSWORD_HEADER_NAME,
+        legacy_auth_is_rejected,
+        note_legacy_auth,
+        resolve_session_subject,
         reverify_password,
         verify_jwt_token,
     )
@@ -277,11 +301,23 @@ async def require_admin(
     if not subject:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    password = request.headers.get(PASSWORD_HEADER_NAME, "")
-    if not password:
-        raise HTTPException(status_code=401, detail="Password required")
-    if not await reverify_password(subject, password):
-        raise HTTPException(status_code=401, detail="Invalid password")
+    # Phase B: a live session-bound token skips X-S43-Password. The live-DB
+    # admin check below still runs regardless of how the caller authenticated.
+    resolved = await resolve_session_subject(claims)
+    if resolved is not None:
+        subject = resolved[0]
+    else:
+        if legacy_auth_is_rejected():
+            raise HTTPException(
+                status_code=401,
+                detail="Legacy authentication is no longer accepted. Log in again.",
+            )
+        note_legacy_auth("/users")
+        password = request.headers.get(PASSWORD_HEADER_NAME, "")
+        if not password:
+            raise HTTPException(status_code=401, detail="Password required")
+        if not await reverify_password(subject, password):
+            raise HTTPException(status_code=401, detail="Invalid password")
 
     try:
         user = await get_user_by_username(session, subject)

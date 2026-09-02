@@ -54,6 +54,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -62,6 +63,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...auth.deps import get_db_session
+
+logger = logging.getLogger(__name__)
 from ...auth.users import (
     ADMIN_INVARIANT_LOCK_KEY,
     APPROVED_ROLES,
@@ -159,6 +162,30 @@ def _parse_user_id(raw: str) -> uuid.UUID:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="user_id must be a UUID.",
+        )
+
+
+async def _revoke_sessions(session: AsyncSession, user_id: uuid.UUID, *, reason: str) -> None:
+    """
+    Revoke every live server-side session for a user, in the caller's
+    transaction (Pass 3 boundary). Called on disablement / role change /
+    password reset so an existing browser session can't outlive the change
+    (beta-execution Phase B, AUTH_MIGRATION_PASS4 M5).
+
+    Defensive: a failure here (e.g. the sessions table isn't present, or a
+    fake session in a unit test) is logged and swallowed — the account change
+    itself already blocks NEW logins, and resolve_live_session() re-checks
+    is_active on every request, so a disabled user is locked out immediately
+    regardless.
+    """
+    try:
+        from ...auth.sessions import revoke_all_user_sessions
+
+        await revoke_all_user_sessions(session, user_id, reason=reason)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "session revocation for %s (%s) failed: %s",
+            user_id, reason, type(exc).__name__,
         )
 
 
@@ -303,10 +330,24 @@ async def update_account(
             detail="Cannot deactivate or demote the last active admin.",
         )
 
-    if new_role is not None and new_role != target.role:
+    role_changed = new_role is not None and new_role != target.role
+    deactivated = (
+        body.is_active is not None
+        and bool(body.is_active) is False
+        and bool(target.is_active) is True
+    )
+
+    if role_changed:
         target = await set_user_role(session, target, role=new_role)
     if body.is_active is not None and bool(body.is_active) != bool(target.is_active):
         target = await set_user_active(session, target, is_active=body.is_active)
+
+    # Revoke live sessions when the account is disabled or its role changes,
+    # in this same transaction, so a browser session can't outlive the change.
+    if deactivated:
+        await _revoke_sessions(session, target.user_id, reason="account_disabled")
+    elif role_changed:
+        await _revoke_sessions(session, target.user_id, reason="role_changed")
 
     await session.commit()
     return _serialize(target)
@@ -329,6 +370,9 @@ async def reset_account_password(
         )
 
     target = await set_user_password(session, target, password=body.new_password)
+    # A password reset invalidates every existing browser session for that
+    # account (they must log in again with the new password).
+    await _revoke_sessions(session, target.user_id, reason="password_reset")
     await session.commit()
     return _serialize(target)
 

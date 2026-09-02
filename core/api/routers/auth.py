@@ -73,12 +73,13 @@ import re
 import secrets
 import threading
 import time
+import uuid
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 import jwt as pyjwt
-from fastapi import APIRouter, Header, HTTPException, status
+from fastapi import APIRouter, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
 from ...security.jwt_constants import APPROVED_JWT_ALGORITHMS
@@ -300,10 +301,28 @@ class LoginRequest(BaseModel):
 
 
 class LoginResponse(BaseModel):
-    token:      str
+    token:      str          # the access token (kept as `token` for existing consumers)
     token_type: str = "bearer"
     subject:    str
     expires_at: str
+    # New-style fields (browser-session redesign, beta-execution Phase 3).
+    # Present for DB-account logins that get a server-side session; absent /
+    # null for the legacy env-operator break-glass path.
+    access_token:  Optional[str] = None
+    expires_in:    Optional[int] = None
+    role:          Optional[str] = None
+    session_bound: bool = False
+
+
+class RefreshResponse(BaseModel):
+    token:         str
+    access_token:  str
+    token_type:    str = "bearer"
+    subject:       str
+    role:          str
+    expires_in:    int
+    expires_at:    str
+    session_bound: bool = True
 
 
 class VerifyResponse(BaseModel):
@@ -389,6 +408,40 @@ def _validate_env_credentials(username: str, password: str) -> str:
     return expected_username
 
 
+async def _env_operator_allowed() -> bool:
+    """
+    RELEASE_FINDINGS #11 (beta-execution Phase 3, AUTH_MIGRATION_PASS4 §3
+    Option C — scoped break-glass).
+
+    The env-var operator (S43_OPERATOR_USERNAME / S43_OPERATOR_PASSWORD_HASH,
+    un-salted SHA-256) is a **break-glass** credential, not a routine account.
+    It authenticates only when:
+
+      * ``S43_BREAK_GLASS_ARMED`` is truthy (an operator deliberately turned
+        it on), OR
+      * there is **no active admin** in the DB — the first-run window before
+        ``/bootstrap/admin`` has been completed, OR
+      * the DB cannot be reached at all — break-glass is exactly for
+        "the database is down and I need in".
+
+    Once a DB admin exists and the DB is healthy, the env operator is inert
+    unless explicitly armed. This removes the "a permanent fast-hashed
+    password checked on every failed login" surface without a breaking
+    ``.env`` change for anyone using it correctly (as break-glass).
+    """
+    if _e("S43_BREAK_GLASS_ARMED", "").lower() in {"1", "true", "yes", "on"}:
+        return True
+    try:
+        from ...auth.users import count_active_admins, get_sessionmaker
+
+        sm = get_sessionmaker()
+        async with sm() as session:
+            return await count_active_admins(session) == 0
+    except Exception:
+        # No DATABASE_URL, DB unreachable, table missing — break-glass applies.
+        return True
+
+
 async def reverify_password(username: str, password: str) -> bool:
     """
     Re-validate a password for a subject that has already passed JWT
@@ -419,6 +472,8 @@ async def reverify_password(username: str, password: str) -> bool:
     except Exception as exc:
         logger.debug("DB-backed password reverify unavailable, falling back to env-var: %s", exc)
 
+    if not await _env_operator_allowed():
+        return False
     try:
         _validate_env_credentials(normalized, password)
         return True
@@ -463,6 +518,13 @@ async def _validate_credentials(username: str, password: str) -> tuple[str, str,
         # Not fatal — fall through to the env-var check below.
         logger.debug("DB-backed login unavailable, falling back to env-var credentials: %s", exc)
 
+    # #11: the env-var operator is break-glass only (see _env_operator_allowed).
+    if not await _env_operator_allowed():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return _validate_env_credentials(normalized, password), "operator", None
 
 
@@ -689,21 +751,224 @@ def verify_jwt_token(token: str) -> dict[str, Any]:
 
 
 # =============================================================================
+# Browser session — refresh cookie, CSRF double-submit, Phase-B dual contract
+# (beta-execution Phase 3; AUTH_ARCHITECTURE_PASS4.md §3, AUTH_MIGRATION_PASS4
+# Phase B). The access token stays the stateless request-hot-path credential
+# (verify_jwt_token, unchanged). The refresh session is the durable one.
+# =============================================================================
+
+REFRESH_COOKIE_NAME = "s43_refresh"
+CSRF_COOKIE_NAME = "s43_csrf"
+CSRF_HEADER_NAME = "X-S43-CSRF"
+# Path=/auth: the browser only ever sends the refresh cookie to /auth/refresh
+# and /auth/logout, never to a protected data route.
+_REFRESH_COOKIE_PATH = "/auth"
+
+# legacy_auth_request_total — Phase D observability. Incremented whenever a
+# protected request authenticates via X-S43-Password or an old-style
+# (sid-less) token. Credential-free. Read by the metrics route / tests.
+_legacy_auth_lock = threading.Lock()
+_legacy_auth_counts: dict[str, int] = {}
+
+
+def legacy_auth_request_total() -> dict[str, int]:
+    with _legacy_auth_lock:
+        return dict(_legacy_auth_counts)
+
+
+def note_legacy_auth(route: str) -> None:
+    key = route[:64] or "unknown"
+    with _legacy_auth_lock:
+        _legacy_auth_counts[key] = _legacy_auth_counts.get(key, 0) + 1
+        _legacy_auth_counts["_all"] = _legacy_auth_counts.get("_all", 0) + 1
+
+
+def legacy_auth_is_rejected() -> bool:
+    """Beta cutover switch (AUTH_MIGRATION_PASS4 Phase E). When true, a
+    protected request carrying X-S43-Password OR an old-style token is 401'd
+    instead of accepted. Off by default — flip only once every consumer emits
+    session tokens (the dashboard SPA + WS), per HANDOFF."""
+    return _e("S43_REJECT_LEGACY_AUTH", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _cookie_secure() -> bool:
+    """Refresh / CSRF cookies are issued Secure unless SENTINEL_ENV is local
+    (so the flow is exercisable over http://localhost in dev). The deployment
+    guarantees HTTPS in production (F-TLS-1); the app never infers scheme
+    (AUTH_TLS_POSTURE_PASS5A §4/§8)."""
+    env = _e("SENTINEL_ENV", "production").lower()
+    if env in {"development", "dev", "local", "test"}:
+        return _e("S43_FORCE_SECURE_COOKIES", "").lower() in {"1", "true", "yes", "on"}
+    return True
+
+
+def _session_access_ttl() -> int:
+    return _ei("S43_SESSION_ACCESS_TTL_SECONDS", 900, lo=60, hi=3600)
+
+
+def _allowed_origins() -> frozenset[str]:
+    raw = _e(
+        "S43_ALLOWED_ORIGINS",
+        "http://127.0.0.1:5500,http://localhost:5500,"
+        "http://127.0.0.1:8000,http://localhost:8000",
+    )
+    return frozenset(o.strip() for o in raw.split(",") if o.strip())
+
+
+def _check_state_change_origin(request: Request) -> None:
+    """Origin/Referer check for cookie-authenticated state changes (login /
+    refresh / logout). CORS is NOT CSRF protection — this is the server-side
+    half. A browser always sends Origin on a cross-site POST and on same-site
+    POSTs in modern browsers; a non-browser API client sends neither and is
+    not CSRF-exposed (it has no ambient cookie). So: if Origin is present it
+    MUST be allow-listed; if absent, fall back to Referer; if both absent,
+    allow (non-browser)."""
+    origin = request.headers.get("origin", "").strip()
+    allowed = _allowed_origins()
+    if origin:
+        if origin not in allowed:
+            raise HTTPException(status_code=403, detail="Origin not allowed.")
+        return
+    referer = request.headers.get("referer", "").strip()
+    if referer:
+        from urllib.parse import urlsplit
+
+        p = urlsplit(referer)
+        base = f"{p.scheme}://{p.netloc}"
+        if base not in allowed:
+            raise HTTPException(status_code=403, detail="Referer not allowed.")
+
+
+def _set_session_cookies(response: Response, refresh_secret: str, csrf_token: str) -> None:
+    from ...auth.sessions import refresh_ttl_seconds
+
+    ttl = refresh_ttl_seconds()
+    secure = _cookie_secure()
+    response.set_cookie(
+        REFRESH_COOKIE_NAME, refresh_secret,
+        max_age=ttl, path=_REFRESH_COOKIE_PATH,
+        httponly=True, secure=secure, samesite="strict",
+    )
+    # CSRF cookie is readable by JS (double-submit) — NOT HttpOnly. SameSite
+    # still Strict; Path=/ so the SPA can read it before calling /auth/*.
+    response.set_cookie(
+        CSRF_COOKIE_NAME, csrf_token,
+        max_age=ttl, path="/",
+        httponly=False, secure=secure, samesite="strict",
+    )
+
+
+def _clear_session_cookies(response: Response) -> None:
+    secure = _cookie_secure()
+    # Attributes must match the set call for the browser to actually drop it.
+    response.set_cookie(
+        REFRESH_COOKIE_NAME, "", max_age=0, path=_REFRESH_COOKIE_PATH,
+        httponly=True, secure=secure, samesite="strict",
+    )
+    response.set_cookie(
+        CSRF_COOKIE_NAME, "", max_age=0, path="/",
+        httponly=False, secure=secure, samesite="strict",
+    )
+
+
+async def _create_login_session(
+    *, user_id: str, request: Optional[Request],
+) -> tuple[str, str, str]:
+    """Create a server-side session for a DB account. Returns
+    (sid, refresh_secret, csrf_token). Commits its own transaction."""
+    from ...auth.sessions import create_session, generate_csrf_token, generate_refresh_secret
+    from ...auth.users import get_sessionmaker
+
+    refresh_secret = generate_refresh_secret()
+    csrf_token = generate_csrf_token()
+    client_ip = None
+    user_agent = None
+    if request is not None:
+        client_ip = request.client.host if request.client else None
+        user_agent = request.headers.get("user-agent")
+    sm = get_sessionmaker()
+    async with sm() as s:
+        row = await create_session(
+            s, user_id=uuid.UUID(user_id), refresh_secret=refresh_secret,
+            client_ip=client_ip, user_agent=user_agent,
+        )
+        await s.commit()
+        sid = str(row.sid)
+    return sid, refresh_secret, csrf_token
+
+
+async def resolve_session_subject(claims: dict[str, Any]) -> Optional[tuple[str, str]]:
+    """
+    Phase-B request gate for a **session-bound** access token.
+
+    Returns (subject, role) when the token's `sid` names a session that is
+    still live AND whose owning account is still active — the caller then does
+    NOT require X-S43-Password. Returns None when the token is NOT session-
+    bound (legacy path — caller falls back to the password check). Raises 401
+    when the token IS session-bound but the session is dead / the owner is
+    disabled.
+
+    One indexed PK lookup + one indexed user lookup per request, read-only
+    (no write — the Pass 3 "no DB write on the hot path" rule holds). This is
+    the immediate-revocation guarantee: logout / disablement / role change /
+    refresh-reuse all set `revoked_at`, so the very next request 401s.
+    """
+    if not token_is_session_bound(claims):
+        return None
+
+    from ...auth.sessions import (
+        SessionError,
+        resolve_live_session,
+    )
+    from ...auth.users import get_sessionmaker
+
+    sid = claims.get("sid")
+    try:
+        sid_uuid = uuid.UUID(str(sid))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="Invalid session.", headers={"WWW-Authenticate": "Bearer"})
+
+    try:
+        sm = get_sessionmaker()
+    except Exception:
+        # No DB configured but the token claims a session — cannot verify it.
+        raise HTTPException(status_code=401, detail="Session cannot be verified.", headers={"WWW-Authenticate": "Bearer"})
+
+    try:
+        async with sm() as s:
+            row, owner = await resolve_live_session(s, sid_uuid)
+    except SessionError:
+        raise HTTPException(
+            status_code=401,
+            detail="Session is no longer valid. Log in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    subject = str(claims.get("sub") or owner.username).strip()
+    # Role: trust the access-token claim for operator-vs-admin gating (≤ the
+    # 15-min access TTL stale). require_admin still re-reads the DB live.
+    role = str(claims.get("role") or owner.role).strip()
+    return subject, role
+
+
+# =============================================================================
 # Routes
 # =============================================================================
 
 @router.post("/login", response_model=LoginResponse)
-async def login(body: LoginRequest) -> LoginResponse:
+async def login(body: LoginRequest, request: Request, response: Response) -> LoginResponse:
     """
-    Exchange operator credentials for a signed JWT.
+    Exchange operator credentials for an access token.
 
-    The JWT is consumed by auth.js (stored in sessionStorage) and then sent
-    by websocket.js during the WebSocket authentication handshake.
+    DB accounts additionally get a server-side session: an opaque refresh
+    credential in an HttpOnly/Secure/SameSite=Strict cookie
+    (Path=/auth), a JS-readable CSRF token cookie, and a `sid`-bound 15-min
+    access token. The env-var break-glass operator (no DB row) gets the
+    legacy 8-hour token and no cookie.
 
-    Per-username brute-force throttle: after S43_LOGIN_MAX_FAILURES (10)
-    failures inside S43_LOGIN_FAIL_WINDOW_SECONDS (300), further attempts for
-    that username get 429 for S43_LOGIN_LOCKOUT_SECONDS (300).
+    Per-username brute-force throttle unchanged.
     """
+    _check_state_change_origin(request)
     _login_check_throttled(body.username)
     try:
         subject, role, user_id = await _validate_credentials(body.username, body.password)
@@ -713,12 +978,135 @@ async def login(body: LoginRequest) -> LoginResponse:
         raise
     _login_clear(body.username)
 
+    if user_id is not None:
+        try:
+            sid, refresh_secret, csrf_token = await _create_login_session(
+                user_id=user_id, request=request,
+            )
+        except Exception as exc:
+            # The account is valid but the session could not be persisted
+            # (sessions table missing / DB write error). Degrade to a legacy
+            # 8h token + X-S43-Password rather than lock a real operator out
+            # (Phase B — the legacy path is still fully wired). Logged so the
+            # deployment notices it is not on the session path.
+            logger.warning(
+                "session creation failed for %s (%s) — issuing a legacy token",
+                subject, type(exc).__name__,
+            )
+        else:
+            token, exp_dt = _issue_token(
+                subject=subject, role=role, user_id=user_id, sid=sid,
+            )
+            _set_session_cookies(response, refresh_secret, csrf_token)
+            return LoginResponse(
+                token=token, access_token=token, subject=subject,
+                role=role, expires_in=_session_access_ttl(),
+                expires_at=exp_dt.isoformat(), session_bound=True,
+            )
+
     token, exp_dt = _issue_token(subject=subject, role=role, user_id=user_id)
     return LoginResponse(
-        token=token,
-        subject=subject,
-        expires_at=exp_dt.isoformat(),
+        token=token, subject=subject, expires_at=exp_dt.isoformat(),
     )
+
+
+@router.post("/refresh", response_model=RefreshResponse)
+async def refresh(request: Request, response: Response) -> RefreshResponse:
+    """
+    Rotate the refresh session and mint a fresh 15-min access token.
+
+    Requires: the `s43_refresh` cookie AND a CSRF double-submit
+    (`X-S43-CSRF` header == `s43_csrf` cookie) AND an allow-listed Origin.
+    Any failure clears the cookies and 401s. Presenting a superseded refresh
+    value is treated as theft — the whole session is revoked.
+    """
+    _check_state_change_origin(request)
+
+    cookie = request.cookies.get(REFRESH_COOKIE_NAME, "")
+    if not cookie:
+        _clear_session_cookies(response)
+        raise HTTPException(status_code=401, detail="No session.", headers={"WWW-Authenticate": "Bearer"})
+
+    from ...auth.sessions import (
+        csrf_tokens_match,
+        generate_csrf_token,
+        generate_refresh_secret,
+        rotate_refresh,
+        RefreshInvalidError,
+        RefreshReuseError,
+        SessionExpiredError,
+        SessionOwnerInactiveError,
+        SessionRevokedError,
+    )
+    from ...auth.users import get_sessionmaker, get_user_by_id
+
+    csrf_cookie = request.cookies.get(CSRF_COOKIE_NAME)
+    if not csrf_tokens_match(csrf_cookie, request.headers.get(CSRF_HEADER_NAME)):
+        raise HTTPException(status_code=403, detail="CSRF check failed.")
+
+    new_secret = generate_refresh_secret()
+    # Keep the CSRF token stable across the session (re-issued only to refresh
+    # its Max-Age) so a client does not have to re-read it after every rotate.
+    new_csrf = csrf_cookie or generate_csrf_token()
+    sm = get_sessionmaker()
+    async with sm() as s:
+        try:
+            row, _outcome = await rotate_refresh(
+                s, presented_secret=cookie, new_refresh_secret=new_secret,
+            )
+        except RefreshReuseError:
+            await s.commit()  # persist the theft revoke
+            _clear_session_cookies(response)
+            raise HTTPException(status_code=401, detail="Session ended. Log in again.", headers={"WWW-Authenticate": "Bearer"})
+        except SessionOwnerInactiveError:
+            await s.commit()  # persist the owner-inactive revoke
+            _clear_session_cookies(response)
+            raise HTTPException(status_code=401, detail="Account is disabled.", headers={"WWW-Authenticate": "Bearer"})
+        except (RefreshInvalidError, SessionRevokedError, SessionExpiredError):
+            _clear_session_cookies(response)
+            raise HTTPException(status_code=401, detail="Session is no longer valid. Log in again.", headers={"WWW-Authenticate": "Bearer"})
+
+        owner = await get_user_by_id(s, row.user_id)
+        if owner is None or not owner.is_active:
+            await s.commit()
+            _clear_session_cookies(response)
+            raise HTTPException(status_code=401, detail="Account is disabled.", headers={"WWW-Authenticate": "Bearer"})
+        subject, role, user_id = owner.username, owner.role, str(owner.user_id)
+        await s.commit()
+
+    token, exp_dt = _issue_token(subject=subject, role=role, user_id=user_id, sid=str(row.sid))
+    _set_session_cookies(response, new_secret, new_csrf)
+    return RefreshResponse(
+        token=token, access_token=token, subject=subject, role=role,
+        expires_in=_session_access_ttl(), expires_at=exp_dt.isoformat(),
+    )
+
+
+@router.post("/logout")
+async def logout(request: Request, response: Response) -> dict[str, Any]:
+    """
+    Revoke the server-side session and clear the cookies. Idempotent: no
+    cookie, an unknown value, or an already-revoked session all return 200.
+    Requires the CSRF double-submit when a refresh cookie is present.
+    """
+    _check_state_change_origin(request)
+    cookie = request.cookies.get(REFRESH_COOKIE_NAME, "")
+    if cookie:
+        from ...auth.sessions import csrf_tokens_match, logout_by_refresh
+        from ...auth.users import get_sessionmaker
+
+        if not csrf_tokens_match(request.cookies.get(CSRF_COOKIE_NAME), request.headers.get(CSRF_HEADER_NAME)):
+            raise HTTPException(status_code=403, detail="CSRF check failed.")
+        try:
+            sm = get_sessionmaker()
+            async with sm() as s:
+                await logout_by_refresh(s, presented_secret=cookie)
+                await s.commit()
+        except Exception as exc:  # never let a teardown error keep a user "logged in"
+            logger.warning("logout revoke error: %s", type(exc).__name__)
+
+    _clear_session_cookies(response)
+    return {"ok": True}
 
 
 @router.get("/verify", response_model=VerifyResponse)

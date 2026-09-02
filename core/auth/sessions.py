@@ -113,9 +113,10 @@ __all__ = [
     "SESSION_ID_RE",
     # config
     "refresh_ttl_seconds",
-    # service-level session logic (isolated; not wired in Pass 5A)
+    # service-level session logic
     "create_session",
     "get_session_by_sid",
+    "resolve_live_session",
     "rotate_refresh",
     "revoke_session",
     "revoke_all_user_sessions",
@@ -541,6 +542,35 @@ async def get_session_by_sid(
         stmt = stmt.with_for_update()
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
+
+
+async def resolve_live_session(
+    session: AsyncSession, sid: uuid.UUID, *, now: Optional[datetime] = None
+) -> tuple[SessionRecord, User]:
+    """
+    Return ``(session_row, owner)`` iff the session ``sid`` is live (not
+    revoked, not expired) AND its owning account is active. Read-only — no
+    lock, no write (the request hot path; beta-execution Phase B). Raises the
+    matching :class:`SessionError` subclass otherwise:
+
+      no such sid            -> RefreshInvalidError
+      revoked                -> SessionRevokedError
+      past expires_at        -> SessionExpiredError
+      owner missing/disabled -> SessionOwnerInactiveError
+    """
+    now = now or datetime.now(timezone.utc)
+    row = await get_session_by_sid(session, sid)
+    if row is None:
+        raise RefreshInvalidError("no session matches the presented sid")
+    if row.revoked_at is not None:
+        raise SessionRevokedError(row.sid)
+    if _aware(row.expires_at) <= now:
+        raise SessionExpiredError(row.sid)
+    result = await session.execute(select(User).where(User.user_id == row.user_id))
+    owner = result.scalar_one_or_none()
+    if owner is None or not owner.is_active:
+        raise SessionOwnerInactiveError(row.sid)
+    return row, owner
 
 
 async def _lock_session_for_refresh(
