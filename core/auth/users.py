@@ -67,7 +67,7 @@ from typing import Optional
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHash, VerificationError
-from sqlalchemy import Boolean, DateTime, String, Uuid, func, select, text
+from sqlalchemy import Boolean, DateTime, MetaData, String, Uuid, func, select, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -116,8 +116,34 @@ class LastAdminError(AccountError):
     """The change would leave the deployment with zero active admins."""
 
 
+# -----------------------------------------------------------------------------
+# Constraint / index naming convention (Pass 5AM — mission §5)
+#
+# Applied to EVERY metadata object Alembic manages (this Base and
+# core.auth.sessions.SessionBase, which imports the same dict). Without an
+# explicit convention Postgres assigns backend-generated constraint names
+# that Alembic cannot deterministically target in a downgrade
+# (`DROP CONSTRAINT <name>` needs a reproducible name). This is a one-time
+# decision fixed here before Alembic revision 0001 is authored.
+#
+# Pre-Alembic databases created by the old create_all() carry Postgres'
+# default names (users_pkey, users_username_key, ...). Those stay as-is when
+# such a database is *stamped* at 0001 — the baseline compatibility check
+# (migrations/baseline.py) compares column/constraint *semantics*, not names.
+# A dedicated future migration can rename them; that is out of scope here
+# (mission §5) and is recorded in HANDOFF_PASS5AM.md.
+# -----------------------------------------------------------------------------
+NAMING_CONVENTION: dict[str, str] = {
+    "ix": "ix_%(table_name)s_%(column_0_N_name)s",
+    "uq": "uq_%(table_name)s_%(column_0_N_name)s",
+    "ck": "ck_%(table_name)s_%(constraint_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_N_name)s_%(referred_table_name)s",
+    "pk": "pk_%(table_name)s",
+}
+
+
 class Base(DeclarativeBase):
-    pass
+    metadata = MetaData(naming_convention=NAMING_CONVENTION)
 
 
 class User(Base):
@@ -416,6 +442,7 @@ __all__ = [
     "APPROVED_ROLES",
     "AccountError",
     "Base",
+    "NAMING_CONVENTION",
     "FirstAdminExistsError",
     "LastAdminError",
     "User",

@@ -70,16 +70,21 @@ from typing import Optional
 
 from sqlalchemy import (
     DateTime,
+    Index,
     Integer,
+    MetaData,
     String,
     Uuid,
     select,
+    text,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 # The engine comes from the account module — one database, one asyncpg pool.
-from .users import User, get_engine
+# NAMING_CONVENTION is shared so Alembic manages both metadata objects with
+# identical, reproducible constraint/index names (Pass 5AM mission §5).
+from .users import NAMING_CONVENTION, User, get_engine
 
 __all__ = [
     "SessionBase",
@@ -334,8 +339,13 @@ class SessionBase(DeclarativeBase):
     Dedicated declarative base for the sessions table. Kept separate from
     ``core.auth.users.Base`` on purpose: ``users.init_models()`` must keep
     creating only the ``users`` table (mission Pass 5A §14 — no change to
-    production DB bootstrap in this pass).
+    production DB bootstrap; Alembic 0002_sessions owns this table now).
+
+    Uses the same ``NAMING_CONVENTION`` as ``users.Base`` so Alembic
+    generates reproducible constraint/index names for both (Pass 5AM §5).
     """
+
+    metadata = MetaData(naming_convention=NAMING_CONVENTION)
 
 
 class SessionRecord(SessionBase):
@@ -349,19 +359,40 @@ class SessionRecord(SessionBase):
 
     __tablename__ = "sessions"
 
+    # --- refresh-hash uniqueness: shape B (Pass 5AM §14) ---------------------
+    # A PARTIAL unique index over the ACTIVE (non-revoked) rows only — NOT an
+    # unconditional UNIQUE across all rows. It enforces the Pass 5A invariant
+    # ("one parent refresh generation -> at most one valid successor") while
+    # still permitting a superseded/revoked historical row to retain a hash
+    # that a later active row could also hold. An unconditional UNIQUE
+    # (shape A) would forbid that and break legitimate rotation/replay
+    # history. See MIGRATION_ARCHITECTURE_PASS5AM.md §refresh-hash-constraint.
+    # 0002_sessions creates this exact index; the model and migration agree.
+    __table_args__ = (
+        Index(
+            "uq_sessions_active_refresh_hash",
+            "refresh_hash",
+            unique=True,
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
+    )
+
     sid: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    # Logical FK to users.user_id. Declared as a plain column (not a SQLAlchemy
-    # ForeignKey) because SessionRecord lives on a separate MetaData from User;
-    # the production DDL in SESSION_MIGRATION_DECISION_PASS5A.md adds the real
-    # `REFERENCES users(user_id) ON DELETE CASCADE`.
+    # Logical FK to users.user_id. Kept as a plain indexed column in the ORM
+    # (SessionRecord lives on a separate MetaData from User so the two remain
+    # bounded contexts — users.init_models() must never create `sessions`,
+    # Pass 5A §14 / Pass 5AM §7). The REAL foreign key
+    # `fk_sessions_user_id_users ... ON DELETE RESTRICT` is created by
+    # 0002_sessions (Pass 5AM §15: no user-deletion pathway exists in the
+    # codebase, so RESTRICT is the least-destructive default). Alembic's
+    # autogenerate metadata reconstructs this FK — see
+    # MIGRATION_ARCHITECTURE_PASS5AM.md.
     user_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), nullable=False, index=True
     )
-    refresh_hash: Mapped[str] = mapped_column(
-        String(64), nullable=False, unique=True, index=True
-    )
+    refresh_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     prev_refresh_hash: Mapped[Optional[str]] = mapped_column(
         String(64), nullable=True, index=True
     )
@@ -379,8 +410,9 @@ class SessionRecord(SessionBase):
     rotated_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # indexed: purge_expired_sessions() filters on expires_at (Pass 5AM §16)
     expires_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
+        DateTime(timezone=True), nullable=False, index=True
     )
     revoked_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
