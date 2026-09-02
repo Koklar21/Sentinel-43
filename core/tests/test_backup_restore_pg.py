@@ -56,6 +56,17 @@ def _cfg() -> Config:
     return cfg
 
 
+from core.auth.schema_version import expected_head as _expected_head  # noqa: E402
+
+_HEAD = _expected_head()  # the single shipped head revision
+
+
+def _drop_restore_db(conn) -> None:
+    # PG 13+: FORCE terminates any lingering connections so the DROP can't
+    # fail with "database is being accessed by other users".
+    conn.exec_driver_sql(f'DROP DATABASE IF EXISTS {_RESTORE_DB} WITH (FORCE)')
+
+
 def _pg(*args: str, db: str = "s43t", stdin: bytes | None = None) -> bytes:
     cmd = ["docker", "exec", "-i", _CONTAINER, *args]
     out = subprocess.run(cmd, input=stdin, capture_output=True, check=True)
@@ -68,11 +79,11 @@ def _clean(monkeypatch):
     eng = create_engine(_SYNC_DSN, isolation_level="AUTOCOMMIT")
     with eng.begin() as c:
         c.exec_driver_sql("DROP TABLE IF EXISTS sessions, users, alembic_version CASCADE")
-        c.exec_driver_sql(f'DROP DATABASE IF EXISTS {_RESTORE_DB}')
+        _drop_restore_db(c)
     yield eng
     with eng.begin() as c:
         c.exec_driver_sql("DROP TABLE IF EXISTS sessions, users, alembic_version CASCADE")
-        c.exec_driver_sql(f'DROP DATABASE IF EXISTS {_RESTORE_DB}')
+        _drop_restore_db(c)
     eng.dispose()
 
 
@@ -122,32 +133,33 @@ def test_pg_dump_restore_preserves_users_and_revoked_sessions(_clean):
     _pg("psql", "-U", "s43t", "-d", _RESTORE_DB, "-v", "ON_ERROR_STOP=1", "-q", stdin=dump)
 
     restore_dsn = _SYNC_DSN.rsplit("/", 1)[0] + f"/{_RESTORE_DB}"
-    dst = create_engine(restore_dsn)
-    with dst.connect() as c:
-        # alembic revision restored
-        assert c.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0002_sessions"
+    from sqlalchemy.pool import NullPool
 
-        # users: identity + security columns unchanged
-        rows = dict(
-            c.execute(text("SELECT username, role, is_active FROM users ORDER BY username")).all()
-        ) if False else c.execute(
-            text("SELECT username, role, is_active FROM users ORDER BY username")
-        ).all()
-        assert rows == [("admin1", "admin", True), ("ops_disabled", "operator", False)]
+    dst = create_engine(restore_dsn, poolclass=NullPool)
+    try:
+        with dst.connect() as c:
+            assert c.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar() == _HEAD
 
-        # sessions: BOTH rows present, revoked one still revoked
-        srows = {
-            r.sid: r
-            for r in c.execute(
-                text("SELECT sid, revoked_at, revoked_reason, refresh_generation FROM sessions")
+            rows = c.execute(
+                text("SELECT username, role, is_active FROM users ORDER BY username")
             ).all()
-        }
-        assert set(srows) == {live_sid, revoked_sid}
-        assert srows[live_sid].revoked_at is None
-        assert srows[revoked_sid].revoked_at is not None
-        assert srows[revoked_sid].revoked_reason == "logout"
-        assert srows[revoked_sid].refresh_generation == 3
-    dst.dispose()
+            assert rows == [("admin1", "admin", True), ("ops_disabled", "operator", False)]
+
+            srows = {
+                r.sid: r
+                for r in c.execute(
+                    text("SELECT sid, revoked_at, revoked_reason, refresh_generation FROM sessions")
+                ).all()
+            }
+            assert set(srows) == {live_sid, revoked_sid}
+            assert srows[live_sid].revoked_at is None
+            assert srows[revoked_sid].revoked_at is not None
+            assert srows[revoked_sid].revoked_reason == "logout"
+            assert srows[revoked_sid].refresh_generation == 3
+    finally:
+        dst.dispose()
 
 
 def test_restored_revoked_session_is_not_live_via_the_model(_clean):
