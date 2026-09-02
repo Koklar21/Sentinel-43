@@ -35,9 +35,21 @@ exactly.
 
 ## B. Ending commit
 
-`git log` on `integration/beta-hardening-20260901` — the Pass 5AM commit
-chain on top of `7a72976` (§AC lists the logical split). Working tree clean.
+Substantive tip: **`84f749b`** on `integration/beta-hardening-20260901`,
+followed by one trailing HANDOFF §B hash-sync commit (this section). Run
+`git log --oneline 7a72976..HEAD` for the exact tip. Working tree clean.
 Branch **not pushed**. Original OneDrive repo still `e859b61`.
+
+Logical commit split (§36 — no squash of historical evidence):
+
+| commit | scope |
+|---|---|
+| `f218e30` | `naming_convention` on both metadata + shape-B partial-unique `refresh_hash` (§5, §14) — `core/auth/users.py`, `core/auth/sessions.py` |
+| `6b37aa4` | Alembic infrastructure + `0001_baseline` + baseline compatibility check — `alembic.ini`, `migrations/{__init__,env,baseline}.py`, `migrations/script.py.mako`, `migrations/versions/0001_baseline.py`, `requirements.txt` |
+| `167aa27` | `0002_sessions` migration (§13–§16) |
+| `d5f402d` | `core/tests/test_migrations_pg.py` — Alembic-migration + Alembic-schema session tests (§33, §21, §22) |
+| `84f749b` | these four Pass 5AM documents |
+| (tip) | HANDOFF §B: concrete ending commit + this table |
 
 ## C. Exact Alembic version
 
