@@ -41,7 +41,7 @@ the pre-change tree too (purely environmental).
 | Full isolated suite at `8614f9b` (inherited Pass 5AM baseline) | 385 passed / 0 failed / 0 skipped |
 | Full isolated suite after **P1+P2** (`d529f04`) | **429 passed** / 0 failed / 0 skipped (191 s) |
 | Full isolated suite after **P3** (`1acc423`) | **449 passed** / 0 failed / 0 skipped (259 s) |
-| Full isolated suite after **P4-P5** (final) | _RECORD HERE_ |
+| Full isolated suite after **P4-P6** (final, `aa64658`) | **454 passed** / 0 failed / 0 skipped (259 s) |
 | `test_migrations_pg.py` (incl. 0003) | 28 passed |
 | `test_auth_session_pg.py` (browser session e2e) | 12 passed |
 | `test_ws_session_pg.py` | 4 passed |

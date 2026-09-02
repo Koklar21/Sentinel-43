@@ -97,10 +97,28 @@ by reading the ORM.
 
 ## 5. Current checkpoint
 
-**PHASE: P4 — service & docker integration.** P1+P2 = `d529f04`; P3 done
-(commit pending). Full isolated suite **449 passed / 0 failed / 0 skipped**.
-Next: route inventory map, container-network exercise, WS close-helper
-`reason` (done in P3), P3-7 + P3-8 migrations, dependency-outage tests.
+**PHASE: P6→P7 — validation + handoff.** Commit chain on `8614f9b`:
+`d529f04` (P1+P2) · `1acc423` (P3) · `aa7f2b1` (P4) · `5c06dbe` (P4-P5).
+Full stack smoke green end to end (`PASS_BETA_VALIDATION.md`). Final full
+regression suite running; then recovery snapshot + `HANDOFF_BETA.md` + STOP
+at the single target-specific decision.
+
+### P4 done
+- `0003_users_role_check` (P3-7 CHECK, fail-closed pre-check); model
+  `__table_args__` matches; `alembic check` clean.
+- P3-8: **deferred** to `0004` with a precise plan (`SERVICE_INTEGRATION_BETA.md §4`).
+- `SERVICE_INTEGRATION_BETA.md` — feature→entrypoint map, container network,
+  finding statuses.
+
+### P5 done (live stack, separate project `s43smoke`, torn down after)
+- clean image build; 6 containers healthy; migrate→api ordering verified.
+- HTTPS through `s43-proxy`; HSTS; backend not published; forged XFF → 401;
+  WSS `101`; bootstrap→login→session `/users` without `X-S43-Password` → 200;
+  refresh/logout/CSRF/Origin; restart + volume persistence; pg_dump→restore.
+- **Finding #13 fixed** (`S43_SECRETS_ROTATED_AT` not forwarded — API
+  crash-looped); `TrustedHostGuard` (probe paths exempt); proxy static-IP
+  collision fixed.
+- in-network load 6617 req/s p50=8ms 0 failed. Log scan: 0 credential hits.
 
 ### P3 done (browser session end to end)
 - `/auth/refresh`, `/auth/logout`; login creates a session + sets HttpOnly
