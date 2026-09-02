@@ -105,16 +105,27 @@ def _t(coro_fn):
 # graph
 # ---------------------------------------------------------------------------
 
+# The single head + the full linear chain, computed from the shipped
+# revision files so this file survives new migrations being added.
+_SD = ScriptDirectory.from_config(_cfg())
+_HEADS = _SD.get_heads()
+_HEAD = _HEADS[0] if len(_HEADS) == 1 else None
+_CHAIN = [r.revision for r in _SD.walk_revisions()]  # head -> base order
+
+
 def test_single_head():
-    heads = ScriptDirectory.from_config(_cfg()).get_heads()
-    assert heads == ["0002_sessions"], heads
+    assert _HEADS == [_HEAD], _HEADS
+    assert _HEAD is not None
 
 
 def test_linear_history():
     sd = ScriptDirectory.from_config(_cfg())
     revs = [r.revision for r in sd.walk_revisions()]
-    assert revs == ["0002_sessions", "0001_baseline"], revs
+    # strictly linear: every revision's down_revision is the next one listed
+    assert revs[-1] == "0001_baseline"
     assert sd.get_revision("0001_baseline").down_revision is None
+    for child, parent in zip(revs, revs[1:]):
+        assert sd.get_revision(child).down_revision == parent, (child, parent)
     assert sd.get_revision("0002_sessions").down_revision == "0001_baseline"
 
 
@@ -147,7 +158,7 @@ def test_fresh_db_upgrade_head(_clean):
     command.upgrade(_cfg(), "head")
     t = _insp(_clean)["tables"]
     assert {"users", "sessions"} <= t
-    assert _version(_clean) == "0002_sessions"
+    assert _version(_clean) == _HEAD
 
 
 def test_fresh_db_sessions_schema_matches_model(_clean):
@@ -214,7 +225,7 @@ def test_existing_compatible_stamp_then_upgrade(_clean):
     command.stamp(_cfg(), "0001_baseline")
     assert _version(_clean) == "0001_baseline"
     command.upgrade(_cfg(), "head")
-    assert _version(_clean) == "0002_sessions"
+    assert _version(_clean) == _HEAD
     t = _insp(_clean)["tables"]
     assert "sessions" in t
     with _clean.connect() as c:
@@ -280,6 +291,58 @@ def test_incompatible_pre_alembic_refused(_clean, broken_ddl):
 
 
 # ---------------------------------------------------------------------------
+# 0003 — users.role CHECK constraint (P3-7)
+# ---------------------------------------------------------------------------
+
+def test_0003_adds_role_check_and_it_is_enforced(_clean):
+    command.upgrade(_cfg(), "head")
+    with _clean.connect() as c:
+        cks = {
+            r[0] for r in c.exec_driver_sql(
+                "SELECT conname FROM pg_constraint "
+                "WHERE conrelid='users'::regclass AND contype='c'"
+            )
+        }
+    assert "ck_users_role" in cks
+    import uuid as _u
+
+    with pytest.raises(IntegrityError):
+        with _clean.begin() as c:
+            c.exec_driver_sql(
+                "INSERT INTO users (user_id, username, password_hash, role, is_active, created_at) "
+                f"VALUES ('{_u.uuid4()}', 'baduser', 'x', 'superuser', true, now())"
+            )
+
+
+def test_0003_refuses_when_an_existing_row_violates_it(_clean):
+    # a DB at 0002 that already holds a bad role value (raw SQL / legacy bug)
+    command.upgrade(_cfg(), "0002_sessions")
+    import uuid as _u
+
+    with _clean.begin() as c:
+        c.exec_driver_sql(
+            "INSERT INTO users (user_id, username, password_hash, role, is_active, created_at) "
+            f"VALUES ('{_u.uuid4()}', 'legacy', 'x', 'root', true, now())"
+        )
+    with pytest.raises(RuntimeError, match="role outside"):
+        command.upgrade(_cfg(), "head")
+    # constraint was NOT added; DB left at 0002
+    assert _version(_clean) == "0002_sessions"
+
+
+def test_0003_downgrade_removes_the_check(_clean):
+    command.upgrade(_cfg(), "head")
+    command.downgrade(_cfg(), "0002_sessions")
+    with _clean.connect() as c:
+        n = c.exec_driver_sql(
+            "SELECT count(*) FROM pg_constraint "
+            "WHERE conrelid='users'::regclass AND contype='c'"
+        ).scalar()
+    assert n == 0
+    assert _version(_clean) == "0002_sessions"
+
+
+# ---------------------------------------------------------------------------
 # downgrade  (§12, §18)
 # ---------------------------------------------------------------------------
 
@@ -301,7 +364,7 @@ def test_downgrade_upgrade_repeatable(_clean):
         command.downgrade(cfg, "0001_baseline")
         assert "sessions" not in _insp(_clean)["tables"]
     command.upgrade(cfg, "head")
-    assert _version(_clean) == "0002_sessions"
+    assert _version(_clean) == _HEAD
 
 
 def test_baseline_downgrade_to_base_refused_and_rolls_back(_clean):
@@ -312,7 +375,7 @@ def test_baseline_downgrade_to_base_refused_and_rolls_back(_clean):
     # still present, version unchanged
     t = _insp(_clean)["tables"]
     assert {"users", "sessions"} <= t
-    assert _version(_clean) == "0002_sessions"
+    assert _version(_clean) == _HEAD
 
 
 # ---------------------------------------------------------------------------

@@ -70,7 +70,17 @@ logger = logging.getLogger(__name__)
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHash, VerificationError
-from sqlalchemy import Boolean, DateTime, MetaData, String, Uuid, func, select, text
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    MetaData,
+    String,
+    Uuid,
+    func,
+    select,
+    text,
+)
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -151,6 +161,12 @@ class Base(DeclarativeBase):
 
 class User(Base):
     __tablename__ = "users"
+
+    # P3-7: DB-level guard matching APPROVED_ROLES. Added by migration
+    # 0003_users_role_check (with a fail-closed pre-check for existing rows).
+    __table_args__ = (
+        CheckConstraint("role IN ('operator', 'admin')", name="role"),
+    )
 
     user_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4

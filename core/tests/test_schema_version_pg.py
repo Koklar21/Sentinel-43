@@ -51,6 +51,11 @@ def _cfg() -> Config:
     return cfg
 
 
+from core.auth.schema_version import expected_head as _expected_head  # noqa: E402
+
+_HEAD = _expected_head()  # the single shipped head revision
+
+
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", _DSN)
@@ -92,7 +97,7 @@ def test_fresh_database_is_blocked_in_production(_clean):
     assert r.state.value == "fresh"
     assert r.serving_blocked is True
     assert r.current is None
-    assert r.expected == "0002_sessions"
+    assert r.expected == _HEAD
 
 
 def test_at_head_is_ok_and_not_blocked(_clean):
@@ -100,7 +105,7 @@ def test_at_head_is_ok_and_not_blocked(_clean):
     r = _report()
     assert r.state.value == "ok"
     assert r.serving_blocked is False
-    assert r.current == "0002_sessions"
+    assert r.current == _HEAD
 
 
 def test_behind_is_blocked(_clean):
