@@ -10,6 +10,9 @@
 # =============================================================================
 set -euo pipefail
 
+# Git Bash / MSYS mangles the openssl "/CN=..." argument into a Windows path.
+export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
+
 HOST="${1:-localhost}"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/certs"
 mkdir -p "$DIR"

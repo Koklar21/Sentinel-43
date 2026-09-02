@@ -28,6 +28,19 @@ data:
 
   S43_WS_REQUIRE_AUTH: "true"
 
+  # Browser session (beta-execution Phase 3).
+  S43_SESSION_ACCESS_TTL_SECONDS: "900"
+  S43_SESSION_REFRESH_TTL_SECONDS: "604800"
+  S43_WS_SESSION_RECHECK_SECONDS: "60"
+
+  # CHANGEME: secret-rotation freshness gate (core/bootstrap.py). A non-local
+  # API refuses to start without S43_SECRETS_ROTATED_AT (finding #13 -- it was
+  # previously in neither the ConfigMap nor the Secret). Set it to the
+  # ISO-8601 UTC timestamp the secret generator emitted alongside the values
+  # you provisioned into `sentinel43-secrets`, e.g.
+  #   S43_SECRETS_ROTATED_AT: "2026-09-02T00:00:00+00:00"
+  S43_SECRETS_ROTATED_AT: "CHANGEME_ISO8601_UTC_WHEN_SECRETS_WERE_GENERATED"
+
   # Empty by default: the firewall trusts NO X-Forwarded-For source unless
   # explicitly configured (fail-safe — see
   # docs/security/trusted_proxy_handling.md). The beta overlay sets this to

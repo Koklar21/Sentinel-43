@@ -16,11 +16,20 @@
 
 from __future__ import annotations
 
+import os
 import pathlib
 
 import pytest
 
-import core.api.main as m
+# core.api.main freezes JWT_SECRET / _ALLOWED_ORIGINS / SENTINEL_ENV as
+# module constants at import time. Pin them before importing it so this
+# file's import doesn't freeze an empty secret for the rest of the process
+# (the test-ordering flake — same guard test_jwt_auth / test_users_admin use).
+os.environ.setdefault("SENTINEL_ENV", "test")
+os.environ.setdefault("S43_JWT_SECRET", "test-secret-tls-posture-000000000000")
+os.environ.setdefault("S43_JWT_ALGORITHM", "HS256")
+
+import core.api.main as m  # noqa: E402
 
 _ROOT = pathlib.Path(__file__).resolve().parents[2]
 

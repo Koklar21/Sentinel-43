@@ -51,6 +51,15 @@ from typing import Iterable, Optional
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+# Probe paths that must answer on ANY Host (Kubernetes httpGet probes send
+# `Host: <podIP>`, Docker healthchecks send `Host: localhost`, an LB sends its
+# own). They carry no sensitive data, so the Host allow-list does not apply.
+_HOST_CHECK_EXEMPT_PATHS = frozenset({
+    "/health", "/ready",
+    "/watchtower/health", "/watchtower/ready",
+    "/api/ready", "/api/watchtower/health", "/api/watchtower/ready",
+})
+
 _LOCAL_ENVIRONMENTS = frozenset({"development", "dev", "local", "test"})
 
 _DEFAULT_HSTS_MAX_AGE = 15552000  # 180 days
@@ -176,4 +185,57 @@ class SecurityHeadersMiddleware:
         await self.app(scope, receive, _send)
 
 
-__all__ = ["SecurityHeadersMiddleware"]
+class TrustedHostGuard:
+    """
+    Explicit Host allow-list (beta-execution Phase 2), replacing Starlette's
+    TrustedHostMiddleware so infra probe paths keep working. When
+    ``S43_TRUSTED_HOSTS`` is a non-empty comma list, every request whose path
+    is not in ``_HOST_CHECK_EXEMPT_PATHS`` must carry a ``Host`` header (port
+    stripped) that exactly matches an entry, or matches a leading-dot wildcard
+    (``.example.com`` matches ``example.com`` and any sub-domain). Mismatch →
+    ``400``. Unset list → no check (dev / a proxy that already validates Host).
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    @staticmethod
+    def _allowed() -> list[str]:
+        raw = os.getenv("S43_TRUSTED_HOSTS", "")
+        return [h.strip().lower() for h in raw.split(",") if h.strip()]
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        allowed = self._allowed()
+        path = scope.get("path", "")
+        if not allowed or path in _HOST_CHECK_EXEMPT_PATHS:
+            await self.app(scope, receive, send)
+            return
+
+        host = ""
+        for k, v in scope.get("headers") or []:
+            if k.lower() == b"host":
+                host = v.decode("latin-1").split(":")[0].strip().lower()
+                break
+
+        ok = False
+        for pat in allowed:
+            if pat == "*" or host == pat:
+                ok = True
+                break
+            if pat.startswith(".") and (host == pat[1:] or host.endswith(pat)):
+                ok = True
+                break
+        if not ok:
+            body = b'{"error":"invalid_host"}'
+            await send({"type": "http.response.start", "status": 400,
+                        "headers": [(b"content-type", b"application/json"),
+                                    (b"content-length", str(len(body)).encode())]})
+            await send({"type": "http.response.body", "body": body})
+            return
+        await self.app(scope, receive, send)
+
+
+__all__ = ["SecurityHeadersMiddleware", "TrustedHostGuard"]

@@ -1019,17 +1019,18 @@ app.add_middleware(SecurityHeadersMiddleware)
 
 # --- Explicit Host allow-list (beta-execution Phase 2) ---
 # S43_TRUSTED_HOSTS is a comma-separated list of the exact Host values this
-# deployment answers on (e.g. "beta.example.com,api.example.com"). Unset =>
-# no Host check (dev / behind a proxy that already validates Host). In a
-# non-local environment an unset value is logged loudly — the beta overlay
-# is expected to set it.
+# deployment answers on (e.g. "beta.example.com,.example.com"). Unset => no
+# Host check (dev / behind a proxy that already validates Host). Probe paths
+# (/health, /ready, ...) are always exempt so Kubernetes / Docker / LB health
+# checks — which send Host: <podIP> or Host: localhost — keep working
+# (see TrustedHostGuard). In a non-local env an unset value is logged loudly.
+from .middleware.security_headers import TrustedHostGuard
+app.add_middleware(TrustedHostGuard)
 _TRUSTED_HOSTS: list[str] = [
     h.strip() for h in _env_str("S43_TRUSTED_HOSTS").split(",") if h.strip()
 ]
 if _TRUSTED_HOSTS:
-    from starlette.middleware.trustedhost import TrustedHostMiddleware
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=_TRUSTED_HOSTS)
-    logger.info("TrustedHostMiddleware active: %s", _TRUSTED_HOSTS)
+    logger.info("Host allow-list active: %s (probe paths exempt)", _TRUSTED_HOSTS)
 elif not _is_local_environment():
     logger.warning(
         "S43_TRUSTED_HOSTS is not set in a non-local environment — the API "

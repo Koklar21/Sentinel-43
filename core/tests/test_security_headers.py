@@ -104,6 +104,38 @@ def test_hsts_emitted_when_forced_in_non_local(monkeypatch):
     assert "includeSubDomains" in r.headers["strict-transport-security"]
 
 
+def test_trusted_host_guard_rejects_bad_host_but_exempts_probes(monkeypatch):
+    monkeypatch.setenv("S43_JWT_SECRET", "test-secret-host-guard")
+    monkeypatch.setenv("S43_JWT_ALGORITHM", "HS256")
+    monkeypatch.setenv("SENTINEL_ENV", "test")
+    monkeypatch.setenv("S43_TRUSTED_HOSTS", "good.example,.wild.example")
+    from fastapi.testclient import TestClient
+    import core.api.main as main_module
+
+    client = TestClient(main_module.app)
+    # a data route with a disallowed Host -> 400
+    assert client.get("/version", headers={"host": "evil.example"}).status_code == 400
+    # exact match ok
+    assert client.get("/version", headers={"host": "good.example"}).status_code == 200
+    # leading-dot wildcard: sub-domain ok
+    assert client.get("/version", headers={"host": "api.wild.example"}).status_code == 200
+    # probe paths answer on ANY host (k8s sends Host: <podIP>)
+    assert client.get("/health", headers={"host": "10.1.2.3"}).status_code == 200
+    assert client.get("/ready", headers={"host": "10.1.2.3"}).status_code == 200
+
+
+def test_no_trusted_hosts_means_no_host_check(monkeypatch):
+    monkeypatch.setenv("S43_JWT_SECRET", "test-secret-host-guard-2")
+    monkeypatch.setenv("S43_JWT_ALGORITHM", "HS256")
+    monkeypatch.setenv("SENTINEL_ENV", "test")
+    monkeypatch.delenv("S43_TRUSTED_HOSTS", raising=False)
+    from fastapi.testclient import TestClient
+    import core.api.main as main_module
+
+    client = TestClient(main_module.app)
+    assert client.get("/version", headers={"host": "anything.at.all"}).status_code == 200
+
+
 def test_csp_is_opt_in(monkeypatch):
     monkeypatch.setenv("S43_JWT_SECRET", "test-secret-csp")
     monkeypatch.setenv("S43_JWT_ALGORITHM", "HS256")

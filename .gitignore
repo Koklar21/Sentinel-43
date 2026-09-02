@@ -288,3 +288,7 @@ deploy/proxy/certs/*.crt
 deploy/proxy/certs/*.key
 deploy/proxy/certs/*.pem
 deploy/proxy/certs/*.p12
+
+# P5 smoke-test scratch (not committed)
+.env.smoke
+docker-compose.smoke.yml

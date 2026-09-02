@@ -212,7 +212,7 @@ services:
       # s43-proxy has a fixed IP on s43_net (see the networks section); the
       # app trusts X-Forwarded-For / X-Forwarded-Proto only from it. uvicorn
       # still ignores forwarded headers itself (--forwarded-allow-ips above).
-      S43_TRUSTED_PROXIES:       ${S43_TRUSTED_PROXIES:-172.28.0.2/32}
+      S43_TRUSTED_PROXIES:       ${S43_TRUSTED_PROXIES:-172.28.0.250/32}
       # Comma-separated exact Host values this deployment answers on. Set to
       # your real hostname(s) for a public beta; the default covers local
       # https://localhost testing through s43-proxy.
@@ -243,6 +243,21 @@ services:
 
       # --- Auth key-store hardening ---
       S43_AUTH_PEPPER:           ${S43_AUTH_PEPPER}
+      # Secret-rotation freshness gate (core/bootstrap.py). The secret
+      # generator writes S43_SECRETS_ROTATED_AT into .env; a non-local API
+      # refuses to start without it (finding #13 — it was previously not
+      # forwarded here). S43_SECRET_MAX_AGE_DAYS overrides the default cap.
+      S43_SECRETS_ROTATED_AT:    ${S43_SECRETS_ROTATED_AT}
+      # S43_SECRET_MAX_AGE_DAYS: add to .env only to override the code default
+      # (an empty value fails strict int parsing, so it is not defaulted here).
+
+      # --- Browser session (beta) ---
+      S43_SESSION_ACCESS_TTL_SECONDS:   ${S43_SESSION_ACCESS_TTL_SECONDS:-900}
+      S43_SESSION_REFRESH_TTL_SECONDS:  ${S43_SESSION_REFRESH_TTL_SECONDS:-604800}
+      S43_WS_SESSION_RECHECK_SECONDS:   ${S43_WS_SESSION_RECHECK_SECONDS:-60}
+      # #11 break-glass + X-S43-Password cutover — see AUTH_SESSION_BETA.md.
+      S43_BREAK_GLASS_ARMED:     ${S43_BREAK_GLASS_ARMED:-}
+      S43_REJECT_LEGACY_AUTH:    ${S43_REJECT_LEGACY_AUTH:-}
 
       # --- Log pseudonymization ---
       SENTINEL_LOG_SALT:         ${SENTINEL_LOG_SALT}
@@ -336,7 +351,7 @@ services:
     networks:
       s43_net:
         # Fixed IP so s43-api's S43_TRUSTED_PROXIES can be a /32.
-        ipv4_address: 172.28.0.2
+        ipv4_address: 172.28.0.250
 
   # ---------------------------------------------------------------------------
   # Setup (one-shot secret generator)
@@ -397,7 +412,7 @@ networks:
     driver: bridge
     ipam:
       config:
-        # Fixed subnet so s43-proxy can hold a stable IP (172.28.0.2) that
+        # Fixed subnet so s43-proxy can hold a stable IP (172.28.0.250) that
         # s43-api trusts for X-Forwarded-* (S43_TRUSTED_PROXIES). Only
         # Sentinel-43's own containers are ever on this network.
         - subnet: 172.28.0.0/24
