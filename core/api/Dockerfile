@@ -1,4 +1,6 @@
-FROM python:3.13-slim
+# Alpine avoids the unfixed Debian package findings in the former slim image.
+# Keep the Python minor version aligned with CI and verify the resulting image.
+FROM python:3.13-alpine AS dependencies
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
@@ -9,6 +11,18 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --upgrade pip \
     && pip install --no-cache-dir -r /app/requirements.txt
+
+# Exercise the same native dependencies and libc as the release image.
+# This stage is built only by CI; test tooling is absent from the final image.
+FROM dependencies AS test
+RUN python -m pip install --no-cache-dir pytest requests
+COPY . /app
+ENV S43_WATCHTOWER_URL=http://127.0.0.1:19100
+ENV S43_WATCHTOWER_TIMEOUT=0.1
+
+FROM dependencies AS runtime
+RUN python -m pip uninstall -y pip \
+    && python -c "import pathlib, shutil, sysconfig; shutil.rmtree(pathlib.Path(sysconfig.get_path('stdlib')) / 'ensurepip')"
 
 COPY . /app
 
@@ -35,8 +49,8 @@ COPY . /app
 # The s43-setup service in docker-compose.yml deliberately overrides `user:`
 # back to root, since it bind-mounts the host repo root and must write
 # .env as whatever user owns the host checkout — see that service's comment.
-RUN groupadd --gid 65532 s43 \
-    && useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin s43 \
+RUN addgroup -S -g 65532 s43 \
+    && adduser -S -D -H -u 65532 -G s43 -s /sbin/nologin s43 \
     && mkdir -p /app/logs /app/sentinel43_state \
     && chown -R 65532:65532 /app/logs /app/sentinel43_state
 USER 65532:65532

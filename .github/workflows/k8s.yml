@@ -10,7 +10,7 @@
 #      images, resource limits, probes, NetworkPolicy coverage, no public
 #      db/redis, no wildcard RBAC, no embedded secrets, no hostPath,
 #      automountServiceAccountToken false)
-#   3. image build + vulnerability scan (Docker Scout)
+#   3. image build + vulnerability scan (Trivy)
 #   4. the full pytest suite
 #   5. an ephemeral kind cluster smoke-deploy (Calico for real NetworkPolicy
 #      enforcement — kind's default CNI does not enforce it) exercising the
@@ -26,14 +26,18 @@ name: Kubernetes
 on:
   pull_request:
     paths:
+      - "requirements*.txt"
       - "core/**"
       - "deploy/kubernetes/**"
       - "scripts/k8s_policy_check.py"
+      - "scripts/ci_live_tests.py"
       - "scripts/k8s-validate.ps1"
       - ".github/workflows/k8s.yml"
   push:
     branches: [main]
     paths:
+      - "requirements*.txt"
+      - "scripts/ci_live_tests.py"
       - "core/**"
       - "deploy/kubernetes/**"
       - "scripts/k8s_policy_check.py"
@@ -79,13 +83,42 @@ jobs:
   test:
     name: pytest
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16.3
+        env:
+          POSTGRES_USER: s43_ci
+          POSTGRES_PASSWORD: disposable-ci-database-only
+          POSTGRES_DB: s43_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U s43_ci -d s43_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: pip install -r requirements-test.txt
-      - run: python -m pytest core/tests/ -q
+      # Install from the runtime manifest present in the merged checkout.
+      # pytest and requests are the additional dependencies used by core/tests.
+      - run: python -m pip install -r requirements.txt pytest requests
+      - name: Isolated application and security tests
+        env:
+          S43_WATCHTOWER_URL: http://127.0.0.1:19100
+          S43_WATCHTOWER_TIMEOUT: "0.1"
+        # Live tests run in the next required step against real processes.
+        run: >-
+          python -m pytest core/tests/ -q
+          --ignore=core/tests/test_bootstrap.py
+          --ignore=core/tests/test_system_smoke.py
+      - name: Live API, PostgreSQL, and Watchtower tests
+        env:
+          S43_CI_DATABASE_URL: postgresql+asyncpg://s43_ci:disposable-ci-database-only@127.0.0.1:5432/s43_ci
+        run: python scripts/ci_live_tests.py
 
   build-and-scan:
     name: Build image + vulnerability scan
@@ -94,21 +127,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Test application on the container runtime
+        run: |
+          docker build --target test -t sentinel43-api:test -f core/api/Dockerfile .
+          docker run --rm sentinel43-api:test python -m pytest core/tests/ -q \
+            --ignore=core/tests/test_bootstrap.py \
+            --ignore=core/tests/test_system_smoke.py
+
       - name: Build image
         run: docker build -t sentinel43-api:ci -f core/api/Dockerfile .
 
-      - name: Docker Scout CVE scan
-        # Docker Scout's free tier covers unauthenticated local-image CVE
-        # scanning; full policy evaluation needs a logged-in Docker Hub
-        # account. No such credentials are configured in this repo (adding
-        # DOCKERHUB_USERNAME/DOCKERHUB_TOKEN as repo secrets is an operator
-        # decision, documented in deploy/kubernetes/README.md) — this step
-        # runs what's available without them and does not block the
-        # pipeline on Scout-specific auth failures, only on actual
-        # critical/high CVE findings once it can run.
-        continue-on-error: true
-        run: |
-          docker scout cves sentinel43-api:ci --exit-code --only-severity critical,high
+      - name: Trivy CVE scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: sentinel43-api:ci
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: "false"
+          format: table
 
   kind-smoke-deploy:
     name: kind smoke deploy
@@ -128,9 +165,17 @@ jobs:
 
       - name: Install Calico (real NetworkPolicy enforcement)
         run: |
+          set -euo pipefail
           kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.1/manifests/tigera-operator.yaml
+          kubectl wait --for=condition=Established crd/installations.operator.tigera.io crd/apiservers.operator.tigera.io --timeout=120s
+          kubectl -n tigera-operator rollout status deployment/tigera-operator --timeout=180s
           kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.1/manifests/custom-resources.yaml
-          kubectl -n calico-system wait --for=condition=Ready pods --all --timeout=180s
+          # The operator creates these asynchronously. Waiting for pods before
+          # they exist exits immediately with "no matching resources found".
+          kubectl -n calico-system wait --for=create daemonset/calico-node --timeout=180s
+          kubectl -n calico-system rollout status daemonset/calico-node --timeout=180s
+          kubectl -n calico-system wait --for=create deployment/calico-kube-controllers --timeout=180s
+          kubectl -n calico-system rollout status deployment/calico-kube-controllers --timeout=180s
           kubectl -n kube-system wait --for=condition=Ready pods --all --timeout=120s
 
       - name: Load image into kind
@@ -160,6 +205,7 @@ jobs:
             --from-literal=S43_JWT_SECRET="$(gen)" \
             --from-literal=S43_OPERATOR_PASSWORD_HASH="$(gen)" \
             --from-literal=S43_AUTH_PEPPER="$(gen)" \
+            --from-literal=S43_WATCHTOWER_SERVICE_TOKEN="$(gen)" \
             --from-literal=SENTINEL_LOG_SALT="$(gen)" \
             --from-literal=SENTINEL_REMOTE_TOKEN_OWNER="$(gen)" \
             --from-literal=SENTINEL_REMOTE_TOKEN_ADMIN="$(gen)" \
@@ -187,7 +233,10 @@ jobs:
           set -euo pipefail
           uid=$(kubectl exec -n sentinel43 deployment/s43-api -- id -u)
           test "$uid" = "65532"
-          kubectl exec -n sentinel43 deployment/s43-api -- sh -c 'touch /app/should_fail' && exit 1 || true
+          if kubectl exec -n sentinel43 deployment/s43-api -- sh -c 'touch /app/should_fail'; then
+            echo "ERROR: application root filesystem is writable"
+            exit 1
+          fi
 
       - name: API smoke test
         run: |
