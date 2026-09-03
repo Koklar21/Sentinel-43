@@ -68,7 +68,6 @@ from .routers.users import router as users_router
 from .routers.bootstrap import router as bootstrap_router
 from .routers.remote_gateway import router as remote_gateway_router
 from .routers.routers import router as watchgate_router
-from .routers.users import router as users_router
 
 logger = logging.getLogger(__name__)
 
@@ -1661,7 +1660,6 @@ app.include_router(system_router)
 app.include_router(fenrir_router)
 app.include_router(api_router)
 app.include_router(audit_router)
-app.include_router(users_router)
 
 # =============================================================================
 # Health-check access-log noise suppression
