@@ -261,3 +261,51 @@ Real headless Chromium (SPKI-pinned to the throwaway test leaf; hostname
   suite re-run clean. Browser deps live in a separate `.venv-browser`.
 - No secret values in any commit, doc, or test log. `.env.browser` /
   `browser_tests/certs/*` gitignored.
+
+---
+
+## 10. Post-merge verification pass — REV 2 (2026-09-03)
+
+PR #251 was **merged to `main`** (`0bd375a`) between REV 1 and REV 2. This
+pass adds four verification items on a new branch
+(`beta/post-merge-verification-20260903` ← `0bd375a`) and a new PR.
+
+### New / changed tests
+
+| test | what it proves |
+|---|---|
+| `test_auth_session_pg.py::test_reject_legacy_auth_off_default_still_accepts_legacy` | flag OFF (default): legacy Bearer+password → 200 on `/v1` |
+| `test_auth_session_pg.py::test_reject_legacy_auth_on_blocks_legacy_v1_and_users_not_the_session` | flag ON: legacy → **401** on `/v1` AND `/users`; session token → 200 on both; flag back OFF → legacy 200 again |
+| `test_ws_session_pg.py::test_reject_legacy_auth_on_blocks_the_legacy_frame_not_the_session` | flag ON: legacy `{token,password}` WS frame rejected; session `{token}` frame connects |
+| `test_migrations_pg.py::test_refresh_hash_uniqueness_is_the_partial_active_scoped_shape` | **direct** `pg_indexes` / `pg_index.indpred` / `pg_constraint` introspection after `alembic upgrade head`: `uq_sessions_active_refresh_hash` is a partial UNIQUE index on `(refresh_hash)` `WHERE (revoked_at IS NULL)` (shape B); no unconditional table-level UNIQUE (shape A) |
+
+### Results
+
+| suite | result | how run |
+|---|---|---|
+| isolated (no PG, `.venv-pass1`) | **368 passed / 89 skipped / 0 failed** (exit 0) | `pytest core/tests/ --ignore test_bootstrap --ignore test_system_smoke` |
+| the 4 new/changed tests, disposable PG `postgres:16.3` :55440 | **4 passed** | targeted |
+| `test_migrations_pg` + `test_auth_session_pg` + `test_ws_session_pg` (full) | **48 passed** | targeted |
+| full isolated + PG suite | _below_ | `pytest core/tests/ --ignore …` with `S43_TEST_PG_DSN` |
+| CI on the REV 2 PR head | _final report_ | `.github/workflows/k8s.yml` |
+
+Full isolated + PG suite (REV 2, `.venv-pass1`, disposable PG :55440):
+**461 passed / 0 failed / 0 skipped** (273 s, exit 0) = REV 1's 457 + the 4
+new tests above.
+
+### deploy_preflight.py — single replica AND single worker
+
+Compose mode: exactly one `s43-api` container (no `--scale`), one uvicorn
+worker process, `WEB_CONCURRENCY` not > 1. Kube mode: `spec.replicas == 1`,
+`readyReplicas == 1`, no HPA, no `--workers > 1` in the container command,
+`WEB_CONCURRENCY` not > 1. `py_compile` clean; placeholder-hostname run
+exits 1.
+
+### Boundaries (REV 2)
+
+- PR #251 merge was the **owner's** action, not this pass. This pass did
+  **not** merge to `main`, force-push, or deploy.
+- Docker Desktop was found stopped (user had shut it down); restarted to run
+  the PG suites. The user's `sentinel43` k8s namespace pods were not touched
+  (`s43-api`/`s43-core` `ErrImageNeverPull` ~33 d — pre-existing).
+- `.venv-pass1` still `pytest 9.1.1`. Disposable PG `--rm --tmpfs`.

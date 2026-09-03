@@ -233,16 +233,53 @@ Adopted from `main` unchanged: `.github/workflows/k8s.yml` (Trivy scan,
 disposable PG service, Calico waits, watchtower service token, read-only
 rootfs assertion), `scripts/ci_live_tests.py`, Watchtower health-log filter.
 
-**Known CI gap (Phase D):** the `test` job sets a `postgres` service but not
-`S43_TEST_PG_DSN` / `S43_TEST_PG_CONTAINER`, so beta's `*_pg.py` suites
-(auth-session, migrations, schema-version, backup-restore, break-glass,
-ws-session) currently `skip` in CI. `ci_live_tests.py` only runs
-`test_bootstrap` + `test_system_smoke`.
+**CI gap (Phase D) — CLOSED:** the standard `test` job's `postgres` service
+does not export `S43_TEST_PG_DSN`, so the `*_pg.py` suites skip there. The
+new **`pg-tests`** job (Phase D) runs all nine `*_pg.py` files against a
+dedicated disposable PostgreSQL and **fails on any skip**.
 
 **#248 reconciliation:** `authenticate_user` stays read-only (no
 `update_last_login=`); `_validate_credentials` owns the one `record_login`
 write at real login; `reverify_password` never writes. Same end state #248
 intended ("don't update last-login on every authenticated request").
+
+#### Merge-diff review — auth/session/authz files (REV 2 evidence)
+
+`git diff f3d93e2^1 f3d93e2` (the merge against the **pre-merge beta
+branch** `a8a5678` — i.e. what the merge actually did to the branch):
+
+```
+ .github/workflows/k8s.yml     | 83 +   (CI — not auth)
+ core/api/Dockerfile           | 24 +   (container — not auth)
+ core/api/main.py              |  6 +   (users_router registration only)
+ core/monitoring/watchtower.py | 16 +   (health-log filter — not auth)
+ scripts/ci_live_tests.py      | 129 +  (new CI helper — not auth)
+```
+
+**Every authentication / session / authorization module is byte-identical
+to the pre-merge beta branch after the merge** — `git diff f3d93e2^1
+f3d93e2` touches **0 lines** in `core/api/deps/deps.py`,
+`core/api/routers/auth.py`, `core/api/routers/users.py`,
+`core/auth/users.py`, `core/auth/sessions.py`,
+`core/middleware/sentinel_firewall.py`. The conflict resolution for those
+files was "keep the branch's version"; the result is the beta
+implementation verbatim, not a blend and not a revert to an older `main`.
+
+The **one** auth-adjacent change, in `main.py` (6 lines): the
+`users_router` import moved up next to `auth_router`, the
+`include_router(users_router)` call moved to right after `auth_router`
+(from the end of the list), and the **second** `include_router(users_router)`
+that the 3-way merge produced was deleted. Same router object, same
+router-level `Depends(require_admin)`, registered exactly once. No
+authorization behaviour change. Pinned by
+`core/tests/test_app_route_registration.py` (no APIRouter included twice;
+`require_admin` still gates `/users`).
+
+`main`'s own PR #250 changes to these files (the `scope`-claim role
+fallback in `require_operator`, the self-committing `set_user_*` helpers,
+the `update_last_login=` parameter) were **discarded** by the resolution —
+they are strictly older/narrower than, or incompatible with, the beta
+contract. See the resolution table in the `f3d93e2` commit message.
 
 ### Active dev session to preserve
 
@@ -344,6 +381,80 @@ host-published, single uvicorn worker / single replica / no HPA, no
 (`*.example.invalid`, `CHANGEME`) fail the run. Target-dependent items
 (WSS through the edge, external port scan, image digest) are reported
 TARGET-REQUIRED, not silently passed.
+
+---
+
+## 8. Post-merge verification pass — REV 2 (2026-09-03, after PR #251 merged)
+
+**PR #251 was MERGED to `main`** (merge commit `0bd375a`, 2026-09-03
+14:53Z) between REV 1 and REV 2. All the §7 work is on `main` now. This pass
+delivers the REV 2 additions on a **new branch off merged `main`**
+(`beta/post-merge-verification-20260903` ← `0bd375a`) and a **new PR** — #251
+cannot be reopened.
+
+Starting HEAD: `0bd375a` (= merged `main`). Commit-count prose corrected:
+`8614f9b..a8a5678` is **six** beta-execution commits, no missing seventh
+(already fixed in `§7`; restated).
+
+### A — merge-diff review (retrospective evidence)
+
+See `§7 → Merge-diff review` above: `git diff f3d93e2^1 f3d93e2` proves the
+merge left every auth/session/authz module **byte-identical** to the
+pre-merge beta branch; the only auth-adjacent change is the 6-line
+`users_router` de-dup in `main.py`.
+
+### B — legacy-rejection flag, BOTH states
+
+`S43_REJECT_LEGACY_AUTH` was only ever tested OFF (the fixtures `delenv` it).
+Added:
+- `test_auth_session_pg.py::test_reject_legacy_auth_off_default_still_accepts_legacy`
+- `test_auth_session_pg.py::test_reject_legacy_auth_on_blocks_legacy_v1_and_users_not_the_session`
+  — flag ON: legacy Bearer+password → **401** on `/v1` **and** `/users`;
+  a live session token → still 200 on both; flipping the flag back off
+  restores the legacy contract (one-var rollback).
+- `test_ws_session_pg.py::test_reject_legacy_auth_on_blocks_the_legacy_frame_not_the_session`
+  — flag ON: legacy `{token,password}` WS frame → rejected;
+  session `{token}` frame → still connects.
+
+### D — refresh-hash constraint, direct schema introspection
+
+`test_migrations_pg.py::test_refresh_hash_uniqueness_is_the_partial_active_scoped_shape`
+— after `alembic upgrade head` on the current tree, queries
+`pg_indexes.indexdef` + `pg_index.indpred` + `pg_constraint` directly and
+asserts `uq_sessions_active_refresh_hash` is a **partial UNIQUE index on
+`(refresh_hash)` with predicate `WHERE (revoked_at IS NULL)`** (shape B),
+and that there is **no** unconditional table-level `UNIQUE` (shape A). Not a
+behavioural inference. Runs in the `pg-tests` CI job (already lists
+`test_migrations_pg.py`).
+
+### E — single replica AND single worker
+
+`deploy_preflight.py` strengthened: compose mode now also checks exactly one
+`s43-api` container (no `--scale`), one uvicorn **worker** process, and
+`WEB_CONCURRENCY` not > 1; kube mode also checks `readyReplicas == 1`, no
+`--workers > 1` in the container command, and `WEB_CONCURRENCY` not > 1.
+
+### Conclusion 3 wording
+
+`HANDOFF_BETA.md §10` conclusion 3 now states it is a **status report
+only** — where production/public/government readiness stands — and does not
+authorize or step toward certification work (excluded by Section 1).
+
+### Validation (REV 2)
+
+| suite | result |
+|---|---|
+| isolated (no PG, `.venv-pass1`) | **368 passed / 89 skipped** (the `*_pg.py` skip without a DB) / 0 failed |
+| the 4 new/changed PG tests, disposable PG :55440 | **4 passed** |
+| `test_migrations_pg` + `test_auth_session_pg` + `test_ws_session_pg` (full) | **48 passed** |
+| full isolated + PG suite (`.venv-pass1`, disposable PG :55440) | **461 passed / 0 failed / 0 skipped** (273 s) |
+| CI on the REV 2 PR head | _recorded in the final report_ |
+
+Docker Desktop was down at the start of this pass (user had stopped it);
+restarted it to run the PG suites. The user's k8s `sentinel43` namespace
+pods are still defined (`s43-db`/`s43-redis` were healthy earlier;
+`s43-api`/`s43-core` have been `ErrImageNeverPull` for ~33 days — a
+pre-existing state, untouched).
 
 ---
 

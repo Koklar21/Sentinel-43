@@ -289,6 +289,21 @@ Test-only. `./browser_tests/run.sh` stands up an isolated `s43browser`
 project (own subnet `172.29.0.0/24`, proxy on `127.0.0.1:8443`), runs the
 Playwright suite, `down -v`s. Never touches another stack.
 
+### Post-merge verification pass (REV 2, after PR #251 merged)
+
+PR #251 merged to `main` as `0bd375a`. A follow-up PR from
+`beta/post-merge-verification-20260903` adds: (1) the documented merge-diff
+review showing the merge left every auth/session/authz file byte-identical
+to the pre-merge branch (`BETA_EXECUTION.md §7/§8`); (2) `S43_REJECT_LEGACY_AUTH`
+tested in **both** states (`test_auth_session_pg.py`, `test_ws_session_pg.py`)
+— on: legacy Bearer/JWT and legacy WS frame rejected on `/v1`, `/users`, and
+`/ws`, session auth unaffected; (3) a **direct schema-introspection** check
+that the `sessions.refresh_hash` uniqueness guard is still the partial,
+`revoked_at IS NULL`-scoped index after the merge
+(`test_migrations_pg.py`, in the `pg-tests` CI job); (4) `deploy_preflight.py`
+now checks **one replica AND one uvicorn worker** (no `--scale`,
+`--workers > 1`, or `WEB_CONCURRENCY > 1`) in both modes.
+
 ## §10 — three separate conclusions
 
 1. **Implementation verified locally: YES.** Every phase's behaviour is
@@ -296,20 +311,25 @@ Playwright suite, `down -v`s. Never touches another stack.
    the deployment/transport/session/ops surface, by an end-to-end run of the
    real Compose beta stack over HTTPS. Full isolated suite green.
 
-2. **Ready for a controlled beta on a named, validated target: NOT YET —
-   blocked on two verifications, both listed in §E:**
-   - **F-TLS-1** — edge TLS proven against a real hostname + CA on the target.
-   - **Browser SPA smoke** — the v1.7.0 dashboard exercised in a real browser
-     against the beta stack.
-   Plus the operational choice in §F (1 replica, or a shared throttle).
+2. **Ready for a controlled beta on a named, validated target: BLOCKED —
+   on one verification and one operational choice:**
+   - **F-TLS-1** — edge TLS proven against a real hostname + CA on the target,
+     with `browser_tests/` re-run against that endpoint (the SPA browser
+     smoke itself is now done locally, 10/10 — REV 1 Phase C).
+   - The operational choice in §F: 1 replica / 1 worker for the login
+     throttle (now checked by `deploy_preflight.py`), or a shared throttle.
    Everything else needed for a controlled beta is in place and reproducible.
 
-3. **Production / public / government readiness: NO.** This is a controlled-
-   beta candidate. Production requires the actual target and its applicable
-   requirements assessed — the k8s path is explicitly "public-beta, not
-   production-certified" (`deploy/kubernetes/README.md`), HA Postgres/Redis is
-   out of scope, `/docs` exposure is an open owner decision, and no
-   certification/compliance claim is made or implied by any test count here.
+3. **Production / public / government readiness: NO.** *This conclusion is a
+   status report only — it states where readiness stands, and is not
+   authorization for, or a step toward, certification or compliance work
+   (that work is out of scope).* This is a controlled-beta candidate.
+   Production would require the actual target and its applicable requirements
+   to be assessed by whoever owns that decision — the k8s path is explicitly
+   "public-beta, not production-certified" (`deploy/kubernetes/README.md`),
+   HA Postgres/Redis is out of scope, `/docs` exposure is an open owner
+   decision, and no certification or compliance claim is made or implied by
+   any test count in this repository.
 
 ---
 
