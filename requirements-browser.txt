@@ -1,0 +1,11 @@
+# Browser SPA smoke tests (browser_tests/). Kept out of requirements.txt /
+# the runtime image on purpose -- this is a CI/dev-only test dependency set.
+#
+#   python -m venv .venv-browser
+#   .venv-browser/bin/pip install -r requirements-browser.txt
+#   .venv-browser/bin/python -m playwright install --with-deps chromium
+#
+# pytest is pinned <9 because pytest-playwright 0.6.2 requires it.
+playwright==1.49.1
+pytest==8.3.4
+pytest-playwright==0.6.2

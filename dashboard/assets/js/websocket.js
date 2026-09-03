@@ -1,7 +1,20 @@
 /* =============================================================================
    Sentinel-43 Dashboard
    websocket.js — Hardened WebSocket bridge
-   v1.7.0
+   v1.8.0
+
+   Changes from v1.7.0 (next-PR Phase C — real-browser + same-origin beta):
+   - WS URL defaults to the /ws endpoint on the page's own origin (wss:// on
+     an https page) instead of ws://localhost:8000/ws. An empty
+     meta[name="sentinel-ws-url"] now falls through to that.
+   - The session token is read from window.SentinelAuth.getToken() (memory)
+     first; the sessionStorage read is kept only as back-compat.
+   - Fix: each socket's open/message/close/error handlers are bound to that
+     specific socket and no-op if a newer socket has since replaced _ws.
+     auth.js's login handler calls disconnect() then connect() back-to-back,
+     and a stale socket's late close handler was nulling the live _ws and
+     dispatching a spurious auth_failed — which re-showed the login overlay
+     immediately after a successful login. Caught by browser_tests/.
 
    Changes from v1.6.0 (beta-execution Phase 3):
    - The auth frame is {token} only when auth.js holds no in-memory password
@@ -119,12 +132,18 @@ const _runtime = window.SENTINEL_RUNTIME_CONFIG ?? {};
 const _locationIsLocal = ["", "localhost", "127.0.0.1", "::1"]
     .includes(location.hostname);
 
+// Empty / unset => the /ws endpoint on the page's own origin (wss:// on an
+// https page). That is the supported beta setup.
+const _sameOriginWs =
+    `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws`;
+
 const WS_CONFIG = Object.freeze({
+    // `||` (not `??`) so an empty meta tag / global also falls through.
     URL: String(
         _runtime.wsUrl
-        ?? window.SENTINEL_WS_URL
-        ?? _readMeta("sentinel-ws-url")
-        ?? "ws://localhost:8000/ws"
+        || window.SENTINEL_WS_URL
+        || _readMeta("sentinel-ws-url")
+        || _sameOriginWs
     ),
     RECONNECT_MS:     1_000,
     RECONNECT_MAX_MS: 30_000,
@@ -213,6 +232,13 @@ function _dispatchGenericOnly(parsed) {
 }
 
 function _getAuthToken() {
+    // The real session token is held in memory by auth.js (never persisted).
+    try {
+        const t = window.SentinelAuth?.getToken?.();
+        if (typeof t === "string" && t.trim()) return t.trim();
+    } catch {}
+
+    // Back-compat: a token left in sessionStorage by an older auth.js build.
     try {
         const sessionToken = sessionStorage.getItem(SESSION_TOKEN_KEY);
         if (sessionToken && sessionToken.trim()) return sessionToken.trim();
@@ -637,7 +663,15 @@ function connect() {
         _scheduleReconnect();
         return;
     }
-    _ws.addEventListener("open", () => {
+    // Bind the handlers to THIS socket. auth.js's login handler does
+    // disconnect() then connect() back-to-back, so a previous socket's
+    // late-arriving open/message/close event must not touch the module
+    // state that now belongs to a newer socket (_ws). Without this guard a
+    // stale close handler nulls _ws and dispatches a spurious auth_failed,
+    // which re-shows the login overlay right after a successful login.
+    const _sock = _ws;
+    _sock.addEventListener("open", () => {
+        if (_ws !== _sock) return;
         _socketOpen        = true;
         _reconnectAttempts = 0;
         _lastMessageAt     = Date.now();
@@ -649,8 +683,12 @@ function connect() {
             }
         }
     });
-    _ws.addEventListener("message", _handleMessage);
-    _ws.addEventListener("close", event => {
+    _sock.addEventListener("message", event => {
+        if (_ws !== _sock) return;
+        _handleMessage(event);
+    });
+    _sock.addEventListener("close", event => {
+        if (_ws !== _sock && _ws !== null) return;
         const wasManual = _manuallyClosed;
         const closeCode = event.code;
         _stopHeartbeat();
@@ -703,7 +741,8 @@ function connect() {
             _scheduleReconnect();
         }
     });
-    _ws.addEventListener("error", () => {
+    _sock.addEventListener("error", () => {
+        if (_ws !== _sock) return;
         _dispatch("sentinel:ws:error", {
             error: "WebSocket transport error",
             timestamp: _nowIso(),

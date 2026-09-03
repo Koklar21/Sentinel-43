@@ -1,7 +1,16 @@
 /* =============================================================================
    Sentinel-43 Dashboard
    auth.js — Operator login flow and JWT lifecycle
-   v1.7.0
+   v1.8.0
+
+   Changes from v1.7.0 (next-PR Phase C — real-browser + same-origin beta):
+   - The bearer access token is now held in module memory ONLY. It is no
+     longer written to sessionStorage (init() refreshes it from the HttpOnly
+     cookie on every load, so persistence bought nothing and was an XSS
+     exfil target). Exposed as window.SentinelAuth.getToken() for
+     websocket.js / dashboard.js; an old sessionStorage["SENTINEL_JWT"] is
+     cleared on load.
+   - No functional change to endpoints (still same-origin /auth/*).
 
    Changes from v1.6.0 (beta-execution Phase 3 — browser session):
    - Login now also gets an HttpOnly refresh cookie + a JS-readable CSRF
@@ -119,12 +128,24 @@ function _sessionStorageAvailable() {
     }
 }
 
+// The bearer access token lives in module memory ONLY -- never sessionStorage
+// or localStorage. It is short-lived (15 min, sid-bound) and init() exchanges
+// the HttpOnly refresh cookie for a fresh one on every page load, so there is
+// nothing to gain by persisting it and a stored token is an XSS-exfiltration
+// target. Cleared on refresh / navigation / tab close by construction.
+let _accessToken = null;
+
+// One-time cleanup of any token left in sessionStorage by an older build.
+try { sessionStorage.removeItem(TOKEN_KEY); } catch {}
+
 function getToken() {
-    try { return sessionStorage.getItem(TOKEN_KEY) || null; } catch { return null; }
+    return typeof _accessToken === "string" && _accessToken ? _accessToken : null;
 }
 
 function setToken(token) {
-    try { sessionStorage.setItem(TOKEN_KEY, token); return true; } catch { return false; }
+    if (typeof token !== "string" || !token) return false;
+    _accessToken = token;
+    return true;
 }
 
 function getPassword() {
@@ -147,6 +168,7 @@ function setSessionPassword(password) {
 
 function clearToken() {
     _sessionPassword = null;
+    _accessToken = null;
     try {
         sessionStorage.removeItem(TOKEN_KEY);
     } catch {}
@@ -541,6 +563,9 @@ return Object.freeze({
     },
     refreshSession,
     hasToken: () => !!getToken(),
+    // In-memory bearer access token for same-origin consumers (websocket.js,
+    // dashboard.js). Never persisted; returns null when logged out.
+    getToken,
     getPassword,
 
     applyManualCredentials(token, password) {
