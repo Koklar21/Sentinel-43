@@ -132,9 +132,15 @@ def stack():
 
 @pytest.fixture(scope="session")
 def browser_type_launch_args(browser_type_launch_args):
-    # Trust exactly our test leaf by its SPKI hash -- NOT a blanket
-    # --ignore-certificate-errors. Map the test hostname to loopback so no
-    # hosts-file edit is needed.
+    # DISPOSABLE stack only: trust exactly our throwaway test leaf by its SPKI
+    # hash (NOT a blanket --ignore-certificate-errors) and map the test
+    # hostname to loopback so no hosts-file edit is needed.
+    #
+    # In TARGET-ACCEPTANCE mode (browser_tests/target/, S43_TARGET_BASE_URL
+    # set) neither of these is applied -- a real target must pass with an
+    # ordinary trusted-CA chain and real DNS. See browser_tests/target/.
+    if os.environ.get("S43_TARGET_BASE_URL"):
+        return browser_type_launch_args
     return {
         **browser_type_launch_args,
         "args": [
@@ -155,21 +161,6 @@ def page(page):
     return page
 
 
-def do_login(page, base_url, username, password):
-    page.goto(base_url + "/dashboard")
-    page.wait_for_selector("#s43-login-overlay")
-    page.fill("#s43-username", username)
-    page.fill("#s43-password", password)
-    page.click("#s43-login-btn")
-    try:
-        page.wait_for_selector("#s43-login-overlay", state="hidden", timeout=10_000)
-    except Exception:
-        err = ""
-        try:
-            err = page.text_content("#s43-login-err") or ""
-        except Exception:
-            pass
-        raise AssertionError(
-            f"login overlay did not hide for {username!r}; "
-            f"#s43-login-err={err!r}; console={getattr(page, '_s43_console_errors', None)}"
-        )
+# do_login lives in browser_tests/_spa.py (re-exported here for back-compat)
+# so `from _spa import do_login` is collision-proof against target/conftest.py.
+from _spa import do_login  # noqa: E402,F401

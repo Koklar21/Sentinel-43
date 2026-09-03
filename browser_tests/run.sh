@@ -12,9 +12,21 @@
 #
 # Nothing here touches the user's own stack: the project is `s43browser`,
 # every container is renamed, and the proxy is on 127.0.0.1:8443/8081.
+# This is the DISPOSABLE runner. It always builds and tears down its own
+# isolated s43browser stack on https://s43.beta.test:8443. To run the browser
+# suite against a REAL deployed target, use browser_tests/run_target.sh --
+# that one never touches a Compose stack. Refuse a stray S43_BROWSER_BASE_URL
+# so nobody thinks this runner is hitting their target.
 # =============================================================================
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+if [ -n "${S43_BROWSER_BASE_URL:-}" ] && \
+   [ "${S43_BROWSER_BASE_URL}" != "https://s43.beta.test:8443" ]; then
+    echo "run.sh is the disposable runner and only serves https://s43.beta.test:8443." >&2
+    echo "For a real target: browser_tests/run_target.sh  (S43_TARGET_BASE_URL=https://<fqdn>)" >&2
+    exit 2
+fi
 
 PROJECT=s43browser
 ENV_FILE=.env.browser
@@ -64,5 +76,7 @@ echo "== building + starting the s43browser stack =="
 "${COMPOSE[@]}" up -d --build
 
 echo "== running browser tests =="
+# target/ is the real-target acceptance suite -- never part of the disposable run.
 S43_BROWSER_BASE_URL="https://s43.beta.test:8443" \
-  "$PY" -m pytest browser_tests/ -q -p no:cacheprovider "$@"
+  "$PY" -m pytest browser_tests/ --ignore=browser_tests/target_acceptance \
+  -q -p no:cacheprovider "$@"

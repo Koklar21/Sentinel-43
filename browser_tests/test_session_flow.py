@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from conftest import do_login
+from _spa import do_login
 
 
 def page_fetch(page, path: str, method: str = "GET", headers: dict | None = None,
