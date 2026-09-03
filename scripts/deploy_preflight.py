@@ -49,7 +49,6 @@ import shutil
 import socket
 import ssl
 import subprocess
-import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -596,7 +595,8 @@ def check_hostname_resolves(rep: Report, hostname: str) -> bool:
 
 
 def check_edge_tls(rep: Report, hostname: str, https_port: int,
-                   http_port: int, ca_bundle: str | None) -> None:
+                   http_port: int, ca_bundle: str | None,
+                   from_external_host: bool = False) -> None:
     print("\n== edge TLS + HTTP ==")
     try:
         with socket.create_connection((hostname, https_port), timeout=10) as sock:
@@ -649,7 +649,7 @@ def check_edge_tls(rep: Report, hostname: str, https_port: int,
                        else FAIL, "HSTS header present at the edge", hsts or "missing")
 
     check_docs_exposure(rep, hostname, https_port, ca_bundle)
-    check_external_exposure(rep, hostname)
+    check_external_exposure(rep, hostname, from_external_host)
     rep.record(INCOMPLETE, "WSS login/refresh/logout through the edge",
                "run browser_tests/run_target.sh against this https:// URL")
 
@@ -669,9 +669,9 @@ def check_docs_exposure(rep: Report, hostname: str, https_port: int,
                    f"{path} is not publicly served", f"HTTP {status}")
 
 
-def check_external_exposure(rep: Report, hostname: str) -> None:
-    external = "--from-external-host" in sys.argv
-    if not external:
+def check_external_exposure(rep: Report, hostname: str,
+                            from_external_host: bool = False) -> None:
+    if not from_external_host:
         rep.record(INCOMPLETE,
                    "backend :8000 / watchtower :9100 / db / redis not reachable externally",
                    "re-run with --from-external-host from outside the target network")
@@ -901,7 +901,8 @@ def run(args: argparse.Namespace) -> int:
         else:
             if check_hostname_resolves(rep, args.hostname):
                 check_edge_tls(rep, args.hostname, args.https_port,
-                               args.http_port, args.ca_bundle or None)
+                               args.http_port, args.ca_bundle or None,
+                               args.from_external_host)
             check_compose_runtime(rep, args.project, args.env_file,
                                   args.compose_files)
     else:
@@ -913,7 +914,8 @@ def run(args: argparse.Namespace) -> int:
         else:
             if check_hostname_resolves(rep, args.hostname):
                 check_edge_tls(rep, args.hostname, args.https_port,
-                               args.http_port, args.ca_bundle or None)
+                               args.http_port, args.ca_bundle or None,
+                               args.from_external_host)
             check_kube_runtime(rep, args.context, args.namespace)
 
     code = rep.exit_code()
