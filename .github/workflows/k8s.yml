@@ -30,12 +30,14 @@ on:
       - "core/**"
       - "deploy/kubernetes/**"
       - "scripts/k8s_policy_check.py"
+      - "scripts/ci_live_tests.py"
       - "scripts/k8s-validate.ps1"
       - ".github/workflows/k8s.yml"
   push:
     branches: [main]
     paths:
       - "requirements*.txt"
+      - "scripts/ci_live_tests.py"
       - "core/**"
       - "deploy/kubernetes/**"
       - "scripts/k8s_policy_check.py"
@@ -81,6 +83,21 @@ jobs:
   test:
     name: pytest
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16.3
+        env:
+          POSTGRES_USER: s43_ci
+          POSTGRES_PASSWORD: disposable-ci-database-only
+          POSTGRES_DB: s43_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U s43_ci -d s43_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -89,7 +106,19 @@ jobs:
       # Install from the runtime manifest present in the merged checkout.
       # pytest and requests are the additional dependencies used by core/tests.
       - run: python -m pip install -r requirements.txt pytest requests
-      - run: python -m pytest core/tests/ -q
+      - name: Isolated application and security tests
+        env:
+          S43_WATCHTOWER_URL: http://127.0.0.1:19100
+          S43_WATCHTOWER_TIMEOUT: "0.1"
+        # Live tests run in the next required step against real processes.
+        run: >-
+          python -m pytest core/tests/ -q
+          --ignore=core/tests/test_bootstrap.py
+          --ignore=core/tests/test_system_smoke.py
+      - name: Live API, PostgreSQL, and Watchtower tests
+        env:
+          S43_CI_DATABASE_URL: postgresql+asyncpg://s43_ci:disposable-ci-database-only@127.0.0.1:5432/s43_ci
+        run: python scripts/ci_live_tests.py
 
   build-and-scan:
     name: Build image + vulnerability scan

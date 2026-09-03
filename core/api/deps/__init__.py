@@ -460,7 +460,7 @@ __all__ = [
     "dev_store_factory",
 ]
 
-from .deps import require_operator
+from .deps import require_admin, require_operator
 
 # -----------------------------------------------------------------------------
 # Batch 2 canonical dependency exports
@@ -478,6 +478,7 @@ from .deps import (
     dev_store_factory,
     get_engine,
     get_store,
+    require_admin,
     require_operator,
     reset_dev_store_state,
 )

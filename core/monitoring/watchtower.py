@@ -100,6 +100,20 @@ from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, s
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from ..logging.health_check_filter import install_health_check_access_filter
+
+# Watchtower's own /watchtower/health and /watchtower/ready are polled
+# routinely (Docker, external monitors, s43-api's own bridge routes) and,
+# like core.api.main, this process never configures uvicorn's access
+# logger (configure_logging() above only touches the root logger via
+# logging.basicConfig). Same narrow fix as core.api.main: quiet successful
+# polls of these two paths only, everything else (failures, all other
+# routes) still logs. See core/logging/health_check_filter.py.
+_HEALTH_CHECK_LOG_PATHS: frozenset[str] = frozenset({
+    "/watchtower/health",
+    "/watchtower/ready",
+})
+
 
 VERSION = "1.3.7"
 logger = logging.getLogger("SentinelWatchtower")
@@ -1387,6 +1401,8 @@ def create_api_app(node: WatchtowerNode) -> FastAPI:
 
     watchtower_router = create_watchtower_router(node)
     api.include_router(watchtower_router)
+
+    install_health_check_access_filter(_HEALTH_CHECK_LOG_PATHS)
 
     @api.get("/")
     def root() -> dict[str, Any]:

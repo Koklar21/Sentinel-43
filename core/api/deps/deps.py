@@ -20,9 +20,9 @@ import os
 import urllib.error
 import urllib.request
 
-import jwt as pyjwt
-from fastapi import HTTPException, Request
-from ...security.jwt_constants import APPROVED_JWT_ALGORITHMS
+from fastapi import Depends, HTTPException, Request
+from sqlalchemy.ext.asyncio import AsyncSession
+from ...auth.deps import get_db_session
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -48,12 +48,7 @@ WATCHTOWER_TIMEOUT = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
 ENV_DEV_ENGINE_ENABLED = "S43_ENABLE_DEV_ENGINE"
 ENV_DEV_STORE_ENABLED = "S43_ENABLE_DEV_STORE"
 
-JWT_SECRET = os.getenv("S43_JWT_SECRET", "").strip()
-JWT_ALGORITHM = os.getenv("S43_JWT_ALGORITHM", "HS256").strip()
-JWT_ISSUER = os.getenv("S43_JWT_ISSUER", "sentinel-43").strip()
-JWT_AUDIENCE = os.getenv("S43_JWT_AUDIENCE", "sentinel-43-dashboard").strip()
 
-_APPROVED_ALGORITHMS = APPROVED_JWT_ALGORITHMS
 _APPROVED_ROLES = frozenset({"operator", "admin"})
 
 
@@ -202,31 +197,10 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _verify_operator_jwt(token: str) -> dict[str, Any]:
-    if JWT_ALGORITHM not in _APPROVED_ALGORITHMS:
-        raise HTTPException(status_code=503, detail="JWT algorithm is not approved")
+    """Use the same verifier and current configuration as login and admin routes."""
+    from ..routers.auth import verify_jwt_token
 
-    if not JWT_SECRET:
-        raise HTTPException(status_code=503, detail="JWT validation not configured")
-
-    try:
-        return pyjwt.decode(
-            token,
-            JWT_SECRET,
-            algorithms=[JWT_ALGORITHM],
-            issuer=JWT_ISSUER,
-            audience=JWT_AUDIENCE,
-            options={"require": ["exp", "iss", "aud", "sub"]},
-        )
-    except pyjwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token has expired")
-    except pyjwt.InvalidIssuerError:
-        raise HTTPException(status_code=401, detail="Invalid token issuer")
-    except pyjwt.InvalidAudienceError:
-        raise HTTPException(status_code=401, detail="Invalid token audience")
-    except pyjwt.MissingRequiredClaimError as exc:
-        raise HTTPException(status_code=401, detail=f"Missing required claim: {exc}")
-    except pyjwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    return verify_jwt_token(token)
 
 
 async def require_operator(request: Request) -> str:
@@ -268,6 +242,73 @@ async def require_operator(request: Request) -> str:
         raise HTTPException(status_code=401, detail="Password required")
     if not await reverify_password(subject, password):
         raise HTTPException(status_code=401, detail="Invalid password")
+
+    return subject
+
+
+async def require_admin(
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+) -> str:
+    """
+    Authenticate the caller and require that they are an active 'admin' in
+    the DB-backed user store (core.auth.users). Gates the account-management
+    router (core/api/routers/users.py).
+
+    The JWT + per-request X-S43-Password check here is deliberately the same
+    one main.py's _get_operator() uses for every other protected route —
+    core.api.routers.auth.verify_jwt_token() / reverify_password(), both of
+    which read their config from the environment at call time, as does
+    require_operator().
+
+    The admin check reads the live database, not the JWT 'role' claim, so an
+    admin who is demoted or deactivated loses this access on their very next
+    request rather than whenever their current token happens to expire.
+
+    The env-var fallback operator (S43_OPERATOR_USERNAME) can never satisfy
+    this — it has no users-table row. Account management is deliberately
+    gated on a real bootstrapped admin (see core/api/routers/bootstrap.py).
+    """
+    from ..routers.auth import (
+        PASSWORD_HEADER_NAME,
+        reverify_password,
+        verify_jwt_token,
+    )
+    from ...auth.users import get_user_by_username
+
+    auth = request.headers.get("Authorization", "").strip()
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    token = auth[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    # Validates signature, claims, and that role is in {operator, admin};
+    # raises HTTPException(401/403/503) itself on any failure.
+    claims = verify_jwt_token(token)
+    subject = str(claims.get("sub") or "").strip()
+    if not subject:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    password = request.headers.get(PASSWORD_HEADER_NAME, "")
+    if not password:
+        raise HTTPException(status_code=401, detail="Password required")
+    if not await reverify_password(subject, password):
+        raise HTTPException(status_code=401, detail="Invalid password")
+
+    try:
+        user = await get_user_by_username(session, subject)
+    except HTTPException:
+        raise
+    except Exception as exc:  # DB unreachable, table missing, etc.
+        raise HTTPException(
+            status_code=503,
+            detail="User account store is unavailable.",
+        ) from exc
+
+    if user is None or not user.is_active or user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
 
     return subject
 
@@ -654,6 +695,7 @@ __all__ = [
     "get_engine",
     "get_store",
     "require_operator",
+    "require_admin",
     "deps_status",
     "clear_factory_caches",
     "reset_dev_store_state",
