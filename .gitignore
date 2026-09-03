@@ -280,3 +280,24 @@ sentinel43_state/
 # Docker
 docker-data/
 .tools/
+docker-compose.override.yml
+docker-compose.override.yaml
+
+# TLS material for the Compose reverse proxy (env-specific, secret)
+deploy/proxy/certs/*.crt
+deploy/proxy/certs/*.key
+deploy/proxy/certs/*.pem
+deploy/proxy/certs/*.p12
+
+# P5 smoke-test scratch (not committed)
+.env.smoke
+docker-compose.smoke.yml
+
+# Browser SPA smoke (next-PR Phase C)
+.venv-browser/
+.venv-*/
+.env.browser
+test-results/
+browser_tests/certs/*.crt
+browser_tests/certs/*.key
+browser_tests/certs/*.srl

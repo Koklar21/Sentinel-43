@@ -103,30 +103,45 @@ kubectl apply -k deploy/kubernetes/overlays/beta
 
 ## Migration process
 
-There is no Alembic (or other) migration system in this repo — schema
-creation is `core/auth/users.py`'s `init_models()`
-(`SQLAlchemy Base.metadata.create_all()`, idempotent). `base/migration-job.yaml`
-wraps that exact function in a single-execution `Job` instead of inventing a
-new migration system. **Apply it and wait for `Complete` before the API
-Deployment is expected to serve real traffic on a fresh database** — both
-`kubectl apply -k` commands above already include it (it's part of `base/`),
-but on a fresh cluster you may want to gate it explicitly:
+**Alembic is Sentinel-43's authoritative production schema mechanism**
+(`MIGRATION_ARCHITECTURE_PASS5AM.md`). `base/migration-job.yaml` is the single
+migration actor: one pod runs `alembic upgrade head`. **Apply it and wait for
+`Complete` before the API Deployment is expected to serve real traffic** —
+both `kubectl apply -k` commands above already include it (it's part of
+`base/`), but you should gate it explicitly on a fresh cluster:
 
 ```bash
 kubectl apply -k deploy/kubernetes/overlays/dev  # or overlays/beta
 kubectl wait --for=condition=Complete job/s43-migration -n sentinel43 --timeout=120s
 ```
 
-**Observed in integration testing**: the migration Job can fail its first
-1-2 attempts with `socket.gaierror: Temporary failure in name resolution`
-in the few seconds right after pod creation, self-healing via its
-`backoffLimit: 3` on retry. This appears to be a NetworkPolicy-programming
-race in Calico (the policy hasn't finished being applied to the pod's
-network namespace yet) rather than a DNS or database problem — the
-long-running Deployments (api/core) didn't exhibit it, only the Job, which
-makes its very first move a database connection attempt with no
-in-process retry of its own. The Job's `Complete` condition is what
-actually matters and was reached every test run.
+The API pods also refuse traffic on their own until the schema matches: each
+`s43-api` pod's **readiness** probe (`GET /ready`) returns `503` while
+`alembic_version` is behind / ahead / missing, so a `RollingUpdate` will not
+send requests to a replica that is pointed at an un-migrated database (see
+`core/auth/schema_version.py`). Liveness (`GET /health`) is unaffected — a
+schema mismatch never restarts a pod.
+
+### Fresh vs existing database
+
+| Situation | What to run |
+|---|---|
+| **Fresh** database (new PVC) | Nothing extra — the Job's `alembic upgrade head` runs `0001_baseline` (creates `users`) then `0002_sessions`. |
+| **Existing pre-Alembic** database (a `users` table created by the old `init_models()`/`create_all` path, no `alembic_version`) | Adopt it once, then let the Job run: `kubectl run s43-stamp --rm -it -n sentinel43 --image=<same image> --restart=Never --overrides='{...same securityContext + envFrom the Job uses...}' --command -- alembic stamp 0001_baseline`. `env.py` runs `migrations/baseline.py`'s **semantic** compatibility check first and refuses (exit 1) on any incompatible column/type/nullability/uniqueness — it never blindly stamps. |
+| **Incompatible** schema | `alembic` exits non-zero, the Job fails its `backoffLimit`, and you do not proceed to the API Deployment. The failure message names the drifting columns only — no row data, no credentials, no connection string. |
+
+`alembic downgrade` is **never** run automatically. `0001_baseline` has no
+supported downgrade (it would drop `users`); `0002_sessions` downgrade drops
+`sessions` and **destroys all active session state** — a deliberate manual
+`kubectl exec` step, not part of any rollout.
+
+**Observed in earlier integration testing** (still applies to the Job's very
+first database contact): the migration Job can fail its first 1-2 attempts
+with `socket.gaierror: Temporary failure in name resolution` in the few
+seconds right after pod creation, self-healing via its `backoffLimit: 3` on
+retry — a NetworkPolicy-programming race in Calico, not a DNS or database
+problem. The Job's `Complete` condition is what matters and was reached every
+run.
 
 ## Health verification
 
@@ -264,12 +279,14 @@ real enforcement, not just object presence.
   introduces or silently works around; fixing it means making the rate
   limiter Redis-backed, which is an application change outside this task's
   scope.
-- **Neither `/health`/`/ready` (api) nor `/watchtower/health` (core) verify
-  Postgres/Redis connectivity.** `core/api/main.py`'s `dependencies_status()`
-  hardcodes both as `"unknown"`. Readiness in this deployment therefore
-  means "the process is serving HTTP," not "this pod can currently reach
-  the database" — a pre-existing app-level gap, documented rather than
-  silently expanded in scope by this deployment.
+- **`/health` (liveness) does not verify Postgres/Redis connectivity** — by
+  design: a DB outage must not make Kubernetes kill every API pod.
+  `/ready` (readiness) now **does** connect to Postgres to check the Alembic
+  schema revision (`core/auth/schema_version.py`), so a pod that cannot reach
+  the database, or is pointed at an un-migrated / wrong-revision one, reports
+  `503` and is taken out of the Service's endpoint list until it recovers.
+  It still does not check Redis (nothing in `core/` uses Redis —
+  `dependencies_status()` reports it `"unknown"`).
 - **`/watchtower/ready` is intentionally NOT used for any probe on
   `s43-core`**, despite the name suggesting it's the obvious readiness
   check. It measures whether every *other* registered module/dependency

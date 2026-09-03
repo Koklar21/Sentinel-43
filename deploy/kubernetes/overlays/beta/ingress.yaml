@@ -35,8 +35,22 @@ metadata:
     nginx.ingress.kubernetes.io/use-forwarded-headers: "true"
     nginx.ingress.kubernetes.io/proxy-body-size: "10m"  # matches FirewallConfig.max_content_length_bytes default
     nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "75"   # > dashboard WS heartbeat (25s)
     nginx.ingress.kubernetes.io/proxy-send-timeout: "30"
+    # HSTS at the edge (beta-execution Phase 2, F-TLS-1). ingress-nginx
+    # enables HSTS by default; pin it explicitly so it survives a controller
+    # ConfigMap that turned it off, and set a 180-day max-age.
+    nginx.ingress.kubernetes.io/hsts: "true"
+    nginx.ingress.kubernetes.io/hsts-max-age: "15552000"
+    nginx.ingress.kubernetes.io/hsts-include-subdomains: "true"
+    # Static hardening headers at the edge (the app also sets these via
+    # SecurityHeadersMiddleware / SentinelFirewall — belt and braces, and
+    # covers any response the app emits without them).
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "X-Content-Type-Options: nosniff";
+      more_set_headers "X-Frame-Options: DENY";
+      more_set_headers "Referrer-Policy: no-referrer";
+      more_set_headers "Strict-Transport-Security: max-age=15552000; includeSubDomains";
 spec:
   ingressClassName: nginx
   tls:

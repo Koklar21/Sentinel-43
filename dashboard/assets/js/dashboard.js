@@ -4,8 +4,14 @@
 // UI logic module. WebSocket transport is handled by websocket.js which
 // dispatches sentinel:ws:* events consumed here.
 //
-// v1.7.0
-// Changes:
+// v1.8.0
+// Changes from v1.7.0 (next-PR Phase C — real-browser + same-origin beta):
+// - API_BASE defaults to location.origin (was http://localhost:8000). An
+//   empty meta[name="sentinel-api-base"] falls through to same-origin.
+// - The real session token is read from window.SentinelAuth.getToken()
+//   (memory) first; the sessionStorage read is kept only as back-compat.
+//
+// Changes (v1.7.0):
 // - RECONSTRUCTION NOTE: this file was recovered from a paste that had
 //   stripped the backticks from every template literal. Backticks have
 //   been restored based on context. Diff against your real working copy
@@ -53,11 +59,14 @@ const _locationIsLocal = ["", "localhost", "127.0.0.1", "::1"]
     .includes(location.hostname);
 
 const CONFIG = Object.freeze({
+    // Empty / unset => same origin as the page. That is the supported beta
+    // setup (SPA served by the API behind the TLS proxy). `||` (not `??`) so
+    // an empty meta tag / global also falls through to location.origin.
     API_BASE: String(
         _runtime.apiBase
-        ?? window.SENTINEL_API_BASE_URL
-        ?? _readMeta("sentinel-api-base")
-        ?? "http://localhost:8000"
+        || window.SENTINEL_API_BASE_URL
+        || _readMeta("sentinel-api-base")
+        || location.origin
     ).replace(/\/+$/, ""),
     FALLBACK_POLL_MS: 15_000,
     DATA_STALE_MS:    60_000,
@@ -320,6 +329,15 @@ function _readStoredToken(storage, key) {
 }
 
 function getDevTokenInfo() {
+    // Real session token: held in memory by auth.js, never persisted.
+    try {
+        const t = window.SentinelAuth?.getToken?.();
+        if (typeof t === "string" && t.trim()) {
+            return { token: t.trim(), isRealSession: true };
+        }
+    } catch {}
+
+    // Back-compat: a token left in sessionStorage by an older auth.js build.
     const sessionToken = _readStoredToken(sessionStorage, SESSION_TOKEN_KEY);
     if (sessionToken) return { token: sessionToken, isRealSession: true };
 

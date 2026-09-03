@@ -1,0 +1,50 @@
+# =============================================================================
+# Sentinel-43 -- browser SPA smoke stack (next-PR Phase C). NOT a deployment
+# artifact.
+#
+# A second, fully isolated copy of the beta stack for the Playwright browser
+# tests in browser_tests/. Every container is renamed (s43browser_*) and the
+# proxy is published on 127.0.0.1:8443 / 8081 so it never collides with the
+# user's running stack (Compose `sentinel-43` or the Docker Desktop k8s
+# `sentinel43` namespace) or the P5 smoke stack.
+#
+#   ./browser_tests/certs/generate-test-ca.sh
+#   ./browser_tests/run.sh            # brings this up, runs pytest, tears down
+#
+# The proxy serves CN=s43.beta.test from the throwaway test CA; Chromium is
+# launched with --host-resolver-rules mapping that name to 127.0.0.1 and an
+# SPKI pin for the leaf. See browser_tests/README.md.
+# =============================================================================
+services:
+  s43-db:      { container_name: s43browser_postgres }
+  s43-redis:   { container_name: s43browser_redis }
+  s43-core:    { container_name: s43browser_core }
+  s43-migrate: { container_name: s43browser_migrate }
+  s43-api:
+    container_name: s43browser_api
+    environment:
+      S43_TRUSTED_HOSTS: "s43.beta.test"
+      S43_ALLOWED_ORIGINS: "https://s43.beta.test:8443"
+      S43_TRUSTED_PROXIES: "172.29.0.250/32"
+  s43-proxy:
+    container_name: s43browser_proxy
+    ports:
+      - "127.0.0.1:8443:443"
+      - "127.0.0.1:8081:80"
+    networks:
+      s43_net:
+        ipv4_address: 172.29.0.250
+    volumes:
+      # Same target as the base compose's ./deploy/proxy/certs mount, so this
+      # replaces it (rather than nesting inside it -- which fails on a fresh
+      # checkout where deploy/proxy/certs/ is empty). generate-test-ca.sh
+      # writes s43.crt (leaf+CA) + s43.key here; all gitignored.
+      - ./browser_tests/certs:/etc/nginx/certs:ro
+  s43-setup:   { container_name: s43browser_setup }
+
+# Own subnet so this never collides with the primary stack's 172.28.0.0/24.
+networks:
+  s43_net:
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24

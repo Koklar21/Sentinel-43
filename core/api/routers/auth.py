@@ -71,17 +71,100 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
+import uuid
+from collections import deque
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 import jwt as pyjwt
-from fastapi import APIRouter, Header, HTTPException, status
+from fastapi import APIRouter, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
 from ...security.jwt_constants import APPROVED_JWT_ALGORITHMS
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Login brute-force throttle (Pass 3, RELEASE_FINDINGS-adjacent)
+#
+# /auth/login had no per-credential rate limiting: the only backstop was the
+# firewall's coarse per-IP limiter (300/60s). A per-username sliding-window
+# lockout raises the cost of guessing a known operator's password. In-process
+# only — adequate for the single-replica beta; a multi-replica deployment
+# wants this in Redis (noted in PASS3_VALIDATION.md). reverify_password()'s
+# per-request path is not throttled here: it already sits behind a valid-JWT
+# gate and its Argon2 verify now runs off the event loop.
+# =============================================================================
+
+def _ei_raw(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def _login_throttle_config() -> tuple[int, int, int]:
+    """(max_failures, window_seconds, lockout_seconds), read at call time."""
+    return (
+        max(1, _ei_raw("S43_LOGIN_MAX_FAILURES", 10)),
+        max(1, _ei_raw("S43_LOGIN_FAIL_WINDOW_SECONDS", 300)),
+        max(1, _ei_raw("S43_LOGIN_LOCKOUT_SECONDS", 300)),
+    )
+
+
+_login_failures: dict[str, deque[float]] = {}
+_login_lock = threading.Lock()
+
+
+def _throttle_key(username: str) -> str:
+    return username.strip().lower()[:MAX_USERNAME_LEN]
+
+
+def _login_check_throttled(username: str) -> None:
+    max_fail, window, lockout = _login_throttle_config()
+    key = _throttle_key(username)
+    now = time.monotonic()
+    with _login_lock:
+        bucket = _login_failures.get(key)
+        if not bucket:
+            return
+        while bucket and bucket[0] < now - max(window, lockout):
+            bucket.popleft()
+        if not bucket:
+            _login_failures.pop(key, None)
+            return
+        recent = [t for t in bucket if t >= now - window]
+        if len(recent) >= max_fail and (now - bucket[-1]) < lockout:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many failed login attempts. Try again later.",
+                headers={"Retry-After": str(lockout)},
+            )
+
+
+def _login_record_failure(username: str) -> None:
+    _, window, lockout = _login_throttle_config()
+    key = _throttle_key(username)
+    now = time.monotonic()
+    with _login_lock:
+        bucket = _login_failures.setdefault(key, deque(maxlen=256))
+        bucket.append(now)
+        # opportunistic GC so the dict can't grow without bound
+        if len(_login_failures) > 4096:
+            cutoff = now - max(window, lockout)
+            for k in [k for k, b in _login_failures.items() if not b or b[-1] < cutoff]:
+                _login_failures.pop(k, None)
+
+
+def _login_clear(username: str) -> None:
+    with _login_lock:
+        _login_failures.pop(_throttle_key(username), None)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -111,6 +194,49 @@ _APPROVED_ROLES: frozenset[str] = frozenset({"operator", "admin"})
 # Three-segment base64url shape. Validated before pyjwt.decode() to reject
 # obviously-malformed input without touching the decode path.
 JWT_SHAPE_RE = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
+
+# ---------------------------------------------------------------------------
+# New-style (session-bound) access-token claims — Pass 5A foundation.
+#
+# The browser-session redesign (AUTH_ARCHITECTURE_PASS4.md "Model B") issues
+# access tokens that additionally carry:
+#   sid  — the server-side session id (canonical UUID string)
+#   jti  — a unique token id
+# Legacy tokens (env-var operator, DB-account login as it works today, the
+# /v1 issuers, any already-minted token) carry NEITHER and are still accepted
+# unchanged — _issue_token() only adds them when a caller passes sid=..., and
+# verify_jwt_token() never *requires* them. Presence of a well-formed `sid`
+# is the explicit new-vs-legacy discriminator (see token_is_session_bound()).
+#
+# Pass 5A does NOT consult the sessions table on the request hot path (no
+# `sid` liveness lookup / LRU) — that is deferred (mission Pass 5A §6, §21).
+# ---------------------------------------------------------------------------
+_SESSION_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+_JTI_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _new_jti() -> str:
+    """A unique, opaque token id for the `jti` claim (128-bit URL-safe)."""
+    return secrets.token_urlsafe(16)
+
+
+def token_is_session_bound(claims: dict[str, Any]) -> bool:
+    """
+    True iff `claims` is a new-style, session-bound access token (carries a
+    well-formed `sid`). False for every legacy token. Never raises.
+
+    Not used on the request hot path in Pass 5A — provided so Pass 5B wiring
+    and tests have one canonical discriminator instead of ad-hoc `"sid" in`
+    checks scattered across call sites.
+    """
+    try:
+        sid = claims.get("sid")
+    except AttributeError:
+        return False
+    return isinstance(sid, str) and bool(_SESSION_ID_RE.match(sid))
 
 
 # =============================================================================
@@ -175,10 +301,28 @@ class LoginRequest(BaseModel):
 
 
 class LoginResponse(BaseModel):
-    token:      str
+    token:      str          # the access token (kept as `token` for existing consumers)
     token_type: str = "bearer"
     subject:    str
     expires_at: str
+    # New-style fields (browser-session redesign, beta-execution Phase 3).
+    # Present for DB-account logins that get a server-side session; absent /
+    # null for the legacy env-operator break-glass path.
+    access_token:  Optional[str] = None
+    expires_in:    Optional[int] = None
+    role:          Optional[str] = None
+    session_bound: bool = False
+
+
+class RefreshResponse(BaseModel):
+    token:         str
+    access_token:  str
+    token_type:    str = "bearer"
+    subject:       str
+    role:          str
+    expires_in:    int
+    expires_at:    str
+    session_bound: bool = True
 
 
 class VerifyResponse(BaseModel):
@@ -264,6 +408,40 @@ def _validate_env_credentials(username: str, password: str) -> str:
     return expected_username
 
 
+async def _env_operator_allowed() -> bool:
+    """
+    RELEASE_FINDINGS #11 (beta-execution Phase 3, AUTH_MIGRATION_PASS4 §3
+    Option C — scoped break-glass).
+
+    The env-var operator (S43_OPERATOR_USERNAME / S43_OPERATOR_PASSWORD_HASH,
+    un-salted SHA-256) is a **break-glass** credential, not a routine account.
+    It authenticates only when:
+
+      * ``S43_BREAK_GLASS_ARMED`` is truthy (an operator deliberately turned
+        it on), OR
+      * there is **no active admin** in the DB — the first-run window before
+        ``/bootstrap/admin`` has been completed, OR
+      * the DB cannot be reached at all — break-glass is exactly for
+        "the database is down and I need in".
+
+    Once a DB admin exists and the DB is healthy, the env operator is inert
+    unless explicitly armed. This removes the "a permanent fast-hashed
+    password checked on every failed login" surface without a breaking
+    ``.env`` change for anyone using it correctly (as break-glass).
+    """
+    if _e("S43_BREAK_GLASS_ARMED", "").lower() in {"1", "true", "yes", "on"}:
+        return True
+    try:
+        from ...auth.users import count_active_admins, get_sessionmaker
+
+        sm = get_sessionmaker()
+        async with sm() as session:
+            return await count_active_admins(session) == 0
+    except Exception:
+        # No DATABASE_URL, DB unreachable, table missing — break-glass applies.
+        return True
+
+
 async def reverify_password(username: str, password: str) -> bool:
     """
     Re-validate a password for a subject that has already passed JWT
@@ -285,12 +463,17 @@ async def reverify_password(username: str, password: str) -> bool:
 
         sessionmaker = get_sessionmaker()
         async with sessionmaker() as session:
-            user = await authenticate_user(session, normalized, password, update_last_login=False)
+            # Read-only: authenticate_user() no longer writes last_login_at on
+            # any path. reverify_password() runs on every protected request —
+            # it must never touch the DB beyond the SELECT + Argon2 verify.
+            user = await authenticate_user(session, normalized, password)
             if user is not None:
                 return True
     except Exception as exc:
         logger.debug("DB-backed password reverify unavailable, falling back to env-var: %s", exc)
 
+    if not await _env_operator_allowed():
+        return False
     try:
         _validate_env_credentials(normalized, password)
         return True
@@ -316,23 +499,42 @@ async def _validate_credentials(username: str, password: str) -> tuple[str, str,
     normalized = username.strip()
 
     try:
-        from ...auth.users import authenticate_user, get_sessionmaker
+        from ...auth.users import authenticate_user, get_sessionmaker, record_login
 
         sessionmaker = get_sessionmaker()
         async with sessionmaker() as session:
             user = await authenticate_user(session, normalized, password)
             if user is not None:
-                return user.username, user.role, str(user.user_id)
+                # This IS a login — record it. authenticate_user() itself is
+                # read-only now; _validate_credentials owns this write and the
+                # commit. reverify_password()'s per-request path does not
+                # reach here, so last_login_at still means "last login".
+                subject, role, user_id = user.username, user.role, str(user.user_id)
+                await record_login(session, user)
+                await session.commit()
+                return subject, role, user_id
     except Exception as exc:
         # DATABASE_URL unset, DB unreachable, or table not created yet.
         # Not fatal — fall through to the env-var check below.
         logger.debug("DB-backed login unavailable, falling back to env-var credentials: %s", exc)
 
+    # #11: the env-var operator is break-glass only (see _env_operator_allowed).
+    if not await _env_operator_allowed():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return _validate_env_credentials(normalized, password), "operator", None
 
 
 def _issue_token(
-    subject: str, role: str = "operator", user_id: str | None = None
+    subject: str,
+    role: str = "operator",
+    user_id: str | None = None,
+    *,
+    sid: str | None = None,
+    jti: str | None = None,
 ) -> tuple[str, datetime]:
     """
     Sign and return a JWT for the given subject.
@@ -345,6 +547,17 @@ def _issue_token(
     user_id is only present for DB-backed accounts (see
     _validate_credentials) — env-var fallback logins omit it rather than
     fabricate one, since main.py and existing tests never require it.
+
+    sid / jti — Pass 5A foundation. When ``sid`` is supplied (a server-side
+    session id) the token becomes a *new-style, session-bound* access token:
+    it gains a ``sid`` claim and a ``jti`` claim (generated if not passed),
+    and its TTL drops to the short session-access TTL (approved target
+    15 min; ``S43_SESSION_ACCESS_TTL_SECONDS``, default 900, clamped
+    60s..1h). When ``sid`` is None — every caller today, including /auth/login
+    as it currently works — the payload is byte-for-byte what it was before
+    (no ``sid``, no ``jti``) and the TTL is the legacy
+    ``S43_JWT_TTL_SECONDS`` (default 8h). This keeps legacy token issuance
+    unchanged while the session layer is built out (mission Pass 5A §3, §6).
     """
     secret = _e("S43_JWT_SECRET")
     if not secret:
@@ -354,7 +567,14 @@ def _issue_token(
         )
 
     now    = int(time.time())
-    ttl    = _ei("S43_JWT_TTL_SECONDS", 28800, lo=60, hi=86400)
+    if sid is not None:
+        # New-style session-bound access token: short TTL (approved target =
+        # 15 min). The refresh session, not the access token, is the durable
+        # credential. Clamped 60s..1h; env-overridable for tuning during the
+        # Pass 5B rollout. Legacy tokens (sid is None) keep the 8h default.
+        ttl = _ei("S43_SESSION_ACCESS_TTL_SECONDS", 900, lo=60, hi=3600)
+    else:
+        ttl = _ei("S43_JWT_TTL_SECONDS", 28800, lo=60, hi=86400)
     exp    = now + ttl
     exp_dt = datetime.fromtimestamp(exp, tz=timezone.utc)
 
@@ -372,6 +592,17 @@ def _issue_token(
     }
     if user_id is not None:
         payload["user_id"] = user_id
+
+    if sid is not None:
+        # New-style session-bound token. Validate the sid shape here so a
+        # malformed session id can never be minted into a token.
+        if not _SESSION_ID_RE.match(sid):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Token generation failed.",
+            )
+        payload["sid"] = sid
+        payload["jti"] = jti if (jti and _JTI_RE.match(jti)) else _new_jti()
 
     token: Any = pyjwt.encode(
         payload,
@@ -493,7 +724,231 @@ def verify_jwt_token(token: str) -> dict[str, Any]:
             detail="Operator role required.",
         )
 
+    # New-style session-bound claims (Pass 5A). NEITHER is required — a legacy
+    # token carries neither and verifies exactly as before. But if a token
+    # presents `sid` or `jti`, they must be well-formed: a malformed value is
+    # a crafted/corrupt token, so fail closed rather than pass it through.
+    # Pass 5A does NOT look `sid` up against the sessions table here (no hot-
+    # path session read — mission Pass 5A §6); it only shape-checks.
+    if "sid" in claims:
+        sid = claims.get("sid")
+        if not isinstance(sid, str) or not _SESSION_ID_RE.match(sid):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    if "jti" in claims:
+        jti = claims.get("jti")
+        if not isinstance(jti, str) or not _JTI_RE.match(jti):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
     return claims
+
+
+# =============================================================================
+# Browser session — refresh cookie, CSRF double-submit, Phase-B dual contract
+# (beta-execution Phase 3; AUTH_ARCHITECTURE_PASS4.md §3, AUTH_MIGRATION_PASS4
+# Phase B). The access token stays the stateless request-hot-path credential
+# (verify_jwt_token, unchanged). The refresh session is the durable one.
+# =============================================================================
+
+REFRESH_COOKIE_NAME = "s43_refresh"
+CSRF_COOKIE_NAME = "s43_csrf"
+CSRF_HEADER_NAME = "X-S43-CSRF"
+# Path=/auth: the browser only ever sends the refresh cookie to /auth/refresh
+# and /auth/logout, never to a protected data route.
+_REFRESH_COOKIE_PATH = "/auth"
+
+# legacy_auth_request_total — Phase D observability. Incremented whenever a
+# protected request authenticates via X-S43-Password or an old-style
+# (sid-less) token. Credential-free. Read by the metrics route / tests.
+_legacy_auth_lock = threading.Lock()
+_legacy_auth_counts: dict[str, int] = {}
+
+
+def legacy_auth_request_total() -> dict[str, int]:
+    with _legacy_auth_lock:
+        return dict(_legacy_auth_counts)
+
+
+def note_legacy_auth(route: str) -> None:
+    key = route[:64] or "unknown"
+    with _legacy_auth_lock:
+        _legacy_auth_counts[key] = _legacy_auth_counts.get(key, 0) + 1
+        _legacy_auth_counts["_all"] = _legacy_auth_counts.get("_all", 0) + 1
+
+
+def legacy_auth_is_rejected() -> bool:
+    """Beta cutover switch (AUTH_MIGRATION_PASS4 Phase E). When true, a
+    protected request carrying X-S43-Password OR an old-style token is 401'd
+    instead of accepted. Off by default — flip only once every consumer emits
+    session tokens (the dashboard SPA + WS), per HANDOFF."""
+    return _e("S43_REJECT_LEGACY_AUTH", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _cookie_secure() -> bool:
+    """Refresh / CSRF cookies are issued Secure unless SENTINEL_ENV is local
+    (so the flow is exercisable over http://localhost in dev). The deployment
+    guarantees HTTPS in production (F-TLS-1); the app never infers scheme
+    (AUTH_TLS_POSTURE_PASS5A §4/§8)."""
+    env = _e("SENTINEL_ENV", "production").lower()
+    if env in {"development", "dev", "local", "test"}:
+        return _e("S43_FORCE_SECURE_COOKIES", "").lower() in {"1", "true", "yes", "on"}
+    return True
+
+
+def _session_access_ttl() -> int:
+    return _ei("S43_SESSION_ACCESS_TTL_SECONDS", 900, lo=60, hi=3600)
+
+
+def _allowed_origins() -> frozenset[str]:
+    raw = _e(
+        "S43_ALLOWED_ORIGINS",
+        "http://127.0.0.1:5500,http://localhost:5500,"
+        "http://127.0.0.1:8000,http://localhost:8000",
+    )
+    return frozenset(o.strip() for o in raw.split(",") if o.strip())
+
+
+def _check_state_change_origin(request: Request) -> None:
+    """Origin/Referer check for cookie-authenticated state changes (login /
+    refresh / logout). CORS is NOT CSRF protection — this is the server-side
+    half. A browser always sends Origin on a cross-site POST and on same-site
+    POSTs in modern browsers; a non-browser API client sends neither and is
+    not CSRF-exposed (it has no ambient cookie). So: if Origin is present it
+    MUST be allow-listed; if absent, fall back to Referer; if both absent,
+    allow (non-browser)."""
+    origin = request.headers.get("origin", "").strip()
+    allowed = _allowed_origins()
+    if origin:
+        if origin not in allowed:
+            raise HTTPException(status_code=403, detail="Origin not allowed.")
+        return
+    referer = request.headers.get("referer", "").strip()
+    if referer:
+        from urllib.parse import urlsplit
+
+        p = urlsplit(referer)
+        base = f"{p.scheme}://{p.netloc}"
+        if base not in allowed:
+            raise HTTPException(status_code=403, detail="Referer not allowed.")
+
+
+def _set_session_cookies(response: Response, refresh_secret: str, csrf_token: str) -> None:
+    from ...auth.sessions import refresh_ttl_seconds
+
+    ttl = refresh_ttl_seconds()
+    secure = _cookie_secure()
+    response.set_cookie(
+        REFRESH_COOKIE_NAME, refresh_secret,
+        max_age=ttl, path=_REFRESH_COOKIE_PATH,
+        httponly=True, secure=secure, samesite="strict",
+    )
+    # CSRF cookie is readable by JS (double-submit) — NOT HttpOnly. SameSite
+    # still Strict; Path=/ so the SPA can read it before calling /auth/*.
+    response.set_cookie(
+        CSRF_COOKIE_NAME, csrf_token,
+        max_age=ttl, path="/",
+        httponly=False, secure=secure, samesite="strict",
+    )
+
+
+def _clear_session_cookies(response: Response) -> None:
+    secure = _cookie_secure()
+    # Attributes must match the set call for the browser to actually drop it.
+    response.set_cookie(
+        REFRESH_COOKIE_NAME, "", max_age=0, path=_REFRESH_COOKIE_PATH,
+        httponly=True, secure=secure, samesite="strict",
+    )
+    response.set_cookie(
+        CSRF_COOKIE_NAME, "", max_age=0, path="/",
+        httponly=False, secure=secure, samesite="strict",
+    )
+
+
+async def _create_login_session(
+    *, user_id: str, request: Optional[Request],
+) -> tuple[str, str, str]:
+    """Create a server-side session for a DB account. Returns
+    (sid, refresh_secret, csrf_token). Commits its own transaction."""
+    from ...auth.sessions import create_session, generate_csrf_token, generate_refresh_secret
+    from ...auth.users import get_sessionmaker
+
+    refresh_secret = generate_refresh_secret()
+    csrf_token = generate_csrf_token()
+    client_ip = None
+    user_agent = None
+    if request is not None:
+        client_ip = request.client.host if request.client else None
+        user_agent = request.headers.get("user-agent")
+    sm = get_sessionmaker()
+    async with sm() as s:
+        row = await create_session(
+            s, user_id=uuid.UUID(user_id), refresh_secret=refresh_secret,
+            client_ip=client_ip, user_agent=user_agent,
+        )
+        await s.commit()
+        sid = str(row.sid)
+    return sid, refresh_secret, csrf_token
+
+
+async def resolve_session_subject(claims: dict[str, Any]) -> Optional[tuple[str, str]]:
+    """
+    Phase-B request gate for a **session-bound** access token.
+
+    Returns (subject, role) when the token's `sid` names a session that is
+    still live AND whose owning account is still active — the caller then does
+    NOT require X-S43-Password. Returns None when the token is NOT session-
+    bound (legacy path — caller falls back to the password check). Raises 401
+    when the token IS session-bound but the session is dead / the owner is
+    disabled.
+
+    One indexed PK lookup + one indexed user lookup per request, read-only
+    (no write — the Pass 3 "no DB write on the hot path" rule holds). This is
+    the immediate-revocation guarantee: logout / disablement / role change /
+    refresh-reuse all set `revoked_at`, so the very next request 401s.
+    """
+    if not token_is_session_bound(claims):
+        return None
+
+    from ...auth.sessions import (
+        SessionError,
+        resolve_live_session,
+    )
+    from ...auth.users import get_sessionmaker
+
+    sid = claims.get("sid")
+    try:
+        sid_uuid = uuid.UUID(str(sid))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="Invalid session.", headers={"WWW-Authenticate": "Bearer"})
+
+    try:
+        sm = get_sessionmaker()
+    except Exception:
+        # No DB configured but the token claims a session — cannot verify it.
+        raise HTTPException(status_code=401, detail="Session cannot be verified.", headers={"WWW-Authenticate": "Bearer"})
+
+    try:
+        async with sm() as s:
+            row, owner = await resolve_live_session(s, sid_uuid)
+    except SessionError:
+        raise HTTPException(
+            status_code=401,
+            detail="Session is no longer valid. Log in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    subject = str(claims.get("sub") or owner.username).strip()
+    # Role: trust the access-token claim for operator-vs-admin gating (≤ the
+    # 15-min access TTL stale). require_admin still re-reads the DB live.
+    role = str(claims.get("role") or owner.role).strip()
+    return subject, role
 
 
 # =============================================================================
@@ -501,21 +956,157 @@ def verify_jwt_token(token: str) -> dict[str, Any]:
 # =============================================================================
 
 @router.post("/login", response_model=LoginResponse)
-async def login(body: LoginRequest) -> LoginResponse:
+async def login(body: LoginRequest, request: Request, response: Response) -> LoginResponse:
     """
-    Exchange operator credentials for a signed JWT.
+    Exchange operator credentials for an access token.
 
-    The JWT is consumed by auth.js (stored in sessionStorage) and then sent
-    by websocket.js during the WebSocket authentication handshake.
+    DB accounts additionally get a server-side session: an opaque refresh
+    credential in an HttpOnly/Secure/SameSite=Strict cookie
+    (Path=/auth), a JS-readable CSRF token cookie, and a `sid`-bound 15-min
+    access token. The env-var break-glass operator (no DB row) gets the
+    legacy 8-hour token and no cookie.
+
+    Per-username brute-force throttle unchanged.
     """
-    subject, role, user_id = await _validate_credentials(body.username, body.password)
+    _check_state_change_origin(request)
+    _login_check_throttled(body.username)
+    try:
+        subject, role, user_id = await _validate_credentials(body.username, body.password)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+            _login_record_failure(body.username)
+        raise
+    _login_clear(body.username)
+
+    if user_id is not None:
+        try:
+            sid, refresh_secret, csrf_token = await _create_login_session(
+                user_id=user_id, request=request,
+            )
+        except Exception as exc:
+            # The account is valid but the session could not be persisted
+            # (sessions table missing / DB write error). Degrade to a legacy
+            # 8h token + X-S43-Password rather than lock a real operator out
+            # (Phase B — the legacy path is still fully wired). Logged so the
+            # deployment notices it is not on the session path.
+            logger.warning(
+                "session creation failed for %s (%s) — issuing a legacy token",
+                subject, type(exc).__name__,
+            )
+        else:
+            token, exp_dt = _issue_token(
+                subject=subject, role=role, user_id=user_id, sid=sid,
+            )
+            _set_session_cookies(response, refresh_secret, csrf_token)
+            return LoginResponse(
+                token=token, access_token=token, subject=subject,
+                role=role, expires_in=_session_access_ttl(),
+                expires_at=exp_dt.isoformat(), session_bound=True,
+            )
+
     token, exp_dt = _issue_token(subject=subject, role=role, user_id=user_id)
-
     return LoginResponse(
-        token=token,
-        subject=subject,
-        expires_at=exp_dt.isoformat(),
+        token=token, subject=subject, expires_at=exp_dt.isoformat(),
     )
+
+
+@router.post("/refresh", response_model=RefreshResponse)
+async def refresh(request: Request, response: Response) -> RefreshResponse:
+    """
+    Rotate the refresh session and mint a fresh 15-min access token.
+
+    Requires: the `s43_refresh` cookie AND a CSRF double-submit
+    (`X-S43-CSRF` header == `s43_csrf` cookie) AND an allow-listed Origin.
+    Any failure clears the cookies and 401s. Presenting a superseded refresh
+    value is treated as theft — the whole session is revoked.
+    """
+    _check_state_change_origin(request)
+
+    cookie = request.cookies.get(REFRESH_COOKIE_NAME, "")
+    if not cookie:
+        _clear_session_cookies(response)
+        raise HTTPException(status_code=401, detail="No session.", headers={"WWW-Authenticate": "Bearer"})
+
+    from ...auth.sessions import (
+        csrf_tokens_match,
+        generate_csrf_token,
+        generate_refresh_secret,
+        rotate_refresh,
+        RefreshInvalidError,
+        RefreshReuseError,
+        SessionExpiredError,
+        SessionOwnerInactiveError,
+        SessionRevokedError,
+    )
+    from ...auth.users import get_sessionmaker, get_user_by_id
+
+    csrf_cookie = request.cookies.get(CSRF_COOKIE_NAME)
+    if not csrf_tokens_match(csrf_cookie, request.headers.get(CSRF_HEADER_NAME)):
+        raise HTTPException(status_code=403, detail="CSRF check failed.")
+
+    new_secret = generate_refresh_secret()
+    # Keep the CSRF token stable across the session (re-issued only to refresh
+    # its Max-Age) so a client does not have to re-read it after every rotate.
+    new_csrf = csrf_cookie or generate_csrf_token()
+    sm = get_sessionmaker()
+    async with sm() as s:
+        try:
+            row, _outcome = await rotate_refresh(
+                s, presented_secret=cookie, new_refresh_secret=new_secret,
+            )
+        except RefreshReuseError:
+            await s.commit()  # persist the theft revoke
+            _clear_session_cookies(response)
+            raise HTTPException(status_code=401, detail="Session ended. Log in again.", headers={"WWW-Authenticate": "Bearer"})
+        except SessionOwnerInactiveError:
+            await s.commit()  # persist the owner-inactive revoke
+            _clear_session_cookies(response)
+            raise HTTPException(status_code=401, detail="Account is disabled.", headers={"WWW-Authenticate": "Bearer"})
+        except (RefreshInvalidError, SessionRevokedError, SessionExpiredError):
+            _clear_session_cookies(response)
+            raise HTTPException(status_code=401, detail="Session is no longer valid. Log in again.", headers={"WWW-Authenticate": "Bearer"})
+
+        owner = await get_user_by_id(s, row.user_id)
+        if owner is None or not owner.is_active:
+            await s.commit()
+            _clear_session_cookies(response)
+            raise HTTPException(status_code=401, detail="Account is disabled.", headers={"WWW-Authenticate": "Bearer"})
+        subject, role, user_id = owner.username, owner.role, str(owner.user_id)
+        await s.commit()
+
+    token, exp_dt = _issue_token(subject=subject, role=role, user_id=user_id, sid=str(row.sid))
+    _set_session_cookies(response, new_secret, new_csrf)
+    return RefreshResponse(
+        token=token, access_token=token, subject=subject, role=role,
+        expires_in=_session_access_ttl(), expires_at=exp_dt.isoformat(),
+    )
+
+
+@router.post("/logout")
+async def logout(request: Request, response: Response) -> dict[str, Any]:
+    """
+    Revoke the server-side session and clear the cookies. Idempotent: no
+    cookie, an unknown value, or an already-revoked session all return 200.
+    Requires the CSRF double-submit when a refresh cookie is present.
+    """
+    _check_state_change_origin(request)
+    cookie = request.cookies.get(REFRESH_COOKIE_NAME, "")
+    if cookie:
+        from ...auth.sessions import csrf_tokens_match, logout_by_refresh
+        from ...auth.users import get_sessionmaker
+
+        if not csrf_tokens_match(request.cookies.get(CSRF_COOKIE_NAME), request.headers.get(CSRF_HEADER_NAME)):
+            raise HTTPException(status_code=403, detail="CSRF check failed.")
+        try:
+            sm = get_sessionmaker()
+            async with sm() as s:
+                await logout_by_refresh(s, presented_secret=cookie)
+                await s.commit()
+        except Exception as exc:  # never let a teardown error keep a user "logged in"
+            logger.warning("logout revoke error: %s", type(exc).__name__)
+
+    _clear_session_cookies(response)
+    return {"ok": True}
 
 
 @router.get("/verify", response_model=VerifyResponse)

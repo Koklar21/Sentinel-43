@@ -64,6 +64,11 @@ from ..bootstrap import bootstrap_expectations
 from ..logging.health_check_filter import install_health_check_access_filter
 from .routers.audit import router as audit_router
 from .routers.auth import router as auth_router
+# core/api/routers/bootstrap.py is a THIRD, unrelated module also named
+# bootstrap — see the naming note in core/bootstrap.py. This one is the
+# first-run admin account setup router (GET /bootstrap/status,
+# POST /bootstrap/admin), not startup expectations. Aliased to avoid
+# colliding with bootstrap_expectations imported above.
 from .routers.users import router as users_router
 from .routers.bootstrap import router as bootstrap_router
 from .routers.remote_gateway import router as remote_gateway_router
@@ -216,7 +221,14 @@ async def _get_operator(
     if auth.startswith("Bearer "):
         token = auth[7:].strip()
         if token:
-            from .routers.auth import PASSWORD_HEADER_NAME, reverify_password, verify_jwt_token
+            from .routers.auth import (
+                PASSWORD_HEADER_NAME,
+                legacy_auth_is_rejected,
+                note_legacy_auth,
+                resolve_session_subject,
+                reverify_password,
+                verify_jwt_token,
+            )
 
             # verify_jwt_token() validates signature, claims, and role, and
             # raises the appropriate HTTPException (401/403/503) itself.
@@ -225,8 +237,20 @@ async def _get_operator(
             subject = str(claims.get("sub") or "").strip()
             subject = subject if subject else f"bearer:{token[:16]}"
 
-            # A valid JWT is no longer sufficient by itself \u2014 every protected
-            # request must also re-supply the operator's password.
+            # Phase B (beta-execution): a session-bound token whose sid names a
+            # live session authenticates by itself. resolve_session_subject()
+            # raises 401 if the session is dead / owner disabled.
+            resolved = await resolve_session_subject(claims)
+            if resolved is not None:
+                return resolved[0]
+
+            # Legacy path: old-style token still needs the per-request password.
+            if legacy_auth_is_rejected():
+                raise HTTPException(
+                    status_code=401,
+                    detail="Legacy authentication is no longer accepted. Log in again.",
+                )
+            note_legacy_auth("dashboard")
             password = request.headers.get(PASSWORD_HEADER_NAME, "")
             if not password:
                 raise HTTPException(status_code=401, detail="Password required")
@@ -318,6 +342,25 @@ def _validate_security_config() -> None:
             raise RuntimeError(
                 "Production Sentinel-43 API requires S43_WS_REQUIRE_AUTH=true"
             )
+        # F-TLS-1 (beta-execution Phase 2): a browser-facing CORS origin over
+        # plain http:// means the refresh cookie / access token cross the wire
+        # in cleartext. Loopback origins are exempt (browsers treat
+        # http://localhost as a secure context). Opt out for a TLS-terminating
+        # proxy on a trusted private network with S43_ALLOW_INSECURE_ORIGINS=true.
+        if not _env_bool("S43_ALLOW_INSECURE_ORIGINS"):
+            _loopback = re.compile(r"^http://(localhost|127\.0\.0\.1)(:\d+)?$")
+            insecure = sorted(
+                o for o in _ALLOWED_ORIGINS
+                if o.startswith("http://") and not _loopback.match(o)
+            )
+            if insecure:
+                raise RuntimeError(
+                    "Non-local Sentinel-43 API requires HTTPS origins in "
+                    f"S43_ALLOWED_ORIGINS; found plaintext: {insecure}. Put the "
+                    "API behind a TLS terminator and use https:// origins, or "
+                    "set S43_ALLOW_INSECURE_ORIGINS=true for a proxy on a "
+                    "trusted private network."
+                )
 
 
 # =============================================================================
@@ -932,6 +975,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# SentinelFirewall is a required security control. A failure to import,
+# configure (FirewallConfig.from_env()), or register it must NOT leave the
+# API silently serving requests unprotected. Outside an explicit
+# development/local/test environment (SENTINEL_ENV), this is a fatal,
+# fail-closed startup error -- the same posture as _validate_security_config().
+# In a local/test environment it degrades to a loud error and continues, so a
+# developer can still iterate without the firewall's config plumbing.
+# To run without the firewall on purpose, set S43_FIREWALL_ENABLED=false
+# (the middleware still mounts, as a pass-through) -- do not rely on this
+# exception path.
 try:
     from core.middleware import SentinelFirewall, FirewallConfig
     app.add_middleware(
@@ -940,10 +993,50 @@ try:
         monitoring_manager=_monitoring_manager,
     )
     logger.info("SentinelFirewall middleware registered")
-except ImportError:
-    logger.warning("core.middleware.SentinelFirewall not available -- no firewall middleware")
-except Exception as _fw_exc:
-    logger.error("SentinelFirewall middleware failed to register: %s", _fw_exc)
+except Exception as _fw_exc:  # noqa: BLE001 - deliberately broad; re-raised below outside local envs
+    if _is_local_environment():
+        logger.error(
+            "SentinelFirewall middleware failed to register (%s: %s) -- "
+            "continuing WITHOUT the firewall because SENTINEL_ENV=%r is a "
+            "local/test environment. This would be a fatal error in production.",
+            type(_fw_exc).__name__, _fw_exc, SENTINEL_ENV,
+        )
+    else:
+        raise RuntimeError(
+            f"SentinelFirewall middleware failed to register "
+            f"({type(_fw_exc).__name__}: {_fw_exc}). The firewall is a "
+            f"required security control outside development/local/test "
+            f"environments; refusing to start unprotected."
+        ) from _fw_exc
+
+# --- Transport-security response headers (beta-execution Phase 2, F-TLS-1) ---
+# HSTS (only when the request actually arrived over HTTPS, or via a trusted
+# proxy that says so), plus static hardening headers. Cookies stay Secure
+# unconditionally regardless (AUTH_TLS_POSTURE_PASS5A §8). Added AFTER the
+# firewall so it also decorates the firewall's own block responses.
+from .middleware.security_headers import SecurityHeadersMiddleware
+app.add_middleware(SecurityHeadersMiddleware)
+
+# --- Explicit Host allow-list (beta-execution Phase 2) ---
+# S43_TRUSTED_HOSTS is a comma-separated list of the exact Host values this
+# deployment answers on (e.g. "beta.example.com,.example.com"). Unset => no
+# Host check (dev / behind a proxy that already validates Host). Probe paths
+# (/health, /ready, ...) are always exempt so Kubernetes / Docker / LB health
+# checks — which send Host: <podIP> or Host: localhost — keep working
+# (see TrustedHostGuard). In a non-local env an unset value is logged loudly.
+from .middleware.security_headers import TrustedHostGuard
+app.add_middleware(TrustedHostGuard)
+_TRUSTED_HOSTS: list[str] = [
+    h.strip() for h in _env_str("S43_TRUSTED_HOSTS").split(",") if h.strip()
+]
+if _TRUSTED_HOSTS:
+    logger.info("Host allow-list active: %s (probe paths exempt)", _TRUSTED_HOSTS)
+elif not _is_local_environment():
+    logger.warning(
+        "S43_TRUSTED_HOSTS is not set in a non-local environment — the API "
+        "will answer on any Host header. Set it to this deployment's public "
+        "hostname(s) for defence against Host-header attacks."
+    )
 
 try:
     from core.monitoring import SpartaCore as _SC, IntegrityConfig as _IC, create_node_router
@@ -991,23 +1084,42 @@ def serve_dashboard_html() -> FileResponse:
 # =============================================================================
 # WebSocket endpoint
 # =============================================================================
-async def _ws_safe_close(websocket: WebSocket, code: int = 1008) -> None:
+async def _ws_safe_close(
+    websocket: WebSocket, code: int = 1008, reason: str = ""
+) -> None:
     """
     Close a WebSocket, swallowing RuntimeError if already closed.
     Starlette/uvicorn raises RuntimeError when close() is attempted on a
     connection that was rejected before accept(), or when the client
     already disconnected. This helper guards every auth-rejection path.
+
+    ``reason`` is a short machine string (e.g. "invalid_token",
+    "invalid_password", "session_revoked", "token_expired",
+    "origin_rejected", "capacity"). dashboard/assets/js/websocket.js
+    classifies a 1008 close as an auth failure vs a generic policy error by
+    matching this string (finding #6) \u2014 auth-related reasons contain one of
+    auth|token|password|credential|session|login.
     """
     try:
-        await websocket.close(code=code)
+        await websocket.close(code=code, reason=reason)
     except RuntimeError:
         pass
+    except TypeError:  # very old starlette: close() had no reason kwarg
+        try:
+            await websocket.close(code=code)
+        except RuntimeError:
+            pass
+
+
+def _ws_session_recheck_seconds() -> int:
+    return _env_int("S43_WS_SESSION_RECHECK_SECONDS", 60)
+
 
 @app.websocket("/ws")
 async def dashboard_websocket(websocket: WebSocket) -> None:
     origin = websocket.headers.get("origin", "")
     if _ALLOWED_ORIGINS and origin and origin not in _ALLOWED_ORIGINS:
-        await _ws_safe_close(websocket)
+        await _ws_safe_close(websocket, reason="origin_rejected")
         return
 
     if len(_dashboard_ws_clients) >= MAX_WS_CLIENTS:
@@ -1016,10 +1128,16 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
             "type": "error",
             "payload": {"error": "Server is at maximum dashboard capacity"},
         })
-        await _ws_safe_close(websocket)
+        await _ws_safe_close(websocket, reason="capacity")
         return
 
     await websocket.accept()
+
+    # Session-bound WS connections carry these so the message loop can drop
+    # the connection when the access token expires or the session is revoked
+    # mid-stream (beta-execution Phase B: "no infinite WS session").
+    ws_sid: str | None = None
+    ws_exp: float | None = None
 
     if WS_REQUIRE_AUTH:
         await websocket.send_json({
@@ -1037,7 +1155,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
         except WebSocketDisconnect:
             return
         except (asyncio.TimeoutError, ValueError):
-            await _ws_safe_close(websocket)
+            await _ws_safe_close(websocket, reason="auth_timeout")
             return
 
         if auth_msg.get("type") != "auth":
@@ -1045,7 +1163,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 "type": "error",
                 "payload": {"error": "First message must be an auth frame"},
             })
-            await _ws_safe_close(websocket)
+            await _ws_safe_close(websocket, reason="invalid_auth_frame")
             return
 
         token = str(auth_msg.get("payload", {}).get("token") or "").strip()
@@ -1054,10 +1172,16 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 "type": "error",
                 "payload": {"error": "Token missing"},
             })
-            await _ws_safe_close(websocket)
+            await _ws_safe_close(websocket, reason="invalid_token")
             return
 
-        from .routers.auth import reverify_password, verify_jwt_token
+        from .routers.auth import (
+            legacy_auth_is_rejected,
+            note_legacy_auth,
+            resolve_session_subject,
+            reverify_password,
+            verify_jwt_token,
+        )
 
         try:
             # verify_jwt_token() validates signature, claims, and role, and
@@ -1065,24 +1189,56 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
             ws_claims = verify_jwt_token(token)
         except HTTPException as exc:
             await websocket.send_json({"type": "error", "payload": {"error": str(exc.detail)}})
-            await _ws_safe_close(websocket)
+            await _ws_safe_close(websocket, reason="invalid_token")
             return
 
-        # A valid JWT is no longer sufficient by itself \u2014 the auth frame must
-        # also carry the operator's password, re-verified against storage.
         ws_subject = str(ws_claims.get("sub") or "").strip()
-        ws_password = str(auth_msg.get("payload", {}).get("password") or "").strip()
-        if not ws_password:
-            await websocket.send_json({"type": "error", "payload": {"error": "Password missing"}})
-            await _ws_safe_close(websocket)
+
+        # Phase B: a live session-bound token needs NO password frame.
+        try:
+            resolved = await resolve_session_subject(ws_claims)
+        except HTTPException:
+            await websocket.send_json({"type": "error", "payload": {"error": "Session is no longer valid"}})
+            await _ws_safe_close(websocket, reason="session_revoked")
             return
 
-        if not await reverify_password(ws_subject, ws_password):
-            await websocket.send_json({"type": "error", "payload": {"error": "Invalid password"}})
-            await _ws_safe_close(websocket)
-            return
+        if resolved is not None:
+            ws_sid = str(ws_claims.get("sid"))
+            _exp = ws_claims.get("exp")
+            ws_exp = float(_exp) if isinstance(_exp, (int, float)) else None
+        else:
+            # Legacy frame: {token, password}, password re-verified.
+            if legacy_auth_is_rejected():
+                await websocket.send_json({"type": "error", "payload": {"error": "Legacy authentication is no longer accepted. Log in again."}})
+                await _ws_safe_close(websocket, reason="legacy_auth_rejected")
+                return
+            note_legacy_auth("websocket")
+            ws_password = str(auth_msg.get("payload", {}).get("password") or "").strip()
+            if not ws_password:
+                await websocket.send_json({"type": "error", "payload": {"error": "Password missing"}})
+                await _ws_safe_close(websocket, reason="invalid_password")
+                return
+            if not await reverify_password(ws_subject, ws_password):
+                await websocket.send_json({"type": "error", "payload": {"error": "Invalid password"}})
+                await _ws_safe_close(websocket, reason="invalid_password")
+                return
 
     _dashboard_ws_clients[websocket] = set()
+
+    async def _session_still_valid() -> tuple[bool, str]:
+        """(ok, reason). Cheap re-check for a session-bound connection."""
+        if ws_exp is not None and time.time() >= ws_exp:
+            return False, "token_expired"
+        if ws_sid is None:
+            return True, ""
+        try:
+            from .routers.auth import resolve_session_subject as _rss
+            ok = await _rss({"sid": ws_sid, "sub": "x", "role": "operator"})
+            return (ok is not None), ("" if ok is not None else "session_revoked")
+        except HTTPException:
+            return False, "session_revoked"
+        except Exception:
+            return True, ""  # transient DB error \u2014 don't drop the operator
 
     try:
         await websocket.send_json({
@@ -1092,10 +1248,26 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
 
         while True:
             try:
-                message = await _receive_ws_message(websocket)
+                message = await asyncio.wait_for(
+                    _receive_ws_message(websocket),
+                    timeout=float(_ws_session_recheck_seconds()),
+                )
+            except asyncio.TimeoutError:
+                ok, why = await _session_still_valid()
+                if not ok:
+                    await websocket.send_json({"type": "error", "payload": {"error": why}})
+                    await _ws_safe_close(websocket, reason=why)
+                    return
+                continue
             except ValueError as exc:
                 await websocket.send_json({"type": "error", "payload": {"error": str(exc)}})
                 continue
+
+            ok, why = await _session_still_valid()
+            if not ok:
+                await websocket.send_json({"type": "error", "payload": {"error": why}})
+                await _ws_safe_close(websocket, reason=why)
+                return
 
             event_type = message.get("type")
             payload    = message.get("payload")
@@ -1559,6 +1731,9 @@ async def fenrir_metrics(request: Request) -> dict[str, Any]:
 # =============================================================================
 @app.get("/health")
 def health() -> dict[str, str]:
+    # LIVENESS. Deliberately does not touch the database or any dependency:
+    # a DB outage or a schema mismatch must not make Kubernetes kill every
+    # API pod. "Is this process serving HTTP?" — nothing more.
     return {
         "status":      "ok",
         "service":     APP_NAME,
@@ -1567,7 +1742,28 @@ def health() -> dict[str, str]:
     }
 
 @app.get("/ready")
-def ready() -> dict[str, str]:
+async def ready() -> Any:
+    # READINESS. "Should this pod receive traffic right now?" In a non-local
+    # environment this refuses (503) when the database it is pointed at is not
+    # at the Alembic revision this code expects — behind (migration Job not
+    # done), ahead (an old replica after a newer deploy migrated), or a
+    # pre-Alembic database that was never adopted. The API never runs the
+    # migration itself (MIGRATION_ARCHITECTURE_PASS5AM.md §25); it only checks.
+    # Local envs and a no-DATABASE_URL deployment are never gated.
+    from ..auth.schema_version import schema_report
+
+    report = await schema_report()
+    if report.serving_blocked:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status":       "not_ready",
+                "service":      APP_NAME,
+                "reason":       "schema_version",
+                "schema_state": report.state.value,
+                "detail":       report.detail,
+            },
+        )
     return {"status": "ready", "service": APP_NAME}
 
 # =============================================================================
@@ -1594,11 +1790,19 @@ def version() -> dict[str, Any]:
 
 @root_router.get("/metrics")
 def metrics() -> dict[str, Any]:
+    # legacy_auth_request_total — Phase D observability for the X-S43-Password
+    # / old-style-token retirement. Per route + `_all`. Credential-free.
+    try:
+        from .routers.auth import legacy_auth_request_total
+        legacy_auth = legacy_auth_request_total()
+    except Exception:
+        legacy_auth = {}
     return {
         "service":                      APP_NAME,
         "uptime_seconds":               uptime_seconds(),
         "status":                       "online",
         "watchtower_heartbeat_seconds": WATCHTOWER_HEARTBEAT_SECONDS,
+        "legacy_auth_request_total":    legacy_auth,
         "timestamp":                    utc_now(),
     }
 
@@ -1608,8 +1812,8 @@ def metrics() -> dict[str, Any]:
 api_router = APIRouter(prefix="/api", tags=["api-compat"])
 
 @api_router.get("/ready")
-def compat_api_ready() -> dict[str, str]:
-    return ready()
+async def compat_api_ready() -> Any:
+    return await ready()
 
 @api_router.get("/status")
 def compat_api_status() -> dict[str, Any]:

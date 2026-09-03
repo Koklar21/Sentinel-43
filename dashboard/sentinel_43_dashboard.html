@@ -20,9 +20,15 @@
 
     All existing IDs preserved. CSP unchanged (script-src 'self').
   -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' http://localhost:8000 ws://localhost:8000; object-src 'none'; base-uri 'self'; form-action 'self'" />
-  <meta name="sentinel-api-base" content="http://localhost:8000" />
-  <meta name="sentinel-ws-url" content="ws://localhost:8000/ws" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'" />
+  <!-- API base + WS URL: empty => same origin as this page. That is the
+       supported beta setup (the SPA is served by the API, behind the TLS
+       proxy, so /auth/*, /api/* and /ws are all same-origin). Only set a
+       value here (or via window.SENTINEL_API_BASE_URL / SENTINEL_WS_URL /
+       SENTINEL_RUNTIME_CONFIG) for a split-origin local-dev setup, and then
+       also add that origin to connect-src above. -->
+  <meta name="sentinel-api-base" content="" />
+  <meta name="sentinel-ws-url" content="" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />

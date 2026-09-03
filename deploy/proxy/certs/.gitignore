@@ -1,0 +1,6 @@
+# TLS material is environment-specific and secret — never committed.
+*.crt
+*.key
+*.pem
+*.p12
+!.gitignore

@@ -1,7 +1,30 @@
 /* =============================================================================
    Sentinel-43 Dashboard
    auth.js — Operator login flow and JWT lifecycle
-   v1.6.0
+   v1.8.0
+
+   Changes from v1.7.0 (next-PR Phase C — real-browser + same-origin beta):
+   - The bearer access token is now held in module memory ONLY. It is no
+     longer written to sessionStorage (init() refreshes it from the HttpOnly
+     cookie on every load, so persistence bought nothing and was an XSS
+     exfil target). Exposed as window.SentinelAuth.getToken() for
+     websocket.js / dashboard.js; an old sessionStorage["SENTINEL_JWT"] is
+     cleared on load.
+   - No functional change to endpoints (still same-origin /auth/*).
+
+   Changes from v1.6.0 (beta-execution Phase 3 — browser session):
+   - Login now also gets an HttpOnly refresh cookie + a JS-readable CSRF
+     cookie (s43_csrf) + a sid-bound 15-min access token for DB accounts
+     (result.session_bound === true). X-S43-Password is no longer required
+     on requests for a session-bound operator — the in-memory password is
+     kept only as a fallback for the legacy env-operator (dual contract).
+   - init() calls POST /auth/refresh on load: a reload no longer forces a
+     fresh login for a DB-account operator (the refresh cookie is exchanged
+     for a new access token). No session cookie / rejected refresh => the
+     login overlay, as before.
+   - logout() calls POST /auth/logout (CSRF double-submit) to revoke the
+     server-side session before clearing local state.
+   - New: refreshSession() on the public API.
 
    Changes from v1.5.1:
    - BREAKING (security): password is no longer persisted to sessionStorage
@@ -41,12 +64,22 @@ window.SentinelAuth = (() => {
    ========================================================================= */
 
 const LOGIN_ENDPOINT    = "/auth/login";
+const REFRESH_ENDPOINT  = "/auth/refresh";
+const LOGOUT_ENDPOINT   = "/auth/logout";
+const CSRF_COOKIE       = "s43_csrf";
+const CSRF_HEADER       = "X-S43-CSRF";
 const TOKEN_KEY         = "SENTINEL_JWT";
 const TOKEN_MIN_LEN     = 20;
 const TOKEN_MAX_LEN     = 4096;
 const USERNAME_MAX_LEN  = 128;
 const PASSWORD_MAX_LEN  = 1024;
 const LOGIN_TIMEOUT_MS  = 10_000;
+const REFRESH_TIMEOUT_MS = 8_000;
+
+function _readCookie(name) {
+    const m = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
+    return m ? decodeURIComponent(m[1]) : null;
+}
 
 const JWT_SHAPE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 
@@ -95,12 +128,24 @@ function _sessionStorageAvailable() {
     }
 }
 
+// The bearer access token lives in module memory ONLY -- never sessionStorage
+// or localStorage. It is short-lived (15 min, sid-bound) and init() exchanges
+// the HttpOnly refresh cookie for a fresh one on every page load, so there is
+// nothing to gain by persisting it and a stored token is an XSS-exfiltration
+// target. Cleared on refresh / navigation / tab close by construction.
+let _accessToken = null;
+
+// One-time cleanup of any token left in sessionStorage by an older build.
+try { sessionStorage.removeItem(TOKEN_KEY); } catch {}
+
 function getToken() {
-    try { return sessionStorage.getItem(TOKEN_KEY) || null; } catch { return null; }
+    return typeof _accessToken === "string" && _accessToken ? _accessToken : null;
 }
 
 function setToken(token) {
-    try { sessionStorage.setItem(TOKEN_KEY, token); return true; } catch { return false; }
+    if (typeof token !== "string" || !token) return false;
+    _accessToken = token;
+    return true;
 }
 
 function getPassword() {
@@ -123,6 +168,7 @@ function setSessionPassword(password) {
 
 function clearToken() {
     _sessionPassword = null;
+    _accessToken = null;
     try {
         sessionStorage.removeItem(TOKEN_KEY);
     } catch {}
@@ -164,7 +210,9 @@ async function attemptLogin(username, password) {
         throw new Error("Invalid username or password.");
     }
 
-    const token = typeof body.token === "string" ? body.token.trim() : "";
+    const token = typeof (body.access_token || body.token) === "string"
+        ? (body.access_token || body.token).trim()
+        : "";
 
     if (
         token.length < TOKEN_MIN_LEN ||
@@ -175,6 +223,39 @@ async function attemptLogin(username, password) {
     }
 
     return { ...body, token };
+}
+
+/* =========================================================================
+   Refresh — exchange the HttpOnly refresh cookie for a new access token.
+   Called on page load so a reload no longer forces a fresh login for a
+   DB-account operator. Returns the new access token, or null.
+   ========================================================================= */
+
+async function refreshSession() {
+    const csrf = _readCookie(CSRF_COOKIE);
+    if (!csrf) return null;  // no session cookie -> nothing to refresh
+
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), REFRESH_TIMEOUT_MS);
+    try {
+        const res = await fetch(REFRESH_ENDPOINT, {
+            method: "POST",
+            headers: { [CSRF_HEADER]: csrf },
+            credentials: "same-origin",
+            cache: "no-store",
+            signal: controller.signal,
+        });
+        if (!res.ok) return null;
+        const body = await res.json().catch(() => ({}));
+        const token = typeof (body.access_token || body.token) === "string"
+            ? (body.access_token || body.token).trim() : "";
+        if (token.length < TOKEN_MIN_LEN || !JWT_SHAPE_RE.test(token)) return null;
+        return token;
+    } catch {
+        return null;
+    } finally {
+        clearTimeout(t);
+    }
 }
 
 /* =========================================================================
@@ -300,9 +381,16 @@ function buildOverlay() {
             const result = await attemptLogin(username, password);
 
             const tokenStored  = setToken(result.token);
+            // For a DB-account operator the backend also set an HttpOnly
+            // refresh cookie + a sid-bound token; X-S43-Password is no longer
+            // required on requests, so we don't *need* to hold the password.
+            // We still keep it (in memory only) as a fallback for the legacy
+            // env-operator / dual-contract path. session_bound === false means
+            // the legacy path, where the password IS required.
             const passwordHeld = setSessionPassword(password);
+            const sessionBound = result.session_bound === true;
 
-            if (!tokenStored || !passwordHeld) {
+            if (!tokenStored || (!passwordHeld && !sessionBound)) {
                 clearToken();
                 throw new Error(
                     "Unable to establish the authenticated session. Check browser storage settings."
@@ -397,10 +485,12 @@ window.addEventListener("sentinel:ws:auth_failed", () => {
 
 /* =========================================================================
    Init
-   Stored-token verification was removed: a token surviving a refresh has
-   no matching in-memory password and cannot drive any protected route, so
-   there is nothing useful to verify it against. A refresh always requires
-   a fresh login.
+   On load, try to exchange the HttpOnly refresh cookie for a fresh access
+   token (POST /auth/refresh). If it works, the operator stays logged in
+   across a reload without re-typing their password (session-bound path).
+   If there's no session cookie, or the refresh is rejected, fall back to
+   the login overlay. The legacy env-operator has no refresh cookie and
+   always lands on the overlay.
    ========================================================================= */
 
 async function init() {
@@ -415,14 +505,24 @@ async function init() {
         return;
     }
 
-    const token = getToken();
+    const staleToken = getToken();
+    if (staleToken) clearToken();
 
-    if (token) {
-        clearToken();
+    const refreshed = await refreshSession();
+    if (refreshed && setToken(refreshed)) {
+        // session-bound: no in-memory password needed for requests
+        _sessionPassword = null;
+        _markAuthReady();
+        hideOverlay();
+        if (window.SentinelWS) {
+            window.SentinelWS.disconnect();
+            window.SentinelWS.connect();
+        }
+        return;
     }
 
-    const expiredMsg = token
-        ? "Your secure session ended when the page was reloaded. Please authenticate again."
+    const expiredMsg = staleToken
+        ? "Your session ended. Please authenticate again."
         : undefined;
 
     if (document.readyState === "loading") {
@@ -443,14 +543,29 @@ init();
    ========================================================================= */
 
 return Object.freeze({
-    logout() {
+    async logout() {
+        // Revoke the server-side session first (best-effort), then clear
+        // local state regardless of the result.
+        const csrf = _readCookie(CSRF_COOKIE);
+        try {
+            await fetch(LOGOUT_ENDPOINT, {
+                method: "POST",
+                headers: csrf ? { [CSRF_HEADER]: csrf } : {},
+                credentials: "same-origin",
+                cache: "no-store",
+            });
+        } catch { /* clear locally anyway */ }
         clearToken();
         _resetAuthReady();
         _markAuthLocked("Operator logged out");
         if (window.SentinelWS) window.SentinelWS.disconnect();
         showOverlay("You have been logged out.");
     },
+    refreshSession,
     hasToken: () => !!getToken(),
+    // In-memory bearer access token for same-origin consumers (websocket.js,
+    // dashboard.js). Never persisted; returns null when logged out.
+    getToken,
     getPassword,
 
     applyManualCredentials(token, password) {

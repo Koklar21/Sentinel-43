@@ -1,0 +1,8 @@
+# Test CA + leaf are generated locally by generate-test-ca.sh, never committed.
+*.crt
+*.key
+*.csr
+*.srl
+*.ext
+*.txt
+!.gitignore

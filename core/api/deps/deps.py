@@ -49,9 +49,6 @@ ENV_DEV_ENGINE_ENABLED = "S43_ENABLE_DEV_ENGINE"
 ENV_DEV_STORE_ENABLED = "S43_ENABLE_DEV_STORE"
 
 
-_APPROVED_ROLES = frozenset({"operator", "admin"})
-
-
 # -----------------------------------------------------------------------------
 # Watchtower intercom
 # -----------------------------------------------------------------------------
@@ -196,14 +193,16 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return default
 
 
-def _verify_operator_jwt(token: str) -> dict[str, Any]:
-    """Use the same verifier and current configuration as login and admin routes."""
-    from ..routers.auth import verify_jwt_token
-
-    return verify_jwt_token(token)
-
-
 async def require_operator(request: Request) -> str:
+    """
+    Require operator authentication for /v1 routes.
+
+    Delegates JWT verification to core.api.routers.auth.verify_jwt_token() —
+    the single JWT verifier for the whole API — rather than keeping a second
+    copy here. That function only recognizes the "role" claim (no "scope"
+    fallback) and reads S43_JWT_SECRET/_ISSUER/_AUDIENCE from the environment
+    at call time, matching main.py's _get_operator()/_require_operator().
+    """
     auth = request.headers.get("Authorization", "").strip()
 
     if not auth.startswith("Bearer "):
@@ -213,30 +212,36 @@ async def require_operator(request: Request) -> str:
     if not token:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    claims = _verify_operator_jwt(token)
+    from ..routers.auth import (
+        PASSWORD_HEADER_NAME,
+        legacy_auth_is_rejected,
+        note_legacy_auth,
+        resolve_session_subject,
+        reverify_password,
+        verify_jwt_token,
+    )
 
-    roles: set[str] = set()
-
-    role_claim = claims.get("role")
-    if role_claim:
-        roles.add(str(role_claim).strip())
-
-    scope_claim = claims.get("scope")
-    if isinstance(scope_claim, str):
-        roles.update(part.strip() for part in scope_claim.split() if part.strip())
-    elif isinstance(scope_claim, (list, tuple, set)):
-        roles.update(str(part).strip() for part in scope_claim if str(part).strip())
-
-    if not roles.intersection(_APPROVED_ROLES):
-        raise HTTPException(status_code=403, detail="Operator role required")
+    claims = verify_jwt_token(token)
 
     subject = str(claims.get("sub") or "").strip()
     subject = subject if subject else f"bearer:{token[:16]}"
 
-    # A valid JWT is no longer sufficient on its own — every protected
-    # request must also re-supply the operator's password.
-    from ..routers.auth import PASSWORD_HEADER_NAME, reverify_password
+    # Phase B (beta-execution): a session-bound access token whose sid names a
+    # live session (owner still active) authenticates on its own — no
+    # X-S43-Password. resolve_session_subject() raises 401 if the session is
+    # dead / the owner is disabled.
+    resolved = await resolve_session_subject(claims)
+    if resolved is not None:
+        return resolved[0]
 
+    # Legacy path: old-style (sid-less) token still requires the per-request
+    # password, exactly as before.
+    if legacy_auth_is_rejected():
+        raise HTTPException(
+            status_code=401,
+            detail="Legacy authentication is no longer accepted. Log in again.",
+        )
+    note_legacy_auth("/v1")
     password = request.headers.get(PASSWORD_HEADER_NAME, "")
     if not password:
         raise HTTPException(status_code=401, detail="Password required")
@@ -255,11 +260,13 @@ async def require_admin(
     the DB-backed user store (core.auth.users). Gates the account-management
     router (core/api/routers/users.py).
 
-    The JWT + per-request X-S43-Password check here is deliberately the same
-    one main.py's _get_operator() uses for every other protected route —
+    The JWT + per-request X-S43-Password check here is the same one
+    require_operator() (post-5332d54) and main.py's _get_operator() run —
     core.api.routers.auth.verify_jwt_token() / reverify_password(), both of
-    which read their config from the environment at call time, as does
-    require_operator().
+    which read their config from the environment at call time. It performs
+    that sequence inline rather than delegating to require_operator() so the
+    admin DB lookup below can reuse the get_db_session() dependency; the two
+    are equivalent post-5332d54 and this could be collapsed later.
 
     The admin check reads the live database, not the JWT 'role' claim, so an
     admin who is demoted or deactivated loses this access on their very next
@@ -271,6 +278,9 @@ async def require_admin(
     """
     from ..routers.auth import (
         PASSWORD_HEADER_NAME,
+        legacy_auth_is_rejected,
+        note_legacy_auth,
+        resolve_session_subject,
         reverify_password,
         verify_jwt_token,
     )
@@ -291,11 +301,23 @@ async def require_admin(
     if not subject:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    password = request.headers.get(PASSWORD_HEADER_NAME, "")
-    if not password:
-        raise HTTPException(status_code=401, detail="Password required")
-    if not await reverify_password(subject, password):
-        raise HTTPException(status_code=401, detail="Invalid password")
+    # Phase B: a live session-bound token skips X-S43-Password. The live-DB
+    # admin check below still runs regardless of how the caller authenticated.
+    resolved = await resolve_session_subject(claims)
+    if resolved is not None:
+        subject = resolved[0]
+    else:
+        if legacy_auth_is_rejected():
+            raise HTTPException(
+                status_code=401,
+                detail="Legacy authentication is no longer accepted. Log in again.",
+            )
+        note_legacy_auth("/users")
+        password = request.headers.get(PASSWORD_HEADER_NAME, "")
+        if not password:
+            raise HTTPException(status_code=401, detail="Password required")
+        if not await reverify_password(subject, password):
+            raise HTTPException(status_code=401, detail="Invalid password")
 
     try:
         user = await get_user_by_username(session, subject)

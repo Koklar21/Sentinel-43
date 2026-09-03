@@ -1,0 +1,21 @@
+# =============================================================================
+# Sentinel-43 -- local debugging override (NOT for any shared/public host)
+#
+# Copy to docker-compose.override.yml (gitignored by .gitignore's *.override.*
+# rule -- add one if missing) to publish the backend and Watchtower directly
+# on loopback, bypassing s43-proxy. Useful for `curl`, an IDE debugger, or
+# poking the Watchtower.
+#
+#   cp docker-compose.override.yml.example docker-compose.override.yml
+#   docker compose up -d
+#   curl http://127.0.0.1:8000/health
+# =============================================================================
+services:
+  s43-api:
+    ports:
+      - "127.0.0.1:8000:8000"   # loopback only
+
+  s43-core:
+    ports:
+      - "127.0.0.1:9100:9100"   # loopback only; every op route still needs
+                                # Authorization: Bearer $S43_WATCHTOWER_SERVICE_TOKEN

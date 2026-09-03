@@ -141,30 +141,44 @@ class _FakeUserStore:
         return user
 
     async def authenticate_user(
-        self, session, username: str, password: str, *, update_last_login: bool = True
+        self, session, username: str, password: str
     ) -> _FakeUser | None:
+        # Read-only, matches the Pass 3 signature (no update_last_login).
         user = self.users.get(username)
         if user is None or not user.is_active or user.password != password:
             return None
-        if update_last_login:
-            user.last_login_at = datetime.now(timezone.utc)
         return user
 
 
-class _NullSession:
-    async def __aenter__(self) -> None:
-        return None
+class _FakeSession:
+    """No-op stand-in for AsyncSession. The dict-backed fake store has no real
+    transaction, so commit/rollback/flush are genuine no-ops here. get_bind()
+    raises so core.auth.users._pg_advisory_xact_lock() correctly no-ops on a
+    non-PostgreSQL bind."""
+
+    async def commit(self) -> None: ...
+    async def rollback(self) -> None: ...
+    async def flush(self) -> None: ...
+    async def refresh(self, _obj) -> None: ...
+
+    def get_bind(self):  # noqa: ANN201
+        raise RuntimeError("fake session has no bind")
+
+
+class _NullSessionCtx:
+    async def __aenter__(self) -> _FakeSession:
+        return _FakeSession()
 
     async def __aexit__(self, *exc_info: object) -> None:
         return None
 
 
 def _fake_get_sessionmaker():
-    return _NullSession
+    return _NullSessionCtx
 
 
-async def _fake_get_db_session() -> AsyncIterator[None]:
-    yield None
+async def _fake_get_db_session() -> AsyncIterator[_FakeSession]:
+    yield _FakeSession()
 
 
 # ---------------------------------------------------------------------------

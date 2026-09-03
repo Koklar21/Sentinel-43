@@ -41,16 +41,20 @@
 #     deployment can never be left with zero admins and no way back in
 #     short of raw SQL. Self-demotion IS allowed while another admin remains.
 #
-# Known gap (same shape as core/api/routers/bootstrap.py's): the last-admin
-# check reads count_active_admins() and then writes without a DB-level lock,
-# so two concurrent PATCHes each demoting a different one of the final two
-# admins could both pass the check before either commits. Low severity — a
-# deliberate multi-admin action on a single deployment — and closing it
-# needs an advisory lock; not done here.
+# Concurrency (Pass 3): the last-admin check (_would_orphan_admins) reads
+# count_active_admins() and then writes. Any PATCH that can move the
+# active-admin count now takes ADMIN_INVARIANT_LOCK_KEY (a PostgreSQL
+# transaction advisory lock, the same one POST /bootstrap/admin uses) before
+# the check, so two concurrent PATCHes each demoting a different one of the
+# final two admins are serialized: the first commits, the second re-reads
+# count==1 and gets 409. Reproduced against real PostgreSQL — see
+# PASS3_VALIDATION.md. Also: the route commits ONCE at the end (helpers only
+# flush), so a role+is_active change can't half-persist.
 # =============================================================================
 
 from __future__ import annotations
 
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -59,9 +63,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...auth.deps import get_db_session
+
+logger = logging.getLogger(__name__)
 from ...auth.users import (
+    ADMIN_INVARIANT_LOCK_KEY,
     APPROVED_ROLES,
     User,
+    _pg_advisory_xact_lock,
     count_active_admins,
     create_user,
     get_user_by_id,
@@ -157,6 +165,30 @@ def _parse_user_id(raw: str) -> uuid.UUID:
         )
 
 
+async def _revoke_sessions(session: AsyncSession, user_id: uuid.UUID, *, reason: str) -> None:
+    """
+    Revoke every live server-side session for a user, in the caller's
+    transaction (Pass 3 boundary). Called on disablement / role change /
+    password reset so an existing browser session can't outlive the change
+    (beta-execution Phase B, AUTH_MIGRATION_PASS4 M5).
+
+    Defensive: a failure here (e.g. the sessions table isn't present, or a
+    fake session in a unit test) is logged and swallowed — the account change
+    itself already blocks NEW logins, and resolve_live_session() re-checks
+    is_active on every request, so a disabled user is locked out immediately
+    regardless.
+    """
+    try:
+        from ...auth.sessions import revoke_all_user_sessions
+
+        await revoke_all_user_sessions(session, user_id, reason=reason)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "session revocation for %s (%s) failed: %s",
+            user_id, reason, type(exc).__name__,
+        )
+
+
 async def _would_orphan_admins(
     session: AsyncSession,
     target: User,
@@ -218,9 +250,10 @@ async def create_account(
             role=role,
             email=email,
         )
+        await session.commit()
     except IntegrityError:
-        # Unique-constraint race on username or email between the check
-        # above and the insert.
+        # Unique-constraint race on username or email between the check above
+        # and the flush inside create_user(). get_db_session() rolls back.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="An account with that username or email already exists.",
@@ -276,6 +309,19 @@ async def update_account(
             detail="You cannot deactivate your own account.",
         )
 
+    # If this change can move the active-admin count, serialize it against
+    # every other admin-count-moving operation (including POST /bootstrap/admin)
+    # with the same advisory lock, so the last-admin check below reads a count
+    # nobody else can change until we commit or roll back. Without this, two
+    # concurrent PATCHes each demoting a different one of the final two admins
+    # both see count==2 and both succeed, leaving zero admins.
+    touches_admin_count = (
+        (body.is_active is not None and target.role == "admin")
+        or (new_role is not None and (target.role == "admin" or new_role == "admin"))
+    )
+    if touches_admin_count:
+        await _pg_advisory_xact_lock(session, ADMIN_INVARIANT_LOCK_KEY)
+
     if await _would_orphan_admins(
         session, target, new_is_active=body.is_active, new_role=new_role
     ):
@@ -284,11 +330,26 @@ async def update_account(
             detail="Cannot deactivate or demote the last active admin.",
         )
 
-    if new_role is not None and new_role != target.role:
+    role_changed = new_role is not None and new_role != target.role
+    deactivated = (
+        body.is_active is not None
+        and bool(body.is_active) is False
+        and bool(target.is_active) is True
+    )
+
+    if role_changed:
         target = await set_user_role(session, target, role=new_role)
     if body.is_active is not None and bool(body.is_active) != bool(target.is_active):
         target = await set_user_active(session, target, is_active=body.is_active)
 
+    # Revoke live sessions when the account is disabled or its role changes,
+    # in this same transaction, so a browser session can't outlive the change.
+    if deactivated:
+        await _revoke_sessions(session, target.user_id, reason="account_disabled")
+    elif role_changed:
+        await _revoke_sessions(session, target.user_id, reason="role_changed")
+
+    await session.commit()
     return _serialize(target)
 
 
@@ -309,6 +370,10 @@ async def reset_account_password(
         )
 
     target = await set_user_password(session, target, password=body.new_password)
+    # A password reset invalidates every existing browser session for that
+    # account (they must log in again with the new password).
+    await _revoke_sessions(session, target.user_id, reason="password_reset")
+    await session.commit()
     return _serialize(target)
 
 

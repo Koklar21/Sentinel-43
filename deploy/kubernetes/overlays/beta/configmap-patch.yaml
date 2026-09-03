@@ -9,6 +9,13 @@
 # means the firewall/rate-limiter/audit trail will attribute every request
 # to the ingress controller's IP instead of the real client. See
 # docs/security/trusted_proxy_handling.md.
+#
+# CHANGEME: S43_TRUSTED_HOSTS and S43_ALLOWED_ORIGINS must be your real
+# public hostname. In a non-local environment the API refuses to start if
+# S43_ALLOWED_ORIGINS holds a plaintext (http://) non-loopback origin
+# (beta-execution Phase 2, F-TLS-1) — the ingress forces HTTPS, so every
+# browser origin here must be https://. S43_TRUSTED_HOSTS unset => the app
+# answers on any Host header (logged as a warning); set it.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -16,3 +23,5 @@ metadata:
   namespace: sentinel43
 data:
   S43_TRUSTED_PROXIES: "CHANGEME_SET_TO_YOUR_INGRESS_CONTROLLER_POD_CIDR"
+  S43_TRUSTED_HOSTS: "beta.example.invalid"             # CHANGEME -> your real host
+  S43_ALLOWED_ORIGINS: "https://beta.example.invalid"   # CHANGEME -> https://<your host>
