@@ -314,12 +314,21 @@ allowing it) — it could not talk to a same-origin HTTPS beta at all.
 - new `pg-tests` job — a dedicated disposable PostgreSQL service +
   `S43_TEST_PG_DSN`/`S43_TEST_PG_CONTAINER`, runs beta's nine `*_pg.py`
   suites, then **fails if any were skipped** (JUnit XML check). Closes the
-  gap where those suites silently skipped in CI.
+  gap where those suites silently skipped in CI. **Green on the first PR
+  run.**
 - new `browser-smoke` job — installs Playwright+Chromium, runs
   `browser_tests/run.sh`, uploads `test-results/` on failure.
 - `build-and-scan` + `kind-smoke-deploy` now also `needs: pg-tests`.
 - triggers widened: `migrations/**`, `dashboard/**`, `browser_tests/**`,
   `deploy/**`, `docker-compose*.yml`.
+
+`scripts/ci_live_tests.py` fix (`07686bc`) — the first PR CI run failed
+here: the merge left the live API with **no schema** (`init_models()` is a
+non-local no-op) and the **env-operator inert** (`#11` break-glass, once
+`test_bootstrap` makes an admin). Fix: run `alembic upgrade head` first
+(as a real deployment does) and set `S43_BREAK_GLASS_ARMED=true` for the
+disposable CI DB. Verified locally: `alembic upgrade head` + 13 passed / 1
+skipped.
 
 ### Phase E — deployment preflight
 

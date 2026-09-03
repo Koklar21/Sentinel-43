@@ -247,7 +247,9 @@ separate project (`s43smoke`, renamed containers, ports 18443/18080) and was
 Adds one reviewable PR: `integration/beta-hardening-20260901` → `main`.
 Full detail in `BETA_EXECUTION.md §7` and `PASS_BETA_VALIDATION.md §9`.
 
-- **Branch pushed** to `origin` at `a8a5678` (no force, `main` untouched).
+- **Branch pushed** to `origin`; **PR #251** (`integration/beta-hardening-20260901`
+  → `main`). Tip `07686bc` = 6 commits on `a8a5678`. No force, `main` untouched,
+  no merge performed.
 - **`main` had advanced** to `eb7780f` (merged PR #250 — CI/container
   hardening, canonical JWT verify, users-router wiring — and PR #248). All
   0 PRs open now; #247 closed unmerged.
@@ -263,9 +265,11 @@ Full detail in `BETA_EXECUTION.md §7` and `PASS_BETA_VALIDATION.md §9`.
   moved the access token to memory-only, and fixed a websocket.js
   multi-socket race. `auth.js`/`websocket.js`/`dashboard.js` → v1.8.0.
 - **CI** (`.github/workflows/k8s.yml`) — new `pg-tests` job runs beta's nine
-  `*_pg.py` suites against a disposable PostgreSQL and **fails on any skip**;
-  new `browser-smoke` job runs `browser_tests/run.sh`; `build-and-scan` +
-  `kind-smoke-deploy` now `needs: pg-tests`.
+  `*_pg.py` suites against a disposable PostgreSQL and **fails on any skip**
+  (green on the first PR run); new `browser-smoke` job runs
+  `browser_tests/run.sh`; `build-and-scan` + `kind-smoke-deploy` now
+  `needs: pg-tests`. `scripts/ci_live_tests.py` fixed (`07686bc`) to run
+  `alembic upgrade head` + arm break-glass for its disposable DB.
 - **Deployment preflight** — `scripts/deploy_preflight.py` (read-only;
   `compose` / `kube` modes). Run it against the named target before any
   deploy command; it fails on placeholder hostnames and lists

@@ -192,6 +192,17 @@ by-behaviour conflict resolution.
 | Merge-affected files (`test_users_admin`, `test_bootstrap_isolated`, `test_v1_auth`, `test_auth_login`, `test_firewall_trusted_proxy_config`, `test_health_check_log_filter`, `test_internal_broadcast_auth`, `test_actions_test_inject_auth`) | 88 passed |
 | **Browser SPA smoke** (`browser_tests/`, Playwright + real Chromium → nginx TLS → API → disposable PG, project `s43browser`) | **10 passed / 0 failed** (19 s) |
 | Full isolated suite after all Phase C/D/E changes (`.venv-pass1`, disposable PG :55440) | **457 passed / 0 failed / 0 skipped** (260 s, exit 0) |
+| `scripts/ci_live_tests.py` (live API + `test_bootstrap` + `test_system_smoke`, disposable PG :5432, `GITHUB_ACTIONS=true`) | **13 passed / 1 skipped** (exit 0) after the `07686bc` fix (see below) |
+
+**CI (`.github/workflows/k8s.yml` on PR #251):** the first run (`7dc4e4d`)
+had `validate-manifests` ✓ and the new **`pg-tests` ✓** (beta's nine
+`*_pg.py` suites all ran in CI, none skipped — the gap this pass closed),
+but the `pytest` job's `ci_live_tests.py` step failed: the merge left the
+live API with no schema (`init_models()` is a non-local no-op now) and the
+env-operator inert (`#11` break-glass, after `test_bootstrap` makes an
+admin). Fixed in **`07686bc`** — `ci_live_tests.py` runs `alembic upgrade
+head` first and arms `S43_BREAK_GLASS_ARMED` for its disposable DB. CI
+re-run on `07686bc`: _conclusion recorded in the final report_.
 
 ### Browser smoke — what actually ran
 
