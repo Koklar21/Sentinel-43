@@ -28,7 +28,11 @@ on:
     paths:
       - "requirements*.txt"
       - "core/**"
-      - "deploy/kubernetes/**"
+      - "migrations/**"
+      - "dashboard/**"
+      - "browser_tests/**"
+      - "deploy/**"
+      - "docker-compose*.yml"
       - "scripts/k8s_policy_check.py"
       - "scripts/ci_live_tests.py"
       - "scripts/k8s-validate.ps1"
@@ -39,7 +43,11 @@ on:
       - "requirements*.txt"
       - "scripts/ci_live_tests.py"
       - "core/**"
-      - "deploy/kubernetes/**"
+      - "migrations/**"
+      - "dashboard/**"
+      - "browser_tests/**"
+      - "deploy/**"
+      - "docker-compose*.yml"
       - "scripts/k8s_policy_check.py"
       - "scripts/k8s-validate.ps1"
       - ".github/workflows/k8s.yml"
@@ -120,10 +128,105 @@ jobs:
           S43_CI_DATABASE_URL: postgresql+asyncpg://s43_ci:disposable-ci-database-only@127.0.0.1:5432/s43_ci
         run: python scripts/ci_live_tests.py
 
+  pg-tests:
+    # Beta's disposable-PostgreSQL suites (schema-version gate, migration
+    # 0001->0003, browser session + refresh rotation/replay, break-glass,
+    # WS session revocation, pg_dump/pg_restore recovery). These `*_pg.py`
+    # files skip when S43_TEST_PG_DSN is unset -- run in their own job with a
+    # dedicated database so they can DROP/CREATE freely without racing the
+    # live-test sequencing in `test`.
+    name: pytest (disposable PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16.3
+        env:
+          POSTGRES_USER: s43t
+          POSTGRES_PASSWORD: disposable-ci-database-only
+          POSTGRES_DB: s43t
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U s43t -d s43t"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -r requirements.txt pytest requests
+      - name: Run the PostgreSQL-backed suites
+        env:
+          S43_TEST_PG_DSN: postgresql+asyncpg://s43t:disposable-ci-database-only@127.0.0.1:55432/s43t
+          # test_backup_restore_pg.py runs pg_dump/pg_restore via `docker exec`
+          # against the service container.
+          S43_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
+          S43_WATCHTOWER_URL: http://127.0.0.1:19100
+          S43_WATCHTOWER_TIMEOUT: "0.1"
+        run: >-
+          python -m pytest -q -rs --junit-xml=/tmp/pg-junit.xml
+          core/tests/test_schema_version_pg.py
+          core/tests/test_schema_authority.py
+          core/tests/test_deploy_migration_wiring.py
+          core/tests/test_migrations_pg.py
+          core/tests/test_backup_restore_pg.py
+          core/tests/test_auth_session_pg.py
+          core/tests/test_ws_session_pg.py
+          core/tests/test_break_glass_pg.py
+          core/tests/test_account_transactions_pg.py
+      - name: Fail if any PostgreSQL suite was skipped
+        # These suites must actually execute here -- a silent skip (missing
+        # S43_TEST_PG_DSN / S43_TEST_PG_CONTAINER) would hide a regression.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          ts = ET.parse("/tmp/pg-junit.xml").getroot()
+          suites = ts.iter("testsuite")
+          skipped = sum(int(s.get("skipped", "0")) for s in suites)
+          tests = sum(int(s.get("tests", "0")) for s in ET.parse("/tmp/pg-junit.xml").getroot().iter("testsuite"))
+          print(f"pg suites: {tests} tests, {skipped} skipped")
+          if skipped:
+              raise SystemExit(f"{skipped} PostgreSQL-backed test(s) were skipped in CI")
+          if tests == 0:
+              raise SystemExit("no PostgreSQL-backed tests ran")
+          PY
+
+  browser-smoke:
+    name: browser SPA smoke (Playwright)
+    runs-on: ubuntu-latest
+    needs: [test]
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install Playwright + Chromium
+        run: |
+          python -m venv .venv-browser
+          .venv-browser/bin/python -m pip install -r requirements-browser.txt
+          .venv-browser/bin/python -m playwright install --with-deps chromium
+      - name: Run the browser SPA smoke against a disposable HTTPS stack
+        env:
+          S43_BROWSER_PYTHON: .venv-browser/bin/python
+        run: bash browser_tests/run.sh
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-smoke-artifacts
+          path: |
+            test-results/
+          if-no-files-found: ignore
+
   build-and-scan:
     name: Build image + vulnerability scan
     runs-on: ubuntu-latest
-    needs: [validate-manifests, test]
+    needs: [validate-manifests, test, pg-tests]
     steps:
       - uses: actions/checkout@v4
 
@@ -150,7 +253,7 @@ jobs:
   kind-smoke-deploy:
     name: kind smoke deploy
     runs-on: ubuntu-latest
-    needs: [validate-manifests, test]
+    needs: [validate-manifests, test, pg-tests]
     steps:
       - uses: actions/checkout@v4
 
