@@ -296,3 +296,62 @@ def test_legacy_bearer_plus_password_still_works_dual_contract(client, db):
     )
     assert _v1(client, legacy, password="op3-password-1234").status_code == 200
     assert _v1(client, legacy).status_code == 401  # no password -> 401
+
+
+# ---------------------------------------------------------------------------
+# S43_REJECT_LEGACY_AUTH -- the Phase-E cutover flag, BOTH states.
+# legacy_auth_is_rejected() reads the env var at call time, so flipping it
+# mid-test exercises the real per-request gate.
+# ---------------------------------------------------------------------------
+
+def _legacy(username: str) -> str:
+    import jwt as pyjwt
+    from datetime import datetime, timezone
+
+    now = int(datetime.now(timezone.utc).timestamp())
+    return pyjwt.encode(
+        {"sub": username, "role": "operator", "iss": "sentinel-43",
+         "aud": "sentinel-43-dashboard", "iat": now, "nbf": now - 5, "exp": now + 3600},
+        JWT_SECRET, algorithm="HS256",
+    )
+
+
+def test_reject_legacy_auth_off_default_still_accepts_legacy(client, db, monkeypatch):
+    # The `client` fixture delenv's the flag; assert the default explicitly.
+    monkeypatch.delenv("S43_REJECT_LEGACY_AUTH", raising=False)
+    _mk_user(db, username="op4", password="op4-password-1234")
+    legacy = _legacy("op4")
+    assert _v1(client, legacy, password="op4-password-1234").status_code == 200
+
+
+def test_reject_legacy_auth_on_blocks_legacy_v1_and_users_not_the_session(client, db, monkeypatch):
+    _mk_user(db, username="adm5", password="adm5-password-1234", role="admin")
+    legacy = _legacy("adm5")
+    # baseline (flag off): the legacy contract works on both routes
+    assert _v1(client, legacy, password="adm5-password-1234").status_code == 200
+    assert client.get(
+        "/users",
+        headers={"Authorization": f"Bearer {legacy}", "X-S43-Password": "adm5-password-1234"},
+    ).status_code == 200
+
+    # flag on: the SAME legacy requests are rejected outright
+    monkeypatch.setenv("S43_REJECT_LEGACY_AUTH", "true")
+    r_v1 = _v1(client, legacy, password="adm5-password-1234")
+    assert r_v1.status_code == 401
+    assert "log in again" in r_v1.text.lower() or "no longer accepted" in r_v1.text.lower()
+    r_users = client.get(
+        "/users",
+        headers={"Authorization": f"Bearer {legacy}", "X-S43-Password": "adm5-password-1234"},
+    )
+    assert r_users.status_code == 401
+
+    # session-token auth is unaffected by the flag
+    token = _login(client, "adm5", "adm5-password-1234").json()["access_token"]
+    assert _v1(client, token).status_code == 200
+    assert client.get(
+        "/users", headers={"Authorization": f"Bearer {token}"}
+    ).status_code == 200
+
+    # flipping the flag back off restores the legacy contract (one-var rollback)
+    monkeypatch.delenv("S43_REJECT_LEGACY_AUTH", raising=False)
+    assert _v1(client, legacy, password="adm5-password-1234").status_code == 200
