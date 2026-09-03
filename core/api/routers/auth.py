@@ -285,7 +285,7 @@ async def reverify_password(username: str, password: str) -> bool:
 
         sessionmaker = get_sessionmaker()
         async with sessionmaker() as session:
-            user = await authenticate_user(session, normalized, password)
+            user = await authenticate_user(session, normalized, password, update_last_login=False)
             if user is not None:
                 return True
     except Exception as exc:
