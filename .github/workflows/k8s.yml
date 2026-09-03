@@ -10,7 +10,7 @@
 #      images, resource limits, probes, NetworkPolicy coverage, no public
 #      db/redis, no wildcard RBAC, no embedded secrets, no hostPath,
 #      automountServiceAccountToken false)
-#   3. image build + vulnerability scan (Docker Scout)
+#   3. image build + vulnerability scan (Trivy)
 #   4. the full pytest suite
 #   5. an ephemeral kind cluster smoke-deploy (Calico for real NetworkPolicy
 #      enforcement — kind's default CNI does not enforce it) exercising the
@@ -130,18 +130,15 @@ jobs:
       - name: Build image
         run: docker build -t sentinel43-api:ci -f core/api/Dockerfile .
 
-      - name: Docker Scout CVE scan
-        # Docker Scout's free tier covers unauthenticated local-image CVE
-        # scanning; full policy evaluation needs a logged-in Docker Hub
-        # account. No such credentials are configured in this repo (adding
-        # DOCKERHUB_USERNAME/DOCKERHUB_TOKEN as repo secrets is an operator
-        # decision, documented in deploy/kubernetes/README.md) — this step
-        # runs what's available without them and does not block the
-        # pipeline on Scout-specific auth failures, only on actual
-        # critical/high CVE findings once it can run.
-        continue-on-error: true
-        run: |
-          docker scout cves sentinel43-api:ci --exit-code --only-severity critical,high
+      - name: Trivy CVE scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: sentinel43-api:ci
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: "false"
+          format: table
 
   kind-smoke-deploy:
     name: kind smoke deploy
