@@ -158,9 +158,17 @@ jobs:
 
       - name: Install Calico (real NetworkPolicy enforcement)
         run: |
+          set -euo pipefail
           kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.1/manifests/tigera-operator.yaml
+          kubectl wait --for=condition=Established crd/installations.operator.tigera.io crd/apiservers.operator.tigera.io --timeout=120s
+          kubectl -n tigera-operator rollout status deployment/tigera-operator --timeout=180s
           kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.1/manifests/custom-resources.yaml
-          kubectl -n calico-system wait --for=condition=Ready pods --all --timeout=180s
+          # The operator creates these asynchronously. Waiting for pods before
+          # they exist exits immediately with "no matching resources found".
+          kubectl -n calico-system wait --for=create daemonset/calico-node --timeout=180s
+          kubectl -n calico-system rollout status daemonset/calico-node --timeout=180s
+          kubectl -n calico-system wait --for=create deployment/calico-kube-controllers --timeout=180s
+          kubectl -n calico-system rollout status deployment/calico-kube-controllers --timeout=180s
           kubectl -n kube-system wait --for=condition=Ready pods --all --timeout=120s
 
       - name: Load image into kind
@@ -190,6 +198,7 @@ jobs:
             --from-literal=S43_JWT_SECRET="$(gen)" \
             --from-literal=S43_OPERATOR_PASSWORD_HASH="$(gen)" \
             --from-literal=S43_AUTH_PEPPER="$(gen)" \
+            --from-literal=S43_WATCHTOWER_SERVICE_TOKEN="$(gen)" \
             --from-literal=SENTINEL_LOG_SALT="$(gen)" \
             --from-literal=SENTINEL_REMOTE_TOKEN_OWNER="$(gen)" \
             --from-literal=SENTINEL_REMOTE_TOKEN_ADMIN="$(gen)" \
@@ -217,7 +226,10 @@ jobs:
           set -euo pipefail
           uid=$(kubectl exec -n sentinel43 deployment/s43-api -- id -u)
           test "$uid" = "65532"
-          kubectl exec -n sentinel43 deployment/s43-api -- sh -c 'touch /app/should_fail' && exit 1 || true
+          if kubectl exec -n sentinel43 deployment/s43-api -- sh -c 'touch /app/should_fail'; then
+            echo "ERROR: application root filesystem is writable"
+            exit 1
+          fi
 
       - name: API smoke test
         run: |
