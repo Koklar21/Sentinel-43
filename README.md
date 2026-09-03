@@ -1,12 +1,44 @@
 # Sentinel-43
 
-## Mission
+## Late Alpha Development Build
 
-Sentinel-43 is a defensive cybersecurity oversight platform designed to observe, analyze, classify, recommend, govern, and audit security events while maintaining human control over enforcement decisions.
+Sentinel-43 is currently in:
+
+> LATE ALPHA — Beta Hardening and Deployment Preparation
+
+Sentinel-43 is undergoing final architecture hardening, authentication
+modernization, deployment validation, migration infrastructure work,
+security regression testing, and Beta-readiness preparation.
+
+This release is intended for controlled development and validation.
+
+It is NOT currently certified or recommended for unrestricted production
+deployment.
+
+---
+
+# Mission
+
+Sentinel-43 is a defensive cybersecurity oversight platform designed to
+observe, analyze, classify, recommend, govern, and audit security events
+while maintaining human control over enforcement decisions.
 
 Sentinel-43 is intentionally designed as a human-gated system.
 
-The platform may detect threats, correlate activity, generate risk assessments, generate recommendations, explain decisions, and record durable audit trails, but it does not autonomously perform enforcement actions without approval through defined governance workflows.
+The platform may:
+
+- detect and receive threat observations
+- correlate security activity
+- classify risk
+- generate recommendations
+- explain decisions
+- route decisions through governance workflows
+- maintain durable audit records
+- expose operational state to authenticated interfaces
+- integrate with independently authenticated internal services
+
+Sentinel-43 does not grant its advisory core autonomous authority to
+perform enforcement.
 
 Core principle:
 
@@ -16,184 +48,333 @@ Sentinel-43 exists to assist operators, not replace them.
 
 ---
 
+# Current Development Status
+
+Sentinel-43 has progressed beyond the early Alpha architecture stage.
+
+Current Late Alpha work focuses on:
+
+- security hardening
+- authentication modernization
+- database migration infrastructure
+- Docker deployment validation
+- Kubernetes deployment architecture
+- TLS edge requirements
+- trusted-proxy enforcement
+- firewall fail-closed behavior
+- service-identity isolation
+- Watchtower endpoint protection
+- WebSocket authentication hardening
+- database transaction safety
+- concurrency validation
+- Beta deployment preparation
+- security regression testing
+- repository and documentation normalization
+
+The system currently has established Docker-based components for:
+
+- Sentinel-43 API
+- Sentinel-43 core
+- PostgreSQL
+- Redis
+- migration execution
+- reverse-proxy / TLS-edge integration
+
+Kubernetes deployment support is also being developed and hardened for
+Beta deployment.
+
+Production readiness has NOT yet been declared.
+
+---
+
+# Late Alpha Security Hardening
+
+Sentinel-43 has undergone multiple dedicated security-hardening passes.
+
+Established security work includes:
+
+- protected Watchtower routes
+- service-token authentication boundaries
+- human/service identity separation
+- reduced public service exposure
+- authenticated API bridge behavior
+- protected WebSocket paths
+- firewall secure defaults
+- trusted-proxy validation
+- fail-closed firewall startup behavior
+- administrator authorization enforcement
+- first-administrator bootstrap concurrency protection
+- PostgreSQL transaction validation
+- account transaction atomicity
+- password-verification hardening
+- malformed-password-hash fail-closed behavior
+- event-loop-safe password verification
+- login throttling
+- authentication timing mitigation
+- security regression testing
+- real PostgreSQL concurrency testing
+
+Security-sensitive behavior is tested against explicit invariants rather
+than relying solely on application startup or unit-level mocks.
+
+Sentinel-43's security architecture continues to be reviewed during Late
+Alpha.
+
+---
+
+# Active Late Alpha Security Work
+
+Several security areas remain intentionally open while Beta preparation
+continues.
+
+These include:
+
+## Authentication Modernization
+
+Sentinel-43 is transitioning away from its legacy repeated-password
+protected-request model toward a session-aware authentication
+architecture.
+
+The target architecture includes:
+
+- short-lived access tokens
+- session-bound token identifiers
+- server-side refresh-session state
+- refresh credential rotation
+- refresh replay detection
+- explicit logout/revocation
+- browser-safe credential handling
+- CSRF protection
+- bounded token lifetime
+- account-state validation
+- WebSocket session-state validation
+
+Legacy authentication remains supported during the controlled migration.
+
+The legacy authentication mechanism will not be removed until compatibility
+testing and migration gates have been satisfied.
+
+---
+
+## Database Migration Infrastructure
+
+Sentinel-43 is establishing Alembic as the authoritative production
+database migration mechanism.
+
+The migration architecture is being designed to support:
+
+- existing pre-migration databases
+- fresh installations
+- schema compatibility validation
+- fail-closed schema-drift detection
+- explicit migration execution
+- migration rollback validation
+- PostgreSQL-backed migration testing
+- Docker migration jobs
+- Kubernetes migration jobs
+
+Production API replicas are not intended to independently migrate the
+database during normal startup.
+
+Schema migration is treated as an explicit deployment operation.
+
+---
+
+## TLS / HTTPS
+
+Production browser-session deployment requires an authenticated and
+encrypted HTTPS transport path.
+
+Sentinel-43 does not currently declare its Late Alpha browser-session
+architecture production-ready until a named deployment target provides
+verified TLS termination and HTTPS-only access.
+
+The intended production model is:
+
+    Client
+        |
+        | HTTPS / WSS
+        v
+    Controlled TLS Edge
+        |
+        v
+    Sentinel-43 Internal Services
+
+TLS may terminate at an approved reverse proxy, ingress controller, load
+balancer, or equivalent controlled edge.
+
+Sentinel-43 does not assume that an unspecified external component
+"probably" provides TLS.
+
+TLS posture must be explicitly configured and validated before production
+browser-session deployment.
+
+---
+
 # System Philosophy
 
 Sentinel-43 is built around five mandatory principles:
 
 1. Human authority remains final.
-2. All significant actions are auditable.
+2. Significant actions are auditable.
 3. Recommendations must be explainable.
 4. Security controls fail closed whenever practical.
-5. Enforcement is separated from analysis.
+5. Enforcement remains separated from analysis.
 
 Sentinel-43 may recommend action.
 
-Sentinel-43 does not claim authority to execute operational action autonomously.
-
----
-
-# What Sentinel-43 Does
-
-Sentinel-43 evaluates structured threat assessments and produces:
-
-* Policy-aligned recommendations
-* Human-readable explanations
-* Durable audit records
-* Reviewable workflow states
-* Governance-aware decision outcomes
-* WebSocket-delivered dashboard state updates
-* Human-gated approval visibility
-
-The core exists to:
-
-* Analyze
-* Classify
-* Recommend
-* Explain
-* Record
-* Route decisions into review workflows
-
-Nothing else.
-
----
-
-# What Sentinel-43 Does Not Do
-
-The Sentinel-43 core does not directly:
-
-* Block users
-* Quarantine hosts
-* Disable accounts
-* Modify firewall rules
-* Terminate sessions
-* Execute remote actions
-* Change infrastructure state without external integration
-* Perform autonomous enforcement
-
-Any enforcement capability must exist outside the core through explicitly wired external adapters, independently governed control planes, or human-approved workflows.
-
----
-
-# Current Build Status
-
-Sentinel-43 is currently in:
-
-> Alpha / Public Beta Preparation
-
-This build is intended for:
-
-* Local development
-* Private beta validation
-* Architecture testing
-* Dashboard integration testing
-* Governance workflow testing
-* WebSocket authentication testing
-* Advisory decision pipeline validation
-* API endpoint load testing
-
-This build is not production-certified.
-
-Known active integration areas:
-
-* S34 authentication support
-* JWT extraction and validation helpers
-* Dashboard WebSocket authentication handshake
-* Policy gate validation
-* Governance queue visibility
-* Watchtower and dependency event channels
-* Docker Compose startup stability
-* API endpoint load testing
-* Dashboard/backend state synchronization
+Sentinel-43 does not claim autonomous authority to execute operational
+action.
 
 ---
 
 # Operational Flow
 
-Sentinel-43 follows a structured decision pipeline:
+Sentinel-43 follows a structured defensive decision pipeline:
 
-> Observe → Analyze → Hunt → Correlate → Recommend → Approve → Enforce → Audit
+    Observe
+        ↓
+    Analyze
+        ↓
+    Hunt
+        ↓
+    Correlate
+        ↓
+    Recommend
+        ↓
+    Govern / Approve
+        ↓
+    External Enforcement
+        ↓
+    Audit
 
-Each subsystem supports a specific stage of this pipeline.
+Not every deployment must contain every optional subsystem.
+
+The core architectural boundary remains:
+
+    Analysis != Governance != Enforcement
 
 ---
 
 # Core Architecture
 
-Sentinel-43 is intentionally separated into independent layers.
+Sentinel-43 is separated into independent functional and trust layers.
+
+---
 
 ## 1. Core Advisory Engine
 
-Role: Deterministic Risk Assessment and Recommendation
+Role:
+
+> Deterministic Risk Assessment and Recommendation
 
 The core advisory engine performs:
 
-* Threat assessment intake
-* Policy evaluation
-* Recommendation generation
-* Workflow state tracking
-* Audit persistence
-* Explanation generation
-* Governance-aware decision routing
+- threat-assessment intake
+- policy evaluation
+- recommendation generation
+- workflow-state tracking
+- audit persistence
+- explanation generation
+- governance-aware decision routing
 
-The core advisory engine does not perform:
+The core advisory engine does NOT directly perform:
 
-* Firewall modification
-* Endpoint isolation
-* Account suspension
-* Remote execution
-* Host quarantine
-* Packet filtering
-* Infrastructure enforcement
+- firewall modification
+- endpoint isolation
+- account suspension
+- remote execution
+- host quarantine
+- packet filtering
+- infrastructure enforcement
 
-The core engine is deterministic and advisory-only.
-
-It answers:
+The core answers:
 
 > "What is happening, what does policy say, and what should be recommended?"
 
 ---
 
-## 2. Watchtower
+## 2. API Layer
 
-Role: Oversight and System Health
+Role:
 
-Watchtower continuously monitors the health and integrity of Sentinel-43 itself.
+> Authenticated access to Sentinel-43 capabilities and state
 
-Responsibilities:
+The API layer provides controlled access to Sentinel-43 functionality.
 
-* Service monitoring
-* Configuration validation
-* Resource monitoring
-* Dependency validation
-* Error-rate monitoring
-* State tracking
-* Health reporting
-* System posture visibility
+Responsibilities include:
+
+- authenticated request handling
+- authorization enforcement
+- administrative operations
+- governance interfaces
+- health/readiness reporting
+- dashboard state access
+- WebSocket connectivity
+- internal service integration
+
+The API layer is protected by Sentinel-43 authentication, authorization,
+firewall, and trusted-proxy controls.
+
+Publicly exposed API behavior is intentionally minimized.
+
+Internal service interfaces must not silently become public interfaces.
+
+---
+
+## 3. Watchtower
+
+Role:
+
+> Oversight and System Health
+
+Watchtower monitors the health and integrity of Sentinel-43 and its
+dependencies.
+
+Responsibilities include:
+
+- service monitoring
+- configuration validation
+- resource monitoring
+- dependency validation
+- error-rate monitoring
+- state tracking
+- health reporting
+- system-posture visibility
 
 Watchtower answers:
 
 > "Is Sentinel-43 operating correctly?"
 
+Watchtower interfaces are authenticated.
+
+Detailed Watchtower information is not intended to be anonymously exposed
+through public-facing endpoints.
+
+Health and readiness interfaces should reveal only the information required
+for their operational purpose.
+
 ---
 
-## 3. Fenrir
+## 4. Fenrir
 
-Role: Threat Hunting and Behavioral Analysis
+Role:
 
-Fenrir is the threat hunting and behavioral analysis layer.
+> Threat Hunting and Behavioral Analysis
 
-Fenrir is responsible for identifying suspicious behavior, correlating observations, detecting patterns, and generating risk assessments that can be reviewed by the advisory engine and governance workflow.
+Fenrir identifies suspicious behavior, correlates observations, detects
+patterns, and generates risk context for Sentinel-43.
 
-Responsibilities:
+Responsibilities include:
 
-* Behavioral analysis
-* Threat hunting
-* Risk scoring
-* Event correlation
-* Pattern detection
-* Anomaly identification
-* Recommendation support
-* Supporting evidence generation
+- behavioral analysis
+- threat hunting
+- risk scoring
+- event correlation
+- pattern detection
+- anomaly identification
+- recommendation support
+- supporting evidence generation
 
 Fenrir answers:
 
@@ -201,132 +382,225 @@ Fenrir answers:
 
 Fenrir does not perform enforcement.
 
-Fenrir produces observations, findings, risk context, recommendations, and supporting evidence.
+Fenrir and other machine/service identities remain cryptographically and
+logically separated from human authentication.
 
 ---
 
-## 4. Governance Layer
+## 5. Governance Layer
 
-Role: Human Decision Authority
+Role:
+
+> Human Decision Authority
 
 The Governance Layer manages approval workflows and operator review.
 
-Responsibilities:
+Responsibilities include:
 
-* Approval requests
-* Escalation workflows
-* Human review queues
-* Decision recording
-* Policy validation
-* Operator approval tracking
-* Rejection tracking
-* Review-state visibility
+- approval requests
+- escalation workflows
+- human-review queues
+- decision recording
+- policy validation
+- operator approval tracking
+- rejection tracking
+- review-state visibility
 
 Governance answers:
 
 > "Should action be taken?"
 
-Human, organizational, legal, and regulatory authority always supersede automation behavior.
+Human, organizational, legal, and regulatory authority supersede
+automation behavior.
 
-Governance always overrides automation.
+Governance cannot be bypassed by the advisory core.
 
 ---
 
-## 5. Jormungandr
+## 6. Jormungandr
 
-Role: Defensive Enforcement and Containment
+Role:
 
-Jormungandr is the defensive enforcement and containment layer.
+> Defensive Enforcement and Containment
 
-Jormungandr applies approved security controls and containment actions only within explicitly approved policy boundaries.
+Jormungandr represents the independently governed defensive enforcement
+layer.
 
-Responsibilities:
+It may apply approved security controls only within explicitly authorized
+policy and governance boundaries.
 
-* Defensive policy enforcement
-* Containment actions
-* Traffic control
-* Access restriction
-* Security response execution
-* Protective controls
-* Approved response application
+Potential responsibilities include:
+
+- defensive policy enforcement
+- containment
+- traffic control
+- access restriction
+- approved response execution
+- protective controls
 
 Jormungandr answers:
 
 > "How is the approved response applied?"
 
-Jormungandr acts only after a recommendation has passed through the required governance path.
+Jormungandr is not part of the autonomous authority of the advisory core.
 
-Jormungandr must never bypass governance.
+It must never bypass required governance.
 
 ---
 
-## 6. Audit Layer
+## 7. Audit Layer
 
-Role: Accountability and Traceability
+Role:
 
-The Audit Layer records all significant system activity.
+> Accountability and Traceability
 
-Responsibilities:
+The Audit Layer records significant system activity.
 
-* Decision recording
-* Event tracking
-* Approval logging
-* Rejection logging
-* Configuration history
-* System activity records
-* Evidence preservation
-* Audit chain history
-* Deterministic audit hashing
+Responsibilities include:
+
+- decision recording
+- event tracking
+- approval logging
+- rejection logging
+- configuration history
+- system activity records
+- evidence preservation
+- audit-chain history
+- deterministic audit hashing
 
 Audit answers:
 
 > "What happened, when, why, and by whom?"
 
-No major decision should exist without an audit trail.
+Security-relevant decisions should not exist without an associated audit
+trail.
 
 ---
 
-## 7. Adapters
+## 8. Adapters
 
-Role: Explicit External Integration
+Role:
 
-Adapters are optional external integrations that consume approved recommendations.
+> Explicit External Integration
 
-Examples:
+Adapters connect Sentinel-43 to independently governed external systems.
 
-* SOAR integrations
-* Queue publishers
-* SIEM forwarding
-* Case-management connectors
-* Review pipelines
-* Infrastructure control-plane integrations
+Examples include:
 
-Adapters are external by design and are never embedded into the governance core.
+- SOAR integrations
+- SIEM forwarding
+- queue publishers
+- case-management systems
+- review pipelines
+- infrastructure control planes
 
-Adapters must be explicitly configured and independently governed.
+Adapters are explicit.
+
+Undocumented external integrations are not part of the Sentinel-43 design.
 
 ---
 
-## 8. Interfaces
+## 9. Human Interfaces
 
-Role: Human-Facing Oversight and Administration
+Role:
 
-Interfaces are external human-facing systems used for:
+> Human Oversight and Administration
 
-* Review
-* Approval
-* Oversight
-* Auditing
-* Administration
+Human-facing interfaces may provide:
 
-Examples:
+- review
+- approval
+- oversight
+- auditing
+- administration
+- health visibility
+- governance visibility
 
-* Dashboards
-* Analyst consoles
-* Workflow approval systems
-* Governance review panels
+Examples include:
 
-Interfaces are intentionally separated from the core engine.
+- dashboards
+- analyst consoles
+- approval interfaces
+- governance panels
+
+Interfaces consume controlled API state rather than bypassing Sentinel-43
+security boundaries.
+
+---
+
+# Service Identity Separation
+
+Sentinel-43 distinguishes human identities from machine/service identities.
+
+Internal services must authenticate through explicitly defined service
+credentials.
+
+Service authentication must not silently satisfy human authentication.
+
+Human authentication must not silently satisfy service authentication.
+
+Current internal security boundaries include dedicated authentication for
+components such as:
+
+- Watchtower
+- Fenrir
+- Sparta
+- remote-gateway integrations
+- other explicitly registered internal services
+
+Service credentials must:
+
+- remain secret
+- be generated using cryptographically secure randomness
+- be independently rotatable
+- not be committed to source control
+- not appear in logs
+- not be exposed through health endpoints
+- not be accepted as human login credentials
+
+---
+
+# Network Trust Model
+
+Sentinel-43 does not automatically trust forwarded network identity.
+
+Forwarded client-address information is accepted only through explicitly
+trusted proxy boundaries.
+
+Untrusted clients must not be able to obtain trusted status merely by
+supplying forwarding headers.
+
+When trusted proxy configuration is unavailable or invalid, Sentinel-43
+uses fail-closed behavior where practical.
+
+Deployment operators are responsible for ensuring that:
+
+- proxy boundaries are explicitly configured
+- internal services are not unnecessarily published
+- database ports are not publicly exposed
+- Redis is not publicly exposed
+- service credentials remain internal
+- TLS termination is explicitly configured for production
+- public endpoints expose only necessary information
+
+---
+
+# Firewall Model
+
+Sentinel-43 includes application-layer firewall controls intended to provide
+secure defaults around exposed API behavior.
+
+The firewall architecture is designed around:
+
+- explicit configuration
+- fail-closed production behavior
+- trusted-proxy awareness
+- controlled route exposure
+- sanitized denial behavior
+- security-event visibility
+
+Failure to establish required production firewall configuration must not
+silently downgrade Sentinel-43 into an unrestricted state.
 
 ---
 
@@ -334,523 +608,524 @@ Interfaces are intentionally separated from the core engine.
 
 The Sentinel-43 dashboard provides operational visibility into:
 
-* System health
-* Watchtower status
-* Fenrir findings
-* Governance queues
-* Pending approvals
-* Staged approvals
-* Audit records
-* Event history
-* Service status
-* Backend-reported records
-* Current runtime configuration
-* Console and diagnostic logs
-* WebSocket connection state
-* Dependency event channels
+- system health
+- Watchtower state
+- Fenrir findings
+- governance queues
+- pending approvals
+- staged approvals
+- audit records
+- event history
+- service status
+- backend-reported state
+- runtime configuration visibility
+- console/diagnostic information
+- WebSocket connection state
+- dependency-event channels
 
-The dashboard is an operational interface, not merely a reporting tool.
+The dashboard is an operational interface rather than merely a reporting
+page.
 
-The dashboard must answer:
+It should allow an authorized operator to answer:
 
 1. Is Sentinel-43 healthy?
-2. Is anything waiting for operator review?
+2. Is anything waiting for review?
 3. What did the backend report?
-4. What changed recently?
+4. What changed?
 5. What configuration is active?
 6. What failed?
 
 ---
 
-# Dashboard and WebSocket Bridge
+# WebSocket Security
 
-The dashboard consumes API and WebSocket state from the backend.
+Sentinel-43 supports authenticated WebSocket communication for live
+operational state.
 
-The WebSocket bridge supports:
+Credentials must never be placed in WebSocket URLs.
 
-* Authenticated connection setup
-* `auth_required` server challenge handling
-* JWT-based auth frames
-* Live action queue updates
-* Governance pending snapshots
-* Watchtower state updates
-* Dependency state updates
-* Polling fallback when WebSocket connectivity is unavailable
+WebSocket authentication is undergoing additional Late Alpha hardening as
+part of the session-authentication migration.
 
-Expected WebSocket authentication flow:
+The target architecture requires:
 
-1. Client connects.
-2. Server sends `auth_required`.
-3. Client sends an auth frame.
-4. Server confirms `authenticated`, `auth_ok`, or `connected`.
-5. Client subscribes to configured channels.
-6. Dashboard receives live state updates.
+- authenticated initial connection
+- no credential-bearing query parameters
+- bounded credential lifetime
+- account/session-state validation
+- sanitized close behavior
+- authenticated subscription establishment
+- controlled reconnect behavior
 
-The client must not subscribe before authentication is accepted.
+The exact WebSocket authentication contract remains subject to change
+during Late Alpha.
 
-Credentials must not be placed in WebSocket URLs.
-
-Expected auth frame pattern:
-
-```json
-{
-  "type": "auth",
-  "payload": {
-    "token": "<jwt>"
-  }
-}
-```
-
-The backend may send:
-
-```json
-{
-  "type": "auth_required"
-}
-```
-
-The client must answer with an auth frame before sending subscription requests.
+Clients must not depend on undocumented message shapes.
 
 ---
 
-# Security Model
+# Docker Architecture
 
-Sentinel-43 is designed around defensive security principles.
+Sentinel-43 uses a multi-service Docker architecture.
 
-Key characteristics:
+A deployment may contain services corresponding to:
 
-* Human-gated decision making
-* Explainable recommendations
-* Audit-first design
-* Fail-closed defaults
-* Authentication and authorization controls
-* Traceable decision paths
-* Separation of analysis and enforcement
-* Explicit governance boundaries
-* No hidden operational behavior
+    s43-api
+    s43-core
+    s43-db
+    s43-redis
+    s43-migrate
+    s43-proxy
 
----
+Roles:
 
-# Core Design Constraints
+s43-api
+    Sentinel-43 API and authenticated interface layer.
 
-These constraints are intentional and mandatory across all environments and modes.
+s43-core
+    Core Sentinel-43 processing/advisory services.
 
-## Sentinel-43 Core Never Performs Autonomous Enforcement
+s43-db
+    PostgreSQL persistent storage.
 
-The core engine never directly executes controls against infrastructure, users, endpoints, or networks.
+s43-redis
+    Shared transient/state infrastructure where required.
 
-All operational actions must occur through:
+s43-migrate
+    One-shot database migration execution.
 
-* External adapters
-* External orchestration systems
-* Human approval workflows
-* Independently governed control planes
+s43-proxy
+    Reverse-proxy / TLS-edge integration.
 
-Sentinel-43 may recommend an action.
+Exact service layout remains subject to change until Beta.
 
-It does not directly execute that action.
-
----
-
-## No Hidden Behavior
-
-Sentinel-43 prohibits:
-
-* Covert surveillance
-* Undocumented integrations
-* Hidden network communication
-* Silent data harvesting
-* Undeclared outbound transmission
-* Opaque enforcement behavior
-
-All recommendations and workflow transitions must be explainable and reviewable.
+Internal database and Redis services should not be exposed publicly.
 
 ---
 
-## Explainability Is Mandatory
+# PostgreSQL
 
-Every decision must provide:
+Sentinel-43 uses PostgreSQL for persistent relational state required by
+the current application architecture.
 
-* Deterministic reasoning
-* Policy traceability
-* Stable auditability
-* Reviewable recommendation paths
+Current development and validation use PostgreSQL 16.x.
 
-No recommendation may be generated through hidden or non-auditable pathways.
+Security-sensitive database behavior is tested against real PostgreSQL
+where transaction or concurrency semantics matter.
 
----
+Examples include:
 
-## Governance Always Overrides Automation
+- account creation
+- administrator bootstrap
+- session rotation
+- session revocation
+- transaction rollback
+- concurrency behavior
+- migration validation
 
-Sentinel-43 may recommend actions.
-
-It does not claim authority to execute them autonomously.
-
-Human review, organizational policy, legal requirements, and regulatory authority always override automated behavior.
-
----
-
-# S34 Authentication Layer
-
-The S34 authentication layer provides import-safe support for authentication and authorization workflows.
-
-Current S34 support includes:
-
-* Constants
-* Structured auth exceptions
-* JWT / bearer-token extraction helpers
-* Runtime auth globals
-* Policy gate integration support
-
-Key files:
-
-```text
-core/s34_auth/
-  __init__.py
-  constants.py
-  exceptions.py
-  extract_token.py
-  globals.py
-  policy_gate.py
-```
-
-The S34 layer should remain:
-
-* Import-safe
-* Dependency-light
-* Explicit
-* Fail-closed
-* Free of hidden runtime side effects
-
-JWT extraction and WebSocket authentication are handled explicitly.
-
-Tokens must not be placed in WebSocket URLs.
+Database behavior must not be considered validated merely because it
+passes against a lightweight substitute database.
 
 ---
 
-# Policy Gate
+# Redis
 
-The policy gate evaluates whether an advisory action may proceed through a workflow mode.
+Redis is available as part of the Sentinel-43 service architecture for
+shared transient/state requirements where appropriate.
 
-The policy gate is responsible for:
+Redis must not be publicly exposed.
 
-* Action normalization
-* Mode validation
-* Governance lookup
-* Allow / deny / human-review decisions
-* Deterministic decision output
+Redis usage remains intentionally limited to cases where shared state is
+actually required.
 
-The policy gate does not:
-
-* Decode JWTs
-* Extract bearer tokens
-* Perform enforcement
-* Modify infrastructure
-* Silently downgrade invalid modes
-
-Invalid policy modes are treated as caller errors and must fail loudly.
+Sentinel-43 does not introduce Redis merely to replace simpler,
+well-defined persistence behavior.
 
 ---
 
-# Operational Modes
+# Database Migrations
 
-Operational modes govern recommendation workflow behavior, not enforcement.
+Sentinel-43 is transitioning to Alembic-managed database migrations.
 
-| Mode              | Behavior                                                                                   |
-| ----------------- | ------------------------------------------------------------------------------------------ |
-| `SHADOW`          | Observe and record only. Recommendations are logged but never staged for execution review. |
-| `HUMAN_GATED`     | Recommendations are staged and require explicit operator approval before export.           |
-| `AUTONOMOUS_VETO` | Conservative allow-list mode. High-risk recommendations are denied automatically.          |
+The intended production model is:
 
-## Advisory Build Mode Mapping
+    Migration Step
+        ↓
+    Schema Validation
+        ↓
+    API / Application Startup
 
-Some advisory builds expose alternate interface terminology.
+API replicas should not independently execute production migrations during
+normal startup.
 
-| Advisory Interface | Governance Core   |
-| ------------------ | ----------------- |
-| `ADVISORY`         | `SHADOW`          |
-| `HUMAN_GATED`      | `HUMAN_GATED`     |
-| `ACTIVE_PLANNING`  | `AUTONOMOUS_VETO` |
+For multi-replica environments, exactly one authorized migration actor
+should apply schema changes.
 
-The governance module remains the canonical source of truth.
+Migration behavior must be:
+
+- explicit
+- reviewable
+- repeatable
+- tested
+- auditable
+- fail-closed on incompatible schema state
+
+---
+
+# Kubernetes Architecture
+
+Sentinel-43 includes Kubernetes deployment support intended for controlled
+Beta and later production deployments.
+
+The Kubernetes architecture is designed around:
+
+- non-root containers
+- explicit service boundaries
+- Kubernetes Secrets
+- controlled configuration
+- readiness probes
+- liveness/health behavior
+- migration Jobs
+- ingress-based external access
+- TLS termination
+- certificate-management integration
+- internal-only database services
+- internal-only Redis services
+- least-required network exposure
+
+A production Kubernetes deployment is expected to use a dedicated migration
+Job or equivalent single migration actor before application rollout.
+
+Each API replica must not independently attempt schema migration.
+
+Ingress and TLS configuration must be completed with deployment-specific
+values.
+
+Placeholder configuration must never be treated as production-ready.
+
+---
+
+# Container Security
+
+Sentinel-43 containers are being hardened around:
+
+- non-root execution
+- minimized host exposure
+- explicit service boundaries
+- controlled environment configuration
+- secret injection rather than source-controlled credentials
+- health/readiness separation
+- migration isolation
+- reduced unnecessary host port publication
+
+Production deployments should expose only the edge services required by the
+deployment architecture.
+
+PostgreSQL, Redis, internal service interfaces, and administrative
+interfaces should remain internal unless explicitly required.
+
+---
+
+# Secrets
+
+Sentinel-43 requires cryptographically strong secrets for security-sensitive
+operations.
+
+Secrets may be required for:
+
+- JWT signing
+- service authentication
+- database authentication
+- cryptographic hashing
+- internal service identity
+- session security
+- deployment integration
+
+Secrets must:
+
+- be generated using a cryptographically secure random generator
+- be unique to the deployment where appropriate
+- never be committed to Git
+- never be copied into documentation
+- never be emitted into application logs
+- be independently rotatable where architecture permits
+- be stored using an appropriate deployment secret mechanism
+
+Examples include:
+
+Docker / local development:
+    environment injection or protected local secret files
+
+Kubernetes:
+    Kubernetes Secrets or an approved external secret-management system
+
+Production operators must understand the impact of rotating each credential
+before rotation.
+
+Some credential rotation may intentionally invalidate active authentication
+state.
+
+---
+
+# Environment Files
+
+Real `.env` files are deployment-specific and may contain sensitive
+information.
+
+They must not be committed to source control.
+
+The repository may provide:
+
+    .env.example
+
+for configuration documentation.
+
+Files such as:
+
+    .env
+    .env.old
+    .env.bak.*
+    secret dumps
+    credential exports
+
+must not be included in distributable source repositories when they contain
+real deployment credentials.
 
 ---
 
 # Failure Behavior
 
-Sentinel-43 is intentionally designed to fail closed in production environments.
+Sentinel-43 is designed to fail closed where security boundaries require
+it.
 
-## Audit Failure
+Examples include:
 
-If audit persistence fails:
+- invalid authentication
+- malformed credentials
+- malformed password hashes
+- insufficient authorization
+- invalid trusted-proxy configuration
+- required firewall configuration failure
+- invalid policy modes
+- missing required cryptographic material
+- incompatible database schema
+- failed security-sensitive transactions
 
-* The recommendation is blocked.
-* The workflow decision is not approved.
-* The engine returns a blocked outcome.
-
-Exception:
-
-Audit fail-open behavior is allowed only when:
-
-* Environment is `dev`
-* `SENTINEL_DEV_ALLOW_AUDIT_FAIL_OPEN=1`
-
-Fail-open behavior must never be enabled in production.
-
----
-
-## Invalid Modes
-
-Invalid policy modes are rejected loudly.
-
-Invalid modes must not silently downgrade to another mode.
-
-Expected behavior:
-
-```text
-Invalid mode -> validation error
-```
-
-This prevents caller bugs from being hidden behind conservative fallback behavior.
+Failure handling must not silently convert a protected operation into an
+unprotected one.
 
 ---
 
-## Missing Cryptographic Secret
+# First Administrator Bootstrap
 
-If `GHOST_DEVICE_HASH_SECRET` is missing or empty:
+Sentinel-43 supports controlled creation of the first administrative
+account.
 
-* Startup fails.
-* The engine raises `RuntimeError`.
-* No insecure fallback is permitted.
+The first-administrator path is protected against concurrent bootstrap
+attempts using PostgreSQL transaction-level coordination.
 
----
+The security invariant is:
 
-## Unknown Actions
+> Exactly one initial bootstrap operation may succeed.
 
-Unknown actions are denied by default outside `SHADOW` mode.
+This does NOT mean Sentinel-43 supports only one administrator.
 
-This behavior is intentional.
-
-In `SHADOW` mode, unknown actions may be recorded for visibility without automatic workflow promotion.
-
----
-
-# Evaluation Workflow
-
-Standard evaluation flow:
-
-1. An upstream detector generates a structured assessment.
-2. Sentinel-43 evaluates the assessment against governance policy.
-3. A recommendation and explanation are generated.
-4. A durable audit record is persisted.
-5. Workflow handling occurs according to mode:
-
-   * `SHADOW`
-   * `HUMAN_GATED`
-   * `AUTONOMOUS_VETO`
-6. Approved recommendations may be exported to external adapters.
-7. The core never directly executes operational controls.
+Additional administrators may exist according to normal authorization and
+account-management policy.
 
 ---
 
-# Threat Input Model
+# Password Security
 
-Sentinel-43 consumes structured threat assessments, not raw detections.
+Human password verification uses a modern password-verification mechanism.
 
-Detection systems are intentionally separated from governance evaluation.
+Security-sensitive password work is designed to:
 
-| Field         | Type        | Description                     |
-| ------------- | ----------- | ------------------------------- |
-| `identity`    | `str`       | Subject identifier              |
-| `source_ip`   | `str`       | Origin IP address               |
-| `threat_kind` | `str`       | Threat classification           |
-| `severity`    | `str`       | Threat severity                 |
-| `source_kind` | `str`       | Detection source classification |
-| `score`       | `float`     | Numeric risk score              |
-| `tags`        | `list[str]` | Classification tags             |
-| `metadata`    | `dict`      | Supplemental structured context |
+- avoid blocking the asynchronous event loop
+- fail closed on malformed hashes
+- reduce account-enumeration timing differences
+- support login throttling
+- avoid logging credentials
+- avoid exposing password material through error messages
+
+Authentication architecture remains under Late Alpha modernization.
 
 ---
 
-# Recommendation Output Model
+# Policy Gate
 
-Sentinel-43 produces recommendations only.
+The policy gate evaluates whether an advisory action may proceed through a
+workflow mode.
 
-These are not enforcement actions.
+Responsibilities include:
 
-| Recommendation         | Meaning                                  |
-| ---------------------- | ---------------------------------------- |
-| `LOG_ONLY`             | Record event only                        |
-| `FLAG_SUSPICIOUS`      | Increase monitoring visibility           |
-| `STEP_UP_AUTH`         | Recommend additional authentication      |
-| `RATE_LIMIT`           | Recommend throttling                     |
-| `TEMP_BLOCK_IDENTITY`  | Recommend temporary identity restriction |
-| `TEMP_BLOCK_IP`        | Recommend temporary IP restriction       |
-| `HARD_BLOCK_IDENTITY`  | Recommend permanent identity restriction |
-| `HARD_BLOCK_IP`        | Recommend permanent IP restriction       |
-| `QUARANTINE_SESSION`   | Recommend session isolation              |
-| `REQUIRE_HUMAN_REVIEW` | Escalate to operator review              |
-| `OPEN_INCIDENT`        | Recommend incident creation              |
+- action normalization
+- mode validation
+- governance lookup
+- allow / deny / human-review decisions
+- deterministic decision output
 
-Enforcement must always occur outside the core.
+The policy gate does not:
 
----
+- perform enforcement
+- modify infrastructure
+- silently downgrade invalid modes
 
-# Approval Workflow
-
-In `HUMAN_GATED` mode:
-
-* Recommendations are staged.
-* Operators explicitly approve or reject them.
-* All workflow transitions are auditable.
-* Approved decisions remain advisory artifacts until consumed externally.
-
-Example interface:
-
-```python
-engine.approve(decision_id, operator_id, reason)
-engine.reject(decision_id, operator_id, reason)
-```
-
-Approved recommendations do not become enforcement by themselves.
-
-They must be consumed by an external adapter, control plane, or operator-approved workflow.
+Invalid policy modes are treated as caller errors and fail explicitly.
 
 ---
 
-# Audit and Storage
+# Operational Modes
 
-Sentinel-43 uses durable local persistence for audit and workflow state.
+Operational modes govern recommendation workflow behavior rather than
+granting autonomous enforcement authority.
 
-Stored data may include:
+| Mode | Behavior |
+| ---- | -------- |
+| SHADOW | Observe and record. |
+| HUMAN_GATED | Recommendations require explicit operator approval before controlled export. |
+| AUTONOMOUS_VETO | Conservative policy mode capable of rejecting disallowed recommendations without granting autonomous enforcement authority. |
 
-* Event logs
-* Decision records
-* Workflow states
-* Deduplication tracking
-* Audit chain history
-* Approval history
-* Rejection history
-* Configuration history
-
-The engine includes:
-
-* Bounded retention cleanup
-* Pseudonymized identity logging
-* Sanitized key generation
-* Deterministic audit hashing
+Governance remains authoritative.
 
 ---
 
-# Environment Variables
+# Audit and Accountability
 
-| Variable                             | Required | Default      | Description                    |
-| ------------------------------------ | -------: | ------------ | ------------------------------ |
-| `GHOST_DEVICE_HASH_SECRET`           |      Yes | —            | HMAC secret for device hashing |
-| `SENTINEL_SYSTEM_ID`                 |       No | `sentinel43` | Engine instance identifier     |
-| `SENTINEL_AUDIT_DB`                  |       No | `audit.db`   | SQLite audit database path     |
-| `SENTINEL_AUDIT_JSONL`               |       No | —            | Optional JSONL audit sink      |
-| `SENTINEL_LOG_SALT`                  |       No | —            | Salt for pseudonymized logs    |
-| `SENTINEL_ACTION_DEDUPE_TTL`         |       No | `3600`       | Recommendation dedupe window   |
-| `SENTINEL_LOG_RETENTION_DAYS`        |       No | `90`         | Event log retention            |
-| `SENTINEL_ACTION_RETENTION_DAYS`     |       No | `365`        | Decision retention             |
-| `SENTINEL_ALLOWED_OPERATORS`         |       No | —            | Allowed operator IDs           |
-| `SENTINEL_VELOCITY_WINDOW_SECONDS`   |       No | `60`         | Velocity limiter window        |
-| `SENTINEL_VELOCITY_LIMIT`            |       No | `10`         | Velocity event limit           |
-| `SENTINEL_AUTH_MAX_AGE_SECONDS`      |       No | `900`        | Max auth context age           |
-| `SENTINEL_ENV`                       |       No | `prod`       | Runtime environment            |
-| `SENTINEL_DEV_ALLOW_AUDIT_FAIL_OPEN` |       No | `0`          | Dev-only audit fail-open       |
+Sentinel-43 records security and governance activity necessary to reconstruct
+significant decisions.
+
+Audit information may include:
+
+- event records
+- recommendations
+- workflow states
+- approvals
+- rejections
+- authentication events
+- security denials
+- configuration changes
+- system-state transitions
+
+Sensitive credentials must never be written into audit records.
+
+Audit answers:
+
+> What happened, when, why, and under whose authority?
 
 ---
 
-# Quick Start
+# Development Validation
 
-Generate a secret:
+Late Alpha validation includes:
 
-```bash
-python -c "import secrets; print(secrets.token_hex(32))"
-```
+- unit testing
+- integration testing
+- PostgreSQL-backed tests
+- concurrency testing
+- authentication regression testing
+- authorization regression testing
+- service-identity isolation testing
+- firewall testing
+- trusted-proxy testing
+- WebSocket testing
+- migration testing
+- Docker validation
+- security-invariant testing
 
-Set environment variables:
-
-```bash
-export GHOST_DEVICE_HASH_SECRET=<generated_secret>
-export SENTINEL_ENV=dev
-```
-
-Run the advisory engine:
-
-```bash
-python sentinel43_nexus_onefile_advisory.py
-```
-
-For Docker-based development:
-
-```bash
-docker compose up --build
-```
-
-Check API health:
-
-```bash
-curl http://localhost:8000/health
-```
+Security-sensitive fixes are expected to include behavioral evidence rather
+than relying solely on source inspection.
 
 ---
 
 # Local Load Testing
 
-A local load-test harness may be used for private-beta validation.
+A local load-test harness may be used for controlled validation.
 
-Recommended first pass:
+Example:
 
-```powershell
-pwsh .\tools\S43_Nightmare_LoadTest.ps1 `
-  -BaseUrl "http://localhost:8000" `
-  -Batches 1 `
-  -HitsPerBatch 100 `
-  -Concurrency 10 `
-  -IUnderstand
-```
+    pwsh .\tools\S43_Nightmare_LoadTest.ps1 `
+      -BaseUrl "http://localhost:8000" `
+      -Batches 1 `
+      -HitsPerBatch 100 `
+      -Concurrency 10 `
+      -IUnderstand
 
-Full stress testing should only be run against systems you own and control.
+Stress testing must only be performed against systems you own or are
+explicitly authorized to test.
 
-Large tests such as:
+Large tests can heavily stress:
 
-```text
-40 batches × 50,000 hits = 2,000,000 requests
-```
+- API workers
+- PostgreSQL
+- Redis
+- Docker
+- host CPU
+- host memory
+- network resources
 
-may heavily stress Docker, Redis, Postgres, API workers, and local hardware.
-
-Do not run large tests against public or third-party infrastructure.
+Do not run Sentinel-43 stress-testing tools against third-party systems
+without authorization.
 
 ---
 
 # Stability
 
-The following are considered stable:
+The following architectural principles are considered stable:
 
-* Governance modes
-* Audit schema
-* Threat input model
-* Recommendation output model
-* Workflow semantics
-* Advisory-only core boundary
-* Human-gated decision model
+- human authority remains final
+- advisory-only core boundary
+- analysis/enforcement separation
+- governance-controlled operational response
+- auditability
+- explainability
+- fail-closed security posture
+- human/service identity separation
+- explicit service boundaries
 
-The following may change during alpha and beta development:
+The following remain subject to change during Late Alpha:
 
-* Internal helper APIs
-* Dashboard event names
-* WebSocket message shapes
-* S34 auth internals
-* Adapter interfaces
-* Docker service layout
-* Dashboard layout
-* Development tooling
+- authentication/session implementation
+- WebSocket authentication details
+- database migration integration
+- Docker service layout
+- Kubernetes manifests
+- TLS-edge configuration
+- internal helper APIs
+- dashboard message formats
+- adapter interfaces
+- development tooling
+- deployment automation
 
-Build against the public advisory interface only.
+Do not build external integrations against undocumented internal APIs.
+
+---
+
+# Beta Exit Criteria
+
+Sentinel-43 will not be declared Beta solely because the code runs.
+
+Late Alpha must establish, at minimum:
+
+- stable authentication migration
+- controlled legacy-auth retirement path
+- tested database migration infrastructure
+- validated fresh-install migration
+- validated existing-database migration
+- Docker deployment stability
+- named TLS-secured deployment architecture
+- Kubernetes deployment validation
+- service-identity isolation
+- firewall/trusted-proxy validation
+- WebSocket authentication hardening
+- complete security regression testing
+- repository normalization
+- deployment documentation
+- secret-generation documentation
+- reproducible installation procedure
+
+Only after these requirements are satisfied should Sentinel-43 transition
+from Late Alpha into formal Beta testing.
 
 ---
 
@@ -858,58 +1133,76 @@ Build against the public advisory interface only.
 
 Sentinel-43 is not:
 
-* An autonomous attack platform
-* An offensive security framework
-* A self-directed response engine
-* An AI system that makes final decisions
-* A hidden enforcement tool
-* A covert surveillance system
+- an autonomous attack platform
+- an offensive security framework
+- a self-directed response engine
+- a system with unrestricted autonomous enforcement authority
+- a hidden enforcement tool
+- a covert surveillance platform
 
 Sentinel-43 assists operators.
 
-Operators remain responsible for final enforcement decisions.
+Operators and authorized governance structures remain responsible for final
+operational decisions.
 
 ---
 
 # Long-Term Vision
 
-Sentinel-43 serves as the security oversight and governance foundation for larger operational environments.
+Sentinel-43 is intended to provide the security oversight and governance
+foundation for larger operational environments.
 
-Its purpose is to provide visibility, analysis, accountability, and controlled response capabilities while maintaining human authority over security actions.
+Its purpose is to provide:
 
-Sentinel-43 is intended to grow into a modular defensive security platform where health monitoring, threat hunting, governance, audit, and defensive containment remain separated but coordinated.
+- visibility
+- analysis
+- threat context
+- accountability
+- governance
+- controlled defensive response integration
+
+while maintaining human authority over operational enforcement.
+
+The platform is intended to remain modular.
+
+Health monitoring, threat hunting, governance, audit, authentication,
+interfaces, and defensive enforcement remain separated by explicit
+architectural and trust boundaries.
 
 ---
 
 # Licensing
 
-Sentinel-43 is distributed under a dual-license model.
+Sentinel-43 is distributed under its established dual-license model.
 
 ## AGPL v3.0
 
-Open-source use, modification, and distribution are governed by the GNU Affero General Public License v3.0.
+Open-source use, modification, and distribution are governed by the GNU
+Affero General Public License v3.0 according to the license terms included
+with the repository.
 
 ## Commercial License
 
-Commercial, enterprise, governmental, or proprietary deployment requires a separate commercial license.
+Commercial, enterprise, governmental, or proprietary use may require a
+separate commercial license according to the commercial licensing terms
+included with Sentinel-43.
 
-Without explicit written permission, you may not:
-
-* Sell Sentinel-43 as proprietary software
-* Deploy it commercially outside the applicable license terms
-* Bundle it into paid products outside the applicable license terms
-* Redistribute it for profit outside the applicable license terms
+Refer to the repository licensing documents for authoritative terms.
 
 ---
 
 # Disclaimer
 
-Sentinel-43 is provided:
+Sentinel-43 is currently Late Alpha software.
+
+It is provided:
 
 > AS IS
 
 without warranty of any kind.
 
-The authors are not liable for damages arising from use, misuse, deployment failure, operational misuse, or unsupported modification.
+Late Alpha builds may contain incomplete features, changing interfaces,
+deployment limitations, or unresolved security findings.
 
-Do not deploy unfinished infrastructure into production and then act surprised when reality develops teeth.
+Do not deploy an unfinished Late Alpha build into a production environment
+and then act surprised when reality develops teeth.
