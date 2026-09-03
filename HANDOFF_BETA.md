@@ -141,7 +141,7 @@ stack.
 | item | why | how to close |
 |---|---|---|
 | **F-TLS-1** | a local self-signed cert proves the *integration*, not issuance/renewal against a real hostname + CA | complete `overlays/beta/ingress.yaml` (real host, `ClusterIssuer`, verified cert-manager Secret) **or** a config-managed proxy cert on the Compose host; re-run the login→refresh→logout + WSS flow over real HTTPS (`deploy/proxy/README.md`) |
-| **Browser SPA smoke** | no headless browser in this environment; `auth.js`/`websocket.js` v1.7.0 changes are graceful-degradation but unrun in a real browser | load the dashboard against the beta stack, confirm: login, reload stays logged in (refresh-on-load), logout, WS connects with `{token}` only, a revoked session drops the socket |
+| **Browser SPA smoke** | **DONE in the integration pass** (`browser_tests/`, real Chromium → nginx TLS → API → disposable PG; 10/10). Remaining: run it against the *named target* (real cert/CA) to close F-TLS-1's browser half. | `./browser_tests/run.sh`; then re-run with `S43_BROWSER_BASE_URL` pointed at the deployed beta |
 | **`S43_REJECT_LEGACY_AUTH` cutover** | Phase E; needs the browser smoke + an observation window with `legacy_auth_request_total._all == 0` + operator sign-off | after the above, set it true (one-var rollback) |
 | **P3-8** case-insensitive uniqueness | Informational; needs a real-target collision inventory | migration `0004` per `SERVICE_INTEGRATION_BETA.md §4` |
 | **Multi-replica login throttle** | still in-process/per-pod (`overlays/beta` runs 2 replicas → 2× the limit) | Redis-backed limiter, or pin beta to 1 replica and document it |
@@ -241,6 +241,49 @@ separate project (`s43smoke`, renamed containers, ports 18443/18080) and was
 - **Deployed externally:** nothing.
 
 ---
+
+## K. Integration pass — next PR (2026-09-02/03)
+
+Adds one reviewable PR: `integration/beta-hardening-20260901` → `main`.
+Full detail in `BETA_EXECUTION.md §7` and `PASS_BETA_VALIDATION.md §9`.
+
+- **Branch pushed** to `origin` at `a8a5678` (no force, `main` untouched).
+- **`main` had advanced** to `eb7780f` (merged PR #250 — CI/container
+  hardening, canonical JWT verify, users-router wiring — and PR #248). All
+  0 PRs open now; #247 closed unmerged.
+- **Merge commit `f3d93e2`** — `main` → the branch, conflicts resolved by
+  behaviour (newer session/auth contract kept, CI/container fixes adopted).
+  Two semantic merge defects fixed: a duplicate `users_router`
+  registration and a `Dockerfile` with both Alpine and Debian user-creation
+  blocks. Post-merge full isolated suite **457 passed / 0 / 0**.
+- **Browser SPA smoke** — `browser_tests/` (Playwright + real Chromium →
+  nginx TLS → API → disposable PG), **10/10**. Uncovered that the SPA was
+  hardwired to `http://localhost:8000`; fixed to same-origin
+  (`connect-src 'self'`, `location.origin`, `wss://<same-origin>/ws`),
+  moved the access token to memory-only, and fixed a websocket.js
+  multi-socket race. `auth.js`/`websocket.js`/`dashboard.js` → v1.8.0.
+- **CI** (`.github/workflows/k8s.yml`) — new `pg-tests` job runs beta's nine
+  `*_pg.py` suites against a disposable PostgreSQL and **fails on any skip**;
+  new `browser-smoke` job runs `browser_tests/run.sh`; `build-and-scan` +
+  `kind-smoke-deploy` now `needs: pg-tests`.
+- **Deployment preflight** — `scripts/deploy_preflight.py` (read-only;
+  `compose` / `kube` modes). Run it against the named target before any
+  deploy command; it fails on placeholder hostnames and lists
+  TARGET-REQUIRED checks.
+
+### Startup addendum (Compose) — the SPA is same-origin now
+
+No SPA config needed for the supported setup: the API serves
+`/dashboard` + `/assets` and the nginx proxy terminates TLS, so `/auth/*`,
+`/api/*` and `/ws` are all same-origin. Only a *split-origin* dev setup
+needs `window.SENTINEL_API_BASE_URL` / `SENTINEL_WS_URL` (and that origin
+added to the page's `connect-src`).
+
+### `docker-compose.browser.yml` / `browser_tests/`
+
+Test-only. `./browser_tests/run.sh` stands up an isolated `s43browser`
+project (own subnet `172.29.0.0/24`, proxy on `127.0.0.1:8443`), runs the
+Playwright suite, `down -v`s. Never touches another stack.
 
 ## §10 — three separate conclusions
 

@@ -202,6 +202,142 @@ export S43_WATCHTOWER_TIMEOUT=0.5
 
 ---
 
+## 7. Integration pass — next PR (2026-09-02, after push of `a8a5678`)
+
+**Goal:** one reviewable PR — `integration/beta-hardening-20260901` → `main` —
+that preserves the beta implementation, folds in the now-merged upstream
+(`main` = `eb7780f`), proves the browser flow in a real browser, and makes a
+named-target deploy reproducible.
+
+### Repository facts re-verified
+
+| Fact | Value |
+|---|---|
+| Branch pushed | `integration/beta-hardening-20260901` @ `a8a5678` → `origin` (Koklar21/Sentinel-43), no force, `main` untouched |
+| `7a72976..8614f9b` (Pass 5AM) | **7** commits |
+| `8614f9b..a8a5678` (beta-execution) | **6** commits (`d529f04`,`1acc423`,`aa7f2b1`,`5c06dbe`,`aa64658`,`a8a5678`) — the completion report's "seven after 8614f9b" was wrong; there is no missing 7th |
+| Open PRs | **0**. #250 MERGED (`c1b8ad0`), #249 MERGED, #248 MERGED (`eb7780f`), #247 CLOSED unmerged |
+| merge-base(`a8a5678`,`main`) | `6dd3a7e` (Pass 1 watchtower work is shared history — beta already has it) |
+| Pre-merge recovery | `sentinel43-recovery/pre-main-merge-20260902.bundle` + tag `pre-main-merge-20260902` |
+
+### Phase A — baseline established. Merge commit `f3d93e2`.
+
+`git merge main` → 7 conflicts, resolved by behaviour (newer session/auth
+contract wins; CI/container fixes retained). Full detail in the merge commit
+message. Semantic (non-flagged) issues fixed: duplicate `users_router`
+import + `include_router` in `main.py`; a broken `Dockerfile` with both
+Alpine and Debian user-creation blocks. Net `main...HEAD` change from the
+merge itself: 5 files. Merge-affected tests: **88 passed**.
+
+Adopted from `main` unchanged: `.github/workflows/k8s.yml` (Trivy scan,
+disposable PG service, Calico waits, watchtower service token, read-only
+rootfs assertion), `scripts/ci_live_tests.py`, Watchtower health-log filter.
+
+**Known CI gap (Phase D):** the `test` job sets a `postgres` service but not
+`S43_TEST_PG_DSN` / `S43_TEST_PG_CONTAINER`, so beta's `*_pg.py` suites
+(auth-session, migrations, schema-version, backup-restore, break-glass,
+ws-session) currently `skip` in CI. `ci_live_tests.py` only runs
+`test_bootstrap` + `test_system_smoke`.
+
+**#248 reconciliation:** `authenticate_user` stays read-only (no
+`update_last_login=`); `_validate_credentials` owns the one `record_login`
+write at real login; `reverify_password` never writes. Same end state #248
+intended ("don't update last-login on every authenticated request").
+
+### Active dev session to preserve
+
+User is now running Sentinel-43 on **Docker Desktop Kubernetes** (namespace
+`sentinel43`: `s43-db`/`s43-redis`/`s43-core`/`s43-api`, up ~2 h as of
+22:00). Do not touch it. (The Compose stack `sentinel-43` from earlier in
+beta-execution is gone.)
+
+### Phase checkpoint
+
+- [x] **A** — integration baseline + merge (`f3d93e2`). Post-merge full
+      isolated suite **457 passed / 0 failed / 0 skipped** (`.venv-pass1`,
+      disposable PG on :55440). = 454 beta baseline + 3 new route-registration
+      guards.
+- [x] **B** — combined auth/deploy path review + regression tests
+- [x] **C** — real browser SPA smoke (Playwright) — `browser_tests/` **10/10**
+- [x] **D** — CI validates the beta implementation
+- [x] **E** — safe concrete beta deployment preflight
+- [x] docs + PR — final full suite (all Phase A–E) **457 passed / 0 / 0**
+
+### Phase B — done
+
+- `core/tests/test_app_route_registration.py` (3 tests): no APIRouter
+  included twice (the exact merge defect), `users_router` wired + router-level
+  `Depends(require_admin)`, `/auth/{login,refresh,logout}` in the schema.
+- Verified the Phase-B session contract survived the merge in **both**
+  `require_operator` (`/v1`) and `require_admin` (`/users`): existing
+  `test_auth_session_pg.py::test_session_bound_token_reaches_v1_without_password_header`
+  and `::test_admin_password_reset_revokes_target_sessions` (admin uses a
+  session token, no `X-S43-Password`) cover it; both green in the 457-suite.
+- `authenticate_user` reconciliation (#248): read-only, no `update_last_login=`
+  kwarg; `_validate_credentials` owns the single `record_login` write.
+
+### Phase C — real-browser harness + SPA deployment-correctness fixes
+
+Found while wiring the browser stack: the shipped SPA was **hardwired to
+`http://localhost:8000`** (meta tags + JS fallbacks + a `connect-src`
+allowing it) — it could not talk to a same-origin HTTPS beta at all.
+
+- `dashboard/sentinel_43_dashboard.html` — `connect-src 'self'` (dropped the
+  `http://localhost:8000 ws://localhost:8000` entries); `sentinel-api-base` /
+  `sentinel-ws-url` meta tags emptied (→ same origin).
+- `dashboard/assets/js/dashboard.js` v1.8.0 — `API_BASE` defaults to
+  `location.origin`; real session token read from
+  `window.SentinelAuth.getToken()`.
+- `dashboard/assets/js/websocket.js` v1.8.0 — WS URL defaults to
+  `wss://<same-origin>/ws`; token from `window.SentinelAuth.getToken()`.
+- `dashboard/assets/js/auth.js` v1.8.0 — **bearer access token held in module
+  memory only** (was `sessionStorage["SENTINEL_JWT"]`); `getToken()` exposed;
+  old sessionStorage token cleared on load. init() already refreshes on load
+  so nothing is lost on reload.
+- `browser_tests/` — Playwright (Python) suite driving the *actual* served
+  SPA through nginx TLS → API → disposable PG. `run.sh` brings up an isolated
+  `s43browser` Compose project (own `172.29.0.0/24`, proxy on
+  `127.0.0.1:8443`), Chromium trusts the throwaway test leaf by **SPKI pin**
+  (not `--ignore-certificate-errors`), `--host-resolver-rules` maps
+  `s43.beta.test`. `requirements-browser.txt`, `docker-compose.browser.yml`.
+- Also fixed: a **websocket.js multi-socket race** — auth.js's login handler
+  `disconnect()`s then `connect()`s, and a stale socket's late `close`
+  handler nulled the live `_ws` + dispatched `auth_failed`, re-showing the
+  login overlay right after login. Handlers are now bound per-socket. This
+  was the fix that made the browser suite green.
+- **Result: 10 passed / 0 failed** (`PASS_BETA_VALIDATION.md §9`).
+- **F-TLS-1 stays OPEN** — a local test CA proves browser⇄nginx only.
+
+### Phase D — CI
+
+`.github/workflows/k8s.yml`:
+- new `pg-tests` job — a dedicated disposable PostgreSQL service +
+  `S43_TEST_PG_DSN`/`S43_TEST_PG_CONTAINER`, runs beta's nine `*_pg.py`
+  suites, then **fails if any were skipped** (JUnit XML check). Closes the
+  gap where those suites silently skipped in CI.
+- new `browser-smoke` job — installs Playwright+Chromium, runs
+  `browser_tests/run.sh`, uploads `test-results/` on failure.
+- `build-and-scan` + `kind-smoke-deploy` now also `needs: pg-tests`.
+- triggers widened: `migrations/**`, `dashboard/**`, `browser_tests/**`,
+  `deploy/**`, `docker-compose*.yml`.
+
+### Phase E — deployment preflight
+
+`scripts/deploy_preflight.py` — strictly **read-only** (no admin bootstrap,
+no DB write, no manifest apply). `compose` and `kube` modes. Checks:
+tooling, hostname is a real FQDN + resolves, cert chain/SAN/expiry against
+the hostname, HTTPS 200 + HTTP→HTTPS redirect + HSTS + no version banner,
+`/docs` `/redoc` `/openapi.json` not publicly served, every required secret
+present + non-placeholder + `S43_SECRETS_ROTATED_AT` ≤ 90 days,
+origins/hosts/trusted-proxy match the real hostname, backend/watchtower not
+host-published, single uvicorn worker / single replica / no HPA, no
+`CHANGEME` in k8s ConfigMaps, ClusterIP services. Placeholder hostnames
+(`*.example.invalid`, `CHANGEME`) fail the run. Target-dependent items
+(WSS through the edge, external port scan, image digest) are reported
+TARGET-REQUIRED, not silently passed.
+
+---
+
 ## 6. Not authorized by this instruction (finish RC + procedure, then ask)
 
 Changing a live database · exposing a service publicly · merging protected

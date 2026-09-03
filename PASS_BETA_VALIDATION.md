@@ -176,3 +176,69 @@ Repository state stable throughout (`8614f9b` base). Every phase's code is
 behavioural-test-backed. Nothing required a live database, a production
 deploy, a push, or a target-specific decision that could not be deferred to
 the final report's single open question.
+
+---
+
+## 9. Integration pass — next PR (2026-09-02/03)
+
+Branch pushed `a8a5678` → `origin`. `main` had advanced to `eb7780f`
+(merged PR #250 CI/container hardening + PR #248). Merged `main` into the
+branch (`f3d93e2`); see `BETA_EXECUTION.md §7` and the merge commit for the
+by-behaviour conflict resolution.
+
+| Suite | Result |
+|---|---|
+| Full isolated suite after the merge (`f3d93e2`, `.venv-pass1`, disposable PG :55440) | **457 passed / 0 failed / 0 skipped** (= 454 beta baseline + 3 new `test_app_route_registration.py`) |
+| Merge-affected files (`test_users_admin`, `test_bootstrap_isolated`, `test_v1_auth`, `test_auth_login`, `test_firewall_trusted_proxy_config`, `test_health_check_log_filter`, `test_internal_broadcast_auth`, `test_actions_test_inject_auth`) | 88 passed |
+| **Browser SPA smoke** (`browser_tests/`, Playwright + real Chromium → nginx TLS → API → disposable PG, project `s43browser`) | **10 passed / 0 failed** (19 s) |
+| Full isolated suite after all Phase C/D/E changes (`.venv-pass1`, disposable PG :55440) | **457 passed / 0 failed / 0 skipped** (260 s, exit 0) |
+
+### Browser smoke — what actually ran
+
+Real headless Chromium (SPKI-pinned to the throwaway test leaf; hostname
+`s43.beta.test` mapped to loopback), driving the *served* SPA
+(`sentinel_43_dashboard.html` + shipped `auth.js`/`websocket.js`/
+`dashboard.js`) through the nginx TLS edge:
+
+| check | result |
+|---|---|
+| `/dashboard` + `/assets/js/*.js` served; `auth.js` runs; **0 console/page errors** | pass |
+| type into the real login overlay → session established → protected `/users` reachable, **no `X-S43-Password`** | pass |
+| access token **only in memory** (`window.SentinelAuth.getToken()`); not in `localStorage`/`sessionStorage`/URL; `s43_refresh` absent from `document.cookie` (HttpOnly); `s43_csrf` present | pass |
+| reload → refresh-cookie exchange → no re-login | pass |
+| two tabs + reload → both stay authenticated, no revoke loop | pass |
+| logout → overlay returns; pre-logout bearer token 401s; refresh 401/403 | pass |
+| `/auth/refresh` — missing CSRF 403, bad Origin 403, valid 200 | pass |
+| operator session → `/users` → 403 | pass |
+| admin disables operator → operator's live token 401s immediately | pass |
+| real `wss://` connects + authenticates; logout drops it | pass |
+
+### Frontend fixes made to pass the browser checks
+
+1. SPA was **hardwired to `http://localhost:8000`** (meta tags + JS
+   fallbacks + CSP `connect-src`) — could not talk to a same-origin HTTPS
+   beta. Now: `connect-src 'self'`, meta tags empty, `API_BASE` →
+   `location.origin`, WS URL → `wss://<same-origin>/ws`.
+2. Access token moved from `sessionStorage` to module memory (auth.js
+   v1.8.0), exposed as `window.SentinelAuth.getToken()`.
+3. **websocket.js multi-socket race** — auth.js's login handler calls
+   `disconnect()` then `connect()`; a stale socket's late `close` handler
+   nulled the live `_ws` and dispatched a spurious `auth_failed`, which
+   re-showed the login overlay right after a successful login. Handlers are
+   now bound per-socket and no-op once `_ws` has moved on. This is the fix
+   that turned the browser suite green.
+
+**F-TLS-1 stays OPEN** — a throwaway test CA proves browser⇄nginx only.
+
+### Boundaries honoured (this pass)
+
+- Branch pushed to `origin` (authorised); **no merge to `main`**, no force,
+  no branch deletion, no production deploy, no live-DB migration.
+- The user's running **Docker Desktop Kubernetes** stack (`sentinel43` ns)
+  was never touched. The browser stack ran as project `s43browser` on its
+  own `172.29.0.0/24` subnet, ports `127.0.0.1:8443/8081`, `down -v` after.
+- `.venv-pass1` was briefly perturbed by a `pip install playwright` (pulled
+  `pytest<9`); restored to `pytest==9.1.1` + `greenlet==3.5.5` and the full
+  suite re-run clean. Browser deps live in a separate `.venv-browser`.
+- No secret values in any commit, doc, or test log. `.env.browser` /
+  `browser_tests/certs/*` gitignored.
