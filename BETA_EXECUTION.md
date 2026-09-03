@@ -295,9 +295,18 @@ beta-execution is gone.)
       disposable PG on :55440). = 454 beta baseline + 3 new route-registration
       guards.
 - [x] **B** — combined auth/deploy path review + regression tests
-- [x] **C** — real browser SPA smoke (Playwright) — `browser_tests/` **10/10**
+- [~] **C** — browser SPA smoke (Playwright) — `browser_tests/` **10/10**.
+      **Scope correction (REV 3 / §9):** this verified the SHIPPED SPA's
+      *application behaviour* against a **local disposable stack** (throwaway
+      test CA, SPKI-pinned, `s43.beta.test` mapped to loopback). It did **not**
+      validate a real target's certificate chain, DNS, or edge — and because
+      `run.sh` pins its own base URL, an external `S43_BROWSER_BASE_URL` was
+      silently ignored. Real-target browser acceptance is `browser_tests/target_acceptance/`
+      (§9), still pending a named target.
 - [x] **D** — CI validates the beta implementation
-- [x] **E** — safe concrete beta deployment preflight
+- [~] **E** — beta deployment preflight. **Superseded by the phase-aware
+      rewrite in §9** (the original conflated pre-deploy and running-target
+      checks and could exit 0 with mandatory verification still open).
 - [x] docs + PR — final full suite (all Phase A–E) **457 passed / 0 / 0**
 
 ### Phase B — done
@@ -342,7 +351,12 @@ allowing it) — it could not talk to a same-origin HTTPS beta at all.
   handler nulled the live `_ws` + dispatched `auth_failed`, re-showing the
   login overlay right after login. Handlers are now bound per-socket. This
   was the fix that made the browser suite green.
-- **Result: 10 passed / 0 failed** (`PASS_BETA_VALIDATION.md §9`).
+- **Result: 10 passed / 0 failed.** **What that actually verified (REV 3):**
+  the shipped SPA + JS behave correctly against a **local disposable HTTPS
+  stack**. TLS "trust" here is a throwaway test CA accepted via a Chromium
+  SPKI exception + a `ssl.CERT_NONE` fixture context — this is
+  application-behaviour evidence, **not** certificate-chain validation and
+  **not** a real-target result.
 - **F-TLS-1 stays OPEN** — a local test CA proves browser⇄nginx only.
 
 ### Phase D — CI
@@ -368,6 +382,11 @@ disposable CI DB. Verified locally: `alembic upgrade head` + 13 passed / 1
 skipped.
 
 ### Phase E — deployment preflight
+
+> **Superseded by §9 (REV 3).** The version described below conflated
+> pre-deploy and running-target checks and returned exit 0 while
+> TARGET-REQUIRED items were still open. §9 replaces it with an explicit
+> `prepare` / `verify` phase split and a distinct INCOMPLETE (exit 2) state.
 
 `scripts/deploy_preflight.py` — strictly **read-only** (no admin bootstrap,
 no DB write, no manifest apply). `compose` and `kube` modes. Checks:
@@ -455,6 +474,118 @@ restarted it to run the PG suites. The user's k8s `sentinel43` namespace
 pods are still defined (`s43-db`/`s43-redis` were healthy earlier;
 `s43-api`/`s43-core` have been `ErrImageNeverPull` for ~33 days — a
 pre-existing state, untouched).
+
+---
+
+## 9. Release-tooling corrections — REV 3 (2026-09-03)
+
+A focused follow-up on the deployment **preflight** and browser **target-
+validation** tooling. No change to the verified auth / migration / session /
+CI work. Started from `beta/post-merge-verification-20260903` (open PR #252);
+merged current `main` first (`18d1dbe` — main had deleted a batch of
+superseded `.md` files; `PASS_BETA_VALIDATION.md` among them, so its live
+content is folded here and into `HANDOFF_BETA.md`).
+
+### Correction to the prior completion claim
+
+REV 1/REV 2 reported Phases A–E complete and "every target-independent
+artifact ready". Findings A–E below **were all still reproducible** in that
+delivered state, so that claim was premature for the tooling. This pass
+fixes the actual causes; the auth/migration/session conclusions are
+unaffected.
+
+### Findings reproduced, and the fix
+
+| # | Reproduced defect | Fix |
+|---|---|---|
+| **A** | `deploy_preflight.py` returned **exit 0** with `TARGET-REQUIRED` items unresolved; one pass covered both pre-deploy and running-target checks | phase-aware: `--phase {prepare,verify}` **required, no default**; three exit codes — `0` all mandatory checks for the phase passed, `1` a confirmed FAIL, `2` a mandatory check INCOMPLETE (never silently 0); `prepare` never touches a running service |
+| **B** | HTTP check used `urlopen` (follows redirects) then asserted a 3xx — a correct server *failed* it; HTTP URL derived from the HTTPS port; later HTTPS calls dropped the non-standard port | `http_probe()` does **not** follow redirects; `classify_http_redirect()` checks status ∈ {301,302,307,308}, `Location` scheme=https, same host, expected port; separate `--http-port` / `--https-port`; every URL built by one `_url()` helper |
+| **C** | `docker compose` calls carried no `-p` / `--env-file` / `-f`; only NDJSON `ps` parsed; `{{.Publishers}}` arrow-string parsing; failed `kubectl get hpa` read as "no HPA"; `--workers` substring match; `containers[0]` assumed to be the API; missing Service → PASS | `compose_base_cmd()` threads project + env-file + files through **every** call; `parse_compose_ps()` handles the array and NDJSON forms; structured `Publishers[].PublishedPort`; `k8s_api_container()` finds the API by name/heuristic (INCOMPLETE if ambiguous); `k8s_worker_flag()` handles `--workers N`, `--workers=N`, `-w N`, `WEB_CONCURRENCY`; `hpa_targets()` matches `scaleTargetRef.name == s43-api`; every inspection failure → INCOMPLETE, never a silent pass |
+| **D** | origins/hosts checked by **substring** (`https://h` ⊂ `https://h.evil`); trusted-proxy only rejected exact `0.0.0.0/0`; any `--image` string passed; `:sha256-…` treated as a digest | `origin_exact_member()` / `host_exact_member()` — exact normalized membership (scheme+host+port; mirrors `TrustedHostGuard`, rejects `*`); `validate_trusted_proxies()` via `ipaddress`, rejects malformed and anything wider than /24; `validate_image_reference()` — `repo/name@sha256:<64-hex>` = PASS, `:sha256-…` tag = FAIL, plain tag = INCOMPLETE unless `--image-id sha256:<id>` + `--source-revision` given |
+| **E** | `run.sh` pinned `S43_BROWSER_BASE_URL` so an external value was ignored; `conftest.py` used a fixed loopback URL + `Host` override; auto-bootstrapped an admin; `ssl.CERT_NONE` + a Chromium SPKI exception (not real trust) | `run.sh` now refuses a foreign `S43_BROWSER_BASE_URL` and points at the new runner; a separate **`browser_tests/target_acceptance/`** suite + **`run_target.sh`** for real targets — explicit `S43_TARGET_BASE_URL` (same endpoint for browser and API), standard trusted-CA verification (optional `S43_TARGET_CA_BUNDLE`, never disabled), **no** stack control, **no** bootstrap, credentials read from files, missing creds = an errored (incomplete) run |
+
+### prepare vs verify
+
+- **prepare** — tools, target hostname is a real FQDN, image is an immutable
+  identity, `.env` secrets present + non-placeholder + rotated ≤ 90 d,
+  `SENTINEL_ENV` non-local, exact origin/host membership, proxy CIDR narrow,
+  (kube) `sentinel43-secrets` keys + no `CHANGEME` ConfigMaps. **A pass is
+  "inputs in order", explicitly *not* beta acceptance.**
+- **verify** — hostname resolves; edge cert validates against the real trust
+  store (or `--ca-bundle`) with library hostname matching; not near expiry;
+  HTTP→HTTPS redirect correct (no downgrade); HTTPS `/health` + `/ready`
+  separately; HSTS; `/docs` `/redoc` `/openapi.json` not served (by actual
+  response — a connection error is INCOMPLETE, not "protected"); exactly one
+  running API instance **and** one worker; backend/db/redis not
+  host-published; (kube) `replicas==1`, `readyReplicas==1`, rollout complete,
+  no HPA targeting `s43-api`, migration Job succeeded, `ClusterIP` services.
+  External port-scan and WSS-through-edge are mandatory-but-INCOMPLETE from
+  this vantage point → `verify` exits 2 until run from outside / via
+  `run_target.sh`.
+
+### Commands
+
+```
+# before deploying — nothing running yet
+python scripts/deploy_preflight.py compose --phase prepare \
+  --hostname beta.example.org --env-file .env \
+  --image ghcr.io/OWNER/sentinel43-api@sha256:<64-hex>
+#   locally-built image instead of a registry digest:
+#   --image sentinel43-api:beta --image-id sha256:<64-hex> --source-revision <git-sha>
+
+# after deploying — against the running target
+python scripts/deploy_preflight.py compose --phase verify \
+  --hostname beta.example.org --project s43 --env-file .env \
+  -f docker-compose.yml -f docker-compose.beta.yml
+python scripts/deploy_preflight.py kube --phase verify \
+  --context <ctx> --namespace <ns> --hostname beta.example.org [--ca-bundle ca.pem]
+
+# browser: disposable (unchanged) vs real target
+bash browser_tests/run.sh
+S43_TARGET_BASE_URL=https://beta.example.org \
+  S43_TARGET_OPERATOR_CRED_FILE=/secure/op.json \
+  bash browser_tests/run_target.sh
+```
+
+Target-account scope: `run_target.sh` read-only edge checks need only the
+URL. Authenticated acceptance needs a **designated** beta operator account
+(`S43_TARGET_OPERATOR_CRED_FILE`). Admin-mutation scenarios (disable / role /
+password / replay) additionally need `S43_TARGET_ADMIN_SCOPE=
+explicit-dedicated-account` + **dedicated throwaway** admin/operator accounts
+— never an owner's ordinary account.
+
+### Tests + CI
+
+`core/tests/test_deploy_preflight.py` — **53** behavioural tests (phase
+required not defaulted; mandatory-incomplete ⇒ exit 2; redirect recognised
+not followed; wrong-host/downgrade fail; non-standard ports; exact
+origin/host vs substring lookalikes; malformed/broad proxy CIDR; compose
+selection reaches every call; both `ps` JSON forms; 0/1/2 API instances;
+unknown worker state ≠ pass; kube inspection error stays INCOMPLETE;
+unrelated HPA distinguished; `:sha256-` tag ≠ digest). Runs in the existing
+`test` job. `browser-smoke` job now also `bash -n`s both runners and
+`--collect-only`s `browser_tests/target_acceptance/` (never executes it — no target).
+
+### Validation (REV 3)
+
+| gate | result |
+|---|---|
+| `core/tests/test_deploy_preflight.py` | **53 passed** |
+| full isolated suite (`.venv-pass1`, no PG) | **421 passed / 93 skipped / 0 failed** (= prior 368 + 53 new) |
+| disposable browser smoke `run.sh` | **10 passed** |
+| `browser_tests/target_acceptance/` | **13 collected** (needs a real target to run) |
+| CI on the pushed head | _recorded in the final report_ |
+
+### Still target-dependent (unchanged)
+
+**F-TLS-1 is NOT closed.** Closing it needs a named target where `verify`
+passes edge TLS (real chain + hostname + expiry), HTTP→HTTPS, HSTS, docs
+surface, one-replica/one-worker, and `run_target.sh` passes
+login/refresh/logout/WSS over a trusted-CA chain. P3-8 stays **deferred**
+(`0004`, pending a real-target collision inventory). One `s43-api` replica
+and one worker remain the recommended controlled-beta configuration; a
+shared throttle is a separate change only if a confirmed requirement needs
+one.
 
 ---
 

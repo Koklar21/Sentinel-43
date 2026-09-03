@@ -8,9 +8,12 @@ Pass 5A-Migration foundation.
 **Read the three conclusions in §10 before treating anything here as
 "production-ready" — it is not.**
 
-Companions: `BETA_EXECUTION.md` (checkpoint), `MIGRATION_DEPLOYMENT_BETA.md`,
-`AUTH_SESSION_BETA.md`, `SERVICE_INTEGRATION_BETA.md`, `PASS_BETA_VALIDATION.md`,
-`deploy/proxy/README.md`. Pass 5A/5AM docs unchanged.
+Companions: `BETA_EXECUTION.md` (checkpoint — §9 has the REV 3 release-tooling
+corrections), `MIGRATION_DEPLOYMENT_BETA.md`, `deploy/proxy/README.md`.
+(`AUTH_SESSION_BETA.md`, `SERVICE_INTEGRATION_BETA.md`, `PASS_BETA_VALIDATION.md`
+and other superseded design/validation docs were removed on `main`; their live
+content now lives in this file and `BETA_EXECUTION.md`.) Pass 5A/5AM docs
+unchanged.
 
 ---
 
@@ -84,7 +87,7 @@ stack.
 - k8s `overlays/beta/ingress.yaml`: HSTS + hardening headers pinned;
   `configmap-patch.yaml` adds `S43_TRUSTED_HOSTS` / https origin placeholders.
 
-### C.3 Browser session (P3, AUTH_SESSION_BETA.md)
+### C.3 Browser session (P3)
 - `POST /auth/refresh`, `POST /auth/logout`; `/auth/login` creates a
   server-side session + sets `s43_refresh` (HttpOnly; Secure*; SameSite=Strict;
   Path=/auth) and `s43_csrf` cookies + a `sid`-bound 15-min access token for
@@ -108,9 +111,10 @@ stack.
 ### C.4 Service integration (P4)
 - `0003_users_role_check` — `CHECK (role IN ('operator','admin'))`, fail-closed
   pre-check; model matches; `alembic check` clean; up/down/up verified.
-- `SERVICE_INTEGRATION_BETA.md` — every feature → entrypoint / auth /
-  permission / dependency / check; container network; `/events/proxy`
-  HTTP-ingest vs WS-rebroadcast distinction.
+- Service-integration map (feature → entrypoint / auth / permission /
+  dependency / check; container network; `/events/proxy` HTTP-ingest vs
+  WS-rebroadcast distinction) was written in `SERVICE_INTEGRATION_BETA.md`;
+  that file was removed on `main` with the other superseded design docs.
 - P3-8 (case-insensitive uniqueness): **deferred** to `0004` with a precise
   plan — Informational, needs a real-target collision inventory.
 
@@ -120,7 +124,7 @@ stack.
 - `generate-dev-cert.sh` MSYS guard; `s43-setup` `generate_secrets.py` path
   (A5); proxy static IP `172.28.0.250`.
 
-## D. Measured validation (PASS_BETA_VALIDATION.md has the detail)
+## D. Measured validation
 
 - Full isolated suite: 385 (start) → 429 (P1+P2) → 449 (P3) → **454** (P4-P6).
   0 failed / 0 skipped throughout. SI: `test_service_identity_separation` 12/12.
@@ -140,13 +144,13 @@ stack.
 
 | item | why | how to close |
 |---|---|---|
-| **F-TLS-1** | a local self-signed cert proves the *integration*, not issuance/renewal against a real hostname + CA | complete `overlays/beta/ingress.yaml` (real host, `ClusterIssuer`, verified cert-manager Secret) **or** a config-managed proxy cert on the Compose host; re-run the login→refresh→logout + WSS flow over real HTTPS (`deploy/proxy/README.md`) |
-| **Browser SPA smoke** | **DONE in the integration pass** (`browser_tests/`, real Chromium → nginx TLS → API → disposable PG; 10/10). Remaining: run it against the *named target* (real cert/CA) to close F-TLS-1's browser half. | `./browser_tests/run.sh`; then re-run with `S43_BROWSER_BASE_URL` pointed at the deployed beta |
-| **`S43_REJECT_LEGACY_AUTH` cutover** | Phase E; needs the browser smoke + an observation window with `legacy_auth_request_total._all == 0` + operator sign-off | after the above, set it true (one-var rollback) |
-| **P3-8** case-insensitive uniqueness | Informational; needs a real-target collision inventory | migration `0004` per `SERVICE_INTEGRATION_BETA.md §4` |
-| **Multi-replica login throttle** | still in-process/per-pod (`overlays/beta` runs 2 replicas → 2× the limit) | Redis-backed limiter, or pin beta to 1 replica and document it |
+| **F-TLS-1** | a local self-signed cert proves the *integration*, not issuance/renewal against a real hostname + CA | complete `overlays/beta/ingress.yaml` (real host, `ClusterIssuer`, verified cert-manager Secret) **or** a config-managed proxy cert on the Compose host; run `deploy_preflight.py --phase verify` and `browser_tests/run_target.sh` against the named target |
+| **Browser SPA smoke** | The disposable run (`browser_tests/`, 10/10) verified the shipped SPA's **application behaviour** against a **local disposable stack** — a throwaway test CA accepted via a Chromium SPKI exception + a `CERT_NONE` fixture context. It is **not** certificate-chain validation and **not** a real-target result. | `browser_tests/run.sh` for the disposable check; **`browser_tests/run_target.sh`** (`S43_TARGET_BASE_URL=https://<fqdn>`, trusted-CA verification, dedicated test accounts) against the deployed beta — that is F-TLS-1's browser half |
+| **`S43_REJECT_LEGACY_AUTH` cutover** | Phase E; needs `run_target.sh` green + an observation window with `legacy_auth_request_total._all == 0` + operator sign-off | after the above, set it true (one-var rollback) |
+| **P3-8** case-insensitive uniqueness | Informational; needs a real-target collision inventory | migration `0004` — **deferred**, needs the collision inventory first (do not introduce it without one) |
+| **Multi-replica login throttle** | still in-process/per-pod (`overlays/beta` runs 2 replicas → 2× the limit) | pin beta to **1 replica + 1 worker** (`deploy_preflight.py --phase verify` checks both) — the recommended config; a shared limiter is a separate change only if a confirmed requirement needs it |
 | **k8s cluster apply** | no cluster tested here | `kubectl apply -k overlays/beta` on a NetworkPolicy-enforcing CNI; `kubectl wait job/s43-migration`; the CI `k8s.yml` kind-smoke covers the mechanism |
-| #19 proxy `raw` rebroadcast · #14 anon status detail · #16 Docker Scout · #18 image digest pinning | lower severity; recorded | `SERVICE_INTEGRATION_BETA.md §4` |
+| #19 proxy `raw` rebroadcast · #14 anon status detail · #16 Docker Scout · #18 image digest pinning | lower severity; recorded | tracked; `deploy_preflight.py` PASSes image identity only on a `repo@sha256:<digest>` reference or a recorded local `--image-id` + `--source-revision` |
 | Windows-loopback load number (p50≈2s through the published port) | Docker Desktop for Windows userland-proxy limit, not the app (in-network 8ms) | a real load test belongs on the named target |
 
 ## F. Supported beta configuration
@@ -245,7 +249,7 @@ separate project (`s43smoke`, renamed containers, ports 18443/18080) and was
 ## K. Integration pass — next PR (2026-09-02/03)
 
 Adds one reviewable PR: `integration/beta-hardening-20260901` → `main`.
-Full detail in `BETA_EXECUTION.md §7` and `PASS_BETA_VALIDATION.md §9`.
+Full detail in `BETA_EXECUTION.md §7` (and §8/§9 for the follow-ups).
 
 - **Branch pushed** to `origin`; **PR #251** (`integration/beta-hardening-20260901`
   → `main`). Tip `07686bc` = 6 commits on `a8a5678`. No force, `main` untouched,
@@ -264,6 +268,11 @@ Full detail in `BETA_EXECUTION.md §7` and `PASS_BETA_VALIDATION.md §9`.
   (`connect-src 'self'`, `location.origin`, `wss://<same-origin>/ws`),
   moved the access token to memory-only, and fixed a websocket.js
   multi-socket race. `auth.js`/`websocket.js`/`dashboard.js` → v1.8.0.
+  **Scope (REV 3):** this run proves the SPA's *application behaviour*
+  against a **local disposable stack** only — its "TLS" is a throwaway test
+  CA via an SPKI exception + `CERT_NONE` fixture, i.e. not certificate-chain
+  validation and not a real-target result. Real-target browser acceptance is
+  `browser_tests/target_acceptance/` + `run_target.sh` (§K REV 3).
 - **CI** (`.github/workflows/k8s.yml`) — new `pg-tests` job runs beta's nine
   `*_pg.py` suites against a disposable PostgreSQL and **fails on any skip**
   (green on the first PR run); new `browser-smoke` job runs
@@ -271,9 +280,8 @@ Full detail in `BETA_EXECUTION.md §7` and `PASS_BETA_VALIDATION.md §9`.
   `needs: pg-tests`. `scripts/ci_live_tests.py` fixed (`07686bc`) to run
   `alembic upgrade head` + arm break-glass for its disposable DB.
 - **Deployment preflight** — `scripts/deploy_preflight.py` (read-only;
-  `compose` / `kube` modes). Run it against the named target before any
-  deploy command; it fails on placeholder hostnames and lists
-  TARGET-REQUIRED checks.
+  `compose` / `kube` modes). **Superseded by the phase-aware rewrite —
+  see §K REV 3 and `BETA_EXECUTION.md §9`.**
 
 ### Startup addendum (Compose) — the SPA is same-origin now
 
@@ -285,9 +293,20 @@ added to the page's `connect-src`).
 
 ### `docker-compose.browser.yml` / `browser_tests/`
 
-Test-only. `./browser_tests/run.sh` stands up an isolated `s43browser`
-project (own subnet `172.29.0.0/24`, proxy on `127.0.0.1:8443`), runs the
-Playwright suite, `down -v`s. Never touches another stack.
+Two suites, kept apart:
+- **`browser_tests/` (disposable)** — `./browser_tests/run.sh` stands up an
+  isolated `s43browser` project (own subnet `172.29.0.0/24`, proxy on
+  `127.0.0.1:8443`), runs the Playwright suite, `down -v`s. Never touches
+  another stack. `run.sh` now **refuses** a foreign `S43_BROWSER_BASE_URL`.
+- **`browser_tests/target_acceptance/` (target acceptance)** — `run_target.sh` against a
+  **real deployed target**: explicit `S43_TARGET_BASE_URL=https://<fqdn>`
+  used for both browser and API, standard trusted-CA verification (optional
+  `S43_TARGET_CA_BUNDLE`, never disabled), **never** starts/stops/`down -v`s a
+  stack, **never** bootstraps an admin, credentials read from files
+  (`S43_TARGET_OPERATOR_CRED_FILE`; admin-mutation needs
+  `S43_TARGET_ADMIN_SCOPE=explicit-dedicated-account` + dedicated throwaway
+  accounts). Missing credentials → an errored (INCOMPLETE) run, not a green
+  skip.
 
 ### Post-merge verification pass (REV 2, after PR #251 merged)
 
@@ -304,6 +323,30 @@ that the `sessions.refresh_hash` uniqueness guard is still the partial,
 now checks **one replica AND one uvicorn worker** (no `--scale`,
 `--workers > 1`, or `WEB_CONCURRENCY > 1`) in both modes.
 
+### Release-tooling corrections (REV 3, 2026-09-03) — `BETA_EXECUTION.md §9`
+
+The REV 1/REV 2 "target-independent work finished" claim was premature for
+the **tooling**: findings A–E were still reproducible. This pass corrects
+their causes (auth/migration/session results unchanged):
+
+- **`deploy_preflight.py` is now phase-aware.** `--phase {prepare,verify}` is
+  **required** (no default). Exit `0` = every mandatory check for that phase
+  passed; `1` = a confirmed FAIL; `2` = a mandatory check **INCOMPLETE** —
+  never silently 0. `prepare` = deploy inputs, nothing running (and a pass is
+  labelled "inputs in order", **not** beta acceptance). `verify` = the live
+  target (edge TLS via the real trust store or `--ca-bundle`, redirect
+  without following it, `/health`+`/ready`, HSTS, docs surface by real
+  response, one instance **and** one worker, structured compose/kube
+  inspection that never treats an error or a missing resource as a pass).
+- **Image identity:** PASS only on `repo/name@sha256:<64-hex>` or a plain tag
+  **plus** `--image-id sha256:<id>` + `--source-revision <git-sha>`. A
+  `:sha256-…` tag is rejected — it is not digest pinning.
+- **Browser target acceptance split out** (`browser_tests/target_acceptance/`,
+  `run_target.sh`) — see the `browser_tests/` note above.
+- `core/tests/test_deploy_preflight.py` (53 tests) in the `test` job; the
+  `browser-smoke` job lints both runners and collects (never runs) the
+  target suite.
+
 ## §10 — three separate conclusions
 
 1. **Implementation verified locally: YES.** Every phase's behaviour is
@@ -312,13 +355,18 @@ now checks **one replica AND one uvicorn worker** (no `--scale`,
    real Compose beta stack over HTTPS. Full isolated suite green.
 
 2. **Ready for a controlled beta on a named, validated target: BLOCKED —
-   on one verification and one operational choice:**
-   - **F-TLS-1** — edge TLS proven against a real hostname + CA on the target,
-     with `browser_tests/` re-run against that endpoint (the SPA browser
-     smoke itself is now done locally, 10/10 — REV 1 Phase C).
-   - The operational choice in §F: 1 replica / 1 worker for the login
-     throttle (now checked by `deploy_preflight.py`), or a shared throttle.
-   Everything else needed for a controlled beta is in place and reproducible.
+   on target-dependent verification and one operational choice:**
+   - **F-TLS-1** — `deploy_preflight.py --phase verify` and
+     `browser_tests/run_target.sh` both green against the real hostname + CA
+     on the target. The disposable browser run (10/10) is
+     **application-behaviour evidence against a local stack only** — it does
+     not validate a real certificate chain.
+   - The operational choice in §F: **1 replica + 1 worker** for the login
+     throttle (both now checked by `deploy_preflight.py --phase verify`), or a
+     shared throttle.
+   Everything target-independent is in place and reproducible; the tooling
+   defects that made the earlier "finished" claim premature are fixed
+   (REV 3 / `BETA_EXECUTION.md §9`).
 
 3. **Production / public / government readiness: NO.** *This conclusion is a
    status report only — it states where readiness stands, and is not
@@ -335,10 +383,22 @@ now checks **one replica AND one uvicorn worker** (no `--scale`,
 
 ## The single remaining target-specific decision
 
-**Name the beta target** (a Docker host + hostname, or a Kubernetes
-context/cluster/namespace + hostname), so that: (a) the edge-TLS cert can be
-provisioned and F-TLS-1 verified against it, (b) `overlays/beta` CHANGEMEs /
-`.env` can be filled with real values, (c) the migration can be run on that
-target's database as an explicit operator step, and (d) the browser smoke can
-be done against it. Until then, this branch is the finished release candidate
-and every rollout artifact + procedure above is ready.
+**Name the beta target** — provide: target type (Docker Compose host, or
+Kubernetes context + namespace); the hostname (FQDN); the certificate
+approach (public CA / cert-manager `ClusterIssuer` / a config-managed proxy
+cert, and any private CA bundle); and whether the database is fresh or
+existing. Then:
+
+1. `python scripts/deploy_preflight.py {compose|kube} --phase prepare
+   --hostname <fqdn> [--env-file .env | --context <ctx> --namespace <ns>]
+   --image <repo@sha256:… | tag --image-id … --source-revision …>`
+2. fill `overlays/beta` CHANGEMEs / `.env` with real values; provision the
+   edge cert
+3. deploy (migrate first — Job / `s43-migrate` — then the API; §G–H)
+4. `python scripts/deploy_preflight.py {compose|kube} --phase verify
+   --hostname <fqdn> …` — must exit 0 from an external vantage point
+5. `S43_TARGET_BASE_URL=https://<fqdn> S43_TARGET_OPERATOR_CRED_FILE=…
+   bash browser_tests/run_target.sh` — closes F-TLS-1's browser half
+
+Until then, every target-independent artifact and procedure above is ready;
+F-TLS-1 stays open and no certification/compliance claim is made.
