@@ -38,13 +38,18 @@ EXT
 openssl x509 -req -in s43.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
     -out s43.crt -days 365 -extfile s43.ext
 
-cat s43.crt ca.crt > s43.fullchain.crt
+# nginx serves the leaf + CA as one file. docker-compose.browser.yml mounts
+# this whole directory at /etc/nginx/certs (replacing the base dir mount),
+# and nginx.conf reads /etc/nginx/certs/s43.crt + /etc/nginx/certs/s43.key.
+mv s43.crt s43.leaf.crt
+cat s43.leaf.crt ca.crt > s43.crt
+cp s43.crt s43.fullchain.crt
 
-SPKI=$(openssl x509 -in s43.crt -pubkey -noout \
+SPKI=$(openssl x509 -in s43.leaf.crt -pubkey -noout \
     | openssl pkey -pubin -outform der \
     | openssl dgst -sha256 -binary | openssl enc -base64)
 printf 'SPKI_SHA256_BASE64=%s\n' "$SPKI" > spki.txt
 
-openssl verify -CAfile ca.crt s43.crt
-echo "wrote ca.crt s43.crt s43.key s43.fullchain.crt spki.txt (host=$HOST, 365d)"
+openssl verify -CAfile ca.crt s43.leaf.crt
+echo "wrote ca.crt s43.crt (leaf+CA) s43.key spki.txt (host=$HOST, 365d)"
 echo "SPKI pin: $SPKI"

@@ -35,9 +35,11 @@ services:
       s43_net:
         ipv4_address: 172.29.0.250
     volumes:
-      # leaf+chain and key from the throwaway test CA (gitignored)
-      - ./browser_tests/certs/s43.fullchain.crt:/etc/nginx/certs/s43.crt:ro
-      - ./browser_tests/certs/s43.key:/etc/nginx/certs/s43.key:ro
+      # Same target as the base compose's ./deploy/proxy/certs mount, so this
+      # replaces it (rather than nesting inside it -- which fails on a fresh
+      # checkout where deploy/proxy/certs/ is empty). generate-test-ca.sh
+      # writes s43.crt (leaf+CA) + s43.key here; all gitignored.
+      - ./browser_tests/certs:/etc/nginx/certs:ro
   s43-setup:   { container_name: s43browser_setup }
 
 # Own subnet so this never collides with the primary stack's 172.28.0.0/24.
