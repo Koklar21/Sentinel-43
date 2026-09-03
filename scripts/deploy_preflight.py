@@ -237,13 +237,32 @@ def check_compose_runtime(hostname: str) -> None:
            "backend / watchtower not host-published (proxy is the only ingress)",
            "; ".join(bad) or "ok")
 
+    # The login throttle is process-local: it is correct only with ONE API
+    # replica AND one uvicorn worker process. Check both.
+    running_api = [
+        s for s in services
+        if (s.get("Service") or "") == "s43-api" and
+           str(s.get("State", "")).lower() in ("running", "up") or
+           "s43-api" in (s.get("Name", "") or "") and "exit" not in str(s.get("State", "")).lower()
+    ]
+    n_containers = len({s.get("Name") or s.get("ID") for s in running_api}) or len(running_api)
+    record(PASS if n_containers <= 1 else FAIL,
+           "exactly one s43-api container (no `--scale s43-api=N`)",
+           f"{n_containers} s43-api containers")
+
     rc, workers = _run(["docker", "compose", "exec", "-T", "s43-api",
-                        "sh", "-c", "ps -eo args | grep -c '[u]vicorn'"])
+                        "sh", "-c",
+                        "ps -eo args 2>/dev/null | grep -c '[u]vicorn.*core.api.main' || "
+                        "ps -eo args | grep -c '[u]vicorn'"])
     if rc == 0:
         n = workers.strip()
-        record(PASS if n in {"1", "2"} else FAIL,
-               "single uvicorn worker (process-local login throttle is correct)",
-               f"{n} uvicorn processes")
+        record(PASS if n == "1" else FAIL,
+               "one uvicorn worker process (no --workers / WEB_CONCURRENCY > 1)",
+               f"{n} uvicorn worker processes")
+    rc, wc = _run(["docker", "compose", "exec", "-T", "s43-api",
+                   "sh", "-c", "printf %s \"$WEB_CONCURRENCY\""])
+    if rc == 0 and wc.strip() not in ("", "1"):
+        record(FAIL, "WEB_CONCURRENCY is not set above 1", wc.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +280,8 @@ def check_kube(context: str, namespace: str, hostname: str) -> None:
     if rc != 0:
         return
 
+    # Login throttle is process-local: correct only with ONE replica AND one
+    # uvicorn worker per pod.
     rc, out = _run(kc + ["get", "deploy", "s43-api", "-o",
                          "jsonpath={.spec.replicas}"])
     record(PASS if out.strip() == "1" else FAIL,
@@ -270,6 +291,25 @@ def check_kube(context: str, namespace: str, hostname: str) -> None:
     rc, out = _run(kc + ["get", "hpa", "-o", "name"])
     record(PASS if rc != 0 or not out.strip() else FAIL,
            "no HorizontalPodAutoscaler on s43-api", out.strip() or "none")
+
+    rc, ready = _run(kc + ["get", "deploy", "s43-api", "-o",
+                           "jsonpath={.status.readyReplicas}"])
+    if rc == 0 and ready.strip() not in ("", "0"):
+        record(PASS if ready.strip() == "1" else FAIL,
+               "exactly one s43-api pod is Ready", f"readyReplicas={ready.strip()}")
+
+    rc, args = _run(kc + ["get", "deploy", "s43-api", "-o", "jsonpath="
+                          "{.spec.template.spec.containers[0].args}"
+                          "{.spec.template.spec.containers[0].command}"])
+    record(FAIL if "--workers" in args and "--workers 1" not in args and "--workers=1" not in args
+           else PASS,
+           "no `--workers > 1` in the s43-api container command", args.strip()[:120] or "(default)")
+
+    rc, wc = _run(kc + ["set", "env", "deploy/s43-api", "--list"])
+    bad_wc = [ln for ln in wc.splitlines()
+              if ln.startswith("WEB_CONCURRENCY=") and ln.split("=", 1)[1].strip() not in ("", "1")]
+    record(PASS if not bad_wc else FAIL,
+           "WEB_CONCURRENCY not set above 1", "; ".join(bad_wc) or "unset or 1")
 
     rc, out = _run(kc + ["get", "job", "s43-migration", "-o",
                          "jsonpath={.status.succeeded}"])
