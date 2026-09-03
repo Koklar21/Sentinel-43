@@ -72,9 +72,31 @@ def main() -> int:
         "S43_SECRETS_ROTATED_AT": datetime.now(timezone.utc).isoformat(),
         "S43_OPERATOR_USERNAME": "ci-live-operator",
         "S43_OPERATOR_PASSWORD_HASH": hashlib.sha256(password.encode()).hexdigest(),
+        # The env-var operator is scoped break-glass now (RELEASE_FINDINGS #11)
+        # -- inert once a DB admin exists. test_bootstrap.py creates one in
+        # this same run, so arm break-glass explicitly for the disposable CI
+        # database so test_system_smoke.py's live-login (which uses this
+        # env-operator) still works.
+        "S43_BREAK_GLASS_ARMED": "true",
         "S43_WATCHTOWER_URL": "http://127.0.0.1:19100",
         "S43_WATCHTOWER_SERVICE_TOKEN": service_token,
     })
+    # SENTINEL_ENV=production above, so core.auth.users.init_models() is a
+    # deliberate no-op (Alembic owns the schema in a non-local environment).
+    # Run the migration explicitly, exactly as a real deployment does, before
+    # starting the API -- otherwise it 500s on a missing `users` table and
+    # never becomes ready.
+    migrate = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=ROOT, env=env, capture_output=True, text=True,
+    )
+    if migrate.returncode != 0:
+        for value in sensitive:
+            migrate.stderr = migrate.stderr.replace(value, "[REDACTED]")
+        print(migrate.stdout)
+        print(migrate.stderr)
+        raise RuntimeError("alembic upgrade head failed before live CI tests")
+
     processes: list[subprocess.Popen] = []
     handles = []
     result = 1
