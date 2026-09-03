@@ -194,15 +194,23 @@ by-behaviour conflict resolution.
 | Full isolated suite after all Phase C/D/E changes (`.venv-pass1`, disposable PG :55440) | **457 passed / 0 failed / 0 skipped** (260 s, exit 0) |
 | `scripts/ci_live_tests.py` (live API + `test_bootstrap` + `test_system_smoke`, disposable PG :5432, `GITHUB_ACTIONS=true`) | **13 passed / 1 skipped** (exit 0) after the `07686bc` fix (see below) |
 
-**CI (`.github/workflows/k8s.yml` on PR #251):** the first run (`7dc4e4d`)
-had `validate-manifests` ✓ and the new **`pg-tests` ✓** (beta's nine
-`*_pg.py` suites all ran in CI, none skipped — the gap this pass closed),
-but the `pytest` job's `ci_live_tests.py` step failed: the merge left the
-live API with no schema (`init_models()` is a non-local no-op now) and the
-env-operator inert (`#11` break-glass, after `test_bootstrap` makes an
-admin). Fixed in **`07686bc`** — `ci_live_tests.py` runs `alembic upgrade
-head` first and arms `S43_BREAK_GLASS_ARMED` for its disposable DB. CI
-re-run on `07686bc`: _conclusion recorded in the final report_.
+**CI (`.github/workflows/k8s.yml` on PR #251).** Two issues surfaced and
+were fixed in-branch:
+- `7dc4e4d` — `pytest` job's `ci_live_tests.py` step failed: post-merge the
+  live API had no schema (`init_models()` is a non-local no-op) + inert
+  env-operator (`#11`, after `test_bootstrap` makes an admin). Fixed
+  `07686bc` (`alembic upgrade head` first + `S43_BREAK_GLASS_ARMED`).
+- `07686bc` — `browser SPA smoke` job failed on a cert bind-mount nested
+  inside the base proxy's (empty on a fresh checkout) cert dir. Fixed
+  `1840237` (mount the test cert dir over it; `s43.crt` = leaf+CA chain).
+
+**Run 33717346210 on `1840237` — all six jobs green:**
+`validate-manifests` ✓ · **`pytest (disposable PostgreSQL)` ✓** (beta's
+nine `*_pg.py` suites, none skipped — the gate this pass added) ·
+`pytest` ✓ · `browser SPA smoke (Playwright)` ✓ ·
+`Build image + vulnerability scan` ✓ (Alpine + Trivy HIGH/CRITICAL +
+container test stage) · `kind smoke deploy` ✓ (Calico, migration Job,
+non-root + read-only-rootfs, `/health` + `/bootstrap`).
 
 ### Browser smoke — what actually ran
 
