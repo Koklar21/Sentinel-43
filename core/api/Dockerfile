@@ -1,6 +1,6 @@
 # Alpine avoids the unfixed Debian package findings in the former slim image.
 # Keep the Python minor version aligned with CI and verify the resulting image.
-FROM python:3.13-alpine
+FROM python:3.13-alpine AS dependencies
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
@@ -10,8 +10,18 @@ WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --upgrade pip \
-    && pip install --no-cache-dir -r /app/requirements.txt \
-    && python -m pip uninstall -y pip \
+    && pip install --no-cache-dir -r /app/requirements.txt
+
+# Exercise the same native dependencies and libc as the release image.
+# This stage is built only by CI; test tooling is absent from the final image.
+FROM dependencies AS test
+RUN python -m pip install --no-cache-dir pytest requests
+COPY . /app
+ENV S43_WATCHTOWER_URL=http://127.0.0.1:19100
+ENV S43_WATCHTOWER_TIMEOUT=0.1
+
+FROM dependencies AS runtime
+RUN python -m pip uninstall -y pip \
     && python -c "import pathlib, shutil, sysconfig; shutil.rmtree(pathlib.Path(sysconfig.get_path('stdlib')) / 'ensurepip')"
 
 COPY . /app

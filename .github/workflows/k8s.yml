@@ -127,6 +127,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Test application on the container runtime
+        run: |
+          docker build --target test -t sentinel43-api:test -f core/api/Dockerfile .
+          docker run --rm sentinel43-api:test python -m pytest core/tests/ -q \
+            --ignore=core/tests/test_bootstrap.py \
+            --ignore=core/tests/test_system_smoke.py
+
       - name: Build image
         run: docker build -t sentinel43-api:ci -f core/api/Dockerfile .
 
