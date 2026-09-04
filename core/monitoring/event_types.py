@@ -384,14 +384,13 @@ def to_event_context(
     SentinelWindowStore keys its deques on (identity, ip) and
     will reject any event missing either field.
     """
-    # Import here to avoid a hard dependency on the AI detection package
-    # at module import time -- if sentinel_43_ai is not installed,
-    # everything except to_event_context() still works normally.
+    # Imported lazily to keep module import light; EventContext lives in the
+    # threat-detector module.
     try:
-        from sentinel_43_ai.detection.sentinel_threat_detector import EventContext
+        from core.detection.sentinel_threat_detector import EventContext
     except ImportError as exc:
         raise ImportError(
-            "to_event_context() requires sentinel_43_ai to be installed: "
+            "to_event_context() requires core.detection.sentinel_threat_detector: "
             f"{exc}"
         ) from exc
 

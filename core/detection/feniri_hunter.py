@@ -86,14 +86,13 @@ import aiohttp
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 
 # ---------------------------------------------------------------------------
-# ADJUST IMPORT PATH if your package layout differs from sentinel_43_ai/detection/
 # Hard imports — Fenrir refuses to start if either is not importable.
 # ---------------------------------------------------------------------------
-from sentinel_43_ai.detection.sentinel_threat_detector import (
+from core.detection.sentinel_threat_detector import (
     DetectorConfig,
     SentinelThreatDetector,
 )
-from sentinel_43_ai.detection.sentinel_threat_types import (
+from core.detection.sentinel_threat_types import (
     ThreatAssessment,
     ThreatSeverity,
 )
