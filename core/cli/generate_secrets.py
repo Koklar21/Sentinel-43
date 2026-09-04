@@ -119,7 +119,7 @@ _REGISTRY: tuple[tuple[str, object, str | None], ...] = (
     # (env_key, generator_fn, section_heading or None)
     ("S43_JWT_SECRET",               _url,  "JWT signing"),
     ("S43_AUTH_PEPPER",              _hex,  "Auth key-store hardening (required in production by bootstrap.py)"),
-    ("SENTINEL_LOG_SALT",            _hex,  "Log pseudonymization (required in production by sentinel_ai_escalation.py)"),
+    ("SENTINEL_LOG_SALT",            _hex,  "Log pseudonymization salt (hashing of IPs/identities in logs)"),
     ("SENTINEL_REMOTE_TOKEN_OWNER",  _url,  "Remote gateway operator tokens"),
     ("SENTINEL_REMOTE_TOKEN_ADMIN",  _url,  None),
     ("SENTINEL_REMOTE_TOKEN_AUDITOR",_url,  None),
