@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from Core.logging_init import get_logger
+from core.logging_init import get_logger
 
 
 RUNTIME_MODULE_ID = os.getenv("S43_RUNTIME_MODULE_ID", "sentinel-43-runtime")

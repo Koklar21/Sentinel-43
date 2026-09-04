@@ -865,11 +865,11 @@ def _require_node_token(authorization: str | None, config: IntegrityConfig) -> N
     Validate bearer token against S43_SPARTA_NODE_TOKEN.
 
     Fails closed:
-      - no configured token = 503
+      - no configured token (unset / blank / whitespace-only) = 503
       - missing/malformed header = 401
       - wrong token = 401
     """
-    if not config.node_api_token:
+    if not config.node_api_token or not config.node_api_token.strip():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(

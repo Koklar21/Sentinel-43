@@ -202,7 +202,7 @@ _MANAGER_MODULE_CANDIDATES: tuple[str, ...] = (
 
 _WINDOW_STORE_CANDIDATES: tuple[str, ...] = (
     ".window_store",
-    "sentinel_43_ai.detection.window_store",
+    "core.detection.sentinel_window_store",
 )
 
 _SPARTA_MODULE_CANDIDATES: tuple[str, ...] = (
@@ -214,6 +214,7 @@ _FIREWALL_MODULE_CANDIDATES: tuple[str, ...] = (
 )
 
 _JORM_MODULE_CANDIDATES: tuple[str, ...] = (
+    "core.monitoring.jormungandr",
     "core.audit.jormungandr",
 )
 
@@ -336,7 +337,7 @@ def _load_window_store_export(name: str) -> Any:
     _warn_missing(
         name,
         errors,
-        hint="Install sentinel_43_ai or provide core.monitoring.window_store.",
+        hint="Provide core/monitoring/window_store.py or core/detection/sentinel_window_store.py.",
     )
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
 
@@ -425,7 +426,7 @@ def _load_jormungandr_export(name: str) -> Any:
     _warn_missing(
         name,
         errors,
-        hint="Ensure core/audit/jormungandr.py exists and required crypto deps are installed.",
+        hint="Ensure core/monitoring/jormungandr.py exists and the 'cryptography' package is installed.",
     )
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
 

@@ -1,6 +1,11 @@
 fastapi>=0.116.0
 uvicorn[standard]>=0.35.0
 pydantic>=2.11.0
+# core/config/{settings,config}.py build their Settings on pydantic-settings'
+# BaseSettings/SettingsConfigDict. It was never declared, so `import
+# core.config` (and core/scripts/governance_smoketest.py) failed on a clean
+# install regardless of the __init__ syntax fix.
+pydantic-settings>=2.0
 python-dotenv>=1.1.0
 
 PyJWT>=2.9.0
@@ -25,3 +30,8 @@ asyncpg>=0.29.0
 alembic>=1.13
 
 argon2-cffi>=23.1.0
+
+# core/monitoring/jormungandr.py (the optional AEAD-encrypted, hash-chained
+# governance audit node) needs cryptography.hazmat. Optional at runtime
+# (core.monitoring lazy-loads it), but the import must resolve where it is used.
+cryptography>=42.0.0

@@ -294,3 +294,6 @@ class AuditState:
             )
 
         return copy.deepcopy(record)
+
+
+audit_state = AuditState()

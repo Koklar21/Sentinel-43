@@ -1411,3 +1411,6 @@ class WatchtowerState:
             )
 
         return cleaned
+
+
+watchtower_state = WatchtowerState()
