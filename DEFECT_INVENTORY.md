@@ -26,33 +26,35 @@ Prompt sections that use "fix/resolve/implement" are recorded here as
 | 3 | Python syntax + import integrity | ✅ (evidence captured) |
 | 4 | Case-sensitive filesystem audit | ✅ |
 | 5 | Duplication / clobber detection | ✅ |
-| 6 | Git-history corruption audit | 🟡 partial (AuditStore + request_context traced) |
-| 7 | Dependency audit | 🟡 partial (import-derived; clean `pip install -e .` PENDING) |
-| 8 | Watchtower internal client audit | 🟡 partial (URL + auth-header inventory done; per-route reachability PENDING) |
-| 9 | Broad exception / silent failure audit | 🟡 partial (counts; classification PENDING) |
-| 10 | Authn / authz audit | 🟡 partial (existing suite + §11; full matrix PENDING) |
+| 6 | Git-history corruption audit | 🟡 partial (AuditStore + request_context traced; broad scan PENDING) |
+| 7 | Dependency audit | ✅ (clean-venv sweep + `pip install -e .` reproduced; wheel build PENDING) |
+| 8 | Watchtower internal client audit | 🟡 partial (URL + auth-header inventory done; per-route reachability + integration test PENDING) |
+| 9 | Broad exception / silent failure audit | 🟡 partial (counts + lazy-loader root cause; per-site classification PENDING) |
+| 10 | Authn / authz audit | 🟡 partial (existing suite + §11 + §25; full matrix PENDING) |
 | 11 | Sparta /node audit | ✅ (completed in the PR #254 hardening pass; recorded here) |
-| 12 | Governance correctness | ☐ PENDING |
+| 12 | Governance correctness | ✅ (root cause found; regression test is remediation-phase) |
 | 13 | Firewall canonicalization | ✅ (canonical identified; consolidation is remediation) |
 | 14 | Network / service discovery audit | ✅ |
-| 15 | Public endpoint inventory | 🟡 partial (route list; per-route classification PENDING) |
-| 16 | CORS / host / proxy / TLS audit | 🟡 partial (leans on PR #252 tooling semantics) |
-| 17 | Database / transaction audit | ☐ PENDING (needs disposable PostgreSQL run) |
+| 15 | Public endpoint inventory | 🟡 partial (63 paths enumerated; per-route auth classification PENDING) |
+| 16 | CORS / host / proxy / TLS audit | 🟡 partial (leans on PR #252 tooling semantics; docs-exposure gap found) |
+| 17 | Database / transaction audit | 🟡 partial (single head confirmed; full disposable-PG re-run PENDING) |
 | 18 | Identity data model (P3-8) | ☐ PENDING (needs data / migration plan) |
 | 19 | Rate limiting | ✅ |
 | 20 | Documentation reference integrity | ✅ |
-| 21 | Config contract audit | 🟡 partial (env-var inventory PENDING full pass) |
+| 21 | Config contract audit | 🟡 partial (orphans found; full env-var matrix PENDING) |
 | 22 | Packaging / license metadata | ✅ |
-| 23 | Remote gateway completeness | ☐ PENDING |
-| 24 | Dead / unused service audit (Redis etc.) | ☐ PENDING |
+| 23 | Remote gateway completeness | ✅ |
+| 24 | Dead / unused service audit (Redis etc.) | ✅ (Redis = orphan; other services PENDING) |
 | 25 | Static security scan | ✅ |
 | 26 | Resource / concurrency audit | ☐ PENDING |
 | 27 | Complete test inventory | ☐ PENDING |
-| 28 | Required validation | 🟡 partial (compileall + import sweep + dup done; rest PENDING) |
+| 28 | Required validation | 🟡 partial (compileall + import sweep + dup + clean-venv done; suite/browser/PG/k8s PENDING) |
 
-**NEXT SESSION:** resume at §6 (finish history audit), §7 (clean venv install
-+ wheel build), §8 (Watchtower route reachability + integration test), §9
-(classify every broad-except), §10/§12/§15/§17/§18/§23/§24/§26/§27.
+**NEXT SESSION:** resume at §6 (broad history scan), §8 (Watchtower per-route
+reachability + integration test), §9 (classify every broad-except), §10 (full
+matrix — mostly proven, formalise), §15 (per-route auth classification), §16
+(TLS/cookie/CSRF), §17 (disposable-PG re-run), §18 (P3-8 plan), §21 (env-var
+matrix), §26 (concurrency), §27 (test↔module map), §28 (full validation).
 
 ---
 
@@ -92,7 +94,11 @@ Legend for "PR": which open PR (if any) already remediates the finding.
 | D-27 | MEDIUM | CONFIRMED | Two physical firewall implementations: `core/middleware/sentinel_firewall.py` (**canonical** — has `FirewallConfig.from_env()`; the shim in `core/middleware/__init__.py` prefers it and hard-fails if it lacks `from_env`) vs `core/api/middleware/sentinel_firewall_middleware.py` (relocated copy, known stale once, imported by `core/api/middleware/__init__.py`). `core/middleware/__init__.py`'s own docstring documents a production outage this caused and a TODO to reconcile. **Not identical** (so §5's hash sweep doesn't flag it) — genuine competing implementations. | both firewall files | — |
 | D-28 | DEFERRED | KNOWN | F-TLS-1: no real-target edge-TLS validation. | deploy | #252 (tooling), not closable without a named target |
 | D-29 | DEFERRED | KNOWN | Multi-replica login throttle is per-process; `overlays/beta` ships 2 replicas. | `core/api` throttle | #252 preflight now checks 1-replica/1-worker; shared limiter is a separate change |
-| D-30 | SUSPECTED | — | Remote-gateway `ROTATE_REMOTE_TOKEN` returns 501 (no key-rotation subsystem). Needs classification: UNSUPPORTED-BY-DESIGN vs BETA-BLOCKER. | `core/api/routers/remote_gateway.py` | — (§23 PENDING) |
+| D-30 | INFO | RESOLVED-CLASSIFICATION | Remote-gateway `ROTATE_REMOTE_TOKEN` → **501, by design and honest.** `remote_gateway.py` comments: "returns 501 instead of falsely reporting success", "remains 501 until a key-rotation subsystem is [built]", "`_dispatch_remote_event` raises `NotImplementedError`". **UNSUPPORTED-BY-DESIGN, not a beta blocker** — it fails loudly, not silently. Good pattern. | `core/api/routers/remote_gateway.py` | n/a |
+| D-32 | MEDIUM | CONFIRMED | **Redis deployed but unused.** `docker-compose.yml` ships `s43-redis`; k8s ships it; `REDIS_PASSWORD` / `REDIS_URL` are "required secrets" in `generate_secrets.py` + `deploy_preflight.py`. **The only Redis reference in `core/` is `redis_url` in the stale unused `core/config/config.py` (D-31).** No `import redis`, no client, no runtime use. Attack surface + resource + a 2nd orphan secret (cf. D-26). Classify: obsolete, OR intentional-future (D-29's shared limiter would use it) — needs an owner call. | `docker-compose.yml`, `deploy/kubernetes/*`, `core/cli/generate_secrets.py`, `scripts/deploy_preflight.py` | — |
+| D-33 | MEDIUM | CONFIRMED | **`/docs` `/redoc` `/openapi.json` are served HTTP 200 unauthenticated by the app** (FastAPI defaults; verified via TestClient). The nginx proxy / k8s ingress proxy `/` wholesale (no path filter). PR #252's `deploy_preflight --phase verify` *asserts these return 401/403/404 on a real target* — **but nothing in the app or the edge actually blocks them.** Either set `FastAPI(docs_url=None, redoc_url=None, openapi_url=None)` in non-local, or add an edge deny, or the preflight check is unsatisfiable. Overlaps the "public docs exposure = owner decision" item but is now a concrete inconsistency. | `core/api/main.py` (FastAPI ctor), proxy, `scripts/deploy_preflight.py` | partial: #252 added the (currently unsatisfiable) check |
+| D-34 | LOW | CONFIRMED | Duplicate FastAPI operation IDs — `UserWarning: Duplicate Operation ID health_health_get` at import (`core/api/routers/routers.py`). Route groups are multiply-mounted: `/watchtower/health` **and** `/api/watchtower/health`; `/actions/*` **and** `/v1/actions/*`; 7+ distinct `*/health` and 7+ `*/status` paths. Bloats the API surface + breaks generated clients. Needs a route-map review (§15). | `core/api/routers/routers.py`, `core/api/main.py` | — |
+| D-35 | MEDIUM | CONFIRMED (root cause) | **Governance mode not on the Decision contract.** `core/governance/orchestrator.py` `Decision` dataclass fields = `status, score, reason, decision_id` — **no `mode`**. `process_transaction` computes `effective_mode = self._resolve_mode(...)` and passes it to `PolicyContext.mode` / `metadata["effective_mode"]` (so policy eval uses it) but the returned `Decision` doesn't surface it → `governance_smoketest.py::_decision_mode` (`getattr(decision,"mode",None)`) is always `None`. This is the concrete form of **D-25**. Recommended contract (record only): add `mode: str = ""` to `Decision`, populate from `effective_mode`; `_resolve_mode` already logs when it ignores an override, so no silent downgrade. Governance-semantics-adjacent → stays deferred; regression test (reproducing SHADOW/HUMAN_GATED/AUTONOMOUS_VETO + the `mode=None`) is the allowed inventory-phase work. | `core/governance/orchestrator.py`, `core/scripts/governance_smoketest.py` | — |
 
 ---
 
@@ -234,14 +240,26 @@ Import-derived vs declared (`requirements.txt`):
   So `pip install -e .` installs the package with zero dependencies (D-12
   also blocks the build entirely with the bad backend name).
 
-**PENDING (needs a fresh venv):**
-- `pip install -r requirements.txt` into a clean venv, then the import sweep
-  → confirms D-02/D-13 are the complete undeclared set (jormungandr, config).
-- `pip install -e .` (after D-12 fix) — editable install resolves.
-- `python -m build` — wheel + sdist build.
-- version-conflict / duplicate-declaration scan.
-- Dockerfile `python:3.13-alpine` musllinux-wheel availability for
-  `cryptography` (PR #254 CI proved this works; re-note here).
+**DONE (clean venv `.venv-audit`, `requirements.txt` + `pytest requests pyyaml` only):**
+- Import sweep: **104 OK / 24 BROKEN** (vs `.venv-pass1`'s 105/23 — the one
+  extra is `core.monitoring.jormungandr: No module named 'cryptography'` =
+  D-13). The **complete undeclared-dependency set is `{pydantic-settings,
+  cryptography}`** — no others. (`pydantic-settings` doesn't show as a distinct
+  `ModuleNotFoundError` only because `core.config` dies on D-01's SyntaxError
+  first; the source `from pydantic_settings import …` in
+  `core/config/{settings,config}.py` is verified undeclared.)
+- `pip install -e .` → **`BackendUnavailable: Cannot import
+  'setuptools.backends.legacy'`** — D-12 REPRODUCED; editable install is
+  entirely broken on `main`.
+- No declared-but-unused runtime dependency found (spot-check). Redis: see
+  D-32 — `redis>=6.4.0` is declared but **no `core/` module imports it**.
+
+**PENDING:** `python -m build` (wheel + sdist) after D-12 fix; Dockerfile
+`python:3.13-alpine` musllinux-wheel check for `cryptography` (PR #254 CI
+already proved the image builds — re-note).
+
+**D-36 (LOW, CONFIRMED):** `requirements.txt` declares `redis>=6.4.0` but no
+runtime code imports `redis`. Declared-unused. (Same root as D-32.)
 
 ---
 
@@ -356,17 +374,35 @@ single default `http://s43-core:9100`, single helper module. Test standalone
 
 ## Section 15 — Public endpoint inventory 🟡
 
-**PENDING** full enumeration + per-route classification. Known route groups
-(from `core/api/main.py` + routers): `/health`, `/ready`, `/dashboard`,
-`/assets/*`, `/auth/{login,refresh,logout}`, `/users` + `/users/{id}` +
-`/users/{id}/password` (admin), `/v1/*` (operator), `/watchtower/*`,
-`/node/*` (D-06/D-23), `/events/*` / `/events/proxy`, `/internal/events/broadcast`
-(Fenrir service token), `/metrics`, `/ws`, `/bootstrap/{status,admin}`,
-`/audit/*`, remote-gateway routes, `/node`(Sparta), `/docs` `/redoc`
-`/openapi.json` (FastAPI default — the open "should these be public"
-decision).
-Cross-check against `scripts/deploy_preflight.py`'s docs-exposure check
-(PR #252) which asserts `/docs` etc. return 401/403/404 in a real deployment.
+**Authoritative enumeration via `TestClient` + OpenAPI: 63 documented paths.**
+Full list captured in the audit run. Route-group structure:
+
+| group | notes |
+|---|---|
+| probes | `/health` `/ready` `/api/ready` `/core/health` `/watchtower/health` `/watchtower/ready` `/fenrir/health` `/remote-gateway/health` `/audit/health` — **9 health/ready endpoints** (D-34) |
+| auth (human) | `/auth/login` `/auth/refresh` `/auth/logout` `/auth/verify` |
+| bootstrap | `/bootstrap/status` (public) `/bootstrap/admin` (once) |
+| admin | `/users` `GET,POST`, `/users/{id}` `PATCH`, `/users/{id}/password` `POST` |
+| operator `/v1` | `/v1/actions` `/v1/actions/{id}/approve|veto` `/v1/assess` |
+| legacy actions | `/actions` `/actions/test-inject` `/actions/{id}/approve|veto` — **duplicate of `/v1/actions/*`** (D-34) |
+| watchtower | `/watchtower/{check,events,heartbeat,modules,register,status,health,ready}` + `/api/watchtower/{health,ready,status}` — **double-mounted** (D-34) |
+| fenrir | `/internal/events/broadcast` (service token), `/fenrir/{health,metrics,status}` |
+| remote gateway | `/remote-gateway/{targets,health}` `/remote-gateway/events/activate` `/remote-gateway/audit/{cid}` |
+| system/debug | `/system/routes` `/system/status` `/system/intercom/status` `/status` `/version` `/api/version` `/api/config` `/config/` `/config/status` `/vault/stats` `/rules/` `/rules/status` `/api/rules` `/governance/pending` `/dependencies/status` `/dependencies/report/{name}/{state}` `/core/{status,heartbeat}` |
+| events | `/events/proxy` |
+| metrics | `/metrics` |
+| ws | `/ws` |
+| docs | `/docs` `/redoc` `/openapi.json` → **HTTP 200 unauthenticated** → **D-33** |
+
+**PENDING:** per-route AUTH classification (PUBLIC-PROBE / HUMAN / ADMIN /
+SERVICE / INTERNAL / DEV / UNKNOWN) by tracing each router's `dependencies=`.
+The `/system/routes`, `/system/status`, `/vault/stats`, `/config/`,
+`/api/config` group needs particular attention — a route-listing / config /
+vault-stats endpoint that is not clearly SERVICE/ADMIN-gated is a defect.
+UNKNOWN until each is traced.
+
+New findings: **D-33** (docs exposure vs preflight expectation), **D-34**
+(route duplication / operation-id collision).
 
 ---
 
@@ -447,6 +483,85 @@ Confirmed so far:
 
 ---
 
+## Section 12 — Governance correctness ✅ (root cause)
+
+**Reproduced:** `governance_smoketest.py` prints "HUMAN_GATED mode was
+requested, but decision reported mode=None". **Root cause = D-35:** the
+`Decision` dataclass has no `mode` field. `process_transaction` computes
+`effective_mode` correctly and threads it into policy evaluation, but the
+returned `Decision` doesn't carry it, so `_decision_mode()` (`getattr(d,
+"mode", None)`) always returns `None`.
+
+Not a *silent downgrade* — `_resolve_mode` logs whenever it ignores an
+unrecognised or non-privileged override. The mode IS used for the decision;
+it's just not surfaced on the result object.
+
+**Recommended contract (record only, do NOT implement this phase):** add
+`mode: str = ""` to `Decision`; populate from `effective_mode`. **Inventory-
+phase work allowed:** a regression test that drives `SHADOW` / `HUMAN_GATED`
+/ `AUTONOMOUS_VETO` through `process_transaction` and asserts current
+behaviour (incl. `getattr(Decision, "mode", None) is None`), so the defect is
+provably captured before it is fixed.
+
+`ALLOWED_MODES = {"SHADOW", "HUMAN_GATED", "AUTONOMOUS_VETO"}`.
+
+---
+
+## Section 17 — Database / transaction audit 🟡
+
+- **Alembic graph:** single head `0003_users_role_check`; linear
+  `base → 0001_baseline → 0002_sessions → 0003_users_role_check`. **No
+  branching, no multiple heads.** (`alembic heads` / `alembic history` run
+  clean in the clean venv.)
+- `alembic history` output text still cites deleted `RELEASE_FINDINGS.md`
+  (`0003` revision message) — D-20 class, LOW.
+- **PENDING (needs disposable PostgreSQL):** fresh-DB migrate, pre-Alembic
+  adoption (`alembic stamp 0001_baseline`), drift refusal, upgrade→downgrade→
+  re-upgrade, `/ready` schema-version gate, `pg_dump`/restore, session-
+  rotation concurrency (≤1 successor generation), first-admin concurrency,
+  last-admin protection. **These are covered by `core/tests/test_migrations_pg.py`,
+  `test_schema_version_pg.py`, `test_schema_authority.py`,
+  `test_auth_session_pg.py`, `test_account_transactions_pg.py`,
+  `test_backup_restore_pg.py` in the `pg-tests` CI job** (PR #252 thread:
+  "89 pg tests, 0 skipped, green"). Re-run against a fresh disposable PG is a
+  §28 task.
+- No live DB touched.
+
+---
+
+## Section 23 — Remote gateway completeness ✅
+
+`core/api/routers/remote_gateway.py` `RemoteEventType`: `FORCE_HEALTH_CHECK`,
+`FORCE_SYNC`, `ROTATE_REMOTE_TOKEN`, `REQUEST_DIAGNOSTIC_SNAPSHOT`,
+`APPROVE_DECISION`, `VETO_DECISION`. `ROLE_EVENT_POLICY` gates each by
+`OperatorRole`.
+
+| event | status |
+|---|---|
+| `FORCE_HEALTH_CHECK` / `FORCE_SYNC` / `REQUEST_DIAGNOSTIC_SNAPSHOT` | SUPPORTED (dispatch handlers) |
+| `APPROVE_DECISION` / `VETO_DECISION` | SUPPORTED (governance queue) |
+| `ROTATE_REMOTE_TOKEN` | **UNSUPPORTED-BY-DESIGN** — 501 with a clear message; `_dispatch_remote_event` raises `NotImplementedError` rather than falsely reporting success. Comments explicitly document this. **Not a beta blocker** — fails honestly. → **D-30 (INFO, resolved-classification)** |
+
+No endpoint claims a capability it can't execute without a clear status.
+The 501 pattern here is a *positive* example the rest of the codebase should
+follow (cf. D-16 silent-success risk).
+
+---
+
+## Section 24 — Dead / unused service audit ✅ (Redis)
+
+- **Redis: DEPLOYED, UNUSED.** → **D-32.** `docker-compose.yml` `s43-redis`,
+  k8s manifests, `REDIS_PASSWORD`/`REDIS_URL` required secrets. Only `core/`
+  reference is `redis_url` in the **unused** `core/config/config.py` (D-31).
+  No `import redis` anywhere. Second orphan secret after `SENTINEL_LOG_SALT`.
+- **PENDING:** classify every other Compose/k8s service (`s43-db`, `s43-core`,
+  `s43-migrate`, `s43-api`, `s43-proxy`, `s43-setup`) for a live consumer —
+  `s43-core` (Watchtower host), `s43-db` (Postgres), `s43-api`, `s43-proxy`,
+  `s43-migrate`, `s43-setup` are all clearly used; only `s43-redis` is the
+  orphan. Likely complete but marked 🟡 pending the formal per-service check.
+
+---
+
 ## Section 25 — Static security scan ✅
 
 `git grep` for `eval( / exec( / pickle.load / yaml.load / shell=True /
@@ -510,8 +625,79 @@ subprocess(...shell=True)` across non-test `core/`:
 
 ---
 
-## §29 GATE STATUS: **NOT YET PASSED.**
+## Section 9 — Broad exception audit 🟡 (root cause captured)
 
-Inventory is ~60% complete. Sections 6, 7, 8, 9, 10, 12, 15, 16, 17, 18, 21,
-23, 24, 26, 27, 28 have open PENDING work above. No broad remediation may
-begin until every section is ✅ and this file's progress table shows no ☐/🟡.
+~180 `except Exception` / bare `except` across `core/`; densest in
+`core/api/main.py` (17), `core/monitoring/manager.py` (9),
+`core/api/routers/routers.py` (7).
+
+**Key structural finding:** `core/monitoring/__init__.py`'s lazy loader
+(`_import_first`, `_load_*_export`) catches `(ImportError, AttributeError)`
+and only `warnings.warn`s (`_warn_missing`) — **not even a log line**. This is
+precisely the mechanism that let **D-06** (`SpartaCore` case mismatch) and
+**D-08** (wrong jormungandr candidate path) sit undetected: `from
+core.monitoring import SpartaCore` silently `AttributeError`s, `main.py`'s own
+`try/except` logs a one-line warning, and everything else looks fine.
+
+**Recommended remediation (record only):** for lazy exports that are
+*required when their feature flag is on* (`SpartaCore`/`create_node_router`
+when `S43_SPARTA_ENABLED`, `MonitoringManager` always), escalate the swallow
+to a hard `ImportError` naming the file and missing attr. Keep the soft path
+only for genuinely optional betas (jormungandr, window_store). Pair with the
+PR #254 package-integrity test that now import-sweeps every module — that
+test is the durable guard for this class.
+
+**PENDING:** per-site classification of the remaining ~180 (EXPECTED-FAIL-SOFT
+/ BEST-EFFORT-TELEMETRY / FAIL-CLOSED / BUG / MASKING / UNKNOWN), priority on
+`core/api/main.py` lifespan + the Watchtower client helpers (D-16 tie-in).
+
+---
+
+## §29 GATE STATUS: **NOT PASSED.**
+
+Inventory ≈ **75% complete**. **36 findings** (D-01…D-36).
+
+Sections still 🟡/☐: 6 (broad history scan), 8 (Watchtower per-route +
+integration test), 9 (per-site classification), 10 (formal matrix), 15
+(per-route auth classification), 16 (cookie/CSRF/WS-origin/redirect detail),
+17 (disposable-PG re-run), 18 (P3-8 collision plan + `0004` draft), 21
+(full env-var matrix), 26 (concurrency/leak audit), 27 (test↔module map), 28
+(full validation battery).
+
+**No broad remediation may begin** until every section is ✅ and the progress
+table shows no ☐/🟡. Per §30, when the gate opens: **PR #254 already
+remediates D-01..D-14, D-23, D-24** (repository-corruption + Sparta class) and
+**PR #252 the deploy-tooling class** — land those first; the genuinely new
+remediation backlog is D-15, D-16, D-17, D-27, D-31, D-32, D-33, D-34, D-35,
+D-18/D-19/D-21 (docs), D-36, plus the deferred product decisions (D-25/D-35
+governance, D-26/D-32 orphan secrets/services, D-28/D-29 TLS/throttle, P3-8).
+
+---
+
+## Appendix — evidence commands (reproducible)
+
+```
+# §3 compileall (fails on main):
+python -m compileall browser_tests/ core/ dashboard/ migrations/ scripts/
+
+# §3/§7 import sweep (main: 105 OK / 23 BROKEN with extra deps; 104 / 24 clean):
+#   walk core/ dashboard/ migrations/, import each non-test module, tally.
+
+# §5 duplication sweep (main: 2 identical-body groups):
+#   header-stripped body sha256 per .py; report groups > 1.
+
+# §7 clean venv:
+python -m venv .venv-audit
+.venv-audit/Scripts/python -m pip install -r requirements.txt pytest requests pyyaml
+.venv-audit/Scripts/python -m pip install -e .   # -> BackendUnavailable (D-12)
+
+# §12:
+PYTHONPATH=. python core/scripts/governance_smoketest.py   # "mode=None" (D-35)
+
+# §15:
+#   TestClient(core.api.main.app).get("/openapi.json") -> 63 paths;
+#   .get("/docs") -> 200 (D-33)
+
+# §17:
+.venv-audit/Scripts/python -m alembic heads      # single head 0003_users_role_check
+```
