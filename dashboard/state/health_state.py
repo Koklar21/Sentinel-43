@@ -765,3 +765,6 @@ class HealthState:
 
         return cleaned
     
+
+
+health_state = HealthState()

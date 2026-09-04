@@ -783,3 +783,6 @@ class RemoteState:
             )
 
         return cleaned
+
+
+remote_state = RemoteState()
