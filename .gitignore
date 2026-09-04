@@ -301,3 +301,7 @@ test-results/
 browser_tests/certs/*.crt
 browser_tests/certs/*.key
 browser_tests/certs/*.srl
+
+# process/audit scratch docs — local only, never committed
+DEFECT_INVENTORY.md
+/agent-notes/
