@@ -30,3 +30,8 @@ asyncpg>=0.29.0
 alembic>=1.13
 
 argon2-cffi>=23.1.0
+
+# core/monitoring/jormungandr.py (the optional AEAD-encrypted, hash-chained
+# governance audit node) needs cryptography.hazmat. Optional at runtime
+# (core.monitoring lazy-loads it), but the import must resolve where it is used.
+cryptography>=42.0.0

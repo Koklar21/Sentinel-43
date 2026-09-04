@@ -14,7 +14,7 @@
 
 [build-system]
 requires = ["setuptools>=68"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "sentinel-43"
@@ -27,5 +27,8 @@ requires-python = ">=3.11"
 # as `s43-generate-secrets` anywhere in the activated virtualenv.
 s43-generate-secrets = "core.cli.generate_secrets:main"
 
-# If you already have a [project.scripts] section, add only this line:
-#   s43-generate-secrets = "core.cli.generate_secrets:main"
+# Flat layout with several top-level dirs (core, dashboard, migrations,
+# browser_tests) — tell setuptools to package only the importable runtime
+# tree so auto-discovery does not error on "multiple top-level packages".
+[tool.setuptools.packages.find]
+include = ["core*"]
