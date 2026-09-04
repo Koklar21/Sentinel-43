@@ -1038,20 +1038,28 @@ elif not _is_local_environment():
         "hostname(s) for defence against Host-header attacks."
     )
 
-try:
-    from core.monitoring import SpartaCore as _SC, IntegrityConfig as _IC, create_node_router
-    _node_router_sparta = _SC(
-        _IC(
-            watched_files={},
-            node_signature="sentinel43-api",
-            token_secret=_env_str("S43_SPARTA_TOKEN_SECRET"),
-            node_api_token=_env_str("S43_SPARTA_NODE_TOKEN", ""),
+# The /node router is part of the SpartaCore subsystem, which is opt-in
+# (S43_SPARTA_ENABLED, default false — same gate as the file-integrity
+# watchdog above and the k8s/compose defaults). Registering it only when
+# Sparta is enabled keeps the default deployment's route surface unchanged.
+# When enabled, /node/* is still fail-closed: every route except the coarse
+# /node/health returns 503 until S43_SPARTA_NODE_TOKEN is set, then 401 for a
+# wrong token (constant-time compare, per-client lockout).
+if _env_bool("S43_SPARTA_ENABLED"):
+    try:
+        from core.monitoring import SpartaCore as _SC, IntegrityConfig as _IC, create_node_router
+        _node_router_sparta = _SC(
+            _IC(
+                watched_files={},
+                node_signature="sentinel43-api",
+                token_secret=_env_str("S43_SPARTA_TOKEN_SECRET"),
+                node_api_token=_env_str("S43_SPARTA_NODE_TOKEN", ""),
+            )
         )
-    )
-    app.include_router(create_node_router(_node_router_sparta))
-    logger.info("SpartaCore node API router registered at /node")
-except Exception as _nr_exc:
-    logger.warning("SpartaCore node router not registered: %s", _nr_exc)
+        app.include_router(create_node_router(_node_router_sparta))
+        logger.info("SpartaCore node API router registered at /node")
+    except Exception as _nr_exc:
+        logger.warning("SpartaCore node router not registered: %s", _nr_exc)
 
 # =============================================================================
 # Dashboard static file serving
