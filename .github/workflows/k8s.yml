@@ -35,6 +35,7 @@ on:
       - "docker-compose*.yml"
       - "scripts/k8s_policy_check.py"
       - "scripts/ci_live_tests.py"
+      - "scripts/deploy_preflight.py"
       - "scripts/k8s-validate.ps1"
       - ".github/workflows/k8s.yml"
   push:
@@ -49,6 +50,7 @@ on:
       - "deploy/**"
       - "docker-compose*.yml"
       - "scripts/k8s_policy_check.py"
+      - "scripts/deploy_preflight.py"
       - "scripts/k8s-validate.ps1"
       - ".github/workflows/k8s.yml"
   workflow_dispatch: {}
@@ -210,6 +212,16 @@ jobs:
           python -m venv .venv-browser
           .venv-browser/bin/python -m pip install -r requirements-browser.txt
           .venv-browser/bin/python -m playwright install --with-deps chromium
+      - name: Lint the runners + collect the target-acceptance suite
+        # The target suite needs a real deployed target, so CI only checks it
+        # parses and collects -- it must never be executed (or silently
+        # skipped) here.
+        run: |
+          set -euo pipefail
+          bash -n browser_tests/run.sh
+          bash -n browser_tests/run_target.sh
+          .venv-browser/bin/python -m pytest browser_tests/target_acceptance/ \
+            --collect-only -q -p no:cacheprovider
       - name: Run the browser SPA smoke against a disposable HTTPS stack
         env:
           S43_BROWSER_PYTHON: .venv-browser/bin/python

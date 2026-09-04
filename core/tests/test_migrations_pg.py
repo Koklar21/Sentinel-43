@@ -179,6 +179,47 @@ def test_fresh_db_sessions_schema_matches_model(_clean):
         }, idx
 
 
+def test_refresh_hash_uniqueness_is_the_partial_active_scoped_shape(_clean):
+    """Direct schema introspection (not a behavioural inference): after
+    `alembic upgrade head` on the current tree, the refresh_hash uniqueness
+    guard MUST be a PARTIAL UNIQUE index scoped to the active
+    (revoked_at IS NULL) rows -- mission shape B, the replay-protection
+    contract. An unconditional UNIQUE (shape A) or a dropped predicate would
+    break legitimate rotation history and is a silent security regression;
+    the next-PR merge must not have changed it.
+    """
+    command.upgrade(_cfg(), "head")
+    with _clean.connect() as c:
+        row = c.exec_driver_sql(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE schemaname = 'public' AND tablename = 'sessions' "
+            "  AND indexname = 'uq_sessions_active_refresh_hash'"
+        ).fetchone()
+        assert row is not None, "uq_sessions_active_refresh_hash is missing"
+        indexdef = row[0].lower()
+
+        # unique
+        assert "create unique index" in indexdef, indexdef
+        # on exactly refresh_hash
+        assert "(refresh_hash)" in indexdef.replace('"', ""), indexdef
+        # partial, scoped to the active rows -- this is the whole point
+        assert "where (revoked_at is null)" in indexdef, indexdef
+
+        # cross-check pg_index.indpred is actually set (a real partial index)
+        indpred = c.exec_driver_sql(
+            "SELECT indpred IS NOT NULL FROM pg_index "
+            "WHERE indexrelid = 'public.uq_sessions_active_refresh_hash'::regclass"
+        ).scalar()
+        assert indpred is True
+
+        # and it is NOT a plain table-level UNIQUE constraint (shape A)
+        conname = c.exec_driver_sql(
+            "SELECT count(*) FROM pg_constraint "
+            "WHERE conrelid = 'public.sessions'::regclass AND contype = 'u'"
+        ).scalar()
+        assert conname == 0, "unexpected unconditional UNIQUE constraint on sessions"
+
+
 # ---------------------------------------------------------------------------
 # existing pre-Alembic database  (§8, §19)
 # ---------------------------------------------------------------------------

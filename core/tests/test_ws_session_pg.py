@@ -149,6 +149,29 @@ def test_legacy_frame_with_password_connects(client):
         assert ws.receive_json()["type"] == "connected"
 
 
+def test_reject_legacy_auth_on_blocks_the_legacy_frame_not_the_session(client, monkeypatch):
+    _mk_user(client._db)
+    legacy = _legacy_token()
+    token = _login(client)["access_token"]
+
+    monkeypatch.setenv("S43_REJECT_LEGACY_AUTH", "true")
+
+    # legacy {token,password} frame -> rejected outright
+    with client.websocket_connect("/ws", headers={"origin": _ORIGIN}) as ws:
+        ws.receive_json()  # auth_required
+        ws.send_json({"type": "auth", "payload": {"token": legacy, "password": "wsop-password-1234"}})
+        msg = ws.receive_json()
+        assert msg["type"] == "error"
+        assert "no longer accepted" in msg["payload"]["error"].lower() \
+            or "log in again" in msg["payload"]["error"].lower()
+
+    # session-bound {token}-only frame -> still connects
+    with client.websocket_connect("/ws", headers={"origin": _ORIGIN}) as ws:
+        ws.receive_json()
+        ws.send_json({"type": "auth", "payload": {"token": token}})
+        assert ws.receive_json()["type"] == "connected"
+
+
 def test_session_revoked_mid_stream_drops_the_connection(client):
     _mk_user(client._db)
     token = _login(client)["access_token"]

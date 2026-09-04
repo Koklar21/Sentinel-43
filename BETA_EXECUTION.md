@@ -233,16 +233,53 @@ Adopted from `main` unchanged: `.github/workflows/k8s.yml` (Trivy scan,
 disposable PG service, Calico waits, watchtower service token, read-only
 rootfs assertion), `scripts/ci_live_tests.py`, Watchtower health-log filter.
 
-**Known CI gap (Phase D):** the `test` job sets a `postgres` service but not
-`S43_TEST_PG_DSN` / `S43_TEST_PG_CONTAINER`, so beta's `*_pg.py` suites
-(auth-session, migrations, schema-version, backup-restore, break-glass,
-ws-session) currently `skip` in CI. `ci_live_tests.py` only runs
-`test_bootstrap` + `test_system_smoke`.
+**CI gap (Phase D) — CLOSED:** the standard `test` job's `postgres` service
+does not export `S43_TEST_PG_DSN`, so the `*_pg.py` suites skip there. The
+new **`pg-tests`** job (Phase D) runs all nine `*_pg.py` files against a
+dedicated disposable PostgreSQL and **fails on any skip**.
 
 **#248 reconciliation:** `authenticate_user` stays read-only (no
 `update_last_login=`); `_validate_credentials` owns the one `record_login`
 write at real login; `reverify_password` never writes. Same end state #248
 intended ("don't update last-login on every authenticated request").
+
+#### Merge-diff review — auth/session/authz files (REV 2 evidence)
+
+`git diff f3d93e2^1 f3d93e2` (the merge against the **pre-merge beta
+branch** `a8a5678` — i.e. what the merge actually did to the branch):
+
+```
+ .github/workflows/k8s.yml     | 83 +   (CI — not auth)
+ core/api/Dockerfile           | 24 +   (container — not auth)
+ core/api/main.py              |  6 +   (users_router registration only)
+ core/monitoring/watchtower.py | 16 +   (health-log filter — not auth)
+ scripts/ci_live_tests.py      | 129 +  (new CI helper — not auth)
+```
+
+**Every authentication / session / authorization module is byte-identical
+to the pre-merge beta branch after the merge** — `git diff f3d93e2^1
+f3d93e2` touches **0 lines** in `core/api/deps/deps.py`,
+`core/api/routers/auth.py`, `core/api/routers/users.py`,
+`core/auth/users.py`, `core/auth/sessions.py`,
+`core/middleware/sentinel_firewall.py`. The conflict resolution for those
+files was "keep the branch's version"; the result is the beta
+implementation verbatim, not a blend and not a revert to an older `main`.
+
+The **one** auth-adjacent change, in `main.py` (6 lines): the
+`users_router` import moved up next to `auth_router`, the
+`include_router(users_router)` call moved to right after `auth_router`
+(from the end of the list), and the **second** `include_router(users_router)`
+that the 3-way merge produced was deleted. Same router object, same
+router-level `Depends(require_admin)`, registered exactly once. No
+authorization behaviour change. Pinned by
+`core/tests/test_app_route_registration.py` (no APIRouter included twice;
+`require_admin` still gates `/users`).
+
+`main`'s own PR #250 changes to these files (the `scope`-claim role
+fallback in `require_operator`, the self-committing `set_user_*` helpers,
+the `update_last_login=` parameter) were **discarded** by the resolution —
+they are strictly older/narrower than, or incompatible with, the beta
+contract. See the resolution table in the `f3d93e2` commit message.
 
 ### Active dev session to preserve
 
@@ -258,9 +295,18 @@ beta-execution is gone.)
       disposable PG on :55440). = 454 beta baseline + 3 new route-registration
       guards.
 - [x] **B** — combined auth/deploy path review + regression tests
-- [x] **C** — real browser SPA smoke (Playwright) — `browser_tests/` **10/10**
+- [~] **C** — browser SPA smoke (Playwright) — `browser_tests/` **10/10**.
+      **Scope correction (REV 3 / §9):** this verified the SHIPPED SPA's
+      *application behaviour* against a **local disposable stack** (throwaway
+      test CA, SPKI-pinned, `s43.beta.test` mapped to loopback). It did **not**
+      validate a real target's certificate chain, DNS, or edge — and because
+      `run.sh` pins its own base URL, an external `S43_BROWSER_BASE_URL` was
+      silently ignored. Real-target browser acceptance is `browser_tests/target_acceptance/`
+      (§9), still pending a named target.
 - [x] **D** — CI validates the beta implementation
-- [x] **E** — safe concrete beta deployment preflight
+- [~] **E** — beta deployment preflight. **Superseded by the phase-aware
+      rewrite in §9** (the original conflated pre-deploy and running-target
+      checks and could exit 0 with mandatory verification still open).
 - [x] docs + PR — final full suite (all Phase A–E) **457 passed / 0 / 0**
 
 ### Phase B — done
@@ -305,7 +351,12 @@ allowing it) — it could not talk to a same-origin HTTPS beta at all.
   handler nulled the live `_ws` + dispatched `auth_failed`, re-showing the
   login overlay right after login. Handlers are now bound per-socket. This
   was the fix that made the browser suite green.
-- **Result: 10 passed / 0 failed** (`PASS_BETA_VALIDATION.md §9`).
+- **Result: 10 passed / 0 failed.** **What that actually verified (REV 3):**
+  the shipped SPA + JS behave correctly against a **local disposable HTTPS
+  stack**. TLS "trust" here is a throwaway test CA accepted via a Chromium
+  SPKI exception + a `ssl.CERT_NONE` fixture context — this is
+  application-behaviour evidence, **not** certificate-chain validation and
+  **not** a real-target result.
 - **F-TLS-1 stays OPEN** — a local test CA proves browser⇄nginx only.
 
 ### Phase D — CI
@@ -332,6 +383,11 @@ skipped.
 
 ### Phase E — deployment preflight
 
+> **Superseded by §9 (REV 3).** The version described below conflated
+> pre-deploy and running-target checks and returned exit 0 while
+> TARGET-REQUIRED items were still open. §9 replaces it with an explicit
+> `prepare` / `verify` phase split and a distinct INCOMPLETE (exit 2) state.
+
 `scripts/deploy_preflight.py` — strictly **read-only** (no admin bootstrap,
 no DB write, no manifest apply). `compose` and `kube` modes. Checks:
 tooling, hostname is a real FQDN + resolves, cert chain/SAN/expiry against
@@ -344,6 +400,192 @@ host-published, single uvicorn worker / single replica / no HPA, no
 (`*.example.invalid`, `CHANGEME`) fail the run. Target-dependent items
 (WSS through the edge, external port scan, image digest) are reported
 TARGET-REQUIRED, not silently passed.
+
+---
+
+## 8. Post-merge verification pass — REV 2 (2026-09-03, after PR #251 merged)
+
+**PR #251 was MERGED to `main`** (merge commit `0bd375a`, 2026-09-03
+14:53Z) between REV 1 and REV 2. All the §7 work is on `main` now. This pass
+delivers the REV 2 additions on a **new branch off merged `main`**
+(`beta/post-merge-verification-20260903` ← `0bd375a`) and a **new PR** — #251
+cannot be reopened.
+
+Starting HEAD: `0bd375a` (= merged `main`). Commit-count prose corrected:
+`8614f9b..a8a5678` is **six** beta-execution commits, no missing seventh
+(already fixed in `§7`; restated).
+
+### A — merge-diff review (retrospective evidence)
+
+See `§7 → Merge-diff review` above: `git diff f3d93e2^1 f3d93e2` proves the
+merge left every auth/session/authz module **byte-identical** to the
+pre-merge beta branch; the only auth-adjacent change is the 6-line
+`users_router` de-dup in `main.py`.
+
+### B — legacy-rejection flag, BOTH states
+
+`S43_REJECT_LEGACY_AUTH` was only ever tested OFF (the fixtures `delenv` it).
+Added:
+- `test_auth_session_pg.py::test_reject_legacy_auth_off_default_still_accepts_legacy`
+- `test_auth_session_pg.py::test_reject_legacy_auth_on_blocks_legacy_v1_and_users_not_the_session`
+  — flag ON: legacy Bearer+password → **401** on `/v1` **and** `/users`;
+  a live session token → still 200 on both; flipping the flag back off
+  restores the legacy contract (one-var rollback).
+- `test_ws_session_pg.py::test_reject_legacy_auth_on_blocks_the_legacy_frame_not_the_session`
+  — flag ON: legacy `{token,password}` WS frame → rejected;
+  session `{token}` frame → still connects.
+
+### D — refresh-hash constraint, direct schema introspection
+
+`test_migrations_pg.py::test_refresh_hash_uniqueness_is_the_partial_active_scoped_shape`
+— after `alembic upgrade head` on the current tree, queries
+`pg_indexes.indexdef` + `pg_index.indpred` + `pg_constraint` directly and
+asserts `uq_sessions_active_refresh_hash` is a **partial UNIQUE index on
+`(refresh_hash)` with predicate `WHERE (revoked_at IS NULL)`** (shape B),
+and that there is **no** unconditional table-level `UNIQUE` (shape A). Not a
+behavioural inference. Runs in the `pg-tests` CI job (already lists
+`test_migrations_pg.py`).
+
+### E — single replica AND single worker
+
+`deploy_preflight.py` strengthened: compose mode now also checks exactly one
+`s43-api` container (no `--scale`), one uvicorn **worker** process, and
+`WEB_CONCURRENCY` not > 1; kube mode also checks `readyReplicas == 1`, no
+`--workers > 1` in the container command, and `WEB_CONCURRENCY` not > 1.
+
+### Conclusion 3 wording
+
+`HANDOFF_BETA.md §10` conclusion 3 now states it is a **status report
+only** — where production/public/government readiness stands — and does not
+authorize or step toward certification work (excluded by Section 1).
+
+### Validation (REV 2)
+
+| suite | result |
+|---|---|
+| isolated (no PG, `.venv-pass1`) | **368 passed / 89 skipped** (the `*_pg.py` skip without a DB) / 0 failed |
+| the 4 new/changed PG tests, disposable PG :55440 | **4 passed** |
+| `test_migrations_pg` + `test_auth_session_pg` + `test_ws_session_pg` (full) | **48 passed** |
+| full isolated + PG suite (`.venv-pass1`, disposable PG :55440) | **461 passed / 0 failed / 0 skipped** (273 s) |
+| CI on the REV 2 PR head | _recorded in the final report_ |
+
+Docker Desktop was down at the start of this pass (user had stopped it);
+restarted it to run the PG suites. The user's k8s `sentinel43` namespace
+pods are still defined (`s43-db`/`s43-redis` were healthy earlier;
+`s43-api`/`s43-core` have been `ErrImageNeverPull` for ~33 days — a
+pre-existing state, untouched).
+
+---
+
+## 9. Release-tooling corrections — REV 3 (2026-09-03)
+
+A focused follow-up on the deployment **preflight** and browser **target-
+validation** tooling. No change to the verified auth / migration / session /
+CI work. Started from `beta/post-merge-verification-20260903` (open PR #252);
+merged current `main` first (`18d1dbe` — main had deleted a batch of
+superseded `.md` files; `PASS_BETA_VALIDATION.md` among them, so its live
+content is folded here and into `HANDOFF_BETA.md`).
+
+### Correction to the prior completion claim
+
+REV 1/REV 2 reported Phases A–E complete and "every target-independent
+artifact ready". Findings A–E below **were all still reproducible** in that
+delivered state, so that claim was premature for the tooling. This pass
+fixes the actual causes; the auth/migration/session conclusions are
+unaffected.
+
+### Findings reproduced, and the fix
+
+| # | Reproduced defect | Fix |
+|---|---|---|
+| **A** | `deploy_preflight.py` returned **exit 0** with `TARGET-REQUIRED` items unresolved; one pass covered both pre-deploy and running-target checks | phase-aware: `--phase {prepare,verify}` **required, no default**; three exit codes — `0` all mandatory checks for the phase passed, `1` a confirmed FAIL, `2` a mandatory check INCOMPLETE (never silently 0); `prepare` never touches a running service |
+| **B** | HTTP check used `urlopen` (follows redirects) then asserted a 3xx — a correct server *failed* it; HTTP URL derived from the HTTPS port; later HTTPS calls dropped the non-standard port | `http_probe()` does **not** follow redirects; `classify_http_redirect()` checks status ∈ {301,302,307,308}, `Location` scheme=https, same host, expected port; separate `--http-port` / `--https-port`; every URL built by one `_url()` helper |
+| **C** | `docker compose` calls carried no `-p` / `--env-file` / `-f`; only NDJSON `ps` parsed; `{{.Publishers}}` arrow-string parsing; failed `kubectl get hpa` read as "no HPA"; `--workers` substring match; `containers[0]` assumed to be the API; missing Service → PASS | `compose_base_cmd()` threads project + env-file + files through **every** call; `parse_compose_ps()` handles the array and NDJSON forms; structured `Publishers[].PublishedPort`; `k8s_api_container()` finds the API by name/heuristic (INCOMPLETE if ambiguous); `k8s_worker_flag()` handles `--workers N`, `--workers=N`, `-w N`, `WEB_CONCURRENCY`; `hpa_targets()` matches `scaleTargetRef.name == s43-api`; every inspection failure → INCOMPLETE, never a silent pass |
+| **D** | origins/hosts checked by **substring** (`https://h` ⊂ `https://h.evil`); trusted-proxy only rejected exact `0.0.0.0/0`; any `--image` string passed; `:sha256-…` treated as a digest | `origin_exact_member()` / `host_exact_member()` — exact normalized membership (scheme+host+port; mirrors `TrustedHostGuard`, rejects `*`); `validate_trusted_proxies()` via `ipaddress`, rejects malformed and anything wider than /24; `validate_image_reference()` — `repo/name@sha256:<64-hex>` = PASS, `:sha256-…` tag = FAIL, plain tag = INCOMPLETE unless `--image-id sha256:<id>` + `--source-revision` given |
+| **E** | `run.sh` pinned `S43_BROWSER_BASE_URL` so an external value was ignored; `conftest.py` used a fixed loopback URL + `Host` override; auto-bootstrapped an admin; `ssl.CERT_NONE` + a Chromium SPKI exception (not real trust) | `run.sh` now refuses a foreign `S43_BROWSER_BASE_URL` and points at the new runner; a separate **`browser_tests/target_acceptance/`** suite + **`run_target.sh`** for real targets — explicit `S43_TARGET_BASE_URL` (same endpoint for browser and API), standard trusted-CA verification (optional `S43_TARGET_CA_BUNDLE`, never disabled), **no** stack control, **no** bootstrap, credentials read from files, missing creds = an errored (incomplete) run |
+
+### prepare vs verify
+
+- **prepare** — tools, target hostname is a real FQDN, image is an immutable
+  identity, `.env` secrets present + non-placeholder + rotated ≤ 90 d,
+  `SENTINEL_ENV` non-local, exact origin/host membership, proxy CIDR narrow,
+  (kube) `sentinel43-secrets` keys + no `CHANGEME` ConfigMaps. **A pass is
+  "inputs in order", explicitly *not* beta acceptance.**
+- **verify** — hostname resolves; edge cert validates against the real trust
+  store (or `--ca-bundle`) with library hostname matching; not near expiry;
+  HTTP→HTTPS redirect correct (no downgrade); HTTPS `/health` + `/ready`
+  separately; HSTS; `/docs` `/redoc` `/openapi.json` not served (by actual
+  response — a connection error is INCOMPLETE, not "protected"); exactly one
+  running API instance **and** one worker; backend/db/redis not
+  host-published; (kube) `replicas==1`, `readyReplicas==1`, rollout complete,
+  no HPA targeting `s43-api`, migration Job succeeded, `ClusterIP` services.
+  External port-scan and WSS-through-edge are mandatory-but-INCOMPLETE from
+  this vantage point → `verify` exits 2 until run from outside / via
+  `run_target.sh`.
+
+### Commands
+
+```
+# before deploying — nothing running yet
+python scripts/deploy_preflight.py compose --phase prepare \
+  --hostname beta.example.org --env-file .env \
+  --image ghcr.io/OWNER/sentinel43-api@sha256:<64-hex>
+#   locally-built image instead of a registry digest:
+#   --image sentinel43-api:beta --image-id sha256:<64-hex> --source-revision <git-sha>
+
+# after deploying — against the running target
+python scripts/deploy_preflight.py compose --phase verify \
+  --hostname beta.example.org --project s43 --env-file .env \
+  -f docker-compose.yml -f docker-compose.beta.yml
+python scripts/deploy_preflight.py kube --phase verify \
+  --context <ctx> --namespace <ns> --hostname beta.example.org [--ca-bundle ca.pem]
+
+# browser: disposable (unchanged) vs real target
+bash browser_tests/run.sh
+S43_TARGET_BASE_URL=https://beta.example.org \
+  S43_TARGET_OPERATOR_CRED_FILE=/secure/op.json \
+  bash browser_tests/run_target.sh
+```
+
+Target-account scope: `run_target.sh` read-only edge checks need only the
+URL. Authenticated acceptance needs a **designated** beta operator account
+(`S43_TARGET_OPERATOR_CRED_FILE`). Admin-mutation scenarios (disable / role /
+password / replay) additionally need `S43_TARGET_ADMIN_SCOPE=
+explicit-dedicated-account` + **dedicated throwaway** admin/operator accounts
+— never an owner's ordinary account.
+
+### Tests + CI
+
+`core/tests/test_deploy_preflight.py` — **53** behavioural tests (phase
+required not defaulted; mandatory-incomplete ⇒ exit 2; redirect recognised
+not followed; wrong-host/downgrade fail; non-standard ports; exact
+origin/host vs substring lookalikes; malformed/broad proxy CIDR; compose
+selection reaches every call; both `ps` JSON forms; 0/1/2 API instances;
+unknown worker state ≠ pass; kube inspection error stays INCOMPLETE;
+unrelated HPA distinguished; `:sha256-` tag ≠ digest). Runs in the existing
+`test` job. `browser-smoke` job now also `bash -n`s both runners and
+`--collect-only`s `browser_tests/target_acceptance/` (never executes it — no target).
+
+### Validation (REV 3)
+
+| gate | result |
+|---|---|
+| `core/tests/test_deploy_preflight.py` | **53 passed** |
+| full isolated suite (`.venv-pass1`, no PG) | **421 passed / 93 skipped / 0 failed** (= prior 368 + 53 new) |
+| disposable browser smoke `run.sh` | **10 passed** |
+| `browser_tests/target_acceptance/` | **13 collected** (needs a real target to run) |
+| CI on the pushed head | _recorded in the final report_ |
+
+### Still target-dependent (unchanged)
+
+**F-TLS-1 is NOT closed.** Closing it needs a named target where `verify`
+passes edge TLS (real chain + hostname + expiry), HTTP→HTTPS, HSTS, docs
+surface, one-replica/one-worker, and `run_target.sh` passes
+login/refresh/logout/WSS over a trusted-CA chain. P3-8 stays **deferred**
+(`0004`, pending a real-target collision inventory). One `s43-api` replica
+and one worker remain the recommended controlled-beta configuration; a
+shared throttle is a separate change only if a confirmed requirement needs
+one.
 
 ---
 
