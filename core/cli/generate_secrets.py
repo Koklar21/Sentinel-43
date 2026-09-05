@@ -42,7 +42,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 import secrets
 import sys
@@ -454,15 +453,27 @@ def password_hash_flow() -> int:
     """
     Interactively generate S43_OPERATOR_PASSWORD_HASH.
 
-    Sentinel-43 uses sha256(password).hexdigest() for closed beta.
-    Upgrade to Argon2/bcrypt before public release.
+    Produces an Argon2id hash via core.auth.users.hash_password() — the same
+    KDF, parameters, and code path used for every DB-backed account — so the
+    break-glass operator credential is Argon2id like everything else, not a
+    bare, unsalted SHA-256 digest. core.api.main._validate_security_config()
+    refuses to start with a non-Argon2id S43_OPERATOR_PASSWORD_HASH outside
+    local/dev/test, and core.api.routers.auth._validate_env_credentials()
+    refuses one at auth time — there is no dual-scheme support.
+
+    Rotating an existing deployment onto this requires a NEW password, not a
+    converted old one: the plaintext behind an existing SHA-256 hash is not
+    recoverable, so there is no automatic migration path. This is a
+    deliberate manual step for the operator, not a background migration.
+
     The hash is printed to stdout only — never logged or written to disk
     by this function. Paste the output into .env manually.
     """
     print(
-        "Generating S43_OPERATOR_PASSWORD_HASH\n"
-        "Note: SHA-256 is used for closed beta. Upgrade to Argon2/bcrypt "
-        "before public release.",
+        "Generating S43_OPERATOR_PASSWORD_HASH (Argon2id)\n"
+        "This is a NEW break-glass password, not a converted one — an "
+        "existing SHA-256 hash cannot be migrated without its plaintext. "
+        "Replace S43_OPERATOR_PASSWORD_HASH in .env with the value below.",
         file=sys.stderr,
     )
 
@@ -481,7 +492,9 @@ def password_hash_flow() -> int:
         print("ERROR: passwords do not match.", file=sys.stderr)
         return 2
 
-    digest = hashlib.sha256(password_1.encode("utf-8")).hexdigest()
+    from core.auth.users import hash_password
+
+    digest = hash_password(password_1)
     print(f"S43_OPERATOR_PASSWORD_HASH={digest}")
     print(
         "\nPaste the line above into .env. "

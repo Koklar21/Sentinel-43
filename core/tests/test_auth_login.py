@@ -18,9 +18,10 @@
 #   - There is no /auth/me. The verify endpoint is GET /auth/verify,
 #     returning VerifyResponse: {valid, subject, role, expires_at}.
 #   - Credentials are read from S43_OPERATOR_USERNAME and
-#     S43_OPERATOR_PASSWORD_HASH (sha256(password).hexdigest(), lowercase
-#     hex). The login endpoint hashes the typed password itself — send the
-#     plaintext password, not the hash, in the login request.
+#     S43_OPERATOR_PASSWORD_HASH (an Argon2id hash — see
+#     core.auth.users.hash_password()). The login endpoint verifies the
+#     typed password against that hash itself — send the plaintext
+#     password, not the hash, in the login request.
 #
 # Consolidated verifier:
 #   main.py no longer keeps its own JWT verifier. _get_operator() and
@@ -31,7 +32,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Generator
@@ -49,9 +49,11 @@ from fastapi.testclient import TestClient
 # time, so it doesn't have this constraint, but we set everything up front
 # for consistency and so both verifiers see the same config.
 
+from core.auth.users import hash_password  # noqa: E402
+
 TEST_USERNAME = "admin"
 TEST_PASSWORD = "ChangeMe_TestPassword_123!"
-TEST_PASSWORD_HASH = hashlib.sha256(TEST_PASSWORD.encode("utf-8")).hexdigest()
+TEST_PASSWORD_HASH = hash_password(TEST_PASSWORD)
 
 os.environ.setdefault("SENTINEL_ENV", "test")
 os.environ.setdefault("S43_ENV", "test")

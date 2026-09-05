@@ -10,12 +10,25 @@
 # core/tests/test_break_glass_pg.py
 #
 # Beta-execution Phase 3 -- RELEASE_FINDINGS #11. The env-var operator is a
-# scoped break-glass credential (AUTH_MIGRATION_PASS4 §3 Option C):
+# scoped break-glass credential (AUTH_MIGRATION_PASS4 §3 Option C), tightened
+# in the P0 security remediation pass to remove the "any DB exception grants
+# break-glass" silent downgrade:
 #
 #   * no active admin in the DB      -> env operator works (first-run window)
 #   * an active admin exists          -> env operator is INERT
 #   * S43_BREAK_GLASS_ARMED=true      -> env operator works regardless
-#   * DB unreachable                  -> env operator works (that's the point)
+#   * DATABASE_URL not configured     -> env operator works (no DB-accounts
+#                                        feature exists in this deployment)
+#   * DB configured but UNREACHABLE   -> env operator is DENIED (503) unless
+#                                        S43_BREAK_GLASS_ARMED=true — this
+#                                        used to silently grant break-glass;
+#                                        that was exactly the "downgrade
+#                                        under a different name" this pass
+#                                        was asked to close.
+#
+# S43_OPERATOR_PASSWORD_HASH is Argon2id (core.auth.users.hash_password()) —
+# the legacy unsalted SHA-256 hash is no longer accepted (see
+# core.api.routers.auth._valid_argon2_hash()).
 #
 #   S43_TEST_PG_DSN=postgresql+asyncpg://s43t:x@127.0.0.1:55440/s43t \
 #     pytest core/tests/test_break_glass_pg.py
@@ -23,7 +36,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import pathlib
 import uuid
@@ -32,6 +44,8 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, text
+
+from core.auth.users import hash_password
 
 _DSN = os.getenv("S43_TEST_PG_DSN")
 pytestmark = pytest.mark.skipif(
@@ -43,8 +57,12 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 _ENV_USER = "breakglass"
 _ENV_PW = "break-glass-password-1234"
-_ENV_HASH = hashlib.sha256(_ENV_PW.encode()).hexdigest()
+_ENV_HASH = hash_password(_ENV_PW)
 JWT_SECRET = "test-secret-break-glass-000000000000"
+# Loopback with nothing listening: connection is refused immediately
+# (ECONNREFUSED), unlike an unroutable address, which would hang until a
+# connect timeout. Deterministic and fast for a "DB unreachable" test.
+_UNREACHABLE_DSN = "postgresql+asyncpg://s43t:x@127.0.0.1:1/s43t"
 
 
 def _cfg() -> Config:
@@ -138,3 +156,42 @@ def test_wrong_env_password_is_401_even_when_allowed(client):
         headers={"Origin": "http://localhost:8000"},
     )
     assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# P0 security remediation pass: a DB error must DENY break-glass, not grant
+# it — the old "any exception => break-glass" behavior was itself a silent
+# downgrade. These point the app's cached engine at an address nothing is
+# listening on (real independent connection failure, not a mock), which is
+# the adversarial case: a genuinely unreachable database, not just "no
+# admin row yet".
+# ---------------------------------------------------------------------------
+
+def test_env_operator_denied_when_db_unreachable_and_not_armed(client, monkeypatch):
+    import core.auth.users as users_mod
+
+    monkeypatch.setenv("DATABASE_URL", _UNREACHABLE_DSN)
+    monkeypatch.delenv("S43_BREAK_GLASS_ARMED", raising=False)
+    users_mod._engine = None
+    users_mod._sessionmaker = None
+    try:
+        r = _login_env(client)
+        assert r.status_code == 503, r.text
+    finally:
+        users_mod._engine = None
+        users_mod._sessionmaker = None
+
+
+def test_armed_flag_overrides_db_unreachable(client, monkeypatch):
+    import core.auth.users as users_mod
+
+    monkeypatch.setenv("DATABASE_URL", _UNREACHABLE_DSN)
+    monkeypatch.setenv("S43_BREAK_GLASS_ARMED", "true")
+    users_mod._engine = None
+    users_mod._sessionmaker = None
+    try:
+        r = _login_env(client)
+        assert r.status_code == 200, r.text
+    finally:
+        users_mod._engine = None
+        users_mod._sessionmaker = None

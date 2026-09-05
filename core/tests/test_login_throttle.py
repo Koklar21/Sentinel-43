@@ -17,16 +17,17 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 from typing import Generator
 
 import pytest
 from fastapi.testclient import TestClient
 
+from core.auth.users import hash_password
+
 USERNAME = "throttle-operator"
 PASSWORD = "correct-throttle-password-123"
-PW_HASH = hashlib.sha256(PASSWORD.encode()).hexdigest()
+PW_HASH = hash_password(PASSWORD)
 
 os.environ.setdefault("SENTINEL_ENV", "test")
 os.environ.setdefault("S43_JWT_SECRET", "test-secret-for-login-throttle-0123456789")

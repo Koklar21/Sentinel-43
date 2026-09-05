@@ -42,7 +42,22 @@
 # Required .env variables:
 #   S43_JWT_SECRET              — HMAC signing key
 #   S43_OPERATOR_USERNAME       — operator username (default: "operator")
-#   S43_OPERATOR_PASSWORD_HASH  — sha256(password).hexdigest() — NOT sha256 of hash
+#   S43_OPERATOR_PASSWORD_HASH  — an Argon2id hash (argon2-cffi format,
+#                                 "$argon2id$..."), generated with
+#                                 `python -m core.cli.generate_secrets --password-hash`.
+#                                 A legacy SHA-256 hex digest is REJECTED
+#                                 outright — see _valid_argon2_hash() below
+#                                 and core.api.main._validate_security_config(),
+#                                 which refuses to start with one configured
+#                                 outside local/dev/test. There is no
+#                                 dual-scheme acceptance window: accepting
+#                                 both schemes "temporarily" is the same
+#                                 silent downgrade under a different name.
+#                                 Rotating to Argon2id requires a NEW
+#                                 break-glass password — the plaintext behind
+#                                 the old SHA-256 hash is not recoverable, so
+#                                 this is a manual, deliberate step, not a
+#                                 background migration.
 #
 # Optional .env variables:
 #   S43_JWT_ALGORITHM     — HS256 only (default: HS256)
@@ -52,16 +67,18 @@
 #
 # Credential setup:
 #   Generate password hash:
-#     python -c "import hashlib; print(hashlib.sha256(b'yourpassword').hexdigest())"
+#     python -m core.cli.generate_secrets --password-hash
 #   Generate JWT secret:
 #     python -c "import secrets; print(secrets.token_urlsafe(32))"
 #
 # Security note:
-#   SHA-256 is used here as a deployment-simple credential check for closed
-#   beta. Upgrade to bcrypt or Argon2 before public release.
-#   All credential comparisons use secrets.compare_digest to prevent timing
-#   attacks. Username comparison hashes both sides to fixed-width digests
-#   before compare_digest to prevent length-based timing leakage.
+#   The break-glass operator credential is Argon2id-hashed (core.auth.users'
+#   PasswordHasher, off the event loop via verify_password_async) — the same
+#   scheme and parameters as every DB-backed account. All credential
+#   comparisons that are NOT the password hash itself (i.e. the username)
+#   still use secrets.compare_digest over fixed-width SHA-256 digests to
+#   prevent length-based timing leakage; that has nothing to do with
+#   credential storage and is not a "SHA-256 password hash".
 # =============================================================================
 
 from __future__ import annotations
@@ -280,15 +297,27 @@ def _jwt_algorithm() -> str:
     return alg
 
 
-def _valid_sha256_hex(value: str) -> bool:
+def _valid_argon2_hash(value: str) -> bool:
     """
-    Return True if value is a valid 64-character hex string.
+    Return True if value has the structural shape of an Argon2id hash
+    produced by argon2-cffi, e.g.
+    "$argon2id$v=19$m=65536,t=3,p=4$<salt>$<hash>".
 
-    A fat-fingered or truncated S43_OPERATOR_PASSWORD_HASH causes login
-    to fail silently with a misleading "Invalid credentials" response.
-    Catching it here surfaces the real config problem immediately.
+    This is a cheap shape check, not a full parse — hash_password() /
+    verify_password_async() (core.auth.users) are what actually produce and
+    verify hashes. It exists so a truncated/malformed value, or a legacy
+    64-char SHA-256 hex digest, is caught as a config error (503) instead of
+    being silently accepted or misread as a wrong password. No dual-scheme
+    acceptance: anything that isn't a well-formed Argon2id hash is rejected
+    outright, including a syntactically-valid hash using a different Argon2
+    variant (argon2i/argon2d) — this deployment only ever produces argon2id.
     """
-    return len(value) == 64 and all(c in "0123456789abcdefABCDEF" for c in value)
+    return (
+        isinstance(value, str)
+        and value.startswith("$argon2id$")
+        and value.count("$") == 5
+        and len(value) <= 512
+    )
 
 
 # =============================================================================
@@ -336,30 +365,38 @@ class VerifyResponse(BaseModel):
 # Internal helpers
 # =============================================================================
 
-def _sha256_hex(value: str) -> str:
-    """Return lowercase hex SHA-256 digest of value."""
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
 def _sha256_digest(value: str) -> bytes:
-    """Return raw SHA-256 digest bytes of value. Used for fixed-width timing-safe comparisons."""
+    """
+    Return raw SHA-256 digest bytes of value. Used ONLY for a fixed-width
+    timing-safe comparison of the operator USERNAME (not a secret, and not
+    the credential hash) — see _validate_env_credentials(). Never used for
+    password storage or verification; that is Argon2id (core.auth.users),
+    run off the event loop.
+    """
     return hashlib.sha256(value.encode("utf-8")).digest()
 
 
-def _validate_env_credentials(username: str, password: str) -> str:
+async def _validate_env_credentials(username: str, password: str) -> str:
     """
     Validate operator credentials against env-configured values.
 
-    Password comparison:
-      sha256(typed_password).hexdigest().lower()
-        compared with
-      S43_OPERATOR_PASSWORD_HASH.lower()
-
-    S43_OPERATOR_PASSWORD_HASH is already sha256(password).hexdigest().
-    Do NOT double-hash it.
+    S43_OPERATOR_PASSWORD_HASH must be an Argon2id hash produced by
+    `python -m core.cli.generate_secrets --password-hash` (see
+    _valid_argon2_hash()). A legacy SHA-256 hex digest is rejected outright
+    as a config error, the same as a truncated or empty value — there is no
+    dual-scheme acceptance window. core.api.main._validate_security_config()
+    additionally refuses to START the server with a non-Argon2id hash
+    configured outside local/dev/test, so a misconfigured production
+    deployment never comes up far enough to reach this function.
 
     Username comparison hashes both sides to fixed-width SHA-256 digests
-    before compare_digest to prevent length-based timing leakage.
+    before compare_digest to prevent length-based timing leakage — this is
+    unrelated to credential storage, just a constant-time-compare trick for
+    a value that was never secret.
+
+    Password verification runs Argon2id (memory-hard, tens of milliseconds)
+    off the event loop via core.auth.users.verify_password_async(), exactly
+    like every DB-backed account.
 
     Both comparisons always run before any error is raised to prevent
     timing-based enumeration of which field failed.
@@ -368,12 +405,15 @@ def _validate_env_credentials(username: str, password: str) -> str:
     casing) as the JWT subject, so the subject in the token is always
     the value from config regardless of how the operator typed it.
     """
+    from ...auth.users import verify_password_async
+
     expected_username = _e("S43_OPERATOR_USERNAME", "operator")
     expected_hash     = _e("S43_OPERATOR_PASSWORD_HASH")
 
-    # Validate hash format before comparison. A truncated or malformed hash
-    # produces silent failures that look like wrong passwords.
-    if not expected_hash or not _valid_sha256_hex(expected_hash):
+    # Validate hash format before comparison. A truncated, empty, or legacy
+    # SHA-256 hash produces silent failures that look like wrong passwords —
+    # surface it as a config error (503) instead.
+    if not expected_hash or not _valid_argon2_hash(expected_hash):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Operator credentials are not configured correctly on this server.",
@@ -389,12 +429,10 @@ def _validate_env_credentials(username: str, password: str) -> str:
         _sha256_digest(expected_username.lower()),
     )
 
-    # Password: compare sha256(typed_password).hexdigest() against the stored
-    # hash directly. The stored hash IS sha256(password) — do not re-hash it.
-    password_ok = secrets.compare_digest(
-        _sha256_hex(password).lower(),
-        expected_hash.lower(),
-    )
+    # Password: Argon2id verify, off the event loop. Always run — never
+    # short-circuited by username_ok — so a wrong username doesn't respond
+    # measurably faster than a wrong password.
+    password_ok = await verify_password_async(password, expected_hash)
 
     if not (username_ok and password_ok):
         raise HTTPException(
@@ -411,35 +449,58 @@ def _validate_env_credentials(username: str, password: str) -> str:
 async def _env_operator_allowed() -> bool:
     """
     RELEASE_FINDINGS #11 (beta-execution Phase 3, AUTH_MIGRATION_PASS4 §3
-    Option C — scoped break-glass).
+    Option C — scoped break-glass), tightened this pass to remove the
+    "any exception => break-glass" silent downgrade.
 
     The env-var operator (S43_OPERATOR_USERNAME / S43_OPERATOR_PASSWORD_HASH,
-    un-salted SHA-256) is a **break-glass** credential, not a routine account.
-    It authenticates only when:
+    Argon2id) is a **break-glass** credential, not a routine account. It
+    authenticates only when:
 
-      * ``S43_BREAK_GLASS_ARMED`` is truthy (an operator deliberately turned
-        it on), OR
-      * there is **no active admin** in the DB — the first-run window before
-        ``/bootstrap/admin`` has been completed, OR
-      * the DB cannot be reached at all — break-glass is exactly for
-        "the database is down and I need in".
+      * ``S43_BREAK_GLASS_ARMED`` is truthy — an operator deliberately
+        turned it on. This is checked FIRST and unconditionally, so arming
+        it works even while the DB is down; it is never inferred from an
+        exception, OR
+      * DATABASE_URL is not configured at all — there is no DB-accounts
+        feature in this deployment to "fall back" from; the env-var operator
+        is this deployment's only account, not an exceptional path, OR
+      * the DB is reachable AND confirms there is **no active admin** yet —
+        the first-run window before ``/bootstrap/admin`` has been completed.
+
+    Explicitly NOT a trigger: the DB being configured but erroring (down,
+    unreachable, table missing, query failure). That used to silently grant
+    break-glass — the exact "downgrade under a different name" this pass
+    was asked to close. A DB error now DENIES break-glass unless
+    S43_BREAK_GLASS_ARMED was already set, and is logged at error level by
+    the caller (reverify_password / _validate_credentials) with the specific
+    exception, never the credential.
 
     Once a DB admin exists and the DB is healthy, the env operator is inert
-    unless explicitly armed. This removes the "a permanent fast-hashed
-    password checked on every failed login" surface without a breaking
-    ``.env`` change for anyone using it correctly (as break-glass).
+    unless explicitly armed.
     """
     if _e("S43_BREAK_GLASS_ARMED", "").lower() in {"1", "true", "yes", "on"}:
         return True
-    try:
-        from ...auth.users import count_active_admins, get_sessionmaker
 
+    from ...auth.users import count_active_admins, get_sessionmaker
+
+    try:
         sm = get_sessionmaker()
+    except RuntimeError:
+        # DATABASE_URL is not configured — no DB-accounts feature exists in
+        # this deployment to downgrade from.
+        return True
+
+    try:
         async with sm() as session:
             return await count_active_admins(session) == 0
-    except Exception:
-        # No DATABASE_URL, DB unreachable, table missing — break-glass applies.
-        return True
+    except Exception as exc:
+        logger.error(
+            "count_active_admins() failed (%s: %s) while deciding whether "
+            "the break-glass operator is allowed — denying break-glass. Set "
+            "S43_BREAK_GLASS_ARMED=true to authenticate while the database "
+            "is unavailable.",
+            type(exc).__name__, exc,
+        )
+        return False
 
 
 async def reverify_password(username: str, password: str) -> bool:
@@ -449,35 +510,76 @@ async def reverify_password(username: str, password: str) -> bool:
     header): a valid JWT alone is no longer sufficient to reach protected
     routes — the operator's password must accompany every request.
 
-    Checks the DB-backed account system first (matching _validate_credentials),
-    then falls back to the env-var operator check. Returns False rather than
-    raising on any mismatch/misconfiguration reachable this way; callers are
-    responsible for turning a False into the appropriate HTTP error.
+    Checks the DB-backed account system first. If DATABASE_URL is not
+    configured at all, falls straight to the env-var operator check (that is
+    this deployment's only account, not a downgrade). If the DB IS
+    configured but the lookup raises (unreachable, table missing, query
+    error), this is a hash-scheme downgrade in the making (Argon2 DB
+    accounts -> the Argon2id break-glass operator) — it is logged at ERROR
+    with the specific exception (never the credential) and raises
+    HTTPException(503) UNLESS break-glass is explicitly armed
+    (_env_operator_allowed()), matching the "no silent downgrade" rule: any
+    remaining break-glass path must be explicitly armed, not merely
+    triggered by an exception.
+
+    Returns False on an ordinary wrong-password/unknown-account outcome (the
+    caller turns that into 401); raises HTTPException(503) on a blocked DB
+    operation with break-glass not armed, which FastAPI turns into a 503
+    response for HTTP callers, and which the WebSocket auth path (main.py)
+    catches explicitly to close with reason="service_unavailable" rather
+    than misreporting it as an auth failure.
     """
     normalized = username.strip()
     if not normalized or not password:
         return False
 
-    try:
-        from ...auth.users import authenticate_user, get_sessionmaker
+    from ...auth.users import authenticate_user, get_sessionmaker
 
+    try:
         sessionmaker = get_sessionmaker()
-        async with sessionmaker() as session:
-            # Read-only: authenticate_user() no longer writes last_login_at on
-            # any path. reverify_password() runs on every protected request —
-            # it must never touch the DB beyond the SELECT + Argon2 verify.
-            user = await authenticate_user(session, normalized, password)
-            if user is not None:
-                return True
-    except Exception as exc:
-        logger.debug("DB-backed password reverify unavailable, falling back to env-var: %s", exc)
+    except RuntimeError:
+        # DATABASE_URL not configured: no DB-accounts feature exists in this
+        # deployment to downgrade from — fall straight to the env-var check.
+        sessionmaker = None
+
+    if sessionmaker is not None:
+        try:
+            async with sessionmaker() as session:
+                # Read-only: authenticate_user() no longer writes
+                # last_login_at on any path. reverify_password() runs on
+                # every protected request — it must never touch the DB
+                # beyond the SELECT + Argon2 verify.
+                user = await authenticate_user(session, normalized, password)
+                if user is not None:
+                    return True
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error(
+                "DB-backed password reverify blocked by an unexpected error "
+                "(%s: %s) for subject %r — refusing to silently fall back to "
+                "the break-glass operator.",
+                type(exc).__name__, exc, normalized,
+            )
+            if not await _env_operator_allowed():
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Authentication service is temporarily unavailable.",
+                )
+            # Break-glass is explicitly armed — fall through and evaluate the
+            # env-var credential below, same as the ordinary not-found path.
 
     if not await _env_operator_allowed():
         return False
     try:
-        _validate_env_credentials(normalized, password)
+        await _validate_env_credentials(normalized, password)
         return True
-    except HTTPException:
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_503_SERVICE_UNAVAILABLE:
+            # Misconfigured break-glass hash (missing/malformed/legacy
+            # SHA-256) is a config error, not "wrong password" — surface it
+            # as 503, not a silently-collapsed 401.
+            raise
         return False
 
 
@@ -485,38 +587,64 @@ async def _validate_credentials(username: str, password: str) -> tuple[str, str,
     """
     Resolve operator credentials to (subject, role, user_id).
 
-    Checks the DB-backed account system (core.auth.users) first. Falls
-    back to the legacy S43_OPERATOR_USERNAME / S43_OPERATOR_PASSWORD_HASH
-    single-account check if DATABASE_URL is unset, the DB is unreachable,
-    or no DB user matches — this is deliberate so existing deployments and
-    the env-var-based test suite (test_auth_login.py) keep working
-    unmodified during the migration to DB-backed accounts. user_id is None
-    on the fallback path since env-var operators have no DB row.
+    Checks the DB-backed account system (core.auth.users) first.
 
-    Both paths still run the fallback's constant-time comparison when
-    reached, so a DB miss doesn't skip straight to a faster-failing check.
+    If DATABASE_URL is not configured at all, falls straight to the env-var
+    operator check — that is this deployment's only account, not a
+    downgrade. If the DB IS configured but the lookup raises (unreachable,
+    table missing, query error), that is a hash-scheme downgrade in the
+    making (Argon2 DB accounts -> the Argon2id break-glass operator): it is
+    logged at ERROR with the specific exception (never the credential), and
+    this raises HTTPException(503) UNLESS break-glass is explicitly armed
+    (_env_operator_allowed()) — no more "any exception silently reaches the
+    break-glass check" behavior.
+
+    An ordinary DB miss (no matching user / wrong password, no exception)
+    still falls through to the env-var break-glass check exactly as before —
+    that path was never a silent downgrade, since break-glass is only
+    reachable there when _env_operator_allowed() independently permits it
+    (armed, or a confirmed zero-admin bootstrap window). user_id is None on
+    the env-var path since it has no DB row.
     """
     normalized = username.strip()
 
-    try:
-        from ...auth.users import authenticate_user, get_sessionmaker, record_login
+    from ...auth.users import authenticate_user, get_sessionmaker, record_login
 
+    try:
         sessionmaker = get_sessionmaker()
-        async with sessionmaker() as session:
-            user = await authenticate_user(session, normalized, password)
-            if user is not None:
-                # This IS a login — record it. authenticate_user() itself is
-                # read-only now; _validate_credentials owns this write and the
-                # commit. reverify_password()'s per-request path does not
-                # reach here, so last_login_at still means "last login".
-                subject, role, user_id = user.username, user.role, str(user.user_id)
-                await record_login(session, user)
-                await session.commit()
-                return subject, role, user_id
-    except Exception as exc:
-        # DATABASE_URL unset, DB unreachable, or table not created yet.
-        # Not fatal — fall through to the env-var check below.
-        logger.debug("DB-backed login unavailable, falling back to env-var credentials: %s", exc)
+    except RuntimeError:
+        # DATABASE_URL not configured: no DB-accounts feature exists in this
+        # deployment to downgrade from — fall straight to the env-var check.
+        sessionmaker = None
+
+    if sessionmaker is not None:
+        try:
+            async with sessionmaker() as session:
+                user = await authenticate_user(session, normalized, password)
+                if user is not None:
+                    # This IS a login — record it. authenticate_user() itself
+                    # is read-only now; _validate_credentials owns this write
+                    # and the commit.
+                    subject, role, user_id = user.username, user.role, str(user.user_id)
+                    await record_login(session, user)
+                    await session.commit()
+                    return subject, role, user_id
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error(
+                "DB-backed login blocked by an unexpected error (%s: %s) for "
+                "subject %r — refusing to silently fall back to break-glass "
+                "credentials.",
+                type(exc).__name__, exc, normalized,
+            )
+            if not await _env_operator_allowed():
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Authentication service is temporarily unavailable.",
+                )
+            # Break-glass is explicitly armed — fall through to the env-var
+            # check below, same as the ordinary not-found path.
 
     # #11: the env-var operator is break-glass only (see _env_operator_allowed).
     if not await _env_operator_allowed():
@@ -525,7 +653,7 @@ async def _validate_credentials(username: str, password: str) -> tuple[str, str,
             detail="Invalid credentials.",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return _validate_env_credentials(normalized, password), "operator", None
+    return await _validate_env_credentials(normalized, password), "operator", None
 
 
 def _issue_token(
@@ -985,24 +1113,29 @@ async def login(body: LoginRequest, request: Request, response: Response) -> Log
             )
         except Exception as exc:
             # The account is valid but the session could not be persisted
-            # (sessions table missing / DB write error). Degrade to a legacy
-            # 8h token + X-S43-Password rather than lock a real operator out
-            # (Phase B — the legacy path is still fully wired). Logged so the
-            # deployment notices it is not on the session path.
-            logger.warning(
-                "session creation failed for %s (%s) — issuing a legacy token",
-                subject, type(exc).__name__,
+            # (sessions table missing / DB write error). This used to
+            # silently degrade to a legacy 8h token + X-S43-Password — a
+            # session-security downgrade for an already-authenticated user,
+            # decided by an exception rather than an explicit choice. Fail
+            # loudly instead: the credential was fine, the platform wasn't.
+            logger.error(
+                "Session creation failed for %s (%s: %s) — refusing to "
+                "silently degrade to a legacy long-lived token.",
+                subject, type(exc).__name__, exc,
             )
-        else:
-            token, exp_dt = _issue_token(
-                subject=subject, role=role, user_id=user_id, sid=sid,
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Login succeeded but the session could not be created. Try again shortly.",
             )
-            _set_session_cookies(response, refresh_secret, csrf_token)
-            return LoginResponse(
-                token=token, access_token=token, subject=subject,
-                role=role, expires_in=_session_access_ttl(),
-                expires_at=exp_dt.isoformat(), session_bound=True,
-            )
+        token, exp_dt = _issue_token(
+            subject=subject, role=role, user_id=user_id, sid=sid,
+        )
+        _set_session_cookies(response, refresh_secret, csrf_token)
+        return LoginResponse(
+            token=token, access_token=token, subject=subject,
+            role=role, expires_in=_session_access_ttl(),
+            expires_at=exp_dt.isoformat(), session_bound=True,
+        )
 
     token, exp_dt = _issue_token(subject=subject, role=role, user_id=user_id)
     return LoginResponse(
