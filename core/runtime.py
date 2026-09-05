@@ -35,25 +35,21 @@
 
 from __future__ import annotations
 
-import json
 import os
 import threading
 import time
 import traceback
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from core.logging_init import get_logger
+from core.monitoring.watchtower_client import WATCHTOWER_URL, watchtower_request
 
 
 RUNTIME_MODULE_ID = os.getenv("S43_RUNTIME_MODULE_ID", "sentinel-43-runtime")
 RUNTIME_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
 
-WATCHTOWER_URL = os.getenv("S43_WATCHTOWER_URL", "http://s43-watchtower:9100").rstrip("/")
-WATCHTOWER_TIMEOUT = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
 RUNTIME_HEARTBEAT_SECONDS = int(os.getenv("S43_RUNTIME_HEARTBEAT_SECONDS", "15"))
 
 
@@ -66,53 +62,11 @@ def _watchtower_request(
     path: str,
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    url = f"{WATCHTOWER_URL}{path}"
-    data = None
-    headers = {"Content-Type": "application/json"}
-
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-
-    request = urllib.request.Request(
-        url=url,
-        data=data,
-        headers=headers,
-        method=method.upper(),
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=WATCHTOWER_TIMEOUT) as response:
-            body = response.read().decode("utf-8")
-            if not body:
-                return {"status_code": response.status}
-
-            parsed = json.loads(body)
-            if isinstance(parsed, dict):
-                parsed.setdefault("status_code", response.status)
-                return parsed
-
-            return {
-                "status_code": response.status,
-                "body": parsed,
-            }
-
-    except urllib.error.HTTPError as exc:
-        try:
-            detail = exc.read().decode("utf-8")
-        except Exception:
-            detail = str(exc)
-
-        return {
-            "error": "watchtower_http_error",
-            "status_code": exc.code,
-            "detail": detail,
-        }
-
-    except Exception as exc:
-        return {
-            "error": "watchtower_unreachable",
-            "detail": str(exc),
-        }
+    # DEFECT_INVENTORY.md D-16 class of bug: this used to build the request
+    # without the internal service token, so every call here 401'd against
+    # Watchtower. (Not currently imported by any live code path — fixed for
+    # consistency with the other 12 call sites of the same bug.)
+    return watchtower_request(method, path, payload)
 
 
 @dataclass

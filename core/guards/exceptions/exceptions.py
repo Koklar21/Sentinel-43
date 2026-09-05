@@ -35,17 +35,14 @@
 
 from __future__ import annotations
 
-import json
 import os
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from ...monitoring.watchtower_client import watchtower_request
 
-WATCHTOWER_URL = os.getenv("S43_WATCHTOWER_URL", "http://s43-watchtower:9100").rstrip("/")
-WATCHTOWER_TIMEOUT = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
+
 EXCEPTIONS_MODULE_ID = os.getenv("S43_EXCEPTIONS_MODULE_ID", "sentinel43-exceptions")
 
 
@@ -60,6 +57,10 @@ def _report_exception_to_watchtower(
     error_type: str,
     details: dict[str, Any] | None = None,
 ) -> None:
+    # DEFECT_INVENTORY.md D-16: this used to build the request without the
+    # internal service token, so it 401'd against Watchtower on every raised
+    # SentinelError and the bare `except Exception: pass` swallowed that
+    # silently.
     payload = {
         "event": {
             "kind": "runtime",
@@ -72,17 +73,7 @@ def _report_exception_to_watchtower(
             "timestamp": utc_now(),
         }
     }
-
-    try:
-        request = urllib.request.Request(
-            f"{WATCHTOWER_URL}/watchtower/analyze",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        urllib.request.urlopen(request, timeout=WATCHTOWER_TIMEOUT)
-    except Exception:
-        pass
+    watchtower_request("POST", "/watchtower/analyze", payload)
 
 
 @dataclass(slots=True)

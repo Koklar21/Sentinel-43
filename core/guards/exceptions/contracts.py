@@ -35,18 +35,15 @@
 
 from __future__ import annotations
 
-import json
 import os
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping, Protocol, runtime_checkable
 
+from ...monitoring.watchtower_client import watchtower_request as _wt_request
 
-WATCHTOWER_URL = os.getenv("S43_WATCHTOWER_URL", "http://s43-watchtower:9100").rstrip("/")
-WATCHTOWER_TIMEOUT = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
+
 CONTRACTS_MODULE_ID = os.getenv("S43_CONTRACTS_MODULE_ID", "sentinel43-contracts")
 
 
@@ -55,16 +52,11 @@ def utc_now() -> str:
 
 
 def _watchtower_request(payload: dict[str, Any]) -> None:
-    try:
-        request = urllib.request.Request(
-            f"{WATCHTOWER_URL}/watchtower/analyze",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        urllib.request.urlopen(request, timeout=WATCHTOWER_TIMEOUT)
-    except Exception:
-        pass
+    # DEFECT_INVENTORY.md D-16: this used to build the request without the
+    # internal service token, so it 401'd against Watchtower on every
+    # contract failure and the bare `except Exception: pass` swallowed that
+    # silently.
+    _wt_request("POST", "/watchtower/analyze", payload)
 
 
 def report_contract_failure(

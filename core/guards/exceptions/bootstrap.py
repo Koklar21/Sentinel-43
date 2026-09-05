@@ -71,14 +71,12 @@ Changes from previous version:
 
 from __future__ import annotations
 
-import json
 import os
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
 
+from ...monitoring.watchtower_client import watchtower_request
 from .expectations import (
     get_basic_expectations,
     get_hardened_expectations,
@@ -136,49 +134,16 @@ def _watchtower_request(
     path: str,
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    url  = f"{_cfg('wt_url')}{path}"
-    data = None
-
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-
-    request = urllib.request.Request(
-        url=url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method=method.upper(),
+    # DEFECT_INVENTORY.md D-16: this used to build the request without the
+    # internal service token, so every call here 401'd against Watchtower.
+    # Delegates to the canonical client (which reads S43_WATCHTOWER_URL /
+    # _TIMEOUT itself); the bounded read (Fix LOW, previously 64 KB here) is
+    # preserved via max_response_bytes.
+    return watchtower_request(
+        method, path, payload,
+        timeout=_cfg("wt_timeout"),
+        max_response_bytes=_MAX_RESPONSE_BYTES,
     )
-
-    try:
-        with urllib.request.urlopen(request, timeout=_cfg("wt_timeout")) as response:
-            # Fix (LOW): bounded read — rogue Watchtower can't exhaust memory.
-            body = response.read(_MAX_RESPONSE_BYTES).decode("utf-8")
-            if not body:
-                return {"status_code": response.status}
-
-            parsed = json.loads(body)
-            if isinstance(parsed, dict):
-                parsed.setdefault("status_code", response.status)
-                return parsed
-
-            return {"status_code": response.status, "body": parsed}
-
-    except urllib.error.HTTPError as exc:
-        try:
-            detail = exc.read(_MAX_RESPONSE_BYTES).decode("utf-8")
-        except Exception:
-            detail = str(exc)
-        return {
-            "error":       "watchtower_http_error",
-            "status_code": exc.code,
-            "detail":      detail,
-        }
-
-    except Exception as exc:
-        return {
-            "error":  "watchtower_unreachable",
-            "detail": type(exc).__name__,
-        }
 
 
 def _register_bootstrap_with_watchtower() -> dict[str, Any]:
