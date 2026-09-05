@@ -322,6 +322,48 @@ def test_ws_rejects_valid_token_wrong_password(client: TestClient):
         _expect_rejection(ws, expected_error_substring="invalid password")
 
 
+def test_ws_reports_service_unavailable_not_auth_failure(client: TestClient):
+    """
+    P0 security remediation, item 2: reverify_password() now raises
+    HTTPException(503) when the DB-backed auth path is blocked and
+    break-glass isn't armed — a platform outage, not a wrong password. The
+    WS handler must catch that and close with a reason that
+    websocket.js's _reasonIndicatesAuthFailure() (matches
+    auth|token|password|credential|session|login) will NOT classify as an
+    auth failure, so the client doesn't misreport "wrong password" for a
+    backend outage.
+    """
+    from fastapi import HTTPException
+
+    async def _raise_503(username: str, password: str) -> bool:
+        raise HTTPException(
+            status_code=503, detail="Authentication service is temporarily unavailable.",
+        )
+
+    original = auth_module.reverify_password
+    auth_module.reverify_password = _raise_503
+    try:
+        with client.websocket_connect(WS_URL) as ws:
+            _consume_auth_required(ws)
+            ws.send_json({
+                "type": "auth",
+                "payload": {"token": make_valid_token(), "password": TEST_PASSWORD},
+            })
+            frame = ws.receive_json()
+            assert frame["type"] == "error"
+            assert "unavailable" in frame["payload"]["error"].lower()
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_text()
+            assert exc_info.value.code == 1008
+            reason = exc_info.value.reason or ""
+            assert reason == "service_unavailable"
+            import re
+
+            assert not re.search(r"auth|token|password|credential|session|login", reason, re.I)
+    finally:
+        auth_module.reverify_password = original
+
+
 def test_ws_rejects_unsupported_algorithm(client: TestClient):
     """
     A token signed with HS384 must be rejected even though HS384 is a

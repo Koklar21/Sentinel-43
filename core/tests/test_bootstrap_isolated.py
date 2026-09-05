@@ -70,6 +70,7 @@ os.environ.setdefault("S43_JWT_AUDIENCE", "sentinel-43-dashboard-test")
 
 import core.api.routers.bootstrap as bootstrap_module  # noqa: E402
 import core.auth.deps as auth_deps_module  # noqa: E402
+import core.auth.sessions as sessions_module  # noqa: E402
 import core.auth.users as users_module  # noqa: E402
 from core.api.main import app  # noqa: E402
 
@@ -156,6 +157,48 @@ class _FakeUserStore:
         user.last_login_at = datetime.now(timezone.utc)
 
 
+@dataclass
+class _FakeSessionRow:
+    sid: uuid.UUID = field(default_factory=uuid.uuid4)
+    user_id: uuid.UUID = field(default_factory=uuid.uuid4)
+
+
+class _FakeSessionStore:
+    """
+    Drop-in replacement for core.auth.sessions.create_session() /
+    resolve_live_session() — the pieces of the server-side session layer
+    that /auth/login and the per-request session check touch. Needed since
+    the P0 security remediation pass made login() raise (503) instead of
+    silently degrading to a legacy token when session creation fails; a
+    DB-backed login in these tests must now actually succeed at creating a
+    session, not rely on that failure path.
+    """
+
+    def __init__(self, user_store: _FakeUserStore) -> None:
+        self.user_store = user_store
+        self.rows: dict[uuid.UUID, _FakeSessionRow] = {}
+
+    async def create_session(
+        self, session, *, user_id, refresh_secret, client_ip=None,
+        user_agent=None, ttl_seconds=None, now=None,
+    ) -> _FakeSessionRow:
+        row = _FakeSessionRow(user_id=user_id)
+        self.rows[row.sid] = row
+        return row
+
+    async def resolve_live_session(self, session, sid):
+        row = self.rows.get(sid)
+        if row is None:
+            raise sessions_module.SessionError("unknown session")
+        owner = next(
+            (u for u in self.user_store.users.values() if u.user_id == row.user_id),
+            None,
+        )
+        if owner is None or not owner.is_active:
+            raise sessions_module.SessionError("owner inactive")
+        return row, owner
+
+
 class _FakeSession:
     """No-op AsyncSession stand-in — the dict store has no real transaction."""
 
@@ -207,6 +250,7 @@ def fresh_user_store(monkeypatch) -> _FakeUserStore:
     enough for those call sites to pick up the fake.
     """
     store = _FakeUserStore()
+    session_store = _FakeSessionStore(store)
 
     monkeypatch.setattr(bootstrap_module, "count_active_admins", store.count_active_admins)
     monkeypatch.setattr(bootstrap_module, "create_first_admin", store.create_first_admin)
@@ -214,6 +258,11 @@ def fresh_user_store(monkeypatch) -> _FakeUserStore:
     monkeypatch.setattr(users_module, "authenticate_user", store.authenticate_user)
     monkeypatch.setattr(users_module, "record_login", store.record_login)
     monkeypatch.setattr(users_module, "get_sessionmaker", _fake_get_sessionmaker)
+    # /auth/login creates a real server-side session for every DB-backed
+    # login (see auth.py's _create_login_session()) — fake that out too, the
+    # same way the user store is faked, rather than letting it fail.
+    monkeypatch.setattr(sessions_module, "create_session", session_store.create_session)
+    monkeypatch.setattr(sessions_module, "resolve_live_session", session_store.resolve_live_session)
 
     app.dependency_overrides[auth_deps_module.get_db_session] = _fake_get_db_session
     yield store

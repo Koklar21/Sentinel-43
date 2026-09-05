@@ -40,7 +40,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -67,6 +66,7 @@ import core.api.routers.users as users_router_module  # noqa: E402
 import core.auth.deps as auth_deps_module  # noqa: E402
 import core.auth.users as users_module  # noqa: E402
 from core.api.main import app  # noqa: E402
+from core.auth.users import hash_password  # noqa: E402
 
 USERS_URL = "/users"
 
@@ -76,9 +76,11 @@ ADMIN_PW = "root-admin-password-1234"
 # An env-var operator that is deliberately never a valid caller here. It
 # only exists so the /auth/login fallback path (auth.py falls back to
 # _validate_env_credentials when the DB has no matching user) returns a
-# clean 401 instead of a 503 "credentials not configured".
+# clean 401 instead of a 503 "credentials not configured". Must be a
+# well-formed Argon2id hash — a legacy SHA-256 digest is rejected outright
+# by _valid_argon2_hash() and would itself 503.
 ENV_OPERATOR_NAME = "env-operator-unused"
-ENV_OPERATOR_HASH = hashlib.sha256(b"env-operator-unused-password").hexdigest()
+ENV_OPERATOR_HASH = hash_password("env-operator-unused-password")
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +152,49 @@ class _FakeUserStore:
         return user
 
 
+@dataclass
+class _FakeSessionRow:
+    sid: uuid.UUID = field(default_factory=uuid.uuid4)
+    user_id: uuid.UUID = field(default_factory=uuid.uuid4)
+
+
+class _FakeSessionStore:
+    """
+    Drop-in replacement for core.auth.sessions.create_session() /
+    resolve_live_session(). /auth/login creates a real server-side session
+    for every DB-backed login (auth.py's _create_login_session()) — needed
+    since the P0 security remediation pass made login() raise (503) rather
+    than silently degrade to a legacy token when session creation fails; a
+    DB-backed login in these tests must now actually succeed at it.
+    """
+
+    def __init__(self, user_store: _FakeUserStore) -> None:
+        self.user_store = user_store
+        self.rows: dict[uuid.UUID, _FakeSessionRow] = {}
+
+    async def create_session(
+        self, session, *, user_id, refresh_secret, client_ip=None,
+        user_agent=None, ttl_seconds=None, now=None,
+    ) -> _FakeSessionRow:
+        row = _FakeSessionRow(user_id=user_id)
+        self.rows[row.sid] = row
+        return row
+
+    async def resolve_live_session(self, session, sid):
+        import core.auth.sessions as sessions_module
+
+        row = self.rows.get(sid)
+        if row is None:
+            raise sessions_module.SessionError("unknown session")
+        owner = next(
+            (u for u in self.user_store.users.values() if u.user_id == row.user_id),
+            None,
+        )
+        if owner is None or not owner.is_active:
+            raise sessions_module.SessionError("owner inactive")
+        return row, owner
+
+
 class _FakeSession:
     """No-op stand-in for AsyncSession. The dict-backed fake store has no real
     transaction, so commit/rollback/flush are genuine no-ops here. get_bind()
@@ -188,6 +233,7 @@ async def _fake_get_db_session() -> AsyncIterator[_FakeSession]:
 @pytest.fixture
 def store(monkeypatch) -> Generator[_FakeUserStore, None, None]:
     s = _FakeUserStore()
+    session_store = _FakeSessionStore(s)
 
     monkeypatch.setenv("SENTINEL_ENV", "test")
     monkeypatch.setenv("S43_JWT_SECRET", JWT_SECRET)
@@ -212,6 +258,11 @@ def store(monkeypatch) -> Generator[_FakeUserStore, None, None]:
     monkeypatch.setattr(users_module, "get_user_by_username", s.get_user_by_username)
     monkeypatch.setattr(users_module, "authenticate_user", s.authenticate_user)
     monkeypatch.setattr(users_module, "get_sessionmaker", _fake_get_sessionmaker)
+    # /auth/login creates a real server-side session for every DB-backed
+    # login — fake that out too (see _FakeSessionStore).
+    import core.auth.sessions as sessions_module
+    monkeypatch.setattr(sessions_module, "create_session", session_store.create_session)
+    monkeypatch.setattr(sessions_module, "resolve_live_session", session_store.resolve_live_session)
 
     app.dependency_overrides[auth_deps_module.get_db_session] = _fake_get_db_session
     yield s

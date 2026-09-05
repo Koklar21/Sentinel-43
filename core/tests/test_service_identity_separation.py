@@ -143,14 +143,17 @@ class TestServiceTokenCannotSatisfyHumanAuth:
     def test_service_token_fails_login_credential_check(self, env, monkeypatch):
         # env-var operator path: a service token is neither the username nor
         # the password hash, so _validate_env_credentials must 401.
+        import asyncio
+
+        from core.auth.users import hash_password
+
         monkeypatch.setenv("S43_OPERATOR_USERNAME", "operator")
-        import hashlib
         monkeypatch.setenv(
             "S43_OPERATOR_PASSWORD_HASH",
-            hashlib.sha256(b"the-real-password").hexdigest(),
+            hash_password("the-real-password"),
         )
         with pytest.raises(HTTPException) as ei:
-            auth_module._validate_env_credentials("operator", SERVICE_TOKEN)
+            asyncio.run(auth_module._validate_env_credentials("operator", SERVICE_TOKEN))
         assert ei.value.status_code == 401
 
     def test_service_token_claims_are_not_session_bound(self, env):
@@ -325,12 +328,15 @@ class TestSpartaTokenCannotSatisfyOtherIdentities:
         assert ei.value.status_code == 401
 
     def test_H_sparta_token_fails_env_login_credential_check(self, env, monkeypatch):
+        import asyncio
+
+        from core.auth.users import hash_password
+
         monkeypatch.setenv("S43_OPERATOR_USERNAME", "operator")
-        import hashlib
         monkeypatch.setenv("S43_OPERATOR_PASSWORD_HASH",
-                           hashlib.sha256(b"the-real-password").hexdigest())
+                           hash_password("the-real-password"))
         with pytest.raises(HTTPException) as ei:
-            auth_module._validate_env_credentials("operator", SPARTA_NODE_TOKEN)
+            asyncio.run(auth_module._validate_env_credentials("operator", SPARTA_NODE_TOKEN))
         assert ei.value.status_code == 401
 
     def test_sparta_token_claims_are_not_session_bound(self, env):

@@ -362,6 +362,27 @@ def _validate_security_config() -> None:
                     "trusted private network."
                 )
 
+        # P0-1 (Argon2id migration): a legacy SHA-256 S43_OPERATOR_PASSWORD_HASH
+        # must never be accepted outside local/dev/test. Checked at startup —
+        # not first login attempt — so a misconfigured non-local deployment
+        # never comes up at all. No dual-scheme grace period: a value that
+        # isn't a well-formed Argon2id hash is rejected the same way whether
+        # it's a legacy SHA-256 digest, empty, or garbage.
+        operator_hash = os.getenv("S43_OPERATOR_PASSWORD_HASH", "").strip()
+        if operator_hash:
+            from .routers.auth import _valid_argon2_hash
+
+            if not _valid_argon2_hash(operator_hash):
+                raise RuntimeError(
+                    "S43_OPERATOR_PASSWORD_HASH is not a well-formed Argon2id "
+                    "hash. The legacy SHA-256 break-glass hash is no longer "
+                    "accepted outside local/dev/test environments. This "
+                    "requires rotating the break-glass password (the old "
+                    "hash cannot be converted without the original "
+                    "plaintext) — generate a new one with: "
+                    "python -m core.cli.generate_secrets --password-hash"
+                )
+
 
 # =============================================================================
 # Validation helpers
@@ -1226,7 +1247,18 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 await websocket.send_json({"type": "error", "payload": {"error": "Password missing"}})
                 await _ws_safe_close(websocket, reason="invalid_password")
                 return
-            if not await reverify_password(ws_subject, ws_password):
+            try:
+                ws_reverified = await reverify_password(ws_subject, ws_password)
+            except HTTPException:
+                # reverify_password() raises 503 when the DB-backed auth path
+                # is blocked and break-glass is not explicitly armed — that
+                # is a platform outage, not a wrong password. Close with a
+                # reason that _reasonIndicatesAuthFailure() (websocket.js)
+                # will NOT classify as an auth failure.
+                await websocket.send_json({"type": "error", "payload": {"error": "Authentication service is temporarily unavailable"}})
+                await _ws_safe_close(websocket, reason="service_unavailable")
+                return
+            if not ws_reverified:
                 await websocket.send_json({"type": "error", "payload": {"error": "Invalid password"}})
                 await _ws_safe_close(websocket, reason="invalid_password")
                 return

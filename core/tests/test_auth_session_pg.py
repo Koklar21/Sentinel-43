@@ -169,6 +169,34 @@ def test_login_rejects_disallowed_origin(client, db):
     assert r.status_code == 403
 
 
+def test_session_creation_failure_is_503_not_a_legacy_token(client, db, monkeypatch):
+    """
+    P0 security remediation, item 2c: a DB-backed login whose session
+    creation fails (sessions table missing / write error) used to silently
+    degrade to a legacy 8h token + X-S43-Password — a session-security
+    downgrade for an already-authenticated user, decided by an exception
+    rather than an explicit choice. It must now fail loudly (503) instead.
+    Forces the real failure mode (create_session() raising) rather than
+    mocking the whole login path, against a real Postgres-backed account.
+    """
+    _mk_user(db)
+
+    import core.auth.sessions as sessions_module
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("sessions table is unavailable (simulated)")
+
+    monkeypatch.setattr(sessions_module, "create_session", _boom)
+
+    r = _login(client)
+    assert r.status_code == 503, r.text
+    # No legacy token anywhere in the response — a partial/degraded
+    # credential must not be handed out alongside the failure.
+    assert "token" not in r.json()
+    # And no session cookies were set on the failed attempt either.
+    assert "s43_refresh" not in r.headers.get("set-cookie", "")
+
+
 # ---------------------------------------------------------------------------
 # refresh
 # ---------------------------------------------------------------------------
