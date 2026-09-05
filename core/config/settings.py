@@ -11,12 +11,9 @@ Sentinel-43 Settings (modern config)
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import secrets
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -25,6 +22,8 @@ from typing import Any, Dict, List, Optional
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from core.monitoring.watchtower_client import watchtower_request
+
 
 _ALLOWED_MODES = {"SHADOW", "HUMAN_GATED", "AUTONOMOUS_VETO"}
 _TRUE = {"1", "true", "t", "yes", "y", "on"}
@@ -32,8 +31,6 @@ _FALSE = {"0", "false", "f", "no", "n", "off"}
 
 SETTINGS_MODULE_ID = os.getenv("S43_SETTINGS_MODULE_ID", "sentinel43-settings")
 SETTINGS_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
-WATCHTOWER_URL = os.getenv("S43_WATCHTOWER_URL", "http://s43-watchtower:9100").rstrip("/")
-WATCHTOWER_TIMEOUT = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
 
 
 def utc_now() -> str:
@@ -45,50 +42,12 @@ def _watchtower_request(
     path: str,
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    url = f"{WATCHTOWER_URL}{path}"
-    data = None
-    headers = {"Content-Type": "application/json"}
-
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-
-    request = urllib.request.Request(
-        url=url,
-        data=data,
-        headers=headers,
-        method=method.upper(),
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=WATCHTOWER_TIMEOUT) as response:
-            body = response.read().decode("utf-8")
-            if not body:
-                return {"status_code": response.status}
-
-            parsed = json.loads(body)
-            if isinstance(parsed, dict):
-                parsed.setdefault("status_code", response.status)
-                return parsed
-
-            return {"status_code": response.status, "body": parsed}
-
-    except urllib.error.HTTPError as exc:
-        try:
-            detail = exc.read().decode("utf-8")
-        except Exception:
-            detail = str(exc)
-
-        return {
-            "error": "watchtower_http_error",
-            "status_code": exc.code,
-            "detail": detail,
-        }
-
-    except Exception as exc:
-        return {
-            "error": "watchtower_unreachable",
-            "detail": str(exc),
-        }
+    # DEFECT_INVENTORY.md D-16: this used to build the request without the
+    # internal service token, so every call here 401'd against Watchtower
+    # and every settings-validation branch below silently believed its
+    # report had succeeded. Delegates to the canonical client, which
+    # attaches Authorization and never swallows a failure without logging it.
+    return watchtower_request(method, path, payload)
 
 
 def _register_settings_with_watchtower() -> None:

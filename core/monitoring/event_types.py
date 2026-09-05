@@ -35,16 +35,16 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-import time
 import threading
-import urllib.request
+import time
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 import uuid
+
+from .watchtower_client import watchtower_request
 
 logger = logging.getLogger("SentinelEventTypes")
 
@@ -52,41 +52,19 @@ EVENT_TYPES_MODULE_ID = os.getenv("S43_EVENT_TYPES_MODULE_ID", "sentinel43-event
 
 EVENT_TYPES_VERSION = os.getenv("S43_EVENT_TYPES_VERSION", os.getenv("SENTINEL_VERSION", "0.1.0"))
 
-WATCHTOWER_URL = os.getenv("S43_WATCHTOWER_URL", "http://s43-watchtower:9100").rstrip("/")
-
-
-def _float_env(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-
-    try:
-        return float(raw)
-    except ValueError:
-        logger.warning(
-            "Invalid value %r for %s, falling back to default %s", raw, name, default,
-        )
-        return default
-
-
-WATCHTOWER_TIMEOUT = _float_env("S43_WATCHTOWER_TIMEOUT", 2.0)
-
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 def _send_watchtower_report(payload: dict[str, Any]) -> None:
-    try:
-        request = urllib.request.Request(
-            f"{WATCHTOWER_URL}/watchtower/analyze",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        urllib.request.urlopen(request, timeout=WATCHTOWER_TIMEOUT)
-    except Exception as exc:
-        logger.debug("Failed to report event-type issue to Watchtower: %s", exc)
+    # DEFECT_INVENTORY.md D-16: this used to build the request without the
+    # internal service token, so it 401'd against Watchtower on every call
+    # and `logger.debug` (invisible at the default log level) hid that
+    # event-normalization issues never reached Watchtower. The canonical
+    # client attaches Authorization and logs a rate-limited WARNING itself
+    # on failure, so no separate except/log here is needed.
+    watchtower_request("POST", "/watchtower/analyze", payload)
 
 
 def _report_event_type_issue(
