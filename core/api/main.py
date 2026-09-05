@@ -42,12 +42,15 @@ import re
 import secrets
 import threading
 import time
-import urllib.error
-import urllib.request
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
+from ..monitoring.watchtower_client import (
+    WATCHTOWER_URL,
+    WATCHTOWER_TIMEOUT,
+    watchtower_request as _canonical_watchtower_request,
+)
 from ..security.jwt_constants import APPROVED_JWT_ALGORITHMS
 from fastapi import (
     APIRouter,
@@ -126,10 +129,7 @@ APP_NAME    = "sentinel-43-api"
 APP_VERSION = _env_str("SENTINEL_VERSION", "0.1.0")
 SENTINEL_ENV = _env_str("SENTINEL_ENV", "production")
 
-WATCHTOWER_URL               = _env_str("S43_WATCHTOWER_URL", "http://s43-core:9100").rstrip("/")
-WATCHTOWER_TIMEOUT           = _env_float("S43_WATCHTOWER_TIMEOUT", 2.0)
 WATCHTOWER_HEARTBEAT_SECONDS = _env_int("S43_WATCHTOWER_HEARTBEAT_SECONDS", 15)
-WATCHTOWER_SERVICE_TOKEN_ENV = "S43_WATCHTOWER_SERVICE_TOKEN"
 
 _ALLOWED_ORIGINS: frozenset[str] = _env_frozenset(
     "S43_ALLOWED_ORIGINS",
@@ -525,39 +525,11 @@ def _watchtower_request(
     path: str,
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    url = f"{WATCHTOWER_URL}{path}"
-    data = None
-    headers = {"Content-Type": "application/json"}
-    # Pass 1: the Watchtower core now requires an internal-service token on
-    # every operational/mutation route. Attach it when configured. Read at
-    # call time so a rotation or a test override takes effect without a
-    # module reload. /watchtower/health and /watchtower/ready ignore it.
-    _wt_token = os.getenv(WATCHTOWER_SERVICE_TOKEN_ENV, "").strip()
-    if _wt_token:
-        headers["Authorization"] = f"Bearer {_wt_token}"
-    if payload is not None:
-        try:
-            data = json.dumps(payload).encode("utf-8")
-        except (TypeError, ValueError) as exc:
-            return {"error": "payload_serialization_error", "detail": str(exc)}
-    req = urllib.request.Request(url=url, data=data, headers=headers, method=method.upper())
-    try:
-        with urllib.request.urlopen(req, timeout=WATCHTOWER_TIMEOUT) as response:
-            body = response.read().decode("utf-8")
-            if not body:
-                return {"status_code": response.status}
-            result = json.loads(body)
-            if isinstance(result, dict):
-                result.setdefault("status_code", response.status)
-            return result
-    except urllib.error.HTTPError as exc:
-        try:
-            detail = exc.read().decode("utf-8")
-        except Exception:
-            detail = str(exc)
-        return {"error": "watchtower_http_error", "status_code": exc.code, "detail": detail}
-    except Exception as exc:
-        return {"error": "watchtower_unreachable", "detail": str(exc)}
+    # Delegates to the canonical client (core/monitoring/watchtower_client.py,
+    # DEFECT_INVENTORY.md D-15/D-16) so this, MonitoringManager's, and every
+    # other internal caller's token handling, URL, and failure logging stay
+    # in exactly one place instead of three copies that happen to agree today.
+    return _canonical_watchtower_request(method, path, payload)
 
 def watchtower_health_check() -> dict[str, Any]:
     result = _watchtower_request("GET", "/watchtower/health")
