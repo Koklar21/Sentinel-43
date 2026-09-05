@@ -35,11 +35,9 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import sys
-import urllib.request
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -48,9 +46,6 @@ from typing import Any
 
 LOGGING_MODULE_ID = os.getenv("S43_LOGGING_MODULE_ID", "sentinel43-logging")
 LOGGING_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
-
-WATCHTOWER_URL = os.getenv("S43_WATCHTOWER_URL", "http://s43-watchtower:9100").rstrip("/")
-WATCHTOWER_TIMEOUT = float(os.getenv("S43_WATCHTOWER_TIMEOUT", "2.0"))
 
 _VALID_LEVELS = {
     "DEBUG",
@@ -66,6 +61,14 @@ def utc_now() -> str:
 
 
 def _watchtower_report(status: str, event: str, details: dict[str, Any] | None = None) -> None:
+    # DEFECT_INVENTORY.md D-16: this used to build the request without the
+    # internal service token, so it 401'd against Watchtower on every call
+    # and the bare `except Exception: pass` swallowed that silently — an
+    # invalid SENTINEL_LOG_LEVEL never actually reached Watchtower. Deferred
+    # import: this module initializes logging very early in process startup
+    # and must not take on an import-time dependency on core.monitoring.
+    from core.monitoring.watchtower_client import watchtower_request
+
     payload = {
         "name": LOGGING_MODULE_ID,
         "status": status,
@@ -76,17 +79,7 @@ def _watchtower_report(status: str, event: str, details: dict[str, Any] | None =
             **(details or {}),
         },
     }
-
-    try:
-        request = urllib.request.Request(
-            f"{WATCHTOWER_URL}/watchtower/dependencies/report",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        urllib.request.urlopen(request, timeout=WATCHTOWER_TIMEOUT)
-    except Exception:
-        pass
+    watchtower_request("POST", "/watchtower/dependencies/report", payload)
 
 
 def _normalize_log_level(value: str | None) -> int:

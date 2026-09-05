@@ -35,24 +35,21 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import threading
 import time
 import traceback
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Union
 
 from .event_types import BaseEvent, MobileEvent, normalize_event, to_event_context
 from .watchtower import WatchtowerConfig, WatchtowerNode
+from .watchtower_client import watchtower_request as _canonical_watchtower_request
 
 
 logger = logging.getLogger("SentinelMonitoringManager")
 
-WATCHTOWER_URL = os.getenv("S43_WATCHTOWER_URL", "http://s43-watchtower:9100").rstrip("/")
 MANAGER_MODULE_ID = os.getenv("S43_MONITORING_MANAGER_ID", "sentinel43-monitoring-manager")
 MANAGER_VERSION = os.getenv("S43_MANAGER_VERSION", os.getenv("SENTINEL_VERSION", "0.1.0"))
 
@@ -72,7 +69,6 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
-WATCHTOWER_TIMEOUT = _float_env("S43_WATCHTOWER_TIMEOUT", 2.0)
 REGISTRATION_RETRY_SECONDS = _float_env("S43_REGISTRATION_RETRY_SECONDS", 30.0)
 
 
@@ -85,63 +81,10 @@ def _watchtower_request(
     path: str,
     payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    url = f"{WATCHTOWER_URL}{path}"
-    data = None
-    headers = {"Content-Type": "application/json"}
-    # Pass 1: the Watchtower core now requires an internal-service token on
-    # every route the manager calls (/modules/register, /dependencies/report,
-    # /analyze). Read at call time so a rotation takes effect without a
-    # reload; harmless on the unauthenticated health/ready probes.
-    _wt_token = os.getenv("S43_WATCHTOWER_SERVICE_TOKEN", "").strip()
-    if _wt_token:
-        headers["Authorization"] = f"Bearer {_wt_token}"
-
-    if payload is not None:
-        try:
-            data = json.dumps(payload).encode("utf-8")
-        except (TypeError, ValueError) as exc:
-            return {
-                "error": "watchtower_payload_serialization_error",
-                "detail": str(exc),
-            }
-
-    request = urllib.request.Request(
-        url=url,
-        data=data,
-        headers=headers,
-        method=method.upper(),
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=WATCHTOWER_TIMEOUT) as response:
-            body = response.read().decode("utf-8")
-            if not body:
-                return {"status_code": response.status}
-
-            parsed = json.loads(body)
-            if isinstance(parsed, dict):
-                parsed.setdefault("status_code", response.status)
-                return parsed
-
-            return {"status_code": response.status, "body": parsed}
-
-    except urllib.error.HTTPError as exc:
-        try:
-            detail = exc.read().decode("utf-8")
-        except Exception:
-            detail = str(exc)
-
-        return {
-            "error": "watchtower_http_error",
-            "status_code": exc.code,
-            "detail": detail,
-        }
-
-    except Exception as exc:
-        return {
-            "error": "watchtower_unreachable",
-            "detail": str(exc),
-        }
+    # Delegates to the canonical client (DEFECT_INVENTORY.md D-15/D-16) so
+    # this and every other internal caller's token handling, URL, and
+    # failure logging stay in exactly one place.
+    return _canonical_watchtower_request(method, path, payload)
 
 
 class MonitoringManager:
