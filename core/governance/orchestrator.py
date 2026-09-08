@@ -4,338 +4,529 @@
 # Copyright (c) 2026 Justin Armstrong
 # All Rights Reserved.
 #
-# This file is part of the Sentinel-43 platform and constitutes original
-# intellectual property of the copyright holder.
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
 #
-# Sentinel-43 is distributed under a dual-license model:
-#
-#   1. GNU Affero General Public License (AGPL v3.0)
-#      for open-source use, modification, and distribution.
-#
-#   2. Commercial License
-#      for proprietary, enterprise, government, or other commercial use
-#      not permitted under the AGPL v3.0.
-#
-# Unauthorized copying, redistribution, relicensing, reverse engineering,
-# or commercial exploitation outside the terms of the applicable license
-# is strictly prohibited.
-#
-# By accessing, modifying, distributing, or using this software, you agree
-# to comply with the terms of the applicable license.
-#
-# License Information:
-# AGPL v3.0: https://www.gnu.org/licenses/agpl-3.0.en.html
-#
-# Commercial Licensing:
-# Contact the copyright holder for commercial licensing terms.
-#
-# Sentinel-43™
-# Original Work and Protected Intellectual Property.
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
+
+"""Human-governed Sentinel-43 transaction governance.
+
+Responsibilities:
+    - authorize the caller
+    - apply velocity limits
+    - evaluate policy
+    - create HUMAN_GATED review records
+    - resolve reviews through explicit human approval/veto
+    - append authoritative audit records
+
+Non-responsibilities:
+    - autonomous enforcement
+    - storage backend selection
+    - audit key generation
+    - background thread creation
+    - monitoring lifecycle management
+"""
 
 from __future__ import annotations
 
 import hashlib
 import logging
 import threading
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from decimal import Decimal
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from enum import Enum
 from types import MappingProxyType
-from typing import Any, Callable, Dict, Mapping, Optional, Set
+from typing import Any, Final, Protocol
 from uuid import uuid4
 
-from core.audit.store import AuditConfig, AuditStore
-from core.guards.velocity import VelocityConfig, VelocityGuard
+from core.guards.velocity import VelocityGuard
 from core.policy_gate import PolicyContext, evaluate
 
-_logger = logging.getLogger("sentinel43.governance")
+
+logger = logging.getLogger("sentinel43.governance")
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+MAX_TRANSACTION_AMOUNT: Final[Decimal] = Decimal("1e15")
+MAX_PENDING_REVIEWS: Final[int] = 10_000
+DEFAULT_REVIEW_TTL_SECONDS: Final[int] = 30 * 60
 
 
-# =============================================================================
-# Reason codes
-# =============================================================================
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
-class ReasonCodes:
-    CLEARED               = "CLEARED"
-    AUTHORIZATION_FAILED  = "AUTHORIZATION_FAILED"
-    AUDIT_APPEND_FAILED   = "AUDIT_APPEND_FAILED"
-    VELOCITY_LIMIT        = "VELOCITY_LIMIT"
+
+class GovernanceMode(str, Enum):
+    SHADOW = "SHADOW"
+    HUMAN_GATED = "HUMAN_GATED"
+
+
+class DecisionStatus(str, Enum):
+    APPROVED = "APPROVED"
+    REVIEW = "REVIEW"
+    BLOCKED = "BLOCKED"
+
+
+class ReasonCode(str, Enum):
+    CLEARED = "CLEARED"
+    AUTHORIZATION_FAILED = "AUTHORIZATION_FAILED"
+    AUDIT_APPEND_FAILED = "AUDIT_APPEND_FAILED"
+    VELOCITY_LIMIT = "VELOCITY_LIMIT"
     VELOCITY_CAP_EXCEEDED = "VELOCITY_CAP_EXCEEDED"
-    INVALID_INPUT         = "INVALID_INPUT"
-    POLICY_DENY           = "POLICY_DENY"
+    INVALID_INPUT = "INVALID_INPUT"
+    POLICY_DENY = "POLICY_DENY"
     POLICY_REQUIRES_HUMAN = "POLICY_REQUIRES_HUMAN"
-    HUMAN_APPROVED        = "HUMAN_APPROVED"
-    HUMAN_VETOED          = "HUMAN_VETOED"
-    REVIEW_NOT_FOUND      = "REVIEW_NOT_FOUND"
+    HUMAN_APPROVED = "HUMAN_APPROVED"
+    HUMAN_VETOED = "HUMAN_VETOED"
+    REVIEW_NOT_FOUND = "REVIEW_NOT_FOUND"
+    REVIEW_EXPIRED = "REVIEW_EXPIRED"
+    REVIEW_CAPACITY_REACHED = "REVIEW_CAPACITY_REACHED"
 
 
-# =============================================================================
-# Governance modes
-# =============================================================================
-
-ALLOWED_MODES: Set[str] = {"SHADOW", "HUMAN_GATED", "AUTONOMOUS_VETO"}
-
-MAX_TRANSACTION_AMOUNT = Decimal("1e15")
-
-
-# =============================================================================
-# Data models
-# =============================================================================
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CallerContext:
     caller_id: str
-    caller_roles: Set[str]
+    caller_roles: frozenset[str]
     authenticated_at: datetime
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "caller_roles", frozenset(self.caller_roles))
+        caller_id = self.caller_id.strip()
+
+        if not caller_id:
+            raise ValueError(
+                "caller_id must not be empty"
+            )
+
+        object.__setattr__(
+            self,
+            "caller_id",
+            caller_id,
+        )
+
+        object.__setattr__(
+            self,
+            "caller_roles",
+            frozenset(
+                role.strip().lower()
+                for role in self.caller_roles
+                if role.strip()
+            ),
+        )
+
+        if self.authenticated_at.tzinfo is None:
+            raise ValueError(
+                "authenticated_at must be timezone-aware"
+            )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TransactionContext:
     user_id: str
     amount: Decimal
     timestamp: datetime
     location: str
     device_id: str
-    metadata: Mapping[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+        if not self.user_id.strip():
+            raise ValueError(
+                "user_id must not be empty"
+            )
+
+        if not self.amount.is_finite():
+            raise ValueError(
+                "amount must be finite"
+            )
+
+        if self.timestamp.tzinfo is None:
+            raise ValueError(
+                "timestamp must be timezone-aware"
+            )
+
+        object.__setattr__(
+            self,
+            "metadata",
+            MappingProxyType(
+                dict(self.metadata)
+            ),
+        )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Decision:
-    status: str          # APPROVED | REVIEW | BLOCKED
-    score: Decimal
-    reason: str
-    # Populated for REVIEW decisions so callers can route the decision_id
-    # to the mobile approve/veto queue and later call resolve_human_decision().
+    status: DecisionStatus
+    score: Decimal | None
+    reason: ReasonCode
     decision_id: str = ""
 
 
-# =============================================================================
-# Settings bridge
-# =============================================================================
-
-def build_orchestrator_from_settings(
-    settings,
-    *,
-    monitoring_manager: Optional[Any] = None,
-) -> "SystemOrchestrator":
-    """
-    Build a SystemOrchestrator from a pydantic Settings object.
-
-    monitoring_manager: optional MonitoringManager. When supplied, governance
-    security events (auth failures, REVIEW decisions, audit failures) are
-    routed through the monitoring pipeline for Watchtower alerting and
-    SentinelWindowStore threat scoring.
-
-    Set S43_JORM_ENABLED=true to swap the plain AuditStore for a
-    JormungandrNode (AEAD-encrypted, hash-chained audit log). The signing
-    key from settings.audit_signing_key is used as the Jormungandr root key.
-    In production, supply a KMS-derived key via this setting.
-    """
-    env    = getattr(settings, "env", "prod")
-    strict = bool(getattr(settings, "strict_mode", True))
-
-    data_dir_raw = getattr(settings, "data_dir", None)
-    if not data_dir_raw:
-        raise RuntimeError("settings.data_dir is required to build the audit store path.")
-    data_dir  = Path(data_dir_raw)
-    audit_db  = data_dir / "ghost_audit.db"
-
-    jsonl_raw  = (getattr(settings, "audit_jsonl_path", "") or "").strip()
-    jsonl_path = Path(jsonl_raw).expanduser().resolve() if jsonl_raw else None
-
-    signing_key = (getattr(settings, "audit_signing_key", "") or "").strip()
-    if not signing_key:
-        if env == "dev":
-            signing_key = "dev-only-change-me"
-            _logger.warning(
-                "audit_signing_key not set; using insecure dev default. "
-                "Never use outside env='dev'."
-            )
-        else:
-            raise RuntimeError(
-                f"audit_signing_key is required for tamper-resistant audit "
-                f"outside of env='dev' (env={env!r})."
-            )
-
-    # Optional Jormungandr swap: S43_JORM_ENABLED=true replaces the plain
-    # AuditStore with a JormungandrNode (AEAD-encrypted, hash-chained log).
-    import os
-    use_jorm = os.getenv("S43_JORM_ENABLED", "").lower() in {"1", "true", "yes"}
-    if use_jorm:
-        try:
-            from core.monitoring import build_jormungandr
-            audit_store: Any = build_jormungandr(
-                root_key=signing_key.encode(),
-                monitoring_manager=monitoring_manager,
-            )
-            _logger.info("Governance audit store: JormungandrNode (AEAD-encrypted)")
-        except ImportError:
-            _logger.warning(
-                "S43_JORM_ENABLED=true but JormungandrNode is unavailable "
-                "(cryptography package missing?). Falling back to AuditStore."
-            )
-            use_jorm = False
-
-    if not use_jorm:
-        audit_cfg   = AuditConfig(
-            sqlite_path=audit_db,
-            jsonl_path=jsonl_path,
-            signing_key=signing_key,
-        )
-        audit_store = AuditStore(audit_cfg)
-        _logger.info("Governance audit store: AuditStore (SQLite)")
-
-    vel_cfg = VelocityConfig(
-        window_seconds=int(getattr(settings, "velocity_window_seconds", 60)),
-        limit=int(getattr(settings, "velocity_limit", 10)),
-        gc_interval_seconds=int(getattr(settings, "velocity_gc_interval_seconds", 300)),
-        max_entries_per_user=int(getattr(settings, "velocity_max_entries_per_user", 1000)),
-    )
-
-    return SystemOrchestrator(
-        audit_store=audit_store,
-        velocity_guard=VelocityGuard(vel_cfg),
-        env=env,
-        strict_mode=strict,
-        default_mode=str(getattr(settings, "default_mode", "SHADOW")),
-        hash_device_ids=bool(getattr(settings, "hash_device_ids", False)),
-        monitoring_manager=monitoring_manager,
-    )
+@dataclass(frozen=True, slots=True)
+class PendingReview:
+    decision_id: str
+    user_id: str
+    caller_id: str
+    score: Decimal | None
+    effective_mode: GovernanceMode
+    created_at: datetime
+    expires_at: datetime
+    transaction_context: TransactionContext
+    policy: Mapping[str, Any]
 
 
-# =============================================================================
-# Orchestrator
-# =============================================================================
+class AuditWriter(Protocol):
+    def append(
+        self,
+        payload: dict[str, Any],
+    ) -> Any:
+        ...
+
+
+class MonitoringSink(Protocol):
+    def analyze_event(
+        self,
+        event: dict[str, Any],
+    ) -> Any:
+        ...
+
 
 class SystemOrchestrator:
-    """
-    Governance orchestrator:
-    - authorization
-    - velocity guard
-    - PolicyGate evaluation (SHADOW / HUMAN_GATED / AUTONOMOUS_VETO)
-    - tamper-resistant audit (AuditStore or JormungandrNode)
-    - pending REVIEW decision tracking for mobile approve/veto
-
-    MonitoringManager integration
-    -----------------------------
-    When monitoring_manager is supplied, security-relevant events
-    (auth failures, REVIEW decisions, audit write failures) are routed
-    through analyze_event() so they surface in Watchtower alerts and
-    accumulate in SentinelWindowStore for threat scoring.
-
-    Human-gated workflow
-    --------------------
-    When default_mode=HUMAN_GATED and a transaction requires human review,
-    process_transaction() returns Decision(status="REVIEW", decision_id=...)
-    and stores the pending review internally. The caller (e.g. main.py
-    approve/veto route or the remote gateway APPROVE_DECISION handler)
-    calls resolve_human_decision(decision_id, approved=...) to complete
-    the flow and write the final audit record.
-    """
+    """Human-governed policy orchestration with authoritative audit."""
 
     def __init__(
         self,
         *,
-        audit_store: Any,           # AuditStore or JormungandrNode (both have append())
+        audit_store: AuditWriter,
         velocity_guard: VelocityGuard,
-        env: str,
-        strict_mode: bool,
-        default_mode: str,
-        authorizer: Optional[Callable[[CallerContext, str], bool]] = None,
+        environment: str,
+        default_mode: GovernanceMode | str = GovernanceMode.HUMAN_GATED,
+        authorizer: Callable[
+            [CallerContext, str],
+            bool,
+        ] | None = None,
         hash_device_ids: bool = False,
-        monitoring_manager: Optional[Any] = None,
+        monitoring_manager: MonitoringSink | None = None,
+        review_ttl_seconds: int = DEFAULT_REVIEW_TTL_SECONDS,
+        max_pending_reviews: int = MAX_PENDING_REVIEWS,
     ) -> None:
-        self.audit_store       = audit_store
-        self.velocity_guard    = velocity_guard
-        self.env               = (env or "prod").lower()
-        self.strict_mode       = bool(strict_mode)
-        self.hash_device_ids   = bool(hash_device_ids)
-        self._monitoring_manager = monitoring_manager
+        self.audit_store = audit_store
+        self.velocity_guard = velocity_guard
+        self.environment = (
+            environment
+            or "production"
+        ).strip().lower()
 
-        normalized = (default_mode or "SHADOW").upper()
-        if normalized not in ALLOWED_MODES:
+        self.default_mode = self._normalize_mode(
+            default_mode
+        )
+
+        self.authorizer = (
+            authorizer
+            or self._default_authorizer
+        )
+
+        self.hash_device_ids = bool(
+            hash_device_ids
+        )
+
+        self._monitoring_manager = (
+            monitoring_manager
+        )
+
+        if not 60 <= review_ttl_seconds <= 86_400:
             raise ValueError(
-                f"default_mode={default_mode!r} is not a recognized governance mode "
-                f"(expected one of {sorted(ALLOWED_MODES)})."
+                "review_ttl_seconds must be between 60 and 86400"
             )
-        self.default_mode = normalized
-        self.authorizer   = authorizer or self._default_authorizer
 
-        # Pending HUMAN_GATED reviews awaiting operator decision.
-        # decision_id -> {user_id, amount, score, caller_id, created_at, context}
-        self._pending_reviews: dict[str, dict[str, Any]] = {}
-        self._pending_reviews_lock = threading.Lock()
+        if not 1 <= max_pending_reviews <= 100_000:
+            raise ValueError(
+                "max_pending_reviews must be between 1 and 100000"
+            )
 
-    # ------------------------------------------------------------------
-    # Authorisation helpers
-    # ------------------------------------------------------------------
+        self.review_ttl_seconds = (
+            review_ttl_seconds
+        )
+
+        self.max_pending_reviews = (
+            max_pending_reviews
+        )
+
+        self._pending_reviews: dict[
+            str,
+            PendingReview,
+        ] = {}
+
+        self._pending_reviews_lock = (
+            threading.RLock()
+        )
 
     @staticmethod
-    def _default_authorizer(caller: CallerContext, target_user_id: str) -> bool:
-        if caller.caller_id == target_user_id:
-            return True
-        return "admin" in caller.caller_roles or "system" in caller.caller_roles
+    def _normalize_mode(
+        mode: GovernanceMode | str,
+    ) -> GovernanceMode:
+        if isinstance(
+            mode,
+            GovernanceMode,
+        ):
+            return mode
+
+        normalized = str(
+            mode
+        ).strip().upper()
+
+        try:
+            return GovernanceMode(
+                normalized
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "governance mode must be SHADOW or HUMAN_GATED"
+            ) from exc
 
     @staticmethod
-    def _is_privileged(caller: CallerContext) -> bool:
-        return "admin" in caller.caller_roles or "system" in caller.caller_roles
+    def _default_authorizer(
+        caller: CallerContext,
+        target_user_id: str,
+    ) -> bool:
+        return (
+            caller.caller_id
+            == target_user_id
+            or "admin"
+            in caller.caller_roles
+        )
 
-    def _resolve_mode(self, caller: CallerContext, requested_mode: Optional[str]) -> str:
+    @staticmethod
+    def _is_privileged(
+        caller: CallerContext,
+    ) -> bool:
+        return (
+            "admin"
+            in caller.caller_roles
+        )
+
+    def _resolve_mode(
+        self,
+        caller: CallerContext,
+        requested_mode: str | None,
+    ) -> GovernanceMode:
         if requested_mode is None:
             return self.default_mode
 
-        normalized = requested_mode.strip().upper()
-        if normalized not in ALLOWED_MODES:
-            _logger.warning(
-                "Ignoring unrecognized governance mode %r from caller_id=%s; "
-                "using default_mode=%s",
-                requested_mode, caller.caller_id, self.default_mode,
+        requested = self._normalize_mode(
+            requested_mode
+        )
+
+        if (
+            requested
+            != self.default_mode
+            and not self._is_privileged(
+                caller
             )
+        ):
             return self.default_mode
 
-        if normalized != self.default_mode and not self._is_privileged(caller):
-            _logger.warning(
-                "Ignoring mode override to %r from non-privileged caller_id=%s; "
-                "using default_mode=%s",
-                normalized, caller.caller_id, self.default_mode,
-            )
-            return self.default_mode
+        return requested
 
-        return normalized
+    def _notify_monitoring(
+        self,
+        event: dict[str, Any],
+    ) -> None:
+        manager = self._monitoring_manager
 
-    # ------------------------------------------------------------------
-    # MonitoringManager integration
-    # ------------------------------------------------------------------
-
-    def _notify_monitoring(self, event: dict[str, Any]) -> None:
-        """Route a governance security event into the monitoring pipeline. Best-effort."""
-        if self._monitoring_manager is None:
+        if manager is None:
             return
-        try:
-            import threading as _t
-            _t.Thread(
-                target=self._monitoring_manager.analyze_event,
-                args=(event,),
-                daemon=True,
-            ).start()
-        except Exception as exc:
-            _logger.debug("MonitoringManager notification failed: %s", exc)
 
-    # ------------------------------------------------------------------
-    # Transaction processing
-    # ------------------------------------------------------------------
+        try:
+            manager.analyze_event(
+                event
+            )
+        except Exception:
+            logger.debug(
+                "Monitoring notification failed",
+                exc_info=True,
+            )
+
+    def _append_audit(
+        self,
+        payload: dict[str, Any],
+    ) -> None:
+        try:
+            self.audit_store.append(
+                payload
+            )
+        except Exception:
+            logger.error(
+                "Authoritative governance audit append failed",
+                exc_info=True,
+            )
+
+            self._notify_monitoring(
+                {
+                    "kind": "security",
+                    "event_category": "governance_audit_failure",
+                    "decision": payload.get(
+                        "decision"
+                    ),
+                }
+            )
+
+            raise
+
+    def _filter_metadata(
+        self,
+        metadata: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        allowed_keys = {
+            "location",
+            "device_id",
+            "txn_type",
+            "channel",
+            "risk_flags",
+            "tenant_id",
+        }
+
+        return {
+            key: metadata[key]
+            for key in allowed_keys
+            if key in metadata
+        }
+
+    def _maybe_hash_device_id(
+        self,
+        device_id: str,
+    ) -> str:
+        if not self.hash_device_ids:
+            return device_id
+
+        digest = hashlib.sha256(
+            device_id.encode(
+                "utf-8"
+            )
+        ).hexdigest()
+
+        return (
+            f"sha256:{digest}"
+        )
+
+    def _audit_record(
+        self,
+        *,
+        context: TransactionContext | None,
+        user_id: str,
+        decision: DecisionStatus | str,
+        reason_code: ReasonCode,
+        score: Decimal | None,
+        caller_id: str | None = None,
+        decision_id: str | None = None,
+        operator_id: str | None = None,
+        resolution_reason: str | None = None,
+        policy: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "user_id": user_id,
+            "decision": (
+                decision.value
+                if isinstance(
+                    decision,
+                    DecisionStatus,
+                )
+                else str(
+                    decision
+                )
+            ),
+            "reason_code": reason_code.value,
+            "score": (
+                str(score)
+                if score is not None
+                else None
+            ),
+        }
+
+        if caller_id is not None:
+            record[
+                "caller_id"
+            ] = caller_id
+
+        if decision_id is not None:
+            record[
+                "decision_id"
+            ] = decision_id
+
+        if operator_id is not None:
+            record[
+                "operator_id"
+            ] = operator_id
+
+        if resolution_reason:
+            record[
+                "resolution_reason"
+            ] = resolution_reason
+
+        if policy is not None:
+            record[
+                "policy"
+            ] = dict(
+                policy
+            )
+
+        if context is not None:
+            filtered = self._filter_metadata(
+                context.metadata
+            )
+
+            if "device_id" in filtered:
+                filtered[
+                    "device_id"
+                ] = self._maybe_hash_device_id(
+                    str(
+                        filtered[
+                            "device_id"
+                        ]
+                    )
+                )
+
+            record.update(
+                {
+                    "amount": str(
+                        context.amount
+                    ),
+                    "location": context.location,
+                    "device_id": self._maybe_hash_device_id(
+                        context.device_id
+                    ),
+                    "transaction_time": context.timestamp.isoformat(),
+                    "filtered_meta": filtered,
+                }
+            )
+
+        return record
+
+    def _purge_expired_reviews_locked(
+        self,
+        *,
+        now: datetime,
+    ) -> int:
+        expired = [
+            decision_id
+            for decision_id, review
+            in self._pending_reviews.items()
+            if review.expires_at
+            <= now
+        ]
+
+        for decision_id in expired:
+            del self._pending_reviews[
+                decision_id
+            ]
+
+        return len(
+            expired
+        )
 
     def process_transaction(
         self,
@@ -343,165 +534,391 @@ class SystemOrchestrator:
         caller: CallerContext,
         user_id: str,
         amount_str: str,
-        metadata: Dict[str, Any],
-        mode: Optional[str] = None,
+        metadata: Mapping[str, Any] | None = None,
+        mode: str | None = None,
+        risk_score: Decimal | str | None = None,
     ) -> Decision:
+        metadata = dict(
+            metadata
+            or {}
+        )
 
-        # --- AUTHZ ---
-        if not self.authorizer(caller, user_id):
-            self._best_effort_audit(
-                context=None, decision="BLOCKED",
-                reason_code=ReasonCodes.AUTHORIZATION_FAILED,
-                score=Decimal("0"),
-                extra={"caller_id": caller.caller_id, "caller_roles": sorted(caller.caller_roles)},
-                metadata=metadata, user_id=user_id,
+        if not self.authorizer(
+            caller,
+            user_id,
+        ):
+            record = self._audit_record(
+                context=None,
+                user_id=user_id,
+                decision=DecisionStatus.BLOCKED,
+                reason_code=ReasonCode.AUTHORIZATION_FAILED,
+                score=None,
+                caller_id=caller.caller_id,
             )
-            self._notify_monitoring({
-                "kind": "security", "auth_failure": True,
-                "event_category": "governance_authz_failure",
-                "caller_id": caller.caller_id,
-            })
-            return Decision(status="BLOCKED", score=Decimal("0"),
-                            reason=ReasonCodes.AUTHORIZATION_FAILED)
 
-        # --- AMOUNT VALIDATION ---
+            try:
+                self._append_audit(
+                    record
+                )
+            except Exception:
+                return Decision(
+                    status=DecisionStatus.BLOCKED,
+                    score=None,
+                    reason=ReasonCode.AUDIT_APPEND_FAILED,
+                )
+
+            self._notify_monitoring(
+                {
+                    "kind": "security",
+                    "event_category": "governance_authz_failure",
+                    "caller_id": caller.caller_id,
+                }
+            )
+
+            return Decision(
+                status=DecisionStatus.BLOCKED,
+                score=None,
+                reason=ReasonCode.AUTHORIZATION_FAILED,
+            )
+
         try:
-            amount = Decimal(amount_str)
-        except Exception:
-            self._best_effort_audit(
-                context=None, decision="BLOCKED",
-                reason_code=ReasonCodes.INVALID_INPUT, score=Decimal("0"),
-                extra={"amount_str": amount_str, "caller_id": caller.caller_id},
-                metadata=metadata, user_id=user_id,
+            amount = Decimal(
+                amount_str
             )
-            return Decision(status="BLOCKED", score=Decimal("0"),
-                            reason=ReasonCodes.INVALID_INPUT)
+        except (
+            InvalidOperation,
+            ValueError,
+            TypeError,
+        ):
+            return Decision(
+                status=DecisionStatus.BLOCKED,
+                score=None,
+                reason=ReasonCode.INVALID_INPUT,
+            )
 
         if (
             not amount.is_finite()
-            or amount > MAX_TRANSACTION_AMOUNT
-            or amount < -MAX_TRANSACTION_AMOUNT
+            or abs(
+                amount
+            )
+            > MAX_TRANSACTION_AMOUNT
         ):
-            self._best_effort_audit(
-                context=None, decision="BLOCKED",
-                reason_code=ReasonCodes.INVALID_INPUT, score=Decimal("0"),
-                extra={"amount_str": amount_str, "caller_id": caller.caller_id},
-                metadata=metadata, user_id=user_id,
+            return Decision(
+                status=DecisionStatus.BLOCKED,
+                score=None,
+                reason=ReasonCode.INVALID_INPUT,
             )
-            return Decision(status="BLOCKED", score=Decimal("0"),
-                            reason=ReasonCodes.INVALID_INPUT)
 
-        now = datetime.now(timezone.utc)
+        score: Decimal | None
 
-        # --- VELOCITY ---
-        allowed, v_reason = self.velocity_guard.allow(user_id, now)
-        if not allowed:
-            reason = (ReasonCodes.VELOCITY_LIMIT
-                      if v_reason == "VELOCITY_LIMIT"
-                      else ReasonCodes.VELOCITY_CAP_EXCEEDED)
-            self._best_effort_audit(
-                context=None, decision="BLOCKED", reason_code=reason,
-                score=Decimal("0"),
-                extra={"window_seconds": self.velocity_guard.cfg.window_seconds,
-                       "limit": self.velocity_guard.cfg.limit},
-                metadata=metadata, user_id=user_id,
-            )
-            return Decision(status="BLOCKED", score=Decimal("0"), reason=reason)
-
-        # --- POLICY ---
-        tctx = TransactionContext(
-            user_id=user_id, amount=amount, timestamp=now,
-            location=str(metadata.get("location", "UNKNOWN")),
-            device_id=str(metadata.get("device_id", "UNKNOWN")),
-            metadata=metadata or {},
-        )
-        effective_mode = self._resolve_mode(caller, mode)
-        pctx = PolicyContext(
-            action="write",
-            actor_id=caller.caller_id,
-            tenant_id=str(metadata.get("tenant_id", "default")),
-            resource=f"txn:{user_id}",
-            mode=effective_mode,
-            metadata={
-                "amount": str(amount),
-                "requested_mode": mode,
-                "effective_mode": effective_mode,
-                **(metadata or {}),
-            },
-        )
-        pdec   = evaluate(pctx)
-        score  = Decimal("0.5")  # placeholder — wire scoring engine here
-
-        if not pdec.allowed:
-            if pdec.status == "REQUIRES_HUMAN":
-                decision_id = str(uuid4())
-
-                ok = self._best_effort_audit(
-                    context=tctx, decision="REVIEW",
-                    reason_code=ReasonCodes.POLICY_REQUIRES_HUMAN,
-                    score=score,
-                    extra={"policy": pdec.to_dict(), "caller_id": caller.caller_id,
-                           "decision_id": decision_id},
-                    metadata=metadata, user_id=user_id,
+        if risk_score is None:
+            score = None
+        else:
+            try:
+                score = Decimal(
+                    str(
+                        risk_score
+                    )
+                )
+            except (
+                InvalidOperation,
+                ValueError,
+                TypeError,
+            ):
+                return Decision(
+                    status=DecisionStatus.BLOCKED,
+                    score=None,
+                    reason=ReasonCode.INVALID_INPUT,
                 )
 
-                if not ok and self.env != "dev" and self.strict_mode:
-                    return Decision(status="BLOCKED", score=Decimal("0"),
-                                    reason=ReasonCodes.AUDIT_APPEND_FAILED)
+            if (
+                not score.is_finite()
+                or score < 0
+                or score > 100
+            ):
+                return Decision(
+                    status=DecisionStatus.BLOCKED,
+                    score=None,
+                    reason=ReasonCode.INVALID_INPUT,
+                )
 
-                # Store for resolve_human_decision()
-                with self._pending_reviews_lock:
-                    self._pending_reviews[decision_id] = {
-                        "decision_id": decision_id,
-                        "user_id": user_id,
-                        "amount": str(amount),
-                        "caller_id": caller.caller_id,
-                        "score": str(score),
-                        "effective_mode": effective_mode,
-                        "created_at": _utc_now(),
-                        "transaction_context": {
-                            "location": tctx.location,
-                            "device_id": tctx.device_id,
-                        },
-                    }
+        now = _utc_now()
 
-                self._notify_monitoring({
-                    "kind": "security",
-                    "event_category": "governance_human_review_pending",
-                    "decision_id": decision_id,
-                    "user_id": user_id,
-                    "effective_mode": effective_mode,
-                })
-
-                return Decision(status="REVIEW", score=score,
-                                reason=ReasonCodes.POLICY_REQUIRES_HUMAN,
-                                decision_id=decision_id)
-
-            self._best_effort_audit(
-                context=tctx, decision="BLOCKED",
-                reason_code=ReasonCodes.POLICY_DENY, score=Decimal("0"),
-                extra={"policy": pdec.to_dict(), "caller_id": caller.caller_id},
-                metadata=metadata, user_id=user_id,
+        allowed, velocity_reason = (
+            self.velocity_guard.allow(
+                user_id,
+                now,
             )
-            return Decision(status="BLOCKED", score=Decimal("0"),
-                            reason=ReasonCodes.POLICY_DENY)
-
-        ok = self._best_effort_audit(
-            context=tctx, decision="APPROVED",
-            reason_code=ReasonCodes.CLEARED, score=score,
-            extra={"policy": pdec.to_dict(), "caller_id": caller.caller_id},
-            metadata=metadata, user_id=user_id,
         )
 
-        if not ok and self.env != "dev" and self.strict_mode:
-            return Decision(status="BLOCKED", score=Decimal("0"),
-                            reason=ReasonCodes.AUDIT_APPEND_FAILED)
+        if not allowed:
+            reason = (
+                ReasonCode.VELOCITY_LIMIT
+                if velocity_reason
+                == "VELOCITY_LIMIT"
+                else ReasonCode.VELOCITY_CAP_EXCEEDED
+            )
 
-        return Decision(status="APPROVED", score=score, reason=ReasonCodes.CLEARED)
+            record = self._audit_record(
+                context=None,
+                user_id=user_id,
+                decision=DecisionStatus.BLOCKED,
+                reason_code=reason,
+                score=score,
+                caller_id=caller.caller_id,
+            )
 
-    # ------------------------------------------------------------------
-    # Human-gated resolution
-    # ------------------------------------------------------------------
+            try:
+                self._append_audit(
+                    record
+                )
+            except Exception:
+                return Decision(
+                    status=DecisionStatus.BLOCKED,
+                    score=score,
+                    reason=ReasonCode.AUDIT_APPEND_FAILED,
+                )
+
+            return Decision(
+                status=DecisionStatus.BLOCKED,
+                score=score,
+                reason=reason,
+            )
+
+        context = TransactionContext(
+            user_id=user_id,
+            amount=amount,
+            timestamp=now,
+            location=str(
+                metadata.get(
+                    "location",
+                    "UNKNOWN",
+                )
+            ),
+            device_id=str(
+                metadata.get(
+                    "device_id",
+                    "UNKNOWN",
+                )
+            ),
+            metadata=metadata,
+        )
+
+        effective_mode = self._resolve_mode(
+            caller,
+            mode,
+        )
+
+        policy_context = PolicyContext(
+            action="write",
+            actor_id=caller.caller_id,
+            tenant_id=str(
+                metadata.get(
+                    "tenant_id",
+                    "default",
+                )
+            ),
+            resource=f"txn:{user_id}",
+            mode=effective_mode.value,
+            metadata={
+                "amount": str(
+                    amount
+                ),
+                "requested_mode": mode,
+                "effective_mode": effective_mode.value,
+                **metadata,
+            },
+        )
+
+        policy_decision = evaluate(
+            policy_context
+        )
+
+        policy_payload = (
+            policy_decision.to_dict()
+        )
+
+        if not policy_decision.allowed:
+            if (
+                policy_decision.status
+                == "REQUIRES_HUMAN"
+            ):
+                if (
+                    effective_mode
+                    is GovernanceMode.SHADOW
+                ):
+                    record = self._audit_record(
+                        context=context,
+                        user_id=user_id,
+                        decision=DecisionStatus.REVIEW,
+                        reason_code=ReasonCode.POLICY_REQUIRES_HUMAN,
+                        score=score,
+                        caller_id=caller.caller_id,
+                        policy=policy_payload,
+                    )
+
+                    try:
+                        self._append_audit(
+                            record
+                        )
+                    except Exception:
+                        return Decision(
+                            status=DecisionStatus.BLOCKED,
+                            score=score,
+                            reason=ReasonCode.AUDIT_APPEND_FAILED,
+                        )
+
+                    return Decision(
+                        status=DecisionStatus.REVIEW,
+                        score=score,
+                        reason=ReasonCode.POLICY_REQUIRES_HUMAN,
+                    )
+
+                decision_id = str(
+                    uuid4()
+                )
+
+                expires_at = (
+                    now
+                    + timedelta(
+                        seconds=self.review_ttl_seconds
+                    )
+                )
+
+                review = PendingReview(
+                    decision_id=decision_id,
+                    user_id=user_id,
+                    caller_id=caller.caller_id,
+                    score=score,
+                    effective_mode=effective_mode,
+                    created_at=now,
+                    expires_at=expires_at,
+                    transaction_context=context,
+                    policy=MappingProxyType(
+                        dict(
+                            policy_payload
+                        )
+                    ),
+                )
+
+                with self._pending_reviews_lock:
+                    self._purge_expired_reviews_locked(
+                        now=now
+                    )
+
+                    if (
+                        len(
+                            self._pending_reviews
+                        )
+                        >= self.max_pending_reviews
+                    ):
+                        return Decision(
+                            status=DecisionStatus.BLOCKED,
+                            score=score,
+                            reason=ReasonCode.REVIEW_CAPACITY_REACHED,
+                        )
+
+                    self._pending_reviews[
+                        decision_id
+                    ] = review
+
+                record = self._audit_record(
+                    context=context,
+                    user_id=user_id,
+                    decision=DecisionStatus.REVIEW,
+                    reason_code=ReasonCode.POLICY_REQUIRES_HUMAN,
+                    score=score,
+                    caller_id=caller.caller_id,
+                    decision_id=decision_id,
+                    policy=policy_payload,
+                )
+
+                try:
+                    self._append_audit(
+                        record
+                    )
+                except Exception:
+                    with self._pending_reviews_lock:
+                        self._pending_reviews.pop(
+                            decision_id,
+                            None,
+                        )
+
+                    return Decision(
+                        status=DecisionStatus.BLOCKED,
+                        score=score,
+                        reason=ReasonCode.AUDIT_APPEND_FAILED,
+                    )
+
+                self._notify_monitoring(
+                    {
+                        "kind": "security",
+                        "event_category": "governance_human_review_pending",
+                        "decision_id": decision_id,
+                        "user_id": user_id,
+                    }
+                )
+
+                return Decision(
+                    status=DecisionStatus.REVIEW,
+                    score=score,
+                    reason=ReasonCode.POLICY_REQUIRES_HUMAN,
+                    decision_id=decision_id,
+                )
+
+            record = self._audit_record(
+                context=context,
+                user_id=user_id,
+                decision=DecisionStatus.BLOCKED,
+                reason_code=ReasonCode.POLICY_DENY,
+                score=score,
+                caller_id=caller.caller_id,
+                policy=policy_payload,
+            )
+
+            try:
+                self._append_audit(
+                    record
+                )
+            except Exception:
+                return Decision(
+                    status=DecisionStatus.BLOCKED,
+                    score=score,
+                    reason=ReasonCode.AUDIT_APPEND_FAILED,
+                )
+
+            return Decision(
+                status=DecisionStatus.BLOCKED,
+                score=score,
+                reason=ReasonCode.POLICY_DENY,
+            )
+
+        record = self._audit_record(
+            context=context,
+            user_id=user_id,
+            decision=DecisionStatus.APPROVED,
+            reason_code=ReasonCode.CLEARED,
+            score=score,
+            caller_id=caller.caller_id,
+            policy=policy_payload,
+        )
+
+        try:
+            self._append_audit(
+                record
+            )
+        except Exception:
+            return Decision(
+                status=DecisionStatus.BLOCKED,
+                score=score,
+                reason=ReasonCode.AUDIT_APPEND_FAILED,
+            )
+
+        return Decision(
+            status=DecisionStatus.APPROVED,
+            score=score,
+            reason=ReasonCode.CLEARED,
+        )
 
     def resolve_human_decision(
         self,
@@ -511,130 +928,148 @@ class SystemOrchestrator:
         operator_id: str,
         reason: str = "",
     ) -> dict[str, Any]:
-        """
-        Complete a pending HUMAN_GATED decision.
+        decision_id = decision_id.strip()
+        operator_id = operator_id.strip()
 
-        Called by:
-        - main.py /actions/{id}/approve and /veto HTTP handlers
-        - remote_gateway._dispatch_remote_event for APPROVE_DECISION / VETO_DECISION
-
-        Returns the resolved review record.
-        Raises KeyError if decision_id is not found in pending reviews.
-        """
-        with self._pending_reviews_lock:
-            review = self._pending_reviews.pop(decision_id, None)
-
-        if review is None:
-            raise KeyError(
-                f"No pending human review found for decision_id={decision_id!r}. "
-                "It may have already been resolved, expired, or never existed."
+        if not decision_id:
+            raise ValueError(
+                "decision_id must not be empty"
             )
 
-        outcome      = "APPROVED" if approved else "VETOED"
-        reason_code  = ReasonCodes.HUMAN_APPROVED if approved else ReasonCodes.HUMAN_VETOED
-        resolved_at  = _utc_now()
+        if not operator_id:
+            raise ValueError(
+                "operator_id must not be empty"
+            )
 
-        self._best_effort_audit(
-            context=None,
-            decision=outcome,
-            reason_code=reason_code,
-            score=Decimal(review.get("score", "0.5")),
-            extra={
-                "decision_id": decision_id,
-                "operator_id": operator_id,
-                "resolution_reason": reason,
-                "original_caller_id": review.get("caller_id"),
-                "resolved_at": resolved_at,
-            },
-            metadata=review.get("transaction_context", {}),
-            user_id=review.get("user_id", "unknown"),
+        now = _utc_now()
+
+        with self._pending_reviews_lock:
+            self._purge_expired_reviews_locked(
+                now=now
+            )
+
+            review = self._pending_reviews.get(
+                decision_id
+            )
+
+            if review is None:
+                raise KeyError(
+                    decision_id
+                )
+
+            if review.expires_at <= now:
+                del self._pending_reviews[
+                    decision_id
+                ]
+                raise TimeoutError(
+                    decision_id
+                )
+
+        outcome = (
+            DecisionStatus.APPROVED
+            if approved
+            else "VETOED"
         )
 
-        self._notify_monitoring({
-            "kind": "log",
-            "event_category": "governance_human_decision_resolved",
-            "decision_id": decision_id,
-            "outcome": outcome,
-            "operator_id": operator_id,
-        })
+        reason_code = (
+            ReasonCode.HUMAN_APPROVED
+            if approved
+            else ReasonCode.HUMAN_VETOED
+        )
 
-        _logger.info(
-            "Human decision resolved: decision_id=%s outcome=%s operator=%s",
-            decision_id, outcome, operator_id,
+        audit_record = self._audit_record(
+            context=review.transaction_context,
+            user_id=review.user_id,
+            decision=outcome,
+            reason_code=reason_code,
+            score=review.score,
+            caller_id=review.caller_id,
+            decision_id=decision_id,
+            operator_id=operator_id,
+            resolution_reason=reason,
+            policy=review.policy,
+        )
+
+        self._append_audit(
+            audit_record
+        )
+
+        with self._pending_reviews_lock:
+            removed = self._pending_reviews.pop(
+                decision_id,
+                None,
+            )
+
+            if removed is None:
+                raise RuntimeError(
+                    "pending review disappeared during resolution"
+                )
+
+        self._notify_monitoring(
+            {
+                "kind": "security",
+                "event_category": "governance_human_decision_resolved",
+                "decision_id": decision_id,
+                "outcome": (
+                    "APPROVED"
+                    if approved
+                    else "VETOED"
+                ),
+                "operator_id": operator_id,
+            }
         )
 
         return {
             "decision_id": decision_id,
-            "outcome": outcome,
+            "outcome": (
+                "APPROVED"
+                if approved
+                else "VETOED"
+            ),
             "operator_id": operator_id,
-            "resolved_at": resolved_at,
-            "original": review,
+            "resolved_at": now.isoformat(),
+            "user_id": review.user_id,
+            "original_caller_id": review.caller_id,
         }
 
-    def list_pending_reviews(self) -> list[dict[str, Any]]:
-        """Return a snapshot of all pending HUMAN_GATED decisions."""
-        with self._pending_reviews_lock:
-            return list(self._pending_reviews.values())
-
-    # ------------------------------------------------------------------
-    # Audit helpers
-    # ------------------------------------------------------------------
-
-    def _filter_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
-        allowed: Dict[str, Any] = {}
-        for k in ("location", "device_id", "txn_type", "channel", "risk_flags", "tenant_id"):
-            if k in metadata:
-                allowed[k] = metadata[k]
-        return allowed
-
-    def _maybe_hash_device_id(self, device_id: str) -> str:
-        if not self.hash_device_ids:
-            return device_id
-        return f"sha256:{hashlib.sha256(device_id.encode()).hexdigest()}"
-
-    def _best_effort_audit(
+    def list_pending_reviews(
         self,
-        *,
-        context: Optional[TransactionContext],
-        decision: str,
-        reason_code: str,
-        score: Decimal,
-        extra: Dict[str, Any],
-        metadata: Dict[str, Any],
-        user_id: str,
-    ) -> bool:
-        try:
-            filtered = self._filter_metadata(metadata or {})
-            if "device_id" in filtered:
-                filtered["device_id"] = self._maybe_hash_device_id(str(filtered["device_id"]))
+    ) -> list[dict[str, Any]]:
+        now = _utc_now()
 
-            payload: Dict[str, Any] = {
-                "decision_time": _utc_now(),
-                "user_id": user_id,
-                "decision": decision,
-                "reason_code": reason_code,
-                "score": str(score),
-                "filtered_meta": filtered,
-                "extra": extra or {},
-            }
-            if context is not None:
-                payload.update({
-                    "amount": str(context.amount),
-                    "location": context.location,
-                    "device_id": self._maybe_hash_device_id(context.device_id),
-                    "timestamp": context.timestamp.isoformat(),
-                })
+        with self._pending_reviews_lock:
+            self._purge_expired_reviews_locked(
+                now=now
+            )
 
-            self.audit_store.append(payload)
-            return True
+            return [
+                {
+                    "decision_id": review.decision_id,
+                    "user_id": review.user_id,
+                    "caller_id": review.caller_id,
+                    "score": (
+                        str(
+                            review.score
+                        )
+                        if review.score is not None
+                        else None
+                    ),
+                    "effective_mode": review.effective_mode.value,
+                    "created_at": review.created_at.isoformat(),
+                    "expires_at": review.expires_at.isoformat(),
+                }
+                for review
+                in self._pending_reviews.values()
+            ]
 
-        except Exception as exc:
-            _logger.error("Audit append failed: %s", exc)
-            self._notify_monitoring({
-                "kind": "log",
-                "audit_write_failed": True,
-                "event_category": "governance_audit_failure",
-                "decision": decision,
-                "error": str(exc),
-            })
-            return False
+
+__all__ = [
+    "CallerContext",
+    "Decision",
+    "DecisionStatus",
+    "GovernanceMode",
+    "PendingReview",
+    "ReasonCode",
+    "SystemOrchestrator",
+    "TransactionContext",
+]
