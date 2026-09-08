@@ -4,99 +4,44 @@
 # Copyright (c) 2026 Justin Armstrong
 # All Rights Reserved.
 #
-# This file is part of the Sentinel-43 platform and constitutes original
-# intellectual property of the copyright holder.
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
 #
-# Sentinel-43 is distributed under a dual-license model:
-#
-# 1. GNU Affero General Public License (AGPL v3.0)
-# for open-source use, modification, and distribution.
-#
-# 2. Commercial License
-# for proprietary, enterprise, government, or other commercial use
-# not permitted under the AGPL v3.0.
-#
-# Use, modification, redistribution, and commercial use are governed by
-# the terms of the applicable license. Any use outside those terms is
-# prohibited.
-#
-# By accessing, modifying, distributing, or using this software, you agree
-# to comply with the terms of the applicable license.
-#
-# License Information:
-# AGPL v3.0: https://www.gnu.org/licenses/agpl-3.0.en.html
-#
-# Commercial Licensing:
-# Contact the copyright holder for commercial licensing terms.
-#
-# Sentinel-43™
-# Original Work and Protected Intellectual Property.
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
+
+"""Canonical expectation contract types for Sentinel-43.
+
+This module defines expectation categories, severities, contexts, violations,
+results, and the validation protocol.
+
+It is intentionally side-effect free:
+    - no Watchtower calls
+    - no environment reads
+    - no logging/reporting
+    - no network I/O
+
+Callers may report failed results after validation through the monitoring layer.
+"""
 
 from __future__ import annotations
 
-import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Mapping, Protocol, runtime_checkable
-
-from ...monitoring.watchtower_client import watchtower_request as _wt_request
-
-
-CONTRACTS_MODULE_ID = os.getenv("S43_CONTRACTS_MODULE_ID", "sentinel43-contracts")
+from types import MappingProxyType
+from typing import Any, Protocol, runtime_checkable
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _watchtower_request(payload: dict[str, Any]) -> None:
-    # DEFECT_INVENTORY.md D-16: this used to build the request without the
-    # internal service token, so it 401'd against Watchtower on every
-    # contract failure and the bare `except Exception: pass` swallowed that
-    # silently.
-    _wt_request("POST", "/watchtower/analyze", payload)
-
-
-def report_contract_failure(
-    *,
-    expectation_name: str,
-    category: str,
-    severity: str,
-    message: str,
-    details: Mapping[str, Any] | None = None,
-) -> None:
-    payload = {
-        "event": {
-            "kind": "expectation",
-            "source": CONTRACTS_MODULE_ID,
-            "expectation_status": "failed",
-            "expectation_name": expectation_name,
-            "category": category,
-            "severity": severity,
-            "message": message,
-            "failed_checks": 1,
-            "details": dict(details or {}),
-            "timestamp": utc_now(),
-        }
-    }
-
-    _watchtower_request(payload)
-
-
-def report_validation_exception(
-    expectation_name: str,
-    exc: Exception,
-) -> None:
-    report_contract_failure(
-        expectation_name=expectation_name,
-        category="contract",
-        severity="critical",
-        message=f"Validation exception: {exc}",
-        details={
-            "exception_type": type(exc).__name__,
-        },
+def _freeze_mapping(
+    value: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    return MappingProxyType(
+        dict(
+            value
+            or {}
+        )
     )
 
 
@@ -120,49 +65,180 @@ class ExpectationSeverity(str, Enum):
     CRITICAL = "critical"
 
 
-@dataclass(slots=True, frozen=True)
+@dataclass(frozen=True, slots=True)
 class ExpectationContext:
-    """
-    Runtime context passed into expectation validators.
+    """Runtime context supplied to an expectation validator."""
 
-    attributes:
-        component: logical subsystem being evaluated
-        operation: current action or workflow
-        actor: user/service/process triggering the action
-        environment: runtime environment (dev/test/prod/etc.)
-        metadata: additional arbitrary context
-    """
     component: str
     operation: str
     actor: str | None = None
     environment: str | None = None
-    metadata: Mapping[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        component = self.component.strip()
+        operation = self.operation.strip()
+
+        if not component:
+            raise ValueError(
+                "component must not be empty"
+            )
+
+        if not operation:
+            raise ValueError(
+                "operation must not be empty"
+            )
+
+        object.__setattr__(
+            self,
+            "component",
+            component,
+        )
+
+        object.__setattr__(
+            self,
+            "operation",
+            operation,
+        )
+
+        if self.actor is not None:
+            actor = self.actor.strip()
+
+            object.__setattr__(
+                self,
+                "actor",
+                actor or None,
+            )
+
+        if self.environment is not None:
+            environment = (
+                self.environment
+                .strip()
+                .lower()
+            )
+
+            object.__setattr__(
+                self,
+                "environment",
+                environment or None,
+            )
+
+        object.__setattr__(
+            self,
+            "metadata",
+            _freeze_mapping(
+                self.metadata
+            ),
+        )
 
 
-@dataclass(slots=True, frozen=True)
+@dataclass(frozen=True, slots=True)
 class ExpectationViolation:
-    """
-    Describes a single expectation failure.
-    """
+    """One concrete violation produced by expectation validation."""
+
     expectation_name: str
     message: str
     category: ExpectationCategory
     severity: ExpectationSeverity
-    details: Mapping[str, Any] = field(default_factory=dict)
+    details: Mapping[str, Any] = field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        name = self.expectation_name.strip()
+        message = self.message.strip()
+
+        if not name:
+            raise ValueError(
+                "expectation_name must not be empty"
+            )
+
+        if not message:
+            raise ValueError(
+                "message must not be empty"
+            )
+
+        object.__setattr__(
+            self,
+            "expectation_name",
+            name,
+        )
+
+        object.__setattr__(
+            self,
+            "message",
+            message,
+        )
+
+        object.__setattr__(
+            self,
+            "details",
+            _freeze_mapping(
+                self.details
+            ),
+        )
 
 
-@dataclass(slots=True, frozen=True)
+@dataclass(frozen=True, slots=True)
 class ExpectationResult:
-    """
-    Result returned by expectation validation.
-    """
+    """Immutable result returned by expectation validation."""
+
     passed: bool
     expectation_name: str
     category: ExpectationCategory
     severity: ExpectationSeverity
     message: str = ""
-    violations: tuple[ExpectationViolation, ...] = ()
-    metadata: Mapping[str, Any] = field(default_factory=dict)
+    violations: tuple[
+        ExpectationViolation,
+        ...
+    ] = ()
+    metadata: Mapping[str, Any] = field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        name = self.expectation_name.strip()
+
+        if not name:
+            raise ValueError(
+                "expectation_name must not be empty"
+            )
+
+        object.__setattr__(
+            self,
+            "expectation_name",
+            name,
+        )
+
+        object.__setattr__(
+            self,
+            "metadata",
+            _freeze_mapping(
+                self.metadata
+            ),
+        )
+
+        violations = tuple(
+            self.violations
+        )
+
+        object.__setattr__(
+            self,
+            "violations",
+            violations,
+        )
+
+        if self.passed and violations:
+            raise ValueError(
+                "passed results must not contain violations"
+            )
+
+        if not self.passed and not self.message.strip():
+            raise ValueError(
+                "failed results must include a message"
+            )
 
     @classmethod
     def success(
@@ -192,57 +268,78 @@ class ExpectationResult:
         category: ExpectationCategory,
         severity: ExpectationSeverity,
         message: str,
-        violations: tuple[ExpectationViolation, ...] | None = None,
+        violations: tuple[
+            ExpectationViolation,
+            ...
+        ] | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> "ExpectationResult":
-        safe_metadata = metadata or {}
-        safe_violations = violations or ()
-
-        report_contract_failure(
-            expectation_name=expectation_name,
-            category=category.value,
-            severity=severity.value,
-            message=message,
-            details={
-                "metadata": dict(safe_metadata),
-                "violation_count": len(safe_violations),
-                "violations": [
-                    {
-                        "expectation_name": violation.expectation_name,
-                        "message": violation.message,
-                        "category": violation.category.value,
-                        "severity": violation.severity.value,
-                        "details": dict(violation.details),
-                    }
-                    for violation in safe_violations
-                ],
-            },
-        )
-
         return cls(
             passed=False,
             expectation_name=expectation_name,
             category=category,
             severity=severity,
             message=message,
-            violations=safe_violations,
-            metadata=safe_metadata,
+            violations=tuple(
+                violations
+                or ()
+            ),
+            metadata=metadata or {},
         )
+
+    def safe_dict(
+        self,
+    ) -> dict[str, Any]:
+        """Return a serialization-friendly representation."""
+        return {
+            "passed": self.passed,
+            "expectation_name": self.expectation_name,
+            "category": self.category.value,
+            "severity": self.severity.value,
+            "message": self.message,
+            "violation_count": len(
+                self.violations
+            ),
+            "violations": [
+                {
+                    "expectation_name": violation.expectation_name,
+                    "message": violation.message,
+                    "category": violation.category.value,
+                    "severity": violation.severity.value,
+                    "details": dict(
+                        violation.details
+                    ),
+                }
+                for violation
+                in self.violations
+            ],
+            "metadata": dict(
+                self.metadata
+            ),
+        }
 
 
 @runtime_checkable
 class ExpectationContract(Protocol):
-    """
-    Protocol every expectation implementation should follow.
-    """
+    """Protocol implemented by every Sentinel-43 expectation."""
 
     name: str
     category: ExpectationCategory
     severity: ExpectationSeverity
     description: str
 
-    def validate(self, context: ExpectationContext) -> ExpectationResult:
-        """
-        Validate the expectation against the provided context.
-        """
+    def validate(
+        self,
+        context: ExpectationContext,
+    ) -> ExpectationResult:
         ...
+
+
+__all__ = [
+    "ExpectationCategory",
+    "ExpectationContext",
+    "ExpectationContract",
+    "ExpectationResult",
+    "ExpectationSeverity",
+    "ExpectationViolation",
+]
