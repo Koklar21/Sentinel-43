@@ -1,23 +1,29 @@
-"""CLI utilities for generating secure random secrets.
+# =============================================================================
+# Sentinel-43
+#
+# Copyright (c) 2026 Justin Armstrong
+# All Rights Reserved.
+#
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
+# =============================================================================
 
-``generate_secret`` / ``generate_secrets`` produce cryptographically strong
-random values suitable for use as JWT signing keys, auth peppers, salts, and
-bearer tokens.
-
-*nbytes* is always the number of **entropy bytes**, not output characters:
-  - urlsafe format: ceil(nbytes * 4/3) base64url characters (e.g. 32 → 43)
-  - hex format:     nbytes * 2 hex characters          (e.g. 32 → 64)
-"""
+"""Generate cryptographically strong random secrets."""
 
 from __future__ import annotations
 
 import argparse
 import secrets
 from collections.abc import Generator
+from typing import Final
 
-__all__ = ["generate_secret", "generate_secrets", "main"]
 
-MIN_SECRET_BYTES = 32
+MIN_SECRET_BYTES: Final[int] = 32
+MAX_SECRET_BYTES: Final[int] = 128
+MAX_SECRET_COUNT: Final[int] = 100
 
 
 def generate_secret(
@@ -25,32 +31,24 @@ def generate_secret(
     *,
     fmt: str = "urlsafe",
 ) -> str:
-    """Generate a cryptographic secret.
-
-    Args:
-        nbytes: Number of random bytes to generate (minimum 32).
-                Output length depends on *fmt* — this is entropy bytes,
-                not character count.
-        fmt:    Output encoding: ``"urlsafe"`` (base64url, default) or
-                ``"hex"``. Use ``"urlsafe"`` for bearer tokens and JWT
-                secrets; use ``"hex"`` for salts and peppers.
-
-    Returns:
-        Encoded secret string.
-
-    Raises:
-        ValueError: If *nbytes* < 32 or *fmt* is unrecognised.
-    """
+    """Generate one cryptographically strong secret."""
     nbytes = int(nbytes)
-    if nbytes < MIN_SECRET_BYTES:
-        raise ValueError(f"nbytes must be at least {MIN_SECRET_BYTES}")
+
+    if not MIN_SECRET_BYTES <= nbytes <= MAX_SECRET_BYTES:
+        raise ValueError(
+            f"nbytes must be between "
+            f"{MIN_SECRET_BYTES} and {MAX_SECRET_BYTES}"
+        )
 
     if fmt == "urlsafe":
         return secrets.token_urlsafe(nbytes)
+
     if fmt == "hex":
         return secrets.token_hex(nbytes)
 
-    raise ValueError(f"fmt must be 'urlsafe' or 'hex', got {fmt!r}")
+    raise ValueError(
+        f"fmt must be 'urlsafe' or 'hex', got {fmt!r}"
+    )
 
 
 def generate_secrets(
@@ -59,78 +57,98 @@ def generate_secrets(
     *,
     fmt: str = "urlsafe",
 ) -> Generator[str, None, None]:
-    """Yield *count* secure random secrets.
-
-    Args:
-        count:  Number of secrets to generate (minimum 1).
-        nbytes: Entropy bytes per secret (minimum 32).
-        fmt:    Output encoding — ``"urlsafe"`` or ``"hex"``.
-
-    Yields:
-        Encoded secret strings.
-
-    Raises:
-        ValueError: If *count* < 1, *nbytes* < 32, or *fmt* is unrecognised.
-    """
+    """Yield one or more cryptographically strong secrets."""
     count = int(count)
-    if count < 1:
-        raise ValueError("count must be at least 1")
+
+    if not 1 <= count <= MAX_SECRET_COUNT:
+        raise ValueError(
+            f"count must be between 1 and {MAX_SECRET_COUNT}"
+        )
 
     for _ in range(count):
-        yield generate_secret(nbytes, fmt=fmt)
+        yield generate_secret(
+            nbytes,
+            fmt=fmt,
+        )
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Generate cryptographically strong random secrets. "
             "Output goes to stdout, one secret per line."
         )
     )
+
     parser.add_argument(
-        "-n", "--count",
+        "-n",
+        "--count",
         type=int,
         default=1,
         metavar="N",
-        help="Number of secrets to generate (default: 1).",
+        help=(
+            f"Number of secrets to generate "
+            f"(default: 1, maximum: {MAX_SECRET_COUNT})."
+        ),
     )
+
     parser.add_argument(
-        "-b", "--bytes",
+        "-b",
+        "--bytes",
         type=int,
         default=MIN_SECRET_BYTES,
         dest="nbytes",
         metavar="BYTES",
         help=(
-            f"Entropy bytes per secret (default: {MIN_SECRET_BYTES}, minimum: {MIN_SECRET_BYTES}). "
-            "Output length varies by format: urlsafe produces ceil(BYTES*4/3) chars, "
-            "hex produces BYTES*2 chars."
+            f"Entropy bytes per secret "
+            f"(default: {MIN_SECRET_BYTES}, "
+            f"range: {MIN_SECRET_BYTES}..{MAX_SECRET_BYTES})."
         ),
     )
+
     parser.add_argument(
-        "-f", "--format",
-        choices=["urlsafe", "hex"],
+        "-f",
+        "--format",
+        choices=("urlsafe", "hex"),
         default="urlsafe",
         dest="fmt",
         help=(
-            "Output encoding (default: urlsafe). "
-            "Use 'urlsafe' for JWT secrets and bearer tokens; "
-            "use 'hex' for salts and peppers."
+            "Output encoding. Use 'urlsafe' for bearer/JWT secrets "
+            "and 'hex' for salts or peppers."
         ),
     )
 
     args = parser.parse_args(argv)
 
     try:
-        for secret in generate_secrets(args.count, args.nbytes, fmt=args.fmt):
+        for secret in generate_secrets(
+            args.count,
+            args.nbytes,
+            fmt=args.fmt,
+        ):
             print(secret)
+
     except ValueError as exc:
-        # parser.error exits with code 2 and prints to stderr — correct for
-        # bad argument values regardless of whether they came from flags or
-        # programmatic misuse.
-        parser.error(str(exc))
+        parser.error(
+            str(exc)
+        )
 
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(
+        main()
+    )
+
+
+__all__ = [
+    "MAX_SECRET_BYTES",
+    "MAX_SECRET_COUNT",
+    "MIN_SECRET_BYTES",
+    "generate_secret",
+    "generate_secrets",
+    "main",
+]
