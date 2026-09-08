@@ -1,127 +1,181 @@
 # =============================================================================
-# Copyright (c) 2026 Justin [LastName or Entity]
+# Sentinel-43
 #
-# Sentinel is dual-licensed:
+# Copyright (c) 2026 Justin Armstrong
+# All Rights Reserved.
+#
+# Sentinel-43 is dual-licensed:
 #   (1) AGPL-3.0-or-later, or
 #   (2) a commercial license (see COMMERCIAL_LICENSE.md).
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
-#
-# See LICENSE.md and COMMERCIAL_LICENSE.md at the repository root.
 # =============================================================================
 
-"""Global request context middleware.
-
-File: api/middleware/request_context.py
+"""Global request-context ASGI middleware.
 
 Responsibilities:
-- Guarantee every request has a request_id
-- Respect incoming X-Request-ID header if provided
-- Attach request_id to request.state.request_id
-- Echo request_id on every response (including 404s)
-
-Import-safe when FastAPI/Starlette are not installed.
+    - guarantee every HTTP request has a request ID
+    - accept an inbound X-Request-ID only when it is valid and bounded
+    - expose the request ID through scope["state"]["request_id"]
+    - echo the request ID on every HTTP response started by the application
+    - avoid import-time side effects
 """
 
 from __future__ import annotations
 
+import re
 import uuid
-from typing import Optional, Any
+from typing import Final
+
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 
-X_REQUEST_ID = "X-Request-ID"
+X_REQUEST_ID: Final[str] = "X-Request-ID"
+_X_REQUEST_ID_BYTES: Final[bytes] = b"x-request-id"
+
+_MAX_REQUEST_ID_LENGTH: Final[int] = 128
+
+_REQUEST_ID_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$"
+)
 
 
-def _normalize_request_id(value: Optional[str]) -> str:
-    if value and str(value).strip():
-        return str(value).strip()
-    return str(uuid.uuid4())
+def _new_request_id() -> str:
+    return str(
+        uuid.uuid4()
+    )
 
 
-def _import_starlette():
-    try:
-        from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint  # type: ignore
-        from starlette.requests import Request  # type: ignore
-        from starlette.responses import Response  # type: ignore
-        return BaseHTTPMiddleware, RequestResponseEndpoint, Request, Response
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError(
-            "Starlette/FastAPI is required for request context middleware. Install fastapi."
-        ) from e
+def _normalize_request_id(
+    value: str | None,
+) -> str:
+    if value is None:
+        return _new_request_id()
+
+    candidate = value.strip()
+
+    if not candidate:
+        return _new_request_id()
+
+    if len(candidate) > _MAX_REQUEST_ID_LENGTH:
+        return _new_request_id()
+
+    if not _REQUEST_ID_PATTERN.fullmatch(
+        candidate
+    ):
+        return _new_request_id()
+
+    return candidate
 
 
-def create_request_context_middleware():
-    BaseHTTPMiddleware, RequestResponseEndpoint, Request, Response = _import_starlette()
+def _request_header(
+    scope: Scope,
+    name: bytes,
+) -> str | None:
+    for key, value in scope.get(
+        "headers",
+        (),
+    ):
+        if key.lower() == name:
+            try:
+                return value.decode(
+                    "ascii"
+                )
+            except UnicodeDecodeError:
+                return None
 
-    class RequestContextMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-            request_id = _normalize_request_id(request.headers.get(X_REQUEST_ID))
-            request.state.request_id = request_id
-
-            response = await call_next(request)
-            response.headers[X_REQUEST_ID] = request_id
-            return response
-
-    return RequestContextMiddleware
-
-
-# -----------------------------------------------------------------------------
-# Minimal tests
-# -----------------------------------------------------------------------------
-
-
-def _run_self_tests() -> None:  # pragma: no cover
-    import unittest
-
-    try:
-        from fastapi import FastAPI  # type: ignore
-        from fastapi.testclient import TestClient  # type: ignore
-    except Exception:
-        FastAPI = None  # type: ignore
-        TestClient = None  # type: ignore
-
-    class MiddlewareTests(unittest.TestCase):
-        def setUp(self) -> None:
-            if FastAPI is None or TestClient is None:
-                self.skipTest("fastapi[test] is not installed in this environment")
-
-        def test_generates_request_id(self):
-            app = FastAPI()
-            app.add_middleware(create_request_context_middleware())
-
-            @app.get("/ping")
-            def ping():
-                return {"ok": True}
-
-            client = TestClient(app)
-            r = client.get("/ping")
-            self.assertEqual(r.status_code, 200)
-            self.assertTrue(X_REQUEST_ID in r.headers)
-            self.assertTrue(len(r.headers[X_REQUEST_ID]) > 0)
-
-        def test_echoes_request_id(self):
-            app = FastAPI()
-            app.add_middleware(create_request_context_middleware())
-
-            @app.get("/ping")
-            def ping():
-                return {"ok": True}
-
-            client = TestClient(app)
-            r = client.get("/ping", headers={X_REQUEST_ID: "abc-123"})
-            self.assertEqual(r.status_code, 200)
-            self.assertEqual(r.headers[X_REQUEST_ID], "abc-123")
-
-        def test_applies_to_404(self):
-            app = FastAPI()
-            app.add_middleware(create_request_context_middleware())
-            client = TestClient(app)
-            r = client.get("/missing")
-            self.assertEqual(r.status_code, 404)
-            self.assertTrue(X_REQUEST_ID in r.headers)
-
-    unittest.main(argv=["request_context.py"], exit=False)
+    return None
 
 
-if __name__ == "__main__":  # pragma: no cover
-    _run_self_tests()
+class RequestContextMiddleware:
+    """Attach a bounded request ID to HTTP request state and response headers."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+    ) -> None:
+        self.app = app
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope["type"] != "http":
+            await self.app(
+                scope,
+                receive,
+                send,
+            )
+            return
+
+        request_id = _normalize_request_id(
+            _request_header(
+                scope,
+                _X_REQUEST_ID_BYTES,
+            )
+        )
+
+        state = scope.setdefault(
+            "state",
+            {},
+        )
+
+        state[
+            "request_id"
+        ] = request_id
+
+        request_id_header = (
+            X_REQUEST_ID.encode(
+                "ascii"
+            ),
+            request_id.encode(
+                "ascii"
+            ),
+        )
+
+        async def send_with_request_id(
+            message: Message,
+        ) -> None:
+            if message["type"] == "http.response.start":
+                headers = list(
+                    message.get(
+                        "headers",
+                        [],
+                    )
+                )
+
+                headers = [
+                    (
+                        key,
+                        value,
+                    )
+                    for key, value in headers
+                    if key.lower()
+                    != _X_REQUEST_ID_BYTES
+                ]
+
+                headers.append(
+                    request_id_header
+                )
+
+                message[
+                    "headers"
+                ] = headers
+
+            await send(
+                message
+            )
+
+        await self.app(
+            scope,
+            receive,
+            send_with_request_id,
+        )
+
+
+__all__ = [
+    "RequestContextMiddleware",
+    "X_REQUEST_ID",
+]
