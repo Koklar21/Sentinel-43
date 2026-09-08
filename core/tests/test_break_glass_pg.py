@@ -212,6 +212,7 @@ def test_armed_flag_overrides_db_unreachable(client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+<<<<<<< Updated upstream
 # reverify_password() -- the per-request X-S43-Password gate. Same DB-error
 # -> deny-unless-armed contract as the login path above, exercised
 # independently: reverify_password() has its own try/except around the
@@ -240,12 +241,41 @@ def test_reverify_password_denied_when_db_unreachable_and_not_armed(db_env, monk
 
     from core.api.routers.auth import reverify_password
     import core.auth.users as users_mod
+=======
+# reverify_password() -- the per-request / WebSocket re-auth path.
+#
+# _validate_credentials() (login(), above) and reverify_password() are two
+# independently-defined functions, not the same path reached twice (see
+# core/api/routers/auth.py: _validate_credentials at module scope calls
+# authenticate_user() + record_login() + commit(); reverify_password() is a
+# separate, read-only function). Both independently call
+# _env_operator_allowed() and both independently raise HTTPException(503) on
+# their own DB-exception branch -- this was reviewed by reading both bodies,
+# but until now only login()'s branch had adversarial DB-down coverage. This
+# closes that gap for reverify_password() using the identical ECONNREFUSED
+# technique above. The WebSocket handler's catch of this exact
+# HTTPException(503) -- translating it to a service_unavailable close
+# instead of invalid_password -- is separately covered by
+# test_ws_auth.py::test_ws_reports_service_unavailable_not_auth_failure
+# (which mocks reverify_password directly); this file exercises
+# reverify_password() itself against a real unreachable database.
+# ---------------------------------------------------------------------------
+
+def test_reverify_password_denied_when_db_unreachable_and_not_armed(client, monkeypatch):
+    import asyncio
+
+    import core.auth.users as users_mod
+    from fastapi import HTTPException
+
+    from core.api.routers.auth import reverify_password
+>>>>>>> Stashed changes
 
     monkeypatch.setenv("DATABASE_URL", _UNREACHABLE_DSN)
     monkeypatch.delenv("S43_BREAK_GLASS_ARMED", raising=False)
     users_mod._engine = None
     users_mod._sessionmaker = None
     try:
+<<<<<<< Updated upstream
         # DB down, break-glass not armed -> fail closed with 503 (a platform
         # outage), not a silent False/401 and not a silent grant of
         # break-glass. Matches _validate_credentials()'s documented contract
@@ -253,15 +283,28 @@ def test_reverify_password_denied_when_db_unreachable_and_not_armed(db_env, monk
         with pytest.raises(HTTPException) as exc_info:
             asyncio.run(reverify_password(_ENV_USER, _ENV_PW))
         assert exc_info.value.status_code == 503
+=======
+        with pytest.raises(HTTPException) as ei:
+            asyncio.run(reverify_password(_ENV_USER, _ENV_PW))
+        assert ei.value.status_code == 503, ei.value.detail
+>>>>>>> Stashed changes
     finally:
         users_mod._engine = None
         users_mod._sessionmaker = None
 
 
+<<<<<<< Updated upstream
 def test_reverify_password_armed_flag_overrides_db_unreachable(db_env, monkeypatch):
     import asyncio
 
     import core.auth.users as users_mod
+=======
+def test_reverify_password_armed_flag_overrides_db_unreachable(client, monkeypatch):
+    import asyncio
+
+    import core.auth.users as users_mod
+
+>>>>>>> Stashed changes
     from core.api.routers.auth import reverify_password
 
     monkeypatch.setenv("DATABASE_URL", _UNREACHABLE_DSN)
@@ -275,12 +318,23 @@ def test_reverify_password_armed_flag_overrides_db_unreachable(db_env, monkeypat
         users_mod._sessionmaker = None
 
 
+<<<<<<< Updated upstream
 def test_reverify_password_wrong_password_is_false_not_503_when_db_unreachable_and_armed(
     db_env, monkeypatch,
 ):
     import asyncio
 
     import core.auth.users as users_mod
+=======
+def test_reverify_password_wrong_password_is_false_not_503_when_db_unreachable_and_armed(client, monkeypatch):
+    # Arming does not widen what counts as a valid credential -- only the
+    # exact configured env-operator password succeeds. A wrong password
+    # against the armed break-glass path is an ordinary False, not a 503.
+    import asyncio
+
+    import core.auth.users as users_mod
+
+>>>>>>> Stashed changes
     from core.api.routers.auth import reverify_password
 
     monkeypatch.setenv("DATABASE_URL", _UNREACHABLE_DSN)
@@ -288,6 +342,7 @@ def test_reverify_password_wrong_password_is_false_not_503_when_db_unreachable_a
     users_mod._engine = None
     users_mod._sessionmaker = None
     try:
+<<<<<<< Updated upstream
         # Armed break-glass still requires the RIGHT password -- a DB outage
         # plus S43_BREAK_GLASS_ARMED=true must not turn into an unconditional
         # pass. This must be an ordinary False (-> 401 at the route), not an
@@ -295,6 +350,9 @@ def test_reverify_password_wrong_password_is_false_not_503_when_db_unreachable_a
         # by _env_operator_allowed() returning True (armed); what remains is
         # plain wrong-password evaluation against the env-var credential.
         assert asyncio.run(reverify_password(_ENV_USER, "definitely-wrong")) is False
+=======
+        assert asyncio.run(reverify_password(_ENV_USER, "wrong-password")) is False
+>>>>>>> Stashed changes
     finally:
         users_mod._engine = None
         users_mod._sessionmaker = None
