@@ -1,15 +1,13 @@
-# Config for the disposable kind cluster used by integration testing (see
-# deploy/kubernetes/README.md's "Integration testing" section). Default CNI
-# (kindnet) does NOT enforce NetworkPolicy — this deployment relies on
-# NetworkPolicy for real isolation (Postgres/Redis must never be reachable
-# except from their approved clients), so kindnet alone would make the
-# NetworkPolicy manifests decorative. Calico is installed instead (see
-# scripts/k8s-kind-test.ps1), which does enforce them.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: s43-test
+
+# kindnet is disabled because this integration environment must use a
+# NetworkPolicy-capable CNI. scripts/k8s-kind-test.ps1 installs Calico
+# before Sentinel-43 workloads are deployed.
 networking:
   disableDefaultCNI: true
   podSubnet: "192.168.0.0/16"
+
 nodes:
   - role: control-plane
