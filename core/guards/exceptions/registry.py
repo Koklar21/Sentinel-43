@@ -4,320 +4,361 @@
 # Copyright (c) 2026 Justin Armstrong
 # All Rights Reserved.
 #
-# This file is part of the Sentinel-43 platform and constitutes original
-# intellectual property of the copyright holder.
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
 #
-# Sentinel-43 is distributed under a dual-license model:
-#
-# 1. GNU Affero General Public License (AGPL v3.0)
-# for open-source use, modification, and distribution.
-#
-# 2. Commercial License
-# for proprietary, enterprise, government, or other commercial use
-# not permitted under the AGPL v3.0.
-#
-# Use, modification, redistribution, and commercial use are governed by
-# the terms of the applicable license. Any use outside those terms is
-# prohibited.
-#
-# By accessing, modifying, distributing, or using this software, you agree
-# to comply with the terms of the applicable license.
-#
-# License Information:
-# AGPL v3.0: https://www.gnu.org/licenses/agpl-3.0.en.html
-#
-# Commercial Licensing:
-# Contact the copyright holder for commercial licensing terms.
-#
-# Sentinel-43™
-# Original Work and Protected Intellectual Property.
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
+
+"""Thread-safe in-process registry for Sentinel-43 expectations.
+
+The registry is intentionally side-effect free:
+    - no Watchtower calls
+    - no environment reads
+    - no timestamps
+    - no network I/O
+    - no monitoring state
+
+Application startup or monitoring layers may inspect registry_status() and
+report it elsewhere.
+"""
 
 from __future__ import annotations
 
-import os
 import threading
-from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, Tuple
+from collections.abc import Iterable
+from typing import Any
 
-from ...monitoring.watchtower_client import WATCHTOWER_URL, watchtower_request
-from .contracts import ExpectationCategory, ExpectationContract
-
-
-REGISTRY_MODULE_ID = os.getenv("S43_EXPECTATION_REGISTRY_ID", "sentinel-43-expectation-registry")
-REGISTRY_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _watchtower_request(
-    method: str,
-    path: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    # DEFECT_INVENTORY.md D-16: this used to build the request without the
-    # internal service token, so every call here 401'd against Watchtower.
-    return watchtower_request(method, path, payload)
+from .contracts import (
+    ExpectationCategory,
+    ExpectationContract,
+)
 
 
 class ExpectationRegistry:
-    """
-    Central registry for Sentinel-43 expectations.
-
-    Responsibilities:
-    - Register expectations
-    - Retrieve expectations by name or category
-    - Provide ordered iteration of expectations
-    - Report registry lifecycle/failures to Watchtower
-    """
+    """Register and retrieve expectation contracts by name/category."""
 
     def __init__(self) -> None:
-        self._by_name: Dict[str, ExpectationContract] = {}
-        self._by_category: Dict[ExpectationCategory, Dict[str, ExpectationContract]] = {}
-        self._lock = threading.RLock()
-        self._registered_with_watchtower = False
-        self._last_watchtower_error: dict[str, Any] | None = None
+        self._by_name: dict[
+            str,
+            ExpectationContract,
+        ] = {}
 
-    # -----------------------------
-    # Watchtower intercom
-    # -----------------------------
-
-    def _register_with_watchtower_if_needed(self) -> None:
-        with self._lock:
-            if self._registered_with_watchtower:
-                return
-
-        payload = {
-            "module_id": REGISTRY_MODULE_ID,
-            "module_type": "expectation-registry",
-            "version": REGISTRY_VERSION,
-            "endpoint": None,
-            "capabilities": [
-                "expectation_registration",
-                "expectation_lookup",
-                "expectation_category_index",
-                "contract_registry",
-                "duplicate_detection",
+        self._by_category: dict[
+            ExpectationCategory,
+            dict[
+                str,
+                ExpectationContract,
             ],
-            "metadata": {
-                "timestamp": utc_now(),
-            },
-        }
+        ] = {}
 
-        result = _watchtower_request("POST", "/watchtower/modules/register", payload)
+        self._lock = threading.RLock()
 
-        with self._lock:
-            self._registered_with_watchtower = "error" not in result
-            self._last_watchtower_error = result if "error" in result else None
-
-    def _report_dependency(
+    def register(
         self,
-        status: str,
-        details: dict[str, Any],
+        expectation: ExpectationContract,
     ) -> None:
-        self._register_with_watchtower_if_needed()
+        name = str(
+            expectation.name
+        ).strip()
 
-        payload = {
-            "name": REGISTRY_MODULE_ID,
-            "status": status,
-            "version": REGISTRY_VERSION,
-            "details": {
-                "timestamp": utc_now(),
-                **details,
-            },
-        }
+        if not name:
+            raise ValueError(
+                "expectation.name must not be empty"
+            )
 
-        result = _watchtower_request("POST", "/watchtower/dependencies/report", payload)
+        category = expectation.category
 
-        with self._lock:
-            self._last_watchtower_error = result if "error" in result else None
-
-    def _report_event(
-        self,
-        kind: str,
-        status: str,
-        details: dict[str, Any],
-    ) -> None:
-        self._register_with_watchtower_if_needed()
-
-        payload = {
-            "event": {
-                "kind": kind,
-                "source": REGISTRY_MODULE_ID,
-                "status": status,
-                "details": {
-                    "timestamp": utc_now(),
-                    **details,
-                },
-            }
-        }
-
-        result = _watchtower_request("POST", "/watchtower/analyze", payload)
-
-        with self._lock:
-            self._last_watchtower_error = result if "error" in result else None
-
-    # -----------------------------
-    # Registration
-    # -----------------------------
-
-    def register(self, expectation: ExpectationContract) -> None:
-        name = expectation.name
+        if not isinstance(
+            category,
+            ExpectationCategory,
+        ):
+            raise TypeError(
+                "expectation.category must be an ExpectationCategory"
+            )
 
         with self._lock:
             if name in self._by_name:
-                self._report_dependency(
-                    status="degraded",
-                    details={
-                        "event": "duplicate_expectation_registration",
-                        "expectation": name,
-                        "category": getattr(expectation.category, "value", str(expectation.category)),
-                    },
+                raise ValueError(
+                    f"expectation {name!r} is already registered"
                 )
-                raise ValueError(f"Expectation '{name}' is already registered.")
 
-            self._by_name[name] = expectation
+            self._by_name[
+                name
+            ] = expectation
 
-            category_map = self._by_category.setdefault(expectation.category, {})
-            category_map[name] = expectation
+            category_map = (
+                self._by_category.setdefault(
+                    category,
+                    {},
+                )
+            )
 
-            total = len(self._by_name)
+            category_map[
+                name
+            ] = expectation
 
-        self._report_event(
-            kind="expectation",
-            status="registered",
-            details={
-                "event": "expectation_registered",
-                "expectation": name,
-                "category": getattr(expectation.category, "value", str(expectation.category)),
-                "total_expectations": total,
-            },
+    def register_many(
+        self,
+        expectations: Iterable[
+            ExpectationContract
+        ],
+    ) -> None:
+        materialized = list(
+            expectations
         )
 
-    def register_many(self, expectations: Iterable[ExpectationContract]) -> None:
-        registered = 0
+        names: set[str] = set()
 
-        for expectation in expectations:
-            self.register(expectation)
-            registered += 1
+        for expectation in materialized:
+            name = str(
+                expectation.name
+            ).strip()
 
-        self._report_dependency(
-            status="online",
-            details={
-                "event": "expectation_batch_registered",
-                "registered_count": registered,
-                "total_expectations": len(self),
-            },
-        )
+            if not name:
+                raise ValueError(
+                    "expectation.name must not be empty"
+                )
 
-    # -----------------------------
-    # Retrieval
-    # -----------------------------
+            if name in names:
+                raise ValueError(
+                    f"duplicate expectation {name!r} in registration batch"
+                )
 
-    def get(self, name: str) -> ExpectationContract:
+            names.add(
+                name
+            )
+
+            if not isinstance(
+                expectation.category,
+                ExpectationCategory,
+            ):
+                raise TypeError(
+                    "expectation.category must be an ExpectationCategory"
+                )
+
+        with self._lock:
+            collisions = sorted(
+                name
+                for name in names
+                if name in self._by_name
+            )
+
+            if collisions:
+                raise ValueError(
+                    "expectations already registered: "
+                    + ", ".join(
+                        repr(name)
+                        for name in collisions
+                    )
+                )
+
+            for expectation in materialized:
+                name = str(
+                    expectation.name
+                ).strip()
+
+                self._by_name[
+                    name
+                ] = expectation
+
+                category_map = (
+                    self._by_category.setdefault(
+                        expectation.category,
+                        {},
+                    )
+                )
+
+                category_map[
+                    name
+                ] = expectation
+
+    def get(
+        self,
+        name: str,
+    ) -> ExpectationContract:
+        normalized = str(
+            name
+        ).strip()
+
+        if not normalized:
+            raise ValueError(
+                "expectation name must not be empty"
+            )
+
         with self._lock:
             try:
-                return self._by_name[name]
+                return self._by_name[
+                    normalized
+                ]
             except KeyError as exc:
-                self._report_dependency(
-                    status="degraded",
-                    details={
-                        "event": "expectation_lookup_missing",
-                        "expectation": name,
-                    },
-                )
-                raise KeyError(f"Expectation '{name}' is not registered.") from exc
+                raise KeyError(
+                    f"expectation {normalized!r} is not registered"
+                ) from exc
 
-    def all(self) -> Tuple[ExpectationContract, ...]:
+    def all(
+        self,
+    ) -> tuple[
+        ExpectationContract,
+        ...
+    ]:
         with self._lock:
-            return tuple(self._by_name.values())
+            return tuple(
+                self._by_name.values()
+            )
 
     def by_category(
         self,
         category: ExpectationCategory,
-    ) -> Tuple[ExpectationContract, ...]:
+    ) -> tuple[
+        ExpectationContract,
+        ...
+    ]:
+        if not isinstance(
+            category,
+            ExpectationCategory,
+        ):
+            raise TypeError(
+                "category must be an ExpectationCategory"
+            )
+
         with self._lock:
-            return tuple(self._by_category.get(category, {}).values())
+            return tuple(
+                self._by_category.get(
+                    category,
+                    {},
+                ).values()
+            )
 
-    # -----------------------------
-    # Status / Utilities
-    # -----------------------------
-
-    def status(self) -> dict[str, Any]:
+    def status(
+        self,
+    ) -> dict[str, Any]:
+        """Return a side-effect-free registry summary."""
         with self._lock:
-            categories = {
-                getattr(category, "value", str(category)): len(items)
-                for category, items in self._by_category.items()
-            }
-
             return {
-                "module_id": REGISTRY_MODULE_ID,
-                "version": REGISTRY_VERSION,
-                "expectation_count": len(self._by_name),
-                "categories": categories,
-                "watchtower_url": WATCHTOWER_URL,
-                "registered_with_watchtower": self._registered_with_watchtower,
-                "last_watchtower_error": self._last_watchtower_error,
-                "timestamp": utc_now(),
+                "expectation_count": len(
+                    self._by_name
+                ),
+                "categories": {
+                    category.value: len(
+                        items
+                    )
+                    for category, items
+                    in self._by_category.items()
+                },
             }
 
-    def clear(self) -> None:
+    def clear(
+        self,
+    ) -> None:
+        """Clear all registered expectations."""
         with self._lock:
-            prior_count = len(self._by_name)
             self._by_name.clear()
             self._by_category.clear()
 
-        self._report_dependency(
-            status="degraded",
-            details={
-                "event": "expectation_registry_cleared",
-                "prior_count": prior_count,
-            },
-        )
-
-    def __len__(self) -> int:
+    def __len__(
+        self,
+    ) -> int:
         with self._lock:
-            return len(self._by_name)
+            return len(
+                self._by_name
+            )
 
-    def __contains__(self, name: str) -> bool:
+    def __contains__(
+        self,
+        name: object,
+    ) -> bool:
+        if not isinstance(
+            name,
+            str,
+        ):
+            return False
+
+        normalized = name.strip()
+
+        if not normalized:
+            return False
+
         with self._lock:
-            return name in self._by_name
+            return (
+                normalized
+                in self._by_name
+            )
 
-
-# -------------------------------------------------
-# Global registry instance
-# -------------------------------------------------
 
 _registry = ExpectationRegistry()
 
 
-def get_registry() -> ExpectationRegistry:
+def get_registry(
+) -> ExpectationRegistry:
     return _registry
 
 
-def register_expectation(expectation: ExpectationContract) -> None:
-    _registry.register(expectation)
+def register_expectation(
+    expectation: ExpectationContract,
+) -> None:
+    _registry.register(
+        expectation
+    )
 
 
-def register_expectations(expectations: Iterable[ExpectationContract]) -> None:
-    _registry.register_many(expectations)
+def register_expectations(
+    expectations: Iterable[
+        ExpectationContract
+    ],
+) -> None:
+    _registry.register_many(
+        expectations
+    )
 
 
-def get_expectation(name: str) -> ExpectationContract:
-    return _registry.get(name)
+def get_expectation(
+    name: str,
+) -> ExpectationContract:
+    return _registry.get(
+        name
+    )
 
 
-def list_expectations() -> Tuple[ExpectationContract, ...]:
+def list_expectations(
+) -> tuple[
+    ExpectationContract,
+    ...
+]:
     return _registry.all()
 
 
 def list_expectations_by_category(
     category: ExpectationCategory,
-) -> Tuple[ExpectationContract, ...]:
-    return _registry.by_category(category)
+) -> tuple[
+    ExpectationContract,
+    ...
+]:
+    return _registry.by_category(
+        category
+    )
 
 
-def registry_status() -> dict[str, Any]:
+def registry_status(
+) -> dict[str, Any]:
     return _registry.status()
+
+
+def clear_registry(
+) -> None:
+    """Clear the global registry, primarily for tests/bootstrap reset."""
+    _registry.clear()
+
+
+__all__ = [
+    "ExpectationRegistry",
+    "clear_registry",
+    "get_expectation",
+    "get_registry",
+    "list_expectations",
+    "list_expectations_by_category",
+    "register_expectation",
+    "register_expectations",
+    "registry_status",
+]
