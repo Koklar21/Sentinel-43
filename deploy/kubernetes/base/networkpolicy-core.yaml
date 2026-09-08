@@ -1,37 +1,46 @@
-# s43-core (Watchtower) only accepts traffic from pods labeled
-# network/s43-core-client: "true" — today that's s43-api only (api posts
-# heartbeats/registration/Fenrir findings to core; core never calls api).
-# Egress: DB, Redis, DNS — core is given the same DATABASE_URL/REDIS_URL as
-# api in docker-compose.yml, so it needs the same reach.
+# s43-core accepts traffic only from pods explicitly labeled as core clients.
+# Today that is s43-api, which reports internal monitoring/events to core.
+#
+# This policy grants core egress to PostgreSQL and Redis.
+# DNS egress is provided separately by networkpolicy-dns.yaml.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
+
 metadata:
   name: s43-core-allow-clients
   namespace: sentinel43
+
 spec:
   podSelector:
     matchLabels:
       app: s43-core
+
   policyTypes:
     - Ingress
     - Egress
+
   ingress:
     - from:
         - podSelector:
             matchLabels:
               network/s43-core-client: "true"
       ports:
-        - {protocol: TCP, port: 9100}
+        - protocol: TCP
+          port: 9100
+
   egress:
     - to:
         - podSelector:
             matchLabels:
               app: s43-db
       ports:
-        - {protocol: TCP, port: 5432}
+        - protocol: TCP
+          port: 5432
+
     - to:
         - podSelector:
             matchLabels:
               app: s43-redis
       ports:
-        - {protocol: TCP, port: 6379}
+        - protocol: TCP
+          port: 6379
