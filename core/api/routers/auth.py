@@ -490,11 +490,11 @@ async def _env_operator_allowed() -> bool:
             return await count_active_admins(session) == 0
     except Exception as exc:
         logger.error(
-            "count_active_admins() failed (%s: %s) while deciding whether "
-            "the break-glass operator is allowed — denying break-glass. Set "
+            "op=auth.env_operator_allowed.count_active_admins_failed "
+            "exception_class=%s — denying break-glass. Set "
             "S43_BREAK_GLASS_ARMED=true to authenticate while the database "
             "is unavailable.",
-            type(exc).__name__, exc,
+            type(exc).__name__,
         )
         return False
 
@@ -552,10 +552,9 @@ async def reverify_password(username: str, password: str) -> bool:
             raise
         except Exception as exc:
             logger.error(
-                "DB-backed password reverify blocked by an unexpected error "
-                "(%s: %s) for subject %r — refusing to silently fall back to "
-                "the break-glass operator.",
-                type(exc).__name__, exc, normalized,
+                "op=auth.reverify_password.db_error exception_class=%s — "
+                "refusing to silently fall back to the break-glass operator.",
+                type(exc).__name__,
             )
             if not await _env_operator_allowed():
                 raise HTTPException(
@@ -629,10 +628,9 @@ async def _validate_credentials(username: str, password: str) -> tuple[str, str,
             raise
         except Exception as exc:
             logger.error(
-                "DB-backed login blocked by an unexpected error (%s: %s) for "
-                "subject %r — refusing to silently fall back to break-glass "
-                "credentials.",
-                type(exc).__name__, exc, normalized,
+                "op=auth.validate_credentials.db_error exception_class=%s — "
+                "refusing to silently fall back to break-glass credentials.",
+                type(exc).__name__,
             )
             if not await _env_operator_allowed():
                 raise HTTPException(
@@ -1115,9 +1113,9 @@ async def login(body: LoginRequest, request: Request, response: Response) -> Log
             # decided by an exception rather than an explicit choice. Fail
             # loudly instead: the credential was fine, the platform wasn't.
             logger.error(
-                "Session creation failed for %s (%s: %s) — refusing to "
-                "silently degrade to a legacy long-lived token.",
-                subject, type(exc).__name__, exc,
+                "op=auth.login.session_create_failed exception_class=%s — "
+                "refusing to silently degrade to a legacy long-lived token.",
+                type(exc).__name__,
             )
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
