@@ -34,12 +34,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,71 @@ def _should_log(key: tuple[str, str]) -> bool:
 # misbehaving Watchtower can't exhaust caller memory via urlopen().read().
 _DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024
 
+# Ceiling on the max_response_bytes argument itself -- a caller passing an
+# unbounded or absurd value defeats the whole point of the cap.
+_MAX_ALLOWED_RESPONSE_BYTES = 64 * 1024 * 1024
+
+# Ceiling on the timeout argument itself -- large enough for any legitimate
+# internal call, small enough that a misconfigured caller can't hang a
+# request thread indefinitely.
+_MAX_ALLOWED_TIMEOUT_SECONDS = 300.0
+
+
+def _validate_timeout(value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"timeout must be a real number, got {type(value).__name__}")
+    if not math.isfinite(value) or value <= 0 or value > _MAX_ALLOWED_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"timeout must be finite and in (0, {_MAX_ALLOWED_TIMEOUT_SECONDS}], got {value!r}"
+        )
+    return float(value)
+
+
+def _validate_max_response_bytes(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"max_response_bytes must be an int, got {type(value).__name__}")
+    if value <= 0 or value > _MAX_ALLOWED_RESPONSE_BYTES:
+        raise ValueError(
+            f"max_response_bytes must be in (0, {_MAX_ALLOWED_RESPONSE_BYTES}], got {value!r}"
+        )
+    return value
+
+
+def _bounded_read(
+    read_fn: Callable[[int], bytes],
+    get_header_fn: Callable[[str], str | None],
+    max_response_bytes: int,
+) -> tuple[bytes, bool]:
+    """
+    Read at most `max_response_bytes` from a urlopen response/error object,
+    proving the cap was respected rather than merely truncating silently.
+
+    Returns (body, oversized). `oversized` is True when the response is (or
+    would be) larger than the cap -- either because a declared
+    Content-Length already exceeds it (no body read attempted), or because
+    reading max_response_bytes + 1 bytes actually yielded that many (an
+    undeclared-length or chunked body that overruns the cap). Callers must
+    treat an oversized body as failure, never as a truncated success.
+    """
+    declared_length: int | None = None
+    try:
+        raw_length = get_header_fn("Content-Length")
+    except Exception:
+        raw_length = None
+    if raw_length is not None:
+        try:
+            declared_length = int(str(raw_length).strip())
+        except ValueError:
+            declared_length = None
+
+    if declared_length is not None and declared_length > max_response_bytes:
+        return b"", True
+
+    chunk = read_fn(max_response_bytes + 1)
+    if len(chunk) > max_response_bytes:
+        return chunk[:max_response_bytes], True
+    return chunk, False
+
 
 def watchtower_request(
     method: str,
@@ -104,10 +170,30 @@ def watchtower_request(
     """
     Send a request to a Watchtower route with the internal service token
     attached. Never raises — every failure mode (bad payload, HTTP error,
-    unreachable host) is returned as `{"error": ..., "detail": ...}` and
-    also logged at WARNING (rate-limited per path+kind). Callers must check
-    for the "error" key; a returned dict is not automatically success.
+    timeout, unreachable host, oversized or malformed response, invalid
+    arguments) is returned as `{"error": ..., "detail": ...}` and also
+    logged at WARNING (rate-limited per path+kind, except invalid-argument
+    misuse which is a caller bug, not a Watchtower outage, and is not
+    rate-limited into invisibility). Callers must check for the "error"
+    key; a returned dict is not automatically success. Never logs the
+    bearer token, the Authorization header, payload contents, or response
+    bodies -- those are returned to the caller (who owns them already), not
+    written to shared logs.
     """
+    try:
+        effective_timeout = _validate_timeout(
+            WATCHTOWER_TIMEOUT if timeout is None else timeout
+        )
+    except ValueError as exc:
+        logger.warning("Watchtower request %s %s rejected: %s", method.upper(), path, exc)
+        return {"error": "watchtower_invalid_timeout", "detail": str(exc)}
+
+    try:
+        max_response_bytes = _validate_max_response_bytes(max_response_bytes)
+    except ValueError as exc:
+        logger.warning("Watchtower request %s %s rejected: %s", method.upper(), path, exc)
+        return {"error": "watchtower_invalid_max_response_bytes", "detail": str(exc)}
+
     url = f"{WATCHTOWER_URL}{path}"
     data = None
     headers = {"Content-Type": "application/json"}
@@ -120,26 +206,72 @@ def watchtower_request(
         try:
             data = json.dumps(payload).encode("utf-8")
         except (TypeError, ValueError) as exc:
+            if _should_log((path, "payload_serialization")):
+                logger.warning(
+                    "Watchtower request %s %s failed: payload could not be "
+                    "serialized (%s)",
+                    method.upper(), path, type(exc).__name__,
+                )
             return {"error": "watchtower_payload_serialization_error", "detail": str(exc)}
 
     request = urllib.request.Request(url=url, data=data, headers=headers, method=method.upper())
-    effective_timeout = WATCHTOWER_TIMEOUT if timeout is None else timeout
 
     try:
         with urllib.request.urlopen(request, timeout=effective_timeout) as response:
-            body = response.read(max_response_bytes).decode("utf-8")
-            if not body:
+            body_bytes, oversized = _bounded_read(
+                response.read, response.getheader, max_response_bytes,
+            )
+            if oversized:
+                if _should_log((path, "oversized_response")):
+                    logger.warning(
+                        "Watchtower request %s %s failed: response exceeded "
+                        "the %d byte cap",
+                        method.upper(), path, max_response_bytes,
+                    )
+                return {"error": "watchtower_response_too_large", "status_code": response.status}
+
+            if not body_bytes:
                 return {"status_code": response.status}
-            parsed = json.loads(body)
+
+            try:
+                body = body_bytes.decode("utf-8")
+                parsed = json.loads(body)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                if _should_log((path, "malformed_response")):
+                    logger.warning(
+                        "Watchtower request %s %s failed: response body was "
+                        "not valid JSON",
+                        method.upper(), path,
+                    )
+                return {"error": "watchtower_malformed_response", "status_code": response.status}
+
             if isinstance(parsed, dict):
                 parsed.setdefault("status_code", response.status)
                 return parsed
             return {"status_code": response.status, "body": parsed}
+
     except urllib.error.HTTPError as exc:
+        body_bytes, oversized = _bounded_read(
+            exc.read,
+            (lambda name: exc.headers.get(name) if exc.headers is not None else None),
+            max_response_bytes,
+        )
+        if oversized:
+            if _should_log((path, "oversized_error_body")):
+                logger.warning(
+                    "Watchtower request %s %s failed: HTTP %s (error body "
+                    "exceeded the %d byte cap)",
+                    method.upper(), path, exc.code, max_response_bytes,
+                )
+            return {
+                "error": "watchtower_http_error",
+                "status_code": exc.code,
+                "detail": "response body exceeded size limit",
+            }
         try:
-            detail = exc.read(max_response_bytes).decode("utf-8")
-        except Exception:
-            detail = str(exc)
+            detail = body_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            detail = "<non-utf8 body>"
         if _should_log((path, "http_error")):
             no_token_note = (
                 " (no S43_WATCHTOWER_SERVICE_TOKEN configured)"
@@ -150,6 +282,30 @@ def watchtower_request(
                 method.upper(), path, exc.code, no_token_note,
             )
         return {"error": "watchtower_http_error", "status_code": exc.code, "detail": detail}
+
+    except TimeoutError:
+        if _should_log((path, "timeout")):
+            logger.warning(
+                "Watchtower request %s %s failed: timed out after %.1fs",
+                method.upper(), path, effective_timeout,
+            )
+        return {"error": "watchtower_timeout", "detail": "request timed out"}
+
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            if _should_log((path, "timeout")):
+                logger.warning(
+                    "Watchtower request %s %s failed: timed out after %.1fs",
+                    method.upper(), path, effective_timeout,
+                )
+            return {"error": "watchtower_timeout", "detail": "request timed out"}
+        if _should_log((path, "unreachable")):
+            logger.warning(
+                "Watchtower request %s %s failed: %s",
+                method.upper(), path, type(exc.reason).__name__,
+            )
+        return {"error": "watchtower_unreachable", "detail": str(exc.reason)}
+
     except Exception as exc:
         if _should_log((path, "unreachable")):
             logger.warning(
