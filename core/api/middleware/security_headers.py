@@ -4,238 +4,482 @@
 # Copyright (c) 2026 Justin Armstrong
 # All Rights Reserved.
 #
-# Sentinel-43 is dual-licensed: (1) AGPL-3.0-or-later, or (2) commercial.
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
 
-"""
-File: core/api/middleware/security_headers.py
+"""Sentinel-43 transport and response security middleware.
 
-Transport / response security headers (beta-execution Phase 2, F-TLS-1).
+SecurityHeadersMiddleware:
+    - Adds static browser hardening headers.
+    - Emits HSTS only for non-local HTTPS requests, unless explicitly forced.
+    - Trusts X-Forwarded-Proto only from configured trusted proxy CIDRs.
+    - Optionally emits an operator-supplied Content-Security-Policy.
 
-The reverse proxy / ingress in front of the API terminates TLS, redirects
-HTTP -> HTTPS, and is the primary place `Strict-Transport-Security` is set
-(deploy/proxy/nginx.conf, deploy/kubernetes/overlays/beta/ingress.yaml). This
-middleware is **defence in depth** inside the app:
-
-  * `Strict-Transport-Security` -- emitted only when the request actually
-    reached the app over HTTPS (or via a trusted proxy that says so with
-    `X-Forwarded-Proto: https`), and never in a local environment. A browser
-    ignores HSTS received over plain HTTP anyway; gating it means a
-    misconfigured plaintext production listener does not pin clients to a
-    scheme it cannot serve.
-  * `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` -- also
-    set by SentinelFirewall; harmless to re-assert and covers responses the
-    firewall's wrapped-send path does not touch.
-  * `Cross-Origin-Opener-Policy`, `Cross-Origin-Resource-Policy`,
-    `Permissions-Policy` -- static, safe hardening.
-  * `Content-Security-Policy` -- opt-in via `S43_CONTENT_SECURITY_POLICY`
-    (the dashboard uses dynamically-injected `<style>` elements, so a
-    default-deny CSP would need `style-src 'unsafe-inline'`; left to the
-    operator rather than guessed).
-
-`X-Forwarded-Proto` is trusted ONLY when the immediate peer is inside
-`S43_TRUSTED_PROXIES` (the same CIDR list SentinelFirewall uses for
-`X-Forwarded-For`). With no trusted proxies configured the header is ignored
--- fail safe.
-
-Cookies are always issued `Secure` regardless of the detected scheme
-(AUTH_TLS_POSTURE_PASS5A §4/§8) -- the deployment guarantees HTTPS, the app
-does not infer it.
+TrustedHostGuard:
+    - Enforces an explicit Host allow-list.
+    - Supports exact hosts and leading-dot suffix patterns.
+    - Correctly parses host:port and bracketed IPv6 authorities.
+    - Exempts only explicitly listed coarse probe paths.
 """
 
 from __future__ import annotations
 
 import ipaddress
 import os
-from typing import Iterable, Optional
+from functools import lru_cache
+from typing import Final, Iterable
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-# Probe paths that must answer on ANY Host (Kubernetes httpGet probes send
-# `Host: <podIP>`, Docker healthchecks send `Host: localhost`, an LB sends its
-# own). They carry no sensitive data, so the Host allow-list does not apply.
-_HOST_CHECK_EXEMPT_PATHS = frozenset({
-    "/health", "/ready",
-    "/watchtower/health", "/watchtower/ready",
-    "/api/ready", "/api/watchtower/health", "/api/watchtower/ready",
-})
 
-_LOCAL_ENVIRONMENTS = frozenset({"development", "dev", "local", "test"})
+_LOCAL_ENVIRONMENTS: Final[frozenset[str]] = frozenset(
+    {"development", "dev", "local", "test"}
+)
 
-_DEFAULT_HSTS_MAX_AGE = 15552000  # 180 days
-_STATIC_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+_HOST_CHECK_EXEMPT_PATHS: Final[frozenset[str]] = frozenset(
+    {
+        "/health",
+        "/ready",
+        "/watchtower/health",
+        "/watchtower/ready",
+        "/api/ready",
+        "/api/watchtower/health",
+        "/api/watchtower/ready",
+    }
+)
+
+_TRUE_VALUES: Final[frozenset[str]] = frozenset(
+    {"1", "true", "yes", "on"}
+)
+
+_FALSE_VALUES: Final[frozenset[str]] = frozenset(
+    {"0", "false", "no", "off"}
+)
+
+_DEFAULT_HSTS_MAX_AGE: Final[int] = 15_552_000  # 180 days
+
+_STATIC_HEADERS: Final[tuple[tuple[bytes, bytes], ...]] = (
     (b"x-content-type-options", b"nosniff"),
     (b"x-frame-options", b"DENY"),
     (b"referrer-policy", b"no-referrer"),
     (b"cross-origin-opener-policy", b"same-origin"),
     (b"cross-origin-resource-policy", b"same-site"),
-    (b"permissions-policy", b"geolocation=(), microphone=(), camera=()"),
+    (
+        b"permissions-policy",
+        b"geolocation=(), microphone=(), camera=()",
+    ),
 )
 
 
+def _environment() -> str:
+    return os.getenv("SENTINEL_ENV", "production").strip().lower()
+
+
 def _is_local_environment() -> bool:
-    return os.getenv("SENTINEL_ENV", "production").strip().lower() in _LOCAL_ENVIRONMENTS
+    return _environment() in _LOCAL_ENVIRONMENTS
 
 
-def _env_int(name: str, default: int) -> int:
+def _env_bool(
+    name: str,
+    *,
+    default: bool | None = None,
+) -> bool | None:
     raw = os.getenv(name)
+
     if raw is None:
         return default
-    try:
-        return max(0, int(raw.strip()))
-    except ValueError:
-        return default
+
+    normalized = raw.strip().lower()
+
+    if normalized in _TRUE_VALUES:
+        return True
+
+    if normalized in _FALSE_VALUES:
+        return False
+
+    raise RuntimeError(
+        f"{name} must be boolean; got {raw!r}"
+    )
 
 
-def _env_bool(name: str) -> Optional[bool]:
+def _env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
     raw = os.getenv(name)
+
     if raw is None:
-        return None
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _trusted_proxy_networks() -> list[ipaddress._BaseNetwork]:
-    raw = os.getenv("S43_TRUSTED_PROXIES", "")
-    nets: list[ipaddress._BaseNetwork] = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
+        value = default
+    else:
         try:
-            nets.append(ipaddress.ip_network(part, strict=False))
-        except ValueError:
+            value = int(raw.strip())
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{name} must be an integer; got {raw!r}"
+            ) from exc
+
+    if not minimum <= value <= maximum:
+        raise RuntimeError(
+            f"{name} must be between {minimum} and {maximum}; got {value}"
+        )
+
+    return value
+
+
+@lru_cache(maxsize=32)
+def _parse_proxy_networks(raw: str) -> tuple[
+    ipaddress.IPv4Network | ipaddress.IPv6Network,
+    ...,
+]:
+    networks: list[
+        ipaddress.IPv4Network | ipaddress.IPv6Network
+    ] = []
+
+    for part in raw.split(","):
+        item = part.strip()
+        if not item:
             continue
-    return nets
+
+        try:
+            networks.append(
+                ipaddress.ip_network(item, strict=False)
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Invalid CIDR {item!r} in S43_TRUSTED_PROXIES"
+            ) from exc
+
+    return tuple(networks)
+
+
+def _trusted_proxy_networks() -> tuple[
+    ipaddress.IPv4Network | ipaddress.IPv6Network,
+    ...,
+]:
+    return _parse_proxy_networks(
+        os.getenv("S43_TRUSTED_PROXIES", "").strip()
+    )
 
 
 def _peer_is_trusted_proxy(scope: Scope) -> bool:
-    nets = _trusted_proxy_networks()
-    if not nets:
+    networks = _trusted_proxy_networks()
+
+    if not networks:
         return False
+
     client = scope.get("client")
-    if not (isinstance(client, (list, tuple)) and client):
+    if not (
+        isinstance(client, (list, tuple))
+        and client
+        and client[0] is not None
+    ):
         return False
+
     try:
-        addr = ipaddress.ip_address(str(client[0]))
+        address = ipaddress.ip_address(str(client[0]).strip())
     except ValueError:
         return False
-    return any(addr in n for n in nets)
+
+    return any(
+        address.version == network.version
+        and address in network
+        for network in networks
+    )
 
 
-def _header_value(headers: Iterable[tuple[bytes, bytes]], name: bytes) -> Optional[bytes]:
-    for k, v in headers:
-        if k.lower() == name:
-            return v
-    return None
+def _header_values(
+    headers: Iterable[tuple[bytes, bytes]],
+    name: bytes,
+) -> list[bytes]:
+    return [
+        value
+        for key, value in headers
+        if key.lower() == name
+    ]
 
 
 def _effective_scheme(scope: Scope) -> str:
-    scheme = str(scope.get("scheme") or "http").lower()
-    if _peer_is_trusted_proxy(scope):
-        xfp = _header_value(scope.get("headers") or [], b"x-forwarded-proto")
-        if xfp:
-            first = xfp.decode("latin-1").split(",")[0].strip().lower()
-            if first in {"http", "https"}:
-                return first
+    scheme = str(scope.get("scheme") or "http").strip().lower()
+
+    if not _peer_is_trusted_proxy(scope):
+        return scheme
+
+    forwarded = _header_values(
+        scope.get("headers") or [],
+        b"x-forwarded-proto",
+    )
+
+    # Multiple X-Forwarded-Proto headers are ambiguous. Ignore them rather
+    # than guessing which proxy/client value deserves trust.
+    if len(forwarded) != 1:
+        return scheme
+
+    first = (
+        forwarded[0]
+        .decode("latin-1")
+        .split(",", 1)[0]
+        .strip()
+        .lower()
+    )
+
+    if first in {"http", "https"}:
+        return first
+
     return scheme
 
 
+def _merge_headers(
+    existing: Iterable[tuple[bytes, bytes]],
+    additions: Iterable[tuple[bytes, bytes]],
+) -> list[tuple[bytes, bytes]]:
+    headers = list(existing)
+    present = {name.lower() for name, _ in headers}
+
+    for name, value in additions:
+        if name.lower() not in present:
+            headers.append((name, value))
+            present.add(name.lower())
+
+    return headers
+
+
+def _parse_host_authority(value: str) -> str:
+    """Extract the hostname from an HTTP Host authority.
+
+    Handles:
+        example.com
+        example.com:8000
+        [2001:db8::1]
+        [2001:db8::1]:8000
+    """
+    authority = value.strip().lower()
+
+    if not authority:
+        return ""
+
+    if authority.startswith("["):
+        closing = authority.find("]")
+        if closing == -1:
+            return ""
+        return authority[1:closing]
+
+    # A normal DNS/IPv4 authority has at most one colon separating a port.
+    if authority.count(":") == 1:
+        host, possible_port = authority.rsplit(":", 1)
+        if possible_port.isdigit():
+            return host
+
+    # Unbracketed IPv6 in Host is invalid HTTP authority syntax, but returning
+    # it unchanged ensures it does not accidentally match a valid allow-list.
+    return authority
+
+
+def _trusted_host_patterns() -> tuple[str, ...]:
+    raw = os.getenv("S43_TRUSTED_HOSTS", "")
+
+    patterns = tuple(
+        item.strip().lower()
+        for item in raw.split(",")
+        if item.strip()
+    )
+
+    if "*" in patterns and not _is_local_environment():
+        raise RuntimeError(
+            "S43_TRUSTED_HOSTS='*' is not permitted outside local/test"
+        )
+
+    return patterns
+
+
+def _host_matches(host: str, pattern: str) -> bool:
+    if pattern == "*":
+        return True
+
+    if pattern.startswith("."):
+        suffix = pattern[1:]
+        return host == suffix or host.endswith(f".{suffix}")
+
+    return host == pattern
+
+
 class SecurityHeadersMiddleware:
-    """Adds transport-security response headers. Read config at call time so a
-    test / restart picks up env changes without a reload."""
+    """Add transport-security and browser-hardening response headers."""
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
 
         secure = _effective_scheme(scope) == "https"
         local = _is_local_environment()
 
-        force_hsts = _env_bool("S43_HSTS_FORCE")
-        disable_hsts = _env_bool("S43_HSTS_DISABLE")
-        emit_hsts = (
+        force_hsts = _env_bool(
+            "S43_HSTS_FORCE",
+            default=False,
+        )
+        disable_hsts = _env_bool(
+            "S43_HSTS_DISABLE",
+            default=False,
+        )
+
+        emit_hsts = bool(
             not disable_hsts
             and not local
-            and (secure or force_hsts is True)
+            and (secure or force_hsts)
         )
-        max_age = _env_int("S43_HSTS_MAX_AGE", _DEFAULT_HSTS_MAX_AGE)
-        csp = os.getenv("S43_CONTENT_SECURITY_POLICY", "").strip()
 
-        async def _send(message: Message) -> None:
-            if message["type"] == "http.response.start":
-                headers = list(message.get("headers") or [])
-                present = {k.lower() for k, _ in headers}
-                for name, value in _STATIC_HEADERS:
-                    if name not in present:
-                        headers.append((name, value))
-                if emit_hsts and b"strict-transport-security" not in present:
-                    headers.append((
-                        b"strict-transport-security",
-                        f"max-age={max_age}; includeSubDomains".encode("ascii"),
-                    ))
-                if csp and b"content-security-policy" not in present:
-                    headers.append((b"content-security-policy", csp.encode("latin-1")))
-                message["headers"] = headers
+        max_age = _env_int(
+            "S43_HSTS_MAX_AGE",
+            _DEFAULT_HSTS_MAX_AGE,
+            minimum=0,
+            maximum=63_072_000,  # 2 years
+        )
+
+        csp = os.getenv(
+            "S43_CONTENT_SECURITY_POLICY",
+            "",
+        ).strip()
+
+        async def wrapped_send(message: Message) -> None:
+            if message.get("type") == "http.response.start":
+                headers = _merge_headers(
+                    message.get("headers") or [],
+                    _STATIC_HEADERS,
+                )
+
+                dynamic: list[tuple[bytes, bytes]] = []
+
+                if emit_hsts:
+                    dynamic.append(
+                        (
+                            b"strict-transport-security",
+                            (
+                                f"max-age={max_age}; includeSubDomains"
+                            ).encode("ascii"),
+                        )
+                    )
+
+                if csp:
+                    try:
+                        encoded_csp = csp.encode("latin-1")
+                    except UnicodeEncodeError as exc:
+                        raise RuntimeError(
+                            "S43_CONTENT_SECURITY_POLICY must be latin-1 encodable"
+                        ) from exc
+
+                    dynamic.append(
+                        (
+                            b"content-security-policy",
+                            encoded_csp,
+                        )
+                    )
+
+                message["headers"] = _merge_headers(
+                    headers,
+                    dynamic,
+                )
+
             await send(message)
 
-        await self.app(scope, receive, _send)
+        await self.app(scope, receive, wrapped_send)
 
 
 class TrustedHostGuard:
-    """
-    Explicit Host allow-list (beta-execution Phase 2), replacing Starlette's
-    TrustedHostMiddleware so infra probe paths keep working. When
-    ``S43_TRUSTED_HOSTS`` is a non-empty comma list, every request whose path
-    is not in ``_HOST_CHECK_EXEMPT_PATHS`` must carry a ``Host`` header (port
-    stripped) that exactly matches an entry, or matches a leading-dot wildcard
-    (``.example.com`` matches ``example.com`` and any sub-domain). Mismatch →
-    ``400``. Unset list → no check (dev / a proxy that already validates Host).
-    """
+    """Enforce an explicit HTTP Host allow-list."""
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
-    @staticmethod
-    def _allowed() -> list[str]:
-        raw = os.getenv("S43_TRUSTED_HOSTS", "")
-        return [h.strip().lower() for h in raw.split(",") if h.strip()]
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
-        allowed = self._allowed()
-        path = scope.get("path", "")
+
+        allowed = _trusted_host_patterns()
+        path = str(scope.get("path") or "")
+
         if not allowed or path in _HOST_CHECK_EXEMPT_PATHS:
             await self.app(scope, receive, send)
             return
 
-        host = ""
-        for k, v in scope.get("headers") or []:
-            if k.lower() == b"host":
-                host = v.decode("latin-1").split(":")[0].strip().lower()
-                break
+        host_values = _header_values(
+            scope.get("headers") or [],
+            b"host",
+        )
 
-        ok = False
-        for pat in allowed:
-            if pat == "*" or host == pat:
-                ok = True
-                break
-            if pat.startswith(".") and (host == pat[1:] or host.endswith(pat)):
-                ok = True
-                break
-        if not ok:
-            body = b'{"error":"invalid_host"}'
-            await send({"type": "http.response.start", "status": 400,
-                        "headers": [(b"content-type", b"application/json"),
-                                    (b"content-length", str(len(body)).encode())]})
-            await send({"type": "http.response.body", "body": body})
+        # HTTP/1.1 requires exactly one Host header. Reject ambiguity instead
+        # of quietly accepting the first value and hoping every upstream proxy
+        # made the same choice.
+        if len(host_values) != 1:
+            await self._reject(send)
             return
+
+        host = _parse_host_authority(
+            host_values[0].decode("latin-1")
+        )
+
+        if not host:
+            await self._reject(send)
+            return
+
+        if not any(
+            _host_matches(host, pattern)
+            for pattern in allowed
+        ):
+            await self._reject(send)
+            return
+
         await self.app(scope, receive, send)
 
+    @staticmethod
+    async def _reject(send: Send) -> None:
+        body = b'{"error":"invalid_host"}'
 
-__all__ = ["SecurityHeadersMiddleware", "TrustedHostGuard"]
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 400,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (
+                        b"content-length",
+                        str(len(body)).encode("ascii"),
+                    ),
+                    (b"cache-control", b"no-store"),
+                ],
+            }
+        )
+
+        await send(
+            {
+                "type": "http.response.body",
+                "body": body,
+                "more_body": False,
+            }
+        )
+
+
+__all__ = [
+    "SecurityHeadersMiddleware",
+    "TrustedHostGuard",
+]
