@@ -4,67 +4,39 @@
 # Copyright (c) 2026 Justin Armstrong
 # All Rights Reserved.
 #
-# This file is part of the Sentinel-43 platform and constitutes original
-# intellectual property of the copyright holder.
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
 #
-# Sentinel-43 is distributed under a dual-license model:
-#
-#   1. GNU Affero General Public License (AGPL v3.0)
-#      for open-source use, modification, and distribution.
-#
-#   2. Commercial License
-#      for proprietary, enterprise, government, or other commercial use
-#      not permitted under the AGPL v3.0.
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
-#
-# core/api/routers/users.py
-#
-# Admin-managed operator/admin accounts.
-#
-# Provides (all gated by require_admin — an authenticated operator whose
-# users-table row is an active 'admin'; see core/api/deps/deps.py):
-#   POST   /users                  — create an operator or admin account
-#   GET    /users                  — list all accounts
-#   PATCH  /users/{user_id}        — deactivate/reactivate, or change role
-#   POST   /users/{user_id}/password — reset an account's password
-#
-# This is the supported path for adding users after first-run setup.
-# /bootstrap/admin (core/api/routers/bootstrap.py) only ever creates the
-# FIRST admin and then refuses forever; every account after that is created
-# here by an existing admin. There is intentionally no public self-service
-# registration — this is a security console, not a signup form.
-#
-# Guard rails enforced here (not in core/auth/users.py, which stays a thin
-# data layer):
-#   - an admin cannot deactivate their own account (log out instead)
-#   - the last active admin cannot be deactivated or demoted, so a
-#     deployment can never be left with zero admins and no way back in
-#     short of raw SQL. Self-demotion IS allowed while another admin remains.
-#
-# Concurrency (Pass 3): the last-admin check (_would_orphan_admins) reads
-# count_active_admins() and then writes. Any PATCH that can move the
-# active-admin count now takes ADMIN_INVARIANT_LOCK_KEY (a PostgreSQL
-# transaction advisory lock, the same one POST /bootstrap/admin uses) before
-# the check, so two concurrent PATCHes each demoting a different one of the
-# final two admins are serialized: the first commits, the second re-reads
-# count==1 and gets 409. Reproduced against real PostgreSQL — see
-# PASS3_VALIDATION.md. Also: the route commits ONCE at the end (helpers only
-# flush), so a role+is_active change can't half-persist.
-# =============================================================================
+
+"""Sentinel-43 admin-managed account routes.
+
+All routes are admin-gated. This module owns account-management guard rails,
+while the auth/users layer remains responsible for persistence primitives.
+
+Security invariants:
+    - no public self-service registration
+    - caller cannot deactivate their own account
+    - deployment may never lose its final active admin
+    - role/active changes are committed atomically
+    - security-sensitive account changes revoke live sessions in the same
+      transaction and fail closed if revocation cannot be completed
+"""
 
 from __future__ import annotations
 
 import logging
 import uuid
+from typing import Final
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...auth.deps import get_db_session
-
-logger = logging.getLogger(__name__)
 from ...auth.users import (
     ADMIN_INVARIANT_LOCK_KEY,
     APPROVED_ROLES,
@@ -81,44 +53,123 @@ from ...auth.users import (
 )
 from ..deps import require_admin
 
-# require_admin gates the whole router. Routes that need the caller's
-# identity (update_account, for the self-deactivation guard) also take it as
-# an explicit parameter — FastAPI runs the dependency once either way.
+logger = logging.getLogger(__name__)
+
 router = APIRouter(
     prefix="/users",
     tags=["users"],
     dependencies=[Depends(require_admin)],
 )
 
-MAX_USERNAME_LEN = 128
-MIN_PASSWORD_LEN = 12  # keep in sync with core/api/routers/bootstrap.py
-MAX_PASSWORD_LEN = 1024
-MAX_EMAIL_LEN = 255
+MAX_USERNAME_LEN: Final[int] = 128
+MIN_PASSWORD_LEN: Final[int] = 12
+MAX_PASSWORD_LEN: Final[int] = 1024
+MAX_EMAIL_LEN: Final[int] = 255
+MAX_LIST_USERS: Final[int] = 500
 
 
 # =============================================================================
 # Models
 # =============================================================================
 
-class CreateUserRequest(BaseModel):
-    username: str = Field(..., min_length=1, max_length=MAX_USERNAME_LEN)
-    password: str = Field(..., min_length=MIN_PASSWORD_LEN, max_length=MAX_PASSWORD_LEN)
+class StrictRequestModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+        validate_assignment=True,
+    )
+
+
+class CreateUserRequest(StrictRequestModel):
+    username: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_USERNAME_LEN,
+    )
+    password: str = Field(
+        ...,
+        min_length=MIN_PASSWORD_LEN,
+        max_length=MAX_PASSWORD_LEN,
+    )
     role: str = Field(default="operator")
-    email: str | None = Field(default=None, max_length=MAX_EMAIL_LEN)
+    email: str | None = Field(
+        default=None,
+        max_length=MAX_EMAIL_LEN,
+    )
+
+    @field_validator("role")
+    @classmethod
+    def normalize_role(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+
+        if cleaned not in APPROVED_ROLES:
+            raise ValueError(
+                f"role must be one of {sorted(APPROVED_ROLES)}"
+            )
+
+        return cleaned
+
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("username must not be blank")
+        return cleaned
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+
+        cleaned = value.strip().lower()
+        return cleaned or None
 
 
-class UpdateUserRequest(BaseModel):
+class UpdateUserRequest(StrictRequestModel):
     is_active: bool | None = Field(default=None)
     role: str | None = Field(default=None)
 
+    @field_validator("role")
+    @classmethod
+    def normalize_role(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
 
-class ResetPasswordRequest(BaseModel):
+        cleaned = value.strip().lower()
+
+        if cleaned not in APPROVED_ROLES:
+            raise ValueError(
+                f"role must be one of {sorted(APPROVED_ROLES)}"
+            )
+
+        return cleaned
+
+    @model_validator(mode="after")
+    def require_change(self) -> "UpdateUserRequest":
+        if self.is_active is None and self.role is None:
+            raise ValueError(
+                "Provide at least one of: is_active, role"
+            )
+
+        return self
+
+
+class ResetPasswordRequest(StrictRequestModel):
     new_password: str = Field(
-        ..., min_length=MIN_PASSWORD_LEN, max_length=MAX_PASSWORD_LEN
+        ...,
+        min_length=MIN_PASSWORD_LEN,
+        max_length=MAX_PASSWORD_LEN,
     )
 
 
 class UserResponse(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        from_attributes=False,
+    )
+
     user_id: str
     username: str
     email: str | None
@@ -133,60 +184,70 @@ class UserResponse(BaseModel):
 # =============================================================================
 
 def _serialize(user: User) -> UserResponse:
+    if user.created_at is None:
+        # A persisted user without creation time is a data-integrity problem,
+        # not something the API should quietly serialize as an empty string.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="User record is incomplete.",
+        )
+
     return UserResponse(
         user_id=str(user.user_id),
         username=user.username,
         email=user.email,
         role=user.role,
         is_active=bool(user.is_active),
-        created_at=user.created_at.isoformat() if user.created_at is not None else "",
+        created_at=user.created_at.isoformat(),
         last_login_at=(
-            user.last_login_at.isoformat() if user.last_login_at is not None else None
+            user.last_login_at.isoformat()
+            if user.last_login_at is not None
+            else None
         ),
     )
-
-
-def _validate_role(role: str) -> str:
-    if role not in APPROVED_ROLES:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"role must be one of {sorted(APPROVED_ROLES)}.",
-        )
-    return role
 
 
 def _parse_user_id(raw: str) -> uuid.UUID:
     try:
         return uuid.UUID(str(raw))
-    except (ValueError, AttributeError, TypeError):
+    except (ValueError, AttributeError, TypeError) as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="user_id must be a UUID.",
-        )
+        ) from exc
 
 
-async def _revoke_sessions(session: AsyncSession, user_id: uuid.UUID, *, reason: str) -> None:
+async def _revoke_sessions(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    *,
+    reason: str,
+) -> None:
+    """Revoke every live session for a security-sensitive account change.
+
+    This operation is part of the caller's transaction. Failure is fatal to the
+    account mutation so the database cannot commit a password/role/active-state
+    change while leaving stale authenticated sessions alive.
     """
-    Revoke every live server-side session for a user, in the caller's
-    transaction (Pass 3 boundary). Called on disablement / role change /
-    password reset so an existing browser session can't outlive the change
-    (beta-execution Phase B, AUTH_MIGRATION_PASS4 M5).
+    from ...auth.sessions import revoke_all_user_sessions
 
-    Defensive: a failure here (e.g. the sessions table isn't present, or a
-    fake session in a unit test) is logged and swallowed — the account change
-    itself already blocks NEW logins, and resolve_live_session() re-checks
-    is_active on every request, so a disabled user is locked out immediately
-    regardless.
-    """
     try:
-        from ...auth.sessions import revoke_all_user_sessions
-
-        await revoke_all_user_sessions(session, user_id, reason=reason)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "session revocation for %s (%s) failed: %s",
-            user_id, reason, type(exc).__name__,
+        await revoke_all_user_sessions(
+            session,
+            user_id,
+            reason=reason,
         )
+    except Exception as exc:
+        logger.error(
+            "Session revocation failed for user_id=%s reason=%s",
+            user_id,
+            reason,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Session revocation service is unavailable.",
+        ) from exc
 
 
 async def _would_orphan_admins(
@@ -196,19 +257,35 @@ async def _would_orphan_admins(
     new_is_active: bool | None,
     new_role: str | None,
 ) -> bool:
-    """
-    True if applying (new_is_active, new_role) to `target` would drop the
-    deployment to zero active admins. Checked before the change is written.
-    """
-    if not (target.is_active and target.role == "admin"):
+    if not (
+        bool(target.is_active)
+        and str(target.role).lower() == "admin"
+    ):
         return False
 
-    effective_is_active = target.is_active if new_is_active is None else new_is_active
-    effective_role = target.role if new_role is None else new_role
+    effective_is_active = (
+        bool(target.is_active)
+        if new_is_active is None
+        else bool(new_is_active)
+    )
+
+    effective_role = (
+        str(target.role).lower()
+        if new_role is None
+        else new_role
+    )
+
     if effective_is_active and effective_role == "admin":
         return False
 
     return await count_active_admins(session) <= 1
+
+
+async def _rollback_safely(session: AsyncSession) -> None:
+    try:
+        await session.rollback()
+    except Exception:
+        logger.exception("User-management transaction rollback failed")
 
 
 # =============================================================================
@@ -224,19 +301,14 @@ async def create_account(
     body: CreateUserRequest,
     session: AsyncSession = Depends(get_db_session),
 ) -> UserResponse:
-    """Create a new operator or admin account. Admin-only."""
-    role = _validate_role(body.role)
+    """Create a new operator/admin account."""
 
-    username = body.username.strip()
-    if not username:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="username must not be blank.",
-        )
-
-    email = body.email.strip() if body.email else None
-
-    if await get_user_by_username(session, username) is not None:
+    # Friendly conflict pre-check. The DB uniqueness constraint remains the
+    # authoritative race-safe enforcement.
+    if await get_user_by_username(
+        session,
+        body.username,
+    ) is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Username already exists.",
@@ -245,135 +317,233 @@ async def create_account(
     try:
         user = await create_user(
             session,
-            username=username,
+            username=body.username,
             password=body.password,
-            role=role,
-            email=email,
+            role=body.role,
+            email=body.email,
         )
         await session.commit()
-    except IntegrityError:
-        # Unique-constraint race on username or email between the check above
-        # and the flush inside create_user(). get_db_session() rolls back.
+
+    except IntegrityError as exc:
+        await _rollback_safely(session)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="An account with that username or email already exists.",
-        )
+            detail=(
+                "An account with that username or email already exists."
+            ),
+        ) from exc
+
+    except HTTPException:
+        await _rollback_safely(session)
+        raise
+
+    except Exception:
+        await _rollback_safely(session)
+        raise
 
     return _serialize(user)
 
 
-@router.get("", response_model=list[UserResponse])
+@router.get(
+    "",
+    response_model=list[UserResponse],
+)
 async def list_accounts(
+    limit: int = Query(
+        default=100,
+        ge=1,
+        le=MAX_LIST_USERS,
+    ),
     session: AsyncSession = Depends(get_db_session),
 ) -> list[UserResponse]:
-    """List every account. Admin-only. Password hashes are never returned."""
-    return [_serialize(u) for u in await list_users(session)]
+    """List admin-visible accounts with a bounded response size."""
+
+    users = await list_users(session)
+    return [
+        _serialize(user)
+        for user in users[:limit]
+    ]
 
 
-@router.patch("/{user_id}", response_model=UserResponse)
+@router.patch(
+    "/{user_id}",
+    response_model=UserResponse,
+)
 async def update_account(
     user_id: str,
     body: UpdateUserRequest,
     admin: str = Depends(require_admin),
     session: AsyncSession = Depends(get_db_session),
 ) -> UserResponse:
-    """
-    Deactivate/reactivate an account (is_active) and/or change its role.
-    Admin-only. Refuses changes that would lock the caller out or remove
-    the last remaining admin.
-    """
+    """Update account activation state and/or role."""
+
     parsed_id = _parse_user_id(user_id)
 
-    if body.is_active is None and body.role is None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Provide at least one of: is_active, role.",
-        )
+    target = await get_user_by_id(
+        session,
+        parsed_id,
+    )
 
-    new_role = _validate_role(body.role) if body.role is not None else None
-
-    target = await get_user_by_id(session, parsed_id)
     if target is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No account with that user_id.",
         )
 
-    # Blanket footgun guard: deactivating your own account has no legitimate
-    # use (just log out) and is an easy way to lock yourself out. Self-
-    # *demotion* is allowed as long as another admin remains — that case is
-    # covered by the last-admin check below, not here.
-    if target.username == admin and body.is_active is False:
+    if (
+        target.username == admin
+        and body.is_active is False
+    ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="You cannot deactivate your own account.",
         )
 
-    # If this change can move the active-admin count, serialize it against
-    # every other admin-count-moving operation (including POST /bootstrap/admin)
-    # with the same advisory lock, so the last-admin check below reads a count
-    # nobody else can change until we commit or roll back. Without this, two
-    # concurrent PATCHes each demoting a different one of the final two admins
-    # both see count==2 and both succeed, leaving zero admins.
-    touches_admin_count = (
-        (body.is_active is not None and target.role == "admin")
-        or (new_role is not None and (target.role == "admin" or new_role == "admin"))
-    )
-    if touches_admin_count:
-        await _pg_advisory_xact_lock(session, ADMIN_INVARIANT_LOCK_KEY)
+    new_role = body.role
 
-    if await _would_orphan_admins(
-        session, target, new_is_active=body.is_active, new_role=new_role
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Cannot deactivate or demote the last active admin.",
+    touches_admin_count = (
+        (
+            body.is_active is not None
+            and str(target.role).lower() == "admin"
+        )
+        or (
+            new_role is not None
+            and (
+                str(target.role).lower() == "admin"
+                or new_role == "admin"
+            )
+        )
+    )
+
+    try:
+        if touches_admin_count:
+            await _pg_advisory_xact_lock(
+                session,
+                ADMIN_INVARIANT_LOCK_KEY,
+            )
+
+        if await _would_orphan_admins(
+            session,
+            target,
+            new_is_active=body.is_active,
+            new_role=new_role,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Cannot deactivate or demote the last active admin."
+                ),
+            )
+
+        role_changed = (
+            new_role is not None
+            and new_role != str(target.role).lower()
         )
 
-    role_changed = new_role is not None and new_role != target.role
-    deactivated = (
-        body.is_active is not None
-        and bool(body.is_active) is False
-        and bool(target.is_active) is True
-    )
+        deactivated = (
+            body.is_active is False
+            and bool(target.is_active)
+        )
 
-    if role_changed:
-        target = await set_user_role(session, target, role=new_role)
-    if body.is_active is not None and bool(body.is_active) != bool(target.is_active):
-        target = await set_user_active(session, target, is_active=body.is_active)
+        if role_changed:
+            target = await set_user_role(
+                session,
+                target,
+                role=new_role,
+            )
 
-    # Revoke live sessions when the account is disabled or its role changes,
-    # in this same transaction, so a browser session can't outlive the change.
-    if deactivated:
-        await _revoke_sessions(session, target.user_id, reason="account_disabled")
-    elif role_changed:
-        await _revoke_sessions(session, target.user_id, reason="role_changed")
+        if (
+            body.is_active is not None
+            and bool(body.is_active) != bool(target.is_active)
+        ):
+            target = await set_user_active(
+                session,
+                target,
+                is_active=body.is_active,
+            )
 
-    await session.commit()
+        # Any role change or deactivation invalidates current authentication
+        # context. Do this before commit in the same transaction.
+        if deactivated:
+            await _revoke_sessions(
+                session,
+                target.user_id,
+                reason="account_disabled",
+            )
+        elif role_changed:
+            await _revoke_sessions(
+                session,
+                target.user_id,
+                reason="role_changed",
+            )
+
+        await session.commit()
+
+    except HTTPException:
+        await _rollback_safely(session)
+        raise
+
+    except IntegrityError as exc:
+        await _rollback_safely(session)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Account update conflicted with existing data.",
+        ) from exc
+
+    except Exception:
+        await _rollback_safely(session)
+        raise
+
     return _serialize(target)
 
 
-@router.post("/{user_id}/password", response_model=UserResponse)
+@router.post(
+    "/{user_id}/password",
+    response_model=UserResponse,
+)
 async def reset_account_password(
     user_id: str,
     body: ResetPasswordRequest,
     session: AsyncSession = Depends(get_db_session),
 ) -> UserResponse:
-    """Set a new password for an account. Admin-only."""
+    """Reset an account password and revoke every existing session."""
+
     parsed_id = _parse_user_id(user_id)
 
-    target = await get_user_by_id(session, parsed_id)
+    target = await get_user_by_id(
+        session,
+        parsed_id,
+    )
+
     if target is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No account with that user_id.",
         )
 
-    target = await set_user_password(session, target, password=body.new_password)
-    # A password reset invalidates every existing browser session for that
-    # account (they must log in again with the new password).
-    await _revoke_sessions(session, target.user_id, reason="password_reset")
-    await session.commit()
+    try:
+        target = await set_user_password(
+            session,
+            target,
+            password=body.new_password,
+        )
+
+        await _revoke_sessions(
+            session,
+            target.user_id,
+            reason="password_reset",
+        )
+
+        await session.commit()
+
+    except HTTPException:
+        await _rollback_safely(session)
+        raise
+
+    except Exception:
+        await _rollback_safely(session)
+        raise
+
     return _serialize(target)
 
 
