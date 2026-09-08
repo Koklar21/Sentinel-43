@@ -4,57 +4,23 @@
 # Copyright (c) 2026 Justin Armstrong
 # All Rights Reserved.
 #
-# This file is part of the Sentinel-43 platform and constitutes original
-# intellectual property of the copyright holder.
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
 #
-# Sentinel-43 is distributed under a dual-license model:
-#
-#   1. GNU Affero General Public License (AGPL v3.0)
-#      for open-source use, modification, and distribution.
-#
-#   2. Commercial License
-#      for proprietary, enterprise, government, or other commercial use
-#      not permitted under the AGPL v3.0.
-#
-# Unauthorized copying, redistribution, relicensing, reverse engineering,
-# or commercial exploitation outside the terms of the applicable license
-# is strictly prohibited.
-#
-# By accessing, modifying, distributing, or using this software, you agree
-# to comply with the terms of the applicable license.
-#
-# License Information:
-# AGPL v3.0: https://www.gnu.org/licenses/agpl-3.0.en.html
-#
-# Commercial Licensing:
-# Contact the copyright holder for commercial licensing terms.
-#
-# Sentinel-43™
-# Original Work and Protected Intellectual Property.
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
 
-"""
-File: core/auth/users.py
+"""Sentinel-43 local operator/admin account persistence.
 
-Local operator/admin account system, backed by Postgres via SQLAlchemy's
-async engine (asyncpg driver). This replaces the single S43_OPERATOR_USERNAME
-/ S43_OPERATOR_PASSWORD_HASH env-var account with a real multi-row users
-table, so the bootstrap flow (core/api/routers/bootstrap.py) can gate
-first-run admin creation on count_active_admins() == 0 rather than assuming
-exactly one operator identity exists.
+Responsibilities:
+    - SQLAlchemy user model
+    - lazy async engine/sessionmaker creation
+    - Argon2id hashing and verification
+    - first-admin concurrency invariant
+    - account lookup and mutation helpers
 
-Password hashing uses Argon2id (argon2-cffi) rather than the bare SHA-256
-scheme the env-var path used — Argon2 is a memory-hard KDF designed for
-credential storage; SHA-256 is not and was only ever a stopgap.
-
-DATABASE_URL is read directly from the environment (postgresql+asyncpg://...,
-see docker-compose.yml) rather than through core/config/settings.py's
-Settings class, matching how core/api/main.py and core/bootstrap.py already
-read their own config directly rather than going through that module.
-
-The engine and sessionmaker are created lazily and cached at module level —
-this file has zero import-time side effects (no DB connection attempted on
-import), matching core/security/jwt_constants.py's zero-dependency stance.
+This module is framework-agnostic. HTTP translation belongs in API routers.
 """
 
 from __future__ import annotations
@@ -63,15 +29,14 @@ import asyncio
 import logging
 import os
 import re
+import threading
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
-
-logger = logging.getLogger(__name__)
+from typing import Final
 
 from argon2 import PasswordHasher
-from argon2 import Type as _Argon2Type
-from argon2 import extract_parameters as _extract_argon2_parameters
+from argon2 import Type as Argon2Type
+from argon2 import extract_parameters
 from argon2.exceptions import InvalidHash, VerificationError
 from sqlalchemy import (
     Boolean,
@@ -92,64 +57,83 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-# =============================================================================
-# Model
-# =============================================================================
 
-# Kept identical to _APPROVED_ROLES in core/api/main.py and
-# core/api/routers/auth.py — a user row with any other role value is a data
-# problem, not a new role, until those call sites are updated too.
-APPROVED_ROLES: frozenset[str] = frozenset({"operator", "admin"})
-
-# Stable 63-bit key for the bootstrap/last-admin advisory lock. Arbitrary but
-# fixed forever: "S43B" (0x53343342) high word + a tag in the low word. Every
-# process/replica that mutates the "how many active admins exist" invariant
-# takes THIS lock, so first-admin creation and last-admin demotion/
-# deactivation are serialized cluster-wide. See _pg_advisory_xact_lock().
-ADMIN_INVARIANT_LOCK_KEY: int = 0x5334334200000001
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# Account-layer exceptions — framework-agnostic (no HTTPException here; the
-# routers translate these to status codes).
+# Constants
+# =============================================================================
+
+APPROVED_ROLES: Final[frozenset[str]] = frozenset(
+    {"operator", "admin"}
+)
+
+ADMIN_INVARIANT_LOCK_KEY: Final[int] = 0x5334334200000001
+
+_LOCAL_ENVIRONMENTS: Final[frozenset[str]] = frozenset(
+    {"development", "dev", "local", "test"}
+)
+
+_TRUE_VALUES: Final[frozenset[str]] = frozenset(
+    {"1", "true", "yes", "on", "enabled"}
+)
+_FALSE_VALUES: Final[frozenset[str]] = frozenset(
+    {"0", "false", "no", "off", "disabled"}
+)
+
+# Explicit Argon2id posture. Do not inherit library defaults silently.
+ARGON2_TIME_COST: Final[int] = 3
+ARGON2_MEMORY_COST_KIB: Final[int] = 65_536
+ARGON2_PARALLELISM: Final[int] = 4
+ARGON2_HASH_LEN: Final[int] = 32
+ARGON2_SALT_LEN: Final[int] = 16
+
+_ARGON2_MAX_ENCODED_LEN: Final[int] = 512
+_ARGON2_MIN_MEMORY_COST_KIB: Final[int] = 8 * 1024
+_ARGON2_MAX_MEMORY_COST_KIB: Final[int] = 1024 * 1024
+_ARGON2_MIN_TIME_COST: Final[int] = 1
+_ARGON2_MAX_TIME_COST: Final[int] = 32
+_ARGON2_MIN_PARALLELISM: Final[int] = 1
+_ARGON2_MAX_PARALLELISM: Final[int] = 16
+_ARGON2_MIN_SALT_LEN: Final[int] = 16
+_ARGON2_MIN_HASH_LEN: Final[int] = 16
+
+_ARGON2ID_STRICT_RE: Final[re.Pattern[str]] = re.compile(
+    r"^\$argon2id\$v=19\$m=[1-9][0-9]{0,9},t=[1-9][0-9]{0,4},p=[1-9][0-9]{0,3}"
+    r"\$[A-Za-z0-9+/]{11,64}\$[A-Za-z0-9+/]{22,86}$"
+)
+
+
+# =============================================================================
+# Exceptions
 # =============================================================================
 
 class AccountError(Exception):
-    """Base for expected, caller-handled account-operation failures."""
+    """Base for expected account-layer failures."""
 
 
 class FirstAdminExistsError(AccountError):
-    """create_first_admin() found an active admin already — initialization is done."""
+    """Raised when first-admin bootstrap has already been completed."""
 
 
 class UsernameTakenError(AccountError):
     def __init__(self, username: str) -> None:
-        super().__init__(f"username already exists: {username!r}")
+        super().__init__(
+            f"username already exists: {username!r}"
+        )
         self.username = username
 
 
 class LastAdminError(AccountError):
-    """The change would leave the deployment with zero active admins."""
+    """Raised when a mutation would remove the final active administrator."""
 
 
-# -----------------------------------------------------------------------------
-# Constraint / index naming convention (Pass 5AM — mission §5)
-#
-# Applied to EVERY metadata object Alembic manages (this Base and
-# core.auth.sessions.SessionBase, which imports the same dict). Without an
-# explicit convention Postgres assigns backend-generated constraint names
-# that Alembic cannot deterministically target in a downgrade
-# (`DROP CONSTRAINT <name>` needs a reproducible name). This is a one-time
-# decision fixed here before Alembic revision 0001 is authored.
-#
-# Pre-Alembic databases created by the old create_all() carry Postgres'
-# default names (users_pkey, users_username_key, ...). Those stay as-is when
-# such a database is *stamped* at 0001 — the baseline compatibility check
-# (migrations/baseline.py) compares column/constraint *semantics*, not names.
-# A dedicated future migration can rename them; that is out of scope here
-# (mission §5) and is recorded in HANDOFF_PASS5AM.md.
-# -----------------------------------------------------------------------------
-NAMING_CONVENTION: dict[str, str] = {
+# =============================================================================
+# SQLAlchemy model
+# =============================================================================
+
+NAMING_CONVENTION: Final[dict[str, str]] = {
     "ix": "ix_%(table_name)s_%(column_0_N_name)s",
     "uq": "uq_%(table_name)s_%(column_0_N_name)s",
     "ck": "ck_%(table_name)s_%(constraint_name)s",
@@ -159,239 +143,380 @@ NAMING_CONVENTION: dict[str, str] = {
 
 
 class Base(DeclarativeBase):
-    metadata = MetaData(naming_convention=NAMING_CONVENTION)
+    metadata = MetaData(
+        naming_convention=NAMING_CONVENTION
+    )
 
 
 class User(Base):
     __tablename__ = "users"
 
-    # P3-7: DB-level guard matching APPROVED_ROLES. Added by migration
-    # 0003_users_role_check (with a fail-closed pre-check for existing rows).
     __table_args__ = (
-        CheckConstraint("role IN ('operator', 'admin')", name="role"),
+        CheckConstraint(
+            "role IN ('operator', 'admin')",
+            name="role",
+        ),
     )
 
     user_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
     )
+
     username: Mapped[str] = mapped_column(
-        String(128), unique=True, nullable=False, index=True
+        String(128),
+        unique=True,
+        nullable=False,
+        index=True,
     )
-    email: Mapped[Optional[str]] = mapped_column(String(255), unique=True, nullable=True)
-    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    role: Mapped[str] = mapped_column(String(32), nullable=False, default="operator")
-    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    email: Mapped[str | None] = mapped_column(
+        String(255),
+        unique=True,
+        nullable=True,
+    )
+
+    password_hash: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+
+    role: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="operator",
+    )
+
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
-        default=lambda: datetime.now(timezone.utc),
+        default=lambda: datetime.now(
+            timezone.utc
+        ),
     )
-    last_login_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True
+
+    last_login_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )
 
 
 # =============================================================================
-# Engine / session factory
+# Environment / DB factory
 # =============================================================================
 
 _engine: AsyncEngine | None = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
+_factory_lock = threading.Lock()
+
+
+def _environment() -> str:
+    raw = (
+        os.getenv("SENTINEL_ENV")
+        or os.getenv("S43_ENV")
+        or "production"
+    ).strip().lower()
+
+    aliases = {
+        "dev": "development",
+        "local": "development",
+        "prod": "production",
+        "stage": "staging",
+    }
+
+    return aliases.get(
+        raw,
+        raw,
+    )
+
+
+def _is_local() -> bool:
+    return _environment() in _LOCAL_ENVIRONMENTS
+
+
+def _env_bool(
+    name: str,
+    default: bool,
+    *,
+    strict: bool,
+) -> bool:
+    raw = os.getenv(name)
+
+    if raw is None or not raw.strip():
+        return default
+
+    normalized = raw.strip().lower()
+
+    if normalized in _TRUE_VALUES:
+        return True
+
+    if normalized in _FALSE_VALUES:
+        return False
+
+    if strict:
+        raise RuntimeError(
+            f"{name} must be boolean; got {raw!r}"
+        )
+
+    logger.warning(
+        "Invalid boolean for %s=%r; using default %s",
+        name,
+        raw,
+        default,
+    )
+    return default
 
 
 def _database_url() -> str:
-    url = os.getenv("DATABASE_URL", "").strip()
+    url = os.getenv(
+        "DATABASE_URL",
+        "",
+    ).strip()
+
     if not url:
         raise RuntimeError(
-            "DATABASE_URL is not set. Expected "
-            "postgresql+asyncpg://s43:<password>@s43-db:5432/s43 — see "
-            "docker-compose.yml."
+            "DATABASE_URL is not configured"
         )
+
+    if not url.startswith(
+        (
+            "postgresql+asyncpg://",
+            "sqlite+aiosqlite://",
+        )
+    ):
+        raise RuntimeError(
+            "DATABASE_URL must use a supported async SQLAlchemy driver"
+        )
+
     return url
 
 
 def get_engine() -> AsyncEngine:
     global _engine
+
     if _engine is None:
-        _engine = create_async_engine(_database_url(), pool_pre_ping=True)
+        with _factory_lock:
+            if _engine is None:
+                _engine = create_async_engine(
+                    _database_url(),
+                    pool_pre_ping=True,
+                )
+
     return _engine
 
 
 def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
     global _sessionmaker
+
     if _sessionmaker is None:
-        _sessionmaker = async_sessionmaker(get_engine(), expire_on_commit=False)
+        with _factory_lock:
+            if _sessionmaker is None:
+                _sessionmaker = async_sessionmaker(
+                    get_engine(),
+                    expire_on_commit=False,
+                )
+
     return _sessionmaker
 
 
-_LOCAL_ENVIRONMENTS = frozenset({"development", "dev", "local", "test"})
+async def dispose_engine() -> None:
+    """Dispose the cached engine during application shutdown."""
+    global _engine, _sessionmaker
+
+    with _factory_lock:
+        engine = _engine
+        _engine = None
+        _sessionmaker = None
+
+    if engine is not None:
+        await engine.dispose()
 
 
-def _schema_is_alembic_managed() -> bool:
-    """
-    True when the production schema is owned by Alembic in this environment and
-    ``create_all()`` must NOT run (it would race the migration Job's DDL and
-    create a second, uncoordinated schema-evolution path —
-    MIGRATION_ARCHITECTURE_PASS5AM.md §11/§24).
+def clear_db_factories_for_tests() -> None:
+    """Clear cached DB factories. Tests must dispose active engines first."""
+    global _engine, _sessionmaker
 
-    Non-local environments are Alembic-managed. ``S43_SCHEMA_CREATE_ALL``
-    (true/false) overrides either way — an escape hatch, not a routine knob.
-    """
-    raw = os.getenv("S43_SCHEMA_CREATE_ALL")
-    if raw is not None:
-        return raw.strip().lower() not in {"1", "true", "yes", "on"}
-    env = os.getenv("SENTINEL_ENV", "production").strip().lower()
-    return env not in _LOCAL_ENVIRONMENTS
+    with _factory_lock:
+        _engine = None
+        _sessionmaker = None
+
+
+def _schema_create_all_enabled() -> bool:
+    """Permit create_all only as an explicit local/test convenience."""
+    configured = os.getenv(
+        "S43_SCHEMA_CREATE_ALL"
+    )
+
+    if configured is None:
+        return _is_local()
+
+    return _env_bool(
+        "S43_SCHEMA_CREATE_ALL",
+        False,
+        strict=not _is_local(),
+    )
 
 
 async def init_models() -> None:
-    """
-    Dev / test convenience: create the ``users`` table if it is missing
-    (idempotent ``Base.metadata.create_all``).
-
-    In a non-local environment the production PostgreSQL schema is owned by
-    **Alembic** — ``alembic upgrade head`` run as an explicit operator / one
-    -shot Job step, never by an API worker
-    (MIGRATION_ARCHITECTURE_PASS5AM.md §11 / §25). There this function is a
-    deliberate **no-op** so it can never race the migration Job's DDL. The
-    runtime schema-version check (``core.auth.schema_version``) is what keeps a
-    pod from serving against an un-migrated database.
-    """
-    if _schema_is_alembic_managed():
-        logger.info(
-            "init_models(): schema is Alembic-managed in this environment "
-            "(SENTINEL_ENV=%s); skipping create_all — run `alembic upgrade head`",
-            os.getenv("SENTINEL_ENV", "production"),
+    """Create tables only when explicitly permitted in local/test environments."""
+    if not _schema_create_all_enabled():
+        logger.debug(
+            "init_models(): create_all disabled; schema must be migrated externally"
         )
         return
+
+    if not _is_local():
+        raise RuntimeError(
+            "S43_SCHEMA_CREATE_ALL is not permitted outside local/test"
+        )
+
     engine = get_engine()
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+
+    async with engine.begin() as connection:
+        await connection.run_sync(
+            Base.metadata.create_all
+        )
 
 
 # =============================================================================
 # Password hashing
-#
-# Argon2id is memory-hard by design (~34 ms / ~64 MiB per hash or verify with
-# the argon2-cffi defaults). Running that on the asyncio event loop stalls the
-# whole worker for the duration, and reverify_password() calls verify on EVERY
-# protected request — so the async helpers below push the work to a bounded
-# thread pool (asyncio.to_thread -> the default ThreadPoolExecutor,
-# max_workers = min(32, cpu+4)). The sync functions are kept for non-async
-# callers (e.g. a future CLI) and for tests.
 # =============================================================================
 
-_ph = PasswordHasher()
-
-# Fixed dummy hash. authenticate_user() verifies against this on the
-# account-miss / inactive path so an unknown or disabled account does not
-# return visibly faster than a wrong password on a real active account.
-_DUMMY_HASH = _ph.hash("s43-timing-equalizer-not-a-real-password")
-
-
-def hash_password(password: str) -> str:
-    return _ph.hash(password)
-
-
-def verify_password(password: str, password_hash: str) -> bool:
-    """
-    Pure predicate: True iff `password` matches `password_hash`. Any failure —
-    wrong password, structurally invalid hash, corrupt hash body, a None/non-str
-    stored value — returns False (fail closed), never raises. A malformed
-    stored credential must not authenticate and must not crash the caller.
-    """
-    try:
-        return _ph.verify(password_hash, password)
-    except (VerificationError, InvalidHash, TypeError, AttributeError):
-        return False
-
-
-async def hash_password_async(password: str) -> str:
-    return await asyncio.to_thread(hash_password, password)
-
-
-async def verify_password_async(password: str, password_hash: str) -> bool:
-    return await asyncio.to_thread(verify_password, password, password_hash)
-
-
-# =============================================================================
-# Argon2id encoded-hash validation (PR #257 blocker 1)
-#
-# Canonical validator for anything claiming to be an Argon2id encoded hash
-# that reaches this codebase from configuration (S43_OPERATOR_PASSWORD_HASH)
-# rather than from hash_password() itself. core.api.routers.auth and
-# core.api.main both call THIS function — no second copy of the policy.
-#
-# argon2.extract_parameters() alone is not a safe validator: it silently
-# drops characters outside the base64 alphabet instead of rejecting them
-# (so "!!!notbase64!!!" decodes to *something* rather than raising), accepts
-# any integer version number including ones this library has never produced
-# (v=99), and enforces no bounds at all on memory_cost / time_cost /
-# parallelism / salt_len / hash_len — a hash with m=4294967295 parses
-# without error and would then be handed straight to a real Argon2 verify,
-# which is a memory/CPU-exhaustion vector on every login attempt. The strict
-# regex below is the actual gate; extract_parameters() only runs afterward,
-# against input already known to use a clean base64 alphabet, so its
-# decoded salt_len/hash_len/cost figures can be trusted for the bounds
-# checks that follow.
-# =============================================================================
-
-_ARGON2ID_STRICT_RE = re.compile(
-    r"^\$argon2id\$v=19\$m=[1-9][0-9]{0,9},t=[1-9][0-9]{0,4},p=[1-9][0-9]{0,3}"
-    r"\$[A-Za-z0-9+/]{11,64}\$[A-Za-z0-9+/]{22,86}$"
+_ph = PasswordHasher(
+    time_cost=ARGON2_TIME_COST,
+    memory_cost=ARGON2_MEMORY_COST_KIB,
+    parallelism=ARGON2_PARALLELISM,
+    hash_len=ARGON2_HASH_LEN,
+    salt_len=ARGON2_SALT_LEN,
+    type=Argon2Type.ID,
 )
 
-# Defensible bounds, not a compatibility knob. hash_password() (PasswordHasher()
-# defaults) produces m=65536 KiB, t=3, p=4, salt_len=16, hash_len=32 --
-# comfortably inside every bound below. A configured hash outside these
-# bounds is rejected as a config error rather than accepted and run through
-# a real (and, at the extremes, resource-exhausting) Argon2 verify.
-_ARGON2_MIN_MEMORY_COST_KIB = 8 * 1024
-_ARGON2_MAX_MEMORY_COST_KIB = 1024 * 1024
-_ARGON2_MIN_TIME_COST = 1
-_ARGON2_MAX_TIME_COST = 32
-_ARGON2_MIN_PARALLELISM = 1
-_ARGON2_MAX_PARALLELISM = 16
-_ARGON2_MIN_SALT_LEN = 16
-_ARGON2_MIN_HASH_LEN = 16
-_ARGON2_MAX_ENCODED_LEN = 512
+# Created from the exact same configured PasswordHasher used for real accounts.
+_DUMMY_HASH = _ph.hash(
+    "s43-timing-equalizer-not-a-real-password"
+)
 
 
-def is_valid_argon2id_hash(value: object) -> bool:
-    """
-    True iff `value` is a well-formed Argon2id encoded hash this deployment
-    would accept as S43_OPERATOR_PASSWORD_HASH: Argon2id only (not
-    Argon2i/Argon2d), Argon2 version 19 only, a strict unpadded-base64 salt
-    and hash (no stray characters, no missing segments, no truncation), and
-    cost parameters inside defensible bounds. Never raises -- any malformed,
-    oversized, or non-string input returns False.
+def hash_password(
+    password: str,
+) -> str:
+    if not isinstance(
+        password,
+        str,
+    ) or not password:
+        raise ValueError(
+            "password must not be empty"
+        )
 
-    This is a structural/config validator, not a verifier: it says nothing
-    about whether a given plaintext password matches. Use
-    verify_password() / verify_password_async() for that, exactly as before.
-    """
-    if not isinstance(value, str) or not value:
+    return _ph.hash(
+        password
+    )
+
+
+def verify_password(
+    password: str,
+    password_hash: str,
+) -> bool:
+    try:
+        return bool(
+            _ph.verify(
+                password_hash,
+                password,
+            )
+        )
+
+    except (
+        VerificationError,
+        InvalidHash,
+        TypeError,
+        AttributeError,
+    ):
         return False
-    if len(value) > _ARGON2_MAX_ENCODED_LEN:
+
+
+async def hash_password_async(
+    password: str,
+) -> str:
+    return await asyncio.to_thread(
+        hash_password,
+        password,
+    )
+
+
+async def verify_password_async(
+    password: str,
+    password_hash: str,
+) -> bool:
+    return await asyncio.to_thread(
+        verify_password,
+        password,
+        password_hash,
+    )
+
+
+def is_valid_argon2id_hash(
+    value: object,
+) -> bool:
+    """Validate configured Argon2id hashes before handing them to verification."""
+    if (
+        not isinstance(
+            value,
+            str,
+        )
+        or not value
+        or len(
+            value
+        )
+        > _ARGON2_MAX_ENCODED_LEN
+    ):
         return False
-    if not _ARGON2ID_STRICT_RE.match(value):
+
+    if not _ARGON2ID_STRICT_RE.fullmatch(
+        value
+    ):
         return False
 
     try:
-        params = _extract_argon2_parameters(value)
+        params = extract_parameters(
+            value
+        )
     except Exception:
         return False
 
-    if params.type is not _Argon2Type.ID:
+    if params.type is not Argon2Type.ID:
         return False
-    if not (_ARGON2_MIN_MEMORY_COST_KIB <= params.memory_cost <= _ARGON2_MAX_MEMORY_COST_KIB):
+
+    if not (
+        _ARGON2_MIN_MEMORY_COST_KIB
+        <= params.memory_cost
+        <= _ARGON2_MAX_MEMORY_COST_KIB
+    ):
         return False
-    if not (_ARGON2_MIN_TIME_COST <= params.time_cost <= _ARGON2_MAX_TIME_COST):
+
+    if not (
+        _ARGON2_MIN_TIME_COST
+        <= params.time_cost
+        <= _ARGON2_MAX_TIME_COST
+    ):
         return False
-    if not (_ARGON2_MIN_PARALLELISM <= params.parallelism <= _ARGON2_MAX_PARALLELISM):
+
+    if not (
+        _ARGON2_MIN_PARALLELISM
+        <= params.parallelism
+        <= _ARGON2_MAX_PARALLELISM
+    ):
         return False
+
     if params.salt_len < _ARGON2_MIN_SALT_LEN:
         return False
+
     if params.hash_len < _ARGON2_MIN_HASH_LEN:
         return False
 
@@ -402,59 +527,133 @@ def is_valid_argon2id_hash(value: object) -> bool:
 # Queries
 # =============================================================================
 
-async def count_active_admins(session: AsyncSession) -> int:
+async def count_active_admins(
+    session: AsyncSession,
+) -> int:
     result = await session.execute(
-        select(func.count())
-        .select_from(User)
-        .where(User.role == "admin", User.is_active.is_(True))
+        select(
+            func.count()
+        )
+        .select_from(
+            User
+        )
+        .where(
+            User.role == "admin",
+            User.is_active.is_(
+                True
+            ),
+        )
     )
-    return int(result.scalar_one())
+
+    return int(
+        result.scalar_one()
+    )
 
 
-async def get_user_by_username(session: AsyncSession, username: str) -> Optional[User]:
-    result = await session.execute(select(User).where(User.username == username))
+async def get_user_by_username(
+    session: AsyncSession,
+    username: str,
+) -> User | None:
+    result = await session.execute(
+        select(
+            User
+        ).where(
+            User.username
+            == username
+        )
+    )
+
     return result.scalar_one_or_none()
 
 
-async def get_user_by_id(session: AsyncSession, user_id: uuid.UUID) -> Optional[User]:
-    result = await session.execute(select(User).where(User.user_id == user_id))
+async def get_user_by_id(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+) -> User | None:
+    result = await session.execute(
+        select(
+            User
+        ).where(
+            User.user_id
+            == user_id
+        )
+    )
+
     return result.scalar_one_or_none()
 
 
-async def list_users(session: AsyncSession) -> list[User]:
-    """All user rows, oldest first. Small table (operators/admins for one
-    deployment), so no pagination — the admin UI shows the whole list."""
-    result = await session.execute(select(User).order_by(User.created_at))
-    return list(result.scalars().all())
+async def list_users(
+    session: AsyncSession,
+    *,
+    limit: int = 500,
+) -> list[User]:
+    if not 1 <= limit <= 500:
+        raise ValueError(
+            "limit must be between 1 and 500"
+        )
+
+    result = await session.execute(
+        select(
+            User
+        )
+        .order_by(
+            User.created_at,
+            User.user_id,
+        )
+        .limit(
+            limit
+        )
+    )
+
+    return list(
+        result.scalars().all()
+    )
 
 
 # =============================================================================
-# Transaction ownership
-#
-# The helpers below do NOT commit. They validate, mutate ORM state, and
-# flush() only when they need a DB-assigned result or want an IntegrityError
-# to surface inside the caller's transaction. The REQUEST / SERVICE that calls
-# them owns the transaction: it commits on complete success and rolls back on
-# any failure (core/auth/deps.py::get_db_session rolls back on exception;
-# routers commit explicitly). This lets a caller compose several helper calls
-# into one atomic operation — e.g. PATCH /users changing role AND is_active is
-# now one transaction, not two.
+# Concurrency invariant
 # =============================================================================
 
-async def _pg_advisory_xact_lock(session: AsyncSession, key: int) -> None:
-    """
-    Take a PostgreSQL transaction-scoped advisory lock (auto-released on
-    COMMIT or ROLLBACK). Blocks until acquired. No-op on any non-PostgreSQL
-    backend — advisory locks are a PostgreSQL feature and the in-memory fakes
-    used by the isolated test suites don't model cross-process concurrency.
-    """
+async def _pg_advisory_xact_lock(
+    session: AsyncSession,
+    key: int,
+) -> None:
     try:
-        dialect = session.get_bind().dialect.name
+        bind = session.get_bind()
+        dialect_name = bind.dialect.name
     except Exception:
-        dialect = ""
-    if dialect != "postgresql":
+        dialect_name = ""
+
+    if dialect_name != "postgresql":
         return
-    await session.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": key})
+
+    await session.execute(
+        text(
+            "SELECT pg_advisory_xact_lock(:key)"
+        ),
+        {
+            "key": key
+        },
+    )
+
+
+# =============================================================================
+# Mutations
+# =============================================================================
+
+def _validate_role(
+    role: str,
+) -> str:
+    normalized = str(
+        role
+    ).strip().lower()
+
+    if normalized not in APPROVED_ROLES:
+        raise ValueError(
+            f"role must be one of {sorted(APPROVED_ROLES)}"
+        )
+
+    return normalized
 
 
 async def create_user(
@@ -465,20 +664,24 @@ async def create_user(
     role: str = "operator",
     email: str | None = None,
 ) -> User:
-    """Add a new user to `session` and flush (assigning user_id / created_at
-    and surfacing a unique-constraint violation as IntegrityError now, inside
-    the caller's transaction). Does NOT commit — the caller does."""
-    if role not in APPROVED_ROLES:
-        raise ValueError(f"role must be one of {sorted(APPROVED_ROLES)}")
+    normalized_role = _validate_role(
+        role
+    )
 
     user = User(
         username=username,
         email=email,
-        password_hash=await hash_password_async(password),
-        role=role,
+        password_hash=await hash_password_async(
+            password
+        ),
+        role=normalized_role,
     )
-    session.add(user)
+
+    session.add(
+        user
+    )
     await session.flush()
+
     return user
 
 
@@ -489,90 +692,115 @@ async def create_first_admin(
     password: str,
     email: str | None = None,
 ) -> User:
-    """
-    Create the first admin account, exactly once under concurrency.
+    await _pg_advisory_xact_lock(
+        session,
+        ADMIN_INVARIANT_LOCK_KEY,
+    )
 
-    Serialized cluster-wide by ADMIN_INVARIANT_LOCK_KEY (a PostgreSQL
-    transaction advisory lock): a second concurrent caller blocks on the lock
-    until the first commits, then sees count_active_admins() > 0 and gets
-    FirstAdminExistsError. The lock is held through the INSERT because neither
-    this function nor create_user() commits — the caller (POST /bootstrap/admin)
-    owns the transaction.
-
-    Raises FirstAdminExistsError / UsernameTakenError; the caller maps both to
-    409. Does NOT commit.
-    """
-    await _pg_advisory_xact_lock(session, ADMIN_INVARIANT_LOCK_KEY)
-
-    if await count_active_admins(session) > 0:
+    if await count_active_admins(
+        session
+    ) > 0:
         raise FirstAdminExistsError()
-    if await get_user_by_username(session, username) is not None:
-        raise UsernameTakenError(username)
+
+    if await get_user_by_username(
+        session,
+        username,
+    ) is not None:
+        raise UsernameTakenError(
+            username
+        )
 
     return await create_user(
-        session, username=username, password=password, role="admin", email=email
+        session,
+        username=username,
+        password=password,
+        role="admin",
+        email=email,
     )
 
 
 async def authenticate_user(
-    session: AsyncSession, username: str, password: str
-) -> Optional[User]:
-    """
-    Read-only. Returns the User on success; None on any failure (unknown
-    username, inactive account, wrong password) — callers must not distinguish
-    these to the client. Performs NO write and NO commit: recording a login
-    timestamp is the caller's job (see
-    core.api.routers.auth._validate_credentials).
+    session: AsyncSession,
+    username: str,
+    password: str,
+) -> User | None:
+    user = await get_user_by_username(
+        session,
+        username,
+    )
 
-    On the account-miss / inactive path it still performs one Argon2 verify
-    (against a fixed dummy hash) so the response time does not obviously reveal
-    whether an account exists or is active.
-    """
-    user = await get_user_by_username(session, username)
-    if user is None or not user.is_active:
-        await verify_password_async(password, _DUMMY_HASH)
+    if (
+        user is None
+        or not user.is_active
+    ):
+        await verify_password_async(
+            password,
+            _DUMMY_HASH,
+        )
         return None
-    if not await verify_password_async(password, user.password_hash):
+
+    if not await verify_password_async(
+        password,
+        user.password_hash,
+    ):
         return None
+
     return user
 
 
-async def record_login(session: AsyncSession, user: User) -> None:
-    """Stamp last_login_at = now on `user`. Does NOT commit — the login route
-    commits. Only /auth/login calls this; the per-request reverify path
-    (reverify_password) deliberately does not."""
-    user.last_login_at = datetime.now(timezone.utc)
+async def record_login(
+    session: AsyncSession,
+    user: User,
+) -> None:
+    user.last_login_at = (
+        datetime.now(
+            timezone.utc
+        )
+    )
+
     await session.flush()
 
 
 async def set_user_active(
-    session: AsyncSession, user: User, *, is_active: bool
+    session: AsyncSession,
+    user: User,
+    *,
+    is_active: bool,
 ) -> User:
-    """Deactivate (is_active=False) or reactivate an account. A deactivated
-    user cannot log in and cannot pass reverify_password() on subsequent
-    requests — authenticate_user() returns None for `not user.is_active`
-    before the password is even checked. Does NOT commit."""
-    user.is_active = is_active
+    user.is_active = bool(
+        is_active
+    )
+
     await session.flush()
     return user
 
 
-async def set_user_role(session: AsyncSession, user: User, *, role: str) -> User:
-    """Does NOT commit."""
-    if role not in APPROVED_ROLES:
-        raise ValueError(f"role must be one of {sorted(APPROVED_ROLES)}")
-    user.role = role
+async def set_user_role(
+    session: AsyncSession,
+    user: User,
+    *,
+    role: str,
+) -> User:
+    user.role = _validate_role(
+        role
+    )
+
     await session.flush()
     return user
 
 
 async def set_user_password(
-    session: AsyncSession, user: User, *, password: str
+    session: AsyncSession,
+    user: User,
+    *,
+    password: str,
 ) -> User:
-    """Overwrite the stored Argon2id hash. Used by the admin password-reset
-    endpoint; there is no self-service "change my password" flow yet. Does
-    NOT commit."""
-    user.password_hash = await hash_password_async(password)
+    user.password_hash = (
+        await hash_password_async(
+            password
+        )
+    )
+
     await session.flush()
     return user
 
@@ -582,15 +810,18 @@ __all__ = [
     "APPROVED_ROLES",
     "AccountError",
     "Base",
-    "NAMING_CONVENTION",
     "FirstAdminExistsError",
     "LastAdminError",
+    "NAMING_CONVENTION",
     "User",
     "UsernameTakenError",
+    "_pg_advisory_xact_lock",
     "authenticate_user",
+    "clear_db_factories_for_tests",
     "count_active_admins",
     "create_first_admin",
     "create_user",
+    "dispose_engine",
     "get_engine",
     "get_sessionmaker",
     "get_user_by_id",
@@ -606,5 +837,4 @@ __all__ = [
     "set_user_role",
     "verify_password",
     "verify_password_async",
-    "_pg_advisory_xact_lock",
 ]
