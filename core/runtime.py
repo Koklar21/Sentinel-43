@@ -4,412 +4,538 @@
 # Copyright (c) 2026 Justin Armstrong
 # All Rights Reserved.
 #
-# This file is part of the Sentinel-43 platform and constitutes original
-# intellectual property of the copyright holder.
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
 #
-# Sentinel-43 is distributed under a dual-license model:
-#
-#   1. GNU Affero General Public License (AGPL v3.0)
-#      for open-source use, modification, and distribution.
-#
-#   2. Commercial License
-#      for proprietary, enterprise, government, or other commercial use
-#      not permitted under the AGPL v3.0.
-#
-# Unauthorized copying, redistribution, relicensing, reverse engineering,
-# or commercial exploitation outside the terms of the applicable license
-# is strictly prohibited.
-#
-# By accessing, modifying, distributing, or using this software, you agree
-# to comply with the terms of the applicable license.
-#
-# License Information:
-# AGPL v3.0: https://www.gnu.org/licenses/agpl-3.0.en.html
-#
-# Commercial Licensing:
-# Contact the copyright holder for commercial licensing terms.
-#
-# Sentinel-43™
-# Original Work and Protected Intellectual Property.
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
+
+"""Sentinel-43 runtime lifecycle state.
+
+This module owns process-local runtime state and bounded worker bookkeeping.
+
+It intentionally performs:
+    - no environment reads
+    - no Watchtower/network calls
+    - no implicit logging configuration
+    - no traceback serialization
+    - no automatic heartbeat thread creation
+"""
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
-import traceback
+import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Callable
-
-from core.logging_init import get_logger
-from core.monitoring.watchtower_client import WATCHTOWER_URL, watchtower_request
+from enum import StrEnum
+from types import MappingProxyType
+from typing import Any, Callable, Mapping, Protocol
 
 
-RUNTIME_MODULE_ID = os.getenv("S43_RUNTIME_MODULE_ID", "sentinel-43-runtime")
-RUNTIME_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
-
-RUNTIME_HEARTBEAT_SECONDS = int(os.getenv("S43_RUNTIME_HEARTBEAT_SECONDS", "15"))
+logger = logging.getLogger(__name__)
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+class RuntimeState(StrEnum):
+    INITIALIZING = "INITIALIZING"
+    STARTING = "STARTING"
+    ACTIVE = "ACTIVE"
+    STOPPING = "STOPPING"
+    STOPPED = "STOPPED"
+    DEGRADED = "DEGRADED"
 
 
-def _watchtower_request(
-    method: str,
-    path: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    # DEFECT_INVENTORY.md D-16 class of bug: this used to build the request
-    # without the internal service token, so every call here 401'd against
-    # Watchtower. (Not currently imported by any live code path — fixed for
-    # consistency with the other 12 call sites of the same bug.)
-    return watchtower_request(method, path, payload)
+class WorkerState(StrEnum):
+    REGISTERED = "REGISTERED"
+    RUNNING = "RUNNING"
+    STOPPED = "STOPPED"
+    FAILED = "FAILED"
 
 
-@dataclass
+class RuntimeEventSink(Protocol):
+    def emit(
+        self,
+        event: Mapping[str, Any],
+    ) -> None:
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeConfig:
+    module_id: str = "sentinel43-runtime"
+    version: str = "unknown"
+    mode: str = "normal"
+    dry_run: bool = False
+    max_workers: int = 32
+    worker_join_timeout_seconds: float = 5.0
+
+    def __post_init__(self) -> None:
+        module_id = str(
+            self.module_id
+        ).strip()
+
+        version = str(
+            self.version
+        ).strip()
+
+        mode = str(
+            self.mode
+        ).strip()
+
+        if not module_id:
+            raise ValueError(
+                "module_id must not be empty"
+            )
+
+        if not version:
+            raise ValueError(
+                "version must not be empty"
+            )
+
+        if not mode:
+            raise ValueError(
+                "mode must not be empty"
+            )
+
+        if not 1 <= self.max_workers <= 256:
+            raise ValueError(
+                "max_workers must be between 1 and 256"
+            )
+
+        if not 0.1 <= self.worker_join_timeout_seconds <= 60.0:
+            raise ValueError(
+                "worker_join_timeout_seconds must be between 0.1 and 60"
+            )
+
+        object.__setattr__(
+            self,
+            "module_id",
+            module_id,
+        )
+
+        object.__setattr__(
+            self,
+            "version",
+            version,
+        )
+
+        object.__setattr__(
+            self,
+            "mode",
+            mode,
+        )
+
+
+@dataclass(slots=True)
 class RuntimeWorker:
     name: str
     target: Callable[[], None]
-    daemon: bool = True
+    daemon: bool = False
+    state: WorkerState = WorkerState.REGISTERED
     thread: threading.Thread | None = None
-    started_ts: float | None = None
-    stopped_ts: float | None = None
-    last_error: str | None = None
-
-    def is_alive(self) -> bool:
-        return bool(self.thread and self.thread.is_alive())
-
-    def to_status(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "alive": self.is_alive(),
-            "started_ts": self.started_ts,
-            "stopped_ts": self.stopped_ts,
-            "last_error": self.last_error,
-        }
-
-
-@dataclass
-class SentinelRuntime:
-    mode: str = "normal"
-    dry_run: bool = False
-
-    _stop_event: threading.Event = field(init=False)
-    _workers: dict[str, RuntimeWorker] = field(init=False, default_factory=dict)
-    _logger: Any = field(init=False)
-    _lock: threading.RLock = field(init=False)
-    _started_ts: float = field(init=False)
-    _last_heartbeat_ts: float | None = field(init=False, default=None)
-    _last_watchtower_error: dict[str, Any] | None = field(init=False, default=None)
-    _runtime_state: str = field(init=False, default="INITIALIZING")
+    started_monotonic: float | None = None
+    stopped_monotonic: float | None = None
+    error_type: str | None = None
 
     def __post_init__(self) -> None:
-        self._stop_event = threading.Event()
-        self._workers = {}
-        self._logger = get_logger(self.__class__.__name__)
-        self._lock = threading.RLock()
-        self._started_ts = time.time()
+        self.name = str(
+            self.name
+        ).strip()
 
-    def uptime_seconds(self) -> float:
-        return round(time.time() - self._started_ts, 3)
+        if not self.name:
+            raise ValueError(
+                "worker name must not be empty"
+            )
 
-    def _report_watchtower_result(self, result: dict[str, Any]) -> None:
-        with self._lock:
-            if "error" in result:
-                self._last_watchtower_error = result
-            else:
-                self._last_watchtower_error = None
+        if not callable(
+            self.target
+        ):
+            raise TypeError(
+                "worker target must be callable"
+            )
 
-    def register_with_watchtower(self) -> dict[str, Any]:
-        payload = {
-            "module_id": RUNTIME_MODULE_ID,
-            "module_type": "runtime-manager",
-            "version": RUNTIME_VERSION,
-            "endpoint": None,
-            "capabilities": [
-                "runtime_lifecycle",
-                "worker_management",
-                "worker_failure_reporting",
-                "runtime_heartbeat",
-                "core_orchestration",
-            ],
-            "metadata": {
-                "mode": self.mode,
-                "dry_run": self.dry_run,
-                "timestamp": utc_now(),
-            },
-        }
-
-        result = _watchtower_request("POST", "/watchtower/modules/register", payload)
-        self._report_watchtower_result(result)
-        return result
-
-    def send_heartbeat(self, status: str = "online", message: str = "Runtime heartbeat online") -> dict[str, Any]:
-        payload = {
-            "module_id": RUNTIME_MODULE_ID,
-            "status": status,
-            "metrics": {
-                "mode": self.mode,
-                "dry_run": self.dry_run,
-                "runtime_state": self._runtime_state,
-                "uptime_seconds": self.uptime_seconds(),
-                "worker_count": len(self._workers),
-                "workers": [worker.to_status() for worker in self._workers.values()],
-                "timestamp": utc_now(),
-            },
-            "message": message,
-        }
-
-        result = _watchtower_request("POST", "/watchtower/modules/heartbeat", payload)
-
-        with self._lock:
-            if "error" not in result:
-                self._last_heartbeat_ts = time.time()
-
-        self._report_watchtower_result(result)
-        return result
-
-    def report_dependency(
+    def is_alive(
         self,
-        name: str,
-        status: str,
-        details: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        payload = {
-            "name": name,
-            "status": status,
-            "version": RUNTIME_VERSION,
-            "details": {
-                "runtime_module_id": RUNTIME_MODULE_ID,
-                "mode": self.mode,
-                "dry_run": self.dry_run,
-                "runtime_state": self._runtime_state,
-                "uptime_seconds": self.uptime_seconds(),
-                "timestamp": utc_now(),
-                **(details or {}),
-            },
-        }
+    ) -> bool:
+        return bool(
+            self.thread
+            and self.thread.is_alive()
+        )
 
-        result = _watchtower_request("POST", "/watchtower/dependencies/report", payload)
-        self._report_watchtower_result(result)
-        return result
-
-    def report_runtime_event(
+    def status(
         self,
-        kind: str,
-        status: str,
-        details: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        payload = {
-            "event": {
-                "kind": kind,
-                "source": RUNTIME_MODULE_ID,
-                "status": status,
-                "runtime_state": self._runtime_state,
-                "mode": self.mode,
-                "dry_run": self.dry_run,
-                "uptime_seconds": self.uptime_seconds(),
-                "details": details or {},
-                "timestamp": utc_now(),
+    ) -> Mapping[str, Any]:
+        return MappingProxyType(
+            {
+                "name": self.name,
+                "state": self.state.value,
+                "alive": self.is_alive(),
+                "started_monotonic": self.started_monotonic,
+                "stopped_monotonic": self.stopped_monotonic,
+                "error_type": self.error_type,
             }
-        }
-
-        result = _watchtower_request("POST", "/watchtower/analyze", payload)
-        self._report_watchtower_result(result)
-        return result
-
-    def add_worker(self, name: str, target: Callable[[], None], daemon: bool = True) -> None:
-        with self._lock:
-            if name in self._workers:
-                raise ValueError(f"Worker already registered: {name}")
-
-            self._workers[name] = RuntimeWorker(
-                name=name,
-                target=target,
-                daemon=daemon,
-            )
-
-    def _run_worker(self, worker: RuntimeWorker) -> None:
-        worker.started_ts = time.time()
-
-        try:
-            self._logger.info("Worker online: %s", worker.name)
-            self.report_dependency(
-                name=f"worker:{worker.name}",
-                status="online",
-                details={"event": "worker_started"},
-            )
-
-            worker.target()
-
-            worker.stopped_ts = time.time()
-            self.report_dependency(
-                name=f"worker:{worker.name}",
-                status="offline",
-                details={"event": "worker_stopped_cleanly"},
-            )
-
-        except Exception as exc:
-            worker.last_error = str(exc)
-            worker.stopped_ts = time.time()
-
-            self._logger.exception("Worker failed: %s", worker.name)
-
-            self.report_dependency(
-                name=f"worker:{worker.name}",
-                status="failed",
-                details={
-                    "event": "worker_failed",
-                    "error": str(exc),
-                    "traceback": traceback.format_exc(limit=10),
-                },
-            )
-
-            self.send_heartbeat(
-                status="degraded",
-                message=f"Runtime worker failed: {worker.name}",
-            )
-
-            self.report_runtime_event(
-                kind="runtime",
-                status="failed",
-                details={
-                    "worker": worker.name,
-                    "error": str(exc),
-                },
-            )
-
-    def _main_loop(self) -> None:
-        self._logger.info("Main loop online.")
-
-        while not self._stop_event.is_set():
-            time.sleep(1.0)
-
-        self._logger.info("Main loop offline.")
-
-    def _watchtower_heartbeat_loop(self) -> None:
-        self._logger.info("Watchtower heartbeat loop online.")
-
-        while not self._stop_event.wait(RUNTIME_HEARTBEAT_SECONDS):
-            result = self.send_heartbeat(
-                status="online",
-                message="Sentinel-43 runtime heartbeat online",
-            )
-
-            if "error" in result:
-                self._logger.warning("Runtime Watchtower heartbeat failed: %s", result)
-
-        self._logger.info("Watchtower heartbeat loop offline.")
-
-    def start(self) -> None:
-        with self._lock:
-            if self._runtime_state == "ACTIVE":
-                self._logger.warning("Runtime already active.")
-                return
-
-            self._runtime_state = "STARTING"
-
-        self._logger.info(
-            "Starting Sentinel-43 runtime (mode=%s dry_run=%s)",
-            self.mode,
-            self.dry_run,
         )
 
-        self.register_with_watchtower()
-        self.report_dependency(
-            name=RUNTIME_MODULE_ID,
-            status="online",
-            details={"event": "runtime_starting"},
-        )
 
-        self.add_worker("sentinel-main-loop", self._main_loop)
-        self.add_worker("watchtower-heartbeat-loop", self._watchtower_heartbeat_loop)
+class SentinelRuntime:
+    """Bounded, process-local runtime lifecycle coordinator."""
 
-        with self._lock:
-            for worker in self._workers.values():
-                if worker.thread is not None:
-                    continue
+    def __init__(
+        self,
+        config: RuntimeConfig,
+        *,
+        event_sink: RuntimeEventSink | None = None,
+    ) -> None:
+        self._config = config
+        self._event_sink = event_sink
 
-                worker.thread = threading.Thread(
-                    target=self._run_worker,
-                    args=(worker,),
-                    name=worker.name,
-                    daemon=worker.daemon,
-                )
-                worker.thread.start()
+        self._pid = os.getpid()
+        self._process_id = uuid.uuid4().hex
+        self._started_monotonic = time.monotonic()
 
-            self._runtime_state = "ACTIVE"
+        self._state = RuntimeState.INITIALIZING
+        self._workers: dict[
+            str,
+            RuntimeWorker,
+        ] = {}
 
-        self.send_heartbeat(
-            status="online",
-            message="Sentinel-43 runtime active",
-        )
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
 
-    def stop(self) -> None:
-        if self._stop_event.is_set():
+    def _refresh_process_identity_if_forked(
+        self,
+    ) -> None:
+        current_pid = os.getpid()
+
+        if current_pid == self._pid:
             return
 
         with self._lock:
-            self._runtime_state = "STOPPING"
+            if current_pid == self._pid:
+                return
 
-        self._logger.info("Stopping Sentinel-43 runtime...")
+            self._pid = current_pid
+            self._process_id = uuid.uuid4().hex
+            self._started_monotonic = time.monotonic()
+            self._state = RuntimeState.INITIALIZING
+            self._workers.clear()
+            self._stop_event = threading.Event()
 
-        self.report_dependency(
-            name=RUNTIME_MODULE_ID,
-            status="degraded",
-            details={"event": "runtime_stopping"},
+    def _emit(
+        self,
+        event_type: str,
+        *,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        sink = self._event_sink
+
+        if sink is None:
+            return
+
+        event = {
+            "kind": "runtime",
+            "event_type": event_type,
+            "module_id": self._config.module_id,
+            "process_id": self._process_id,
+            "pid": self._pid,
+            "state": self._state.value,
+            "details": dict(
+                details
+                or {}
+            ),
+        }
+
+        try:
+            sink.emit(
+                event
+            )
+        except Exception:
+            logger.debug(
+                "runtime event sink failed",
+                exc_info=True,
+            )
+
+    def uptime_seconds(
+        self,
+    ) -> float:
+        self._refresh_process_identity_if_forked()
+
+        return round(
+            time.monotonic()
+            - self._started_monotonic,
+            3,
         )
 
-        self.send_heartbeat(
-            status="degraded",
-            message="Sentinel-43 runtime stopping",
-        )
+    def add_worker(
+        self,
+        name: str,
+        target: Callable[[], None],
+        *,
+        daemon: bool = False,
+    ) -> None:
+        self._refresh_process_identity_if_forked()
 
-        self._stop_event.set()
+        worker = RuntimeWorker(
+            name=name,
+            target=target,
+            daemon=daemon,
+        )
 
         with self._lock:
-            workers = list(self._workers.values())
+            if self._state not in {
+                RuntimeState.INITIALIZING,
+                RuntimeState.STOPPED,
+            }:
+                raise RuntimeError(
+                    "workers may only be registered before runtime start"
+                )
+
+            if worker.name in self._workers:
+                raise ValueError(
+                    f"worker already registered: {worker.name}"
+                )
+
+            if len(
+                self._workers
+            ) >= self._config.max_workers:
+                raise RuntimeError(
+                    "runtime worker capacity reached"
+                )
+
+            self._workers[
+                worker.name
+            ] = worker
+
+    def _run_worker(
+        self,
+        worker: RuntimeWorker,
+    ) -> None:
+        worker.started_monotonic = (
+            time.monotonic()
+        )
+        worker.state = WorkerState.RUNNING
+
+        self._emit(
+            "worker_started",
+            details={
+                "worker": worker.name,
+            },
+        )
+
+        try:
+            worker.target()
+
+        except Exception as exc:
+            worker.error_type = (
+                type(
+                    exc
+                ).__name__
+            )
+            worker.state = WorkerState.FAILED
+            worker.stopped_monotonic = (
+                time.monotonic()
+            )
+
+            with self._lock:
+                if self._state is RuntimeState.ACTIVE:
+                    self._state = RuntimeState.DEGRADED
+
+            logger.exception(
+                "runtime worker failed: %s",
+                worker.name,
+            )
+
+            self._emit(
+                "worker_failed",
+                details={
+                    "worker": worker.name,
+                    "error_type": worker.error_type,
+                },
+            )
+
+            return
+
+        worker.state = WorkerState.STOPPED
+        worker.stopped_monotonic = (
+            time.monotonic()
+        )
+
+        self._emit(
+            "worker_stopped",
+            details={
+                "worker": worker.name,
+            },
+        )
+
+    def start(
+        self,
+    ) -> None:
+        self._refresh_process_identity_if_forked()
+
+        with self._lock:
+            if self._state in {
+                RuntimeState.STARTING,
+                RuntimeState.ACTIVE,
+            }:
+                return
+
+            if self._state is RuntimeState.STOPPING:
+                raise RuntimeError(
+                    "runtime cannot start while stopping"
+                )
+
+            self._stop_event.clear()
+            self._state = RuntimeState.STARTING
+
+            workers = tuple(
+                self._workers.values()
+            )
+
+        self._emit(
+            "runtime_starting"
+        )
 
         for worker in workers:
-            if worker.thread and worker.thread.is_alive():
-                worker.thread.join(timeout=5)
+            if worker.thread is not None:
+                raise RuntimeError(
+                    f"worker {worker.name!r} already has a thread"
+                )
+
+            thread = threading.Thread(
+                target=self._run_worker,
+                args=(
+                    worker,
+                ),
+                name=worker.name,
+                daemon=worker.daemon,
+            )
+
+            worker.thread = thread
+            thread.start()
 
         with self._lock:
-            self._runtime_state = "STOPPED"
+            if any(
+                worker.state is WorkerState.FAILED
+                for worker in workers
+            ):
+                self._state = RuntimeState.DEGRADED
+            else:
+                self._state = RuntimeState.ACTIVE
 
-        self.report_dependency(
-            name=RUNTIME_MODULE_ID,
-            status="offline",
-            details={"event": "runtime_stopped"},
+        self._emit(
+            "runtime_started"
         )
 
-        self.send_heartbeat(
-            status="offline",
-            message="Sentinel-43 runtime stopped",
-        )
+    def stop(
+        self,
+    ) -> None:
+        self._refresh_process_identity_if_forked()
 
-        self._logger.info("Sentinel-43 runtime stopped.")
-
-    def block_forever(self) -> None:
-        while not self._stop_event.is_set():
-            time.sleep(0.25)
-
-    def status(self) -> dict[str, Any]:
         with self._lock:
-            return {
-                "module_id": RUNTIME_MODULE_ID,
-                "version": RUNTIME_VERSION,
-                "mode": self.mode,
-                "dry_run": self.dry_run,
-                "state": self._runtime_state,
-                "uptime_seconds": self.uptime_seconds(),
-                "worker_count": len(self._workers),
-                "workers": [worker.to_status() for worker in self._workers.values()],
-                "last_heartbeat_ts": self._last_heartbeat_ts,
-                "last_watchtower_error": self._last_watchtower_error,
-                "watchtower_url": WATCHTOWER_URL,
-                "timestamp": utc_now(),
-            }
+            if self._state is RuntimeState.STOPPED:
+                return
+
+            self._state = RuntimeState.STOPPING
+            self._stop_event.set()
+
+            workers = tuple(
+                self._workers.values()
+            )
+
+        self._emit(
+            "runtime_stopping"
+        )
+
+        for worker in workers:
+            thread = worker.thread
+
+            if (
+                thread is None
+                or not thread.is_alive()
+            ):
+                continue
+
+            thread.join(
+                timeout=(
+                    self._config.worker_join_timeout_seconds
+                )
+            )
+
+        with self._lock:
+            still_alive = tuple(
+                worker.name
+                for worker in workers
+                if worker.is_alive()
+            )
+
+            self._state = (
+                RuntimeState.DEGRADED
+                if still_alive
+                else RuntimeState.STOPPED
+            )
+
+        self._emit(
+            "runtime_stopped"
+            if not still_alive
+            else "runtime_stop_incomplete",
+            details={
+                "alive_workers": still_alive,
+            },
+        )
+
+    def stop_requested(
+        self,
+    ) -> bool:
+        return self._stop_event.is_set()
+
+    def wait_for_stop(
+        self,
+        timeout: float | None = None,
+    ) -> bool:
+        return self._stop_event.wait(
+            timeout
+        )
+
+    def status(
+        self,
+    ) -> Mapping[str, Any]:
+        self._refresh_process_identity_if_forked()
+
+        with self._lock:
+            workers = tuple(
+                dict(
+                    worker.status()
+                )
+                for worker
+                in self._workers.values()
+            )
+
+            return MappingProxyType(
+                {
+                    "module_id": self._config.module_id,
+                    "version": self._config.version,
+                    "mode": self._config.mode,
+                    "dry_run": self._config.dry_run,
+                    "state": self._state.value,
+                    "pid": self._pid,
+                    "process_id": self._process_id,
+                    "uptime_seconds": self.uptime_seconds(),
+                    "worker_count": len(
+                        self._workers
+                    ),
+                    "workers": workers,
+                }
+            )
+
+
+__all__ = [
+    "RuntimeConfig",
+    "RuntimeEventSink",
+    "RuntimeState",
+    "RuntimeWorker",
+    "SentinelRuntime",
+    "WorkerState",
+]
