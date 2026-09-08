@@ -4,45 +4,41 @@
 # Copyright (c) 2026 Justin Armstrong
 # All Rights Reserved.
 #
-# This file is part of the Sentinel-43 platform and constitutes original
-# intellectual property of the copyright holder.
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
 #
-# Sentinel-43 is distributed under a dual-license model:
-#
-# 1. GNU Affero General Public License (AGPL v3.0)
-# for open-source use, modification, and distribution.
-#
-# 2. Commercial License
-# for proprietary, enterprise, government, or other commercial use
-# not permitted under the AGPL v3.0.
-#
-# Use, modification, redistribution, and commercial use are governed by
-# the terms of the applicable license. Any use outside those terms is
-# prohibited.
-#
-# By accessing, modifying, distributing, or using this software, you agree
-# to comply with the terms of the applicable license.
-#
-# License Information:
-# AGPL v3.0: https://www.gnu.org/licenses/agpl-3.0.en.html
-#
-# Commercial Licensing:
-# Contact the copyright holder for commercial licensing terms.
-#
-# Sentinel-43™
-# Original Work and Protected Intellectual Property.
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
+
+"""Small helpers for expectation collections."""
 
 from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable
 
 from .contracts import ExpectationContract
 
 
-def expectation_names(expectations: Iterable[ExpectationContract]) -> tuple[str, ...]:
-    return tuple(e.name for e in expectations)
+def expectation_names(
+    expectations: Iterable[ExpectationContract],
+) -> tuple[str, ...]:
+    return tuple(
+        expectation.name
+        for expectation in expectations
+    )
 
 
-def expectation_categories(expectations: Iterable[ExpectationContract]) -> tuple[str, ...]:
-    return tuple(e.category.value for e in expectations)
+def expectation_categories(
+    expectations: Iterable[ExpectationContract],
+) -> tuple[str, ...]:
+    return tuple(
+        expectation.category.value
+        for expectation in expectations
+    )
+
+
+__all__ = [
+    "expectation_categories",
+    "expectation_names",
+]
