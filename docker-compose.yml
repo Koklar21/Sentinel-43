@@ -1,296 +1,80 @@
 # =============================================================================
-# Sentinel-43 — Docker Compose
+# Sentinel-43
 #
-# Local / single-host deployment.
+# Copyright (c) 2026 Justin Armstrong
+# All Rights Reserved.
 #
-# Production-like invariants:
-#   - Postgres is the only database service in the base stack.
-#   - Alembic is the only schema migration authority.
-#   - s43-api does not start until migration completes successfully.
-#   - s43-core is not host-published.
-#   - s43-api is not host-published.
-#   - s43-proxy is the only host-facing service.
-#   - canonical configuration uses the S43_ namespace.
-#   - canonical Sentinel-43 auth owns JWT/session identity.
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
 
-services:
-
-  # ---------------------------------------------------------------------------
-  # PostgreSQL
-  # ---------------------------------------------------------------------------
-  s43-db:
-    image: postgres:16.3
-    restart: unless-stopped
-
-    environment:
-      POSTGRES_DB: s43
-      POSTGRES_USER: s43
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -h 127.0.0.1'
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
-    volumes:
-      - s43_pgdata:/var/lib/postgresql/data
-
-    networks:
-      - s43_net
-
-
-  # ---------------------------------------------------------------------------
-  # Watchtower / core monitoring service
-  # ---------------------------------------------------------------------------
-  s43-core:
-    build:
-      context: .
-      dockerfile: core/api/Dockerfile
-
-    restart: unless-stopped
-
-    command:
-      - uvicorn
-      - core.monitoring.watchtower:app
-      - --host
-      - 0.0.0.0
-      - --port
-      - "9100"
-
-    environment:
-      S43_ENV: ${S43_ENV:-production}
-      S43_LOG_LEVEL: ${S43_LOG_LEVEL:-INFO}
-
-      S43_WATCHTOWER_HOST: 0.0.0.0
-      S43_WATCHTOWER_PORT: "9100"
-      S43_WATCHTOWER_SERVICE_TOKEN: ${S43_WATCHTOWER_SERVICE_TOKEN}
-
-      DATABASE_URL: ${DATABASE_URL}
-
-      S43_AUDIT_HMAC_KEY: ${S43_AUDIT_HMAC_KEY}
-      S43_SESSION_HASH_PEPPER: ${S43_SESSION_HASH_PEPPER}
-
-    depends_on:
-      s43-db:
-        condition: service_healthy
-
-    volumes:
-      - sentinel43_state:/app/sentinel43_state
-
-    networks:
-      - s43_net
-
-
-  # ---------------------------------------------------------------------------
-  # Schema migration
-  # ---------------------------------------------------------------------------
-  s43-migrate:
-    build:
-      context: .
-      dockerfile: core/api/Dockerfile
-
-    command:
-      - alembic
-      - upgrade
-      - head
-
-    restart: "no"
-
-    environment:
-      S43_ENV: ${S43_ENV:-production}
-      S43_LOG_LEVEL: ${S43_LOG_LEVEL:-INFO}
-      DATABASE_URL: ${DATABASE_URL}
-
-    depends_on:
-      s43-db:
-        condition: service_healthy
-
-    networks:
-      - s43_net
-
-
-  # ---------------------------------------------------------------------------
-  # API
-  # ---------------------------------------------------------------------------
-  s43-api:
-    build:
-      context: .
-      dockerfile: core/api/Dockerfile
-
-    restart: unless-stopped
-
-    command:
-      - uvicorn
-      - core.api.main:app
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8000"
-      - --forwarded-allow-ips
-      - 127.0.0.1
-
-    expose:
-      - "8000"
-
-    environment:
-      # Runtime
-      S43_ENV: ${S43_ENV:-production}
-      S43_LOG_LEVEL: ${S43_LOG_LEVEL:-INFO}
-
-      # Transport / trusted proxy boundary
-      S43_TRUSTED_PROXIES: ${S43_TRUSTED_PROXIES:-172.28.0.250/32}
-      S43_TRUSTED_HOSTS: ${S43_TRUSTED_HOSTS:-localhost,127.0.0.1}
-      S43_ALLOW_INSECURE_ORIGINS: ${S43_ALLOW_INSECURE_ORIGINS:-}
-
-      # Internal services
-      S43_WATCHTOWER_URL: http://s43-core:9100
-      S43_WATCHTOWER_SERVICE_TOKEN: ${S43_WATCHTOWER_SERVICE_TOKEN}
-      S43_WATCHTOWER_TIMEOUT: ${S43_WATCHTOWER_TIMEOUT:-2.0}
-
-      # Database
-      DATABASE_URL: ${DATABASE_URL}
-      S43_DB_PATH: /app/sentinel43_state/sentinel43.sqlite3
-
-      # Canonical JWT authentication
-      S43_JWT_SECRET: ${S43_JWT_SECRET}
-      S43_JWT_ALGORITHM: ${S43_JWT_ALGORITHM:-HS256}
-      S43_JWT_ISSUER: ${S43_JWT_ISSUER:-sentinel-43}
-      S43_JWT_AUDIENCE: ${S43_JWT_AUDIENCE:-sentinel-43-dashboard}
-      S43_JWT_TTL_SECONDS: ${S43_JWT_TTL_SECONDS:-28800}
-
-      # Operator credentials
-      S43_OPERATOR_USERNAME: ${S43_OPERATOR_USERNAME:-operator}
-      S43_OPERATOR_PASSWORD_HASH: ${S43_OPERATOR_PASSWORD_HASH}
-
-      # Auth/session integrity
-      S43_AUTH_PEPPER: ${S43_AUTH_PEPPER}
-      S43_SESSION_HASH_PEPPER: ${S43_SESSION_HASH_PEPPER}
-      S43_SESSION_ACCESS_TTL_SECONDS: ${S43_SESSION_ACCESS_TTL_SECONDS:-900}
-      S43_SESSION_REFRESH_TTL_SECONDS: ${S43_SESSION_REFRESH_TTL_SECONDS:-604800}
-      S43_WS_SESSION_RECHECK_SECONDS: ${S43_WS_SESSION_RECHECK_SECONDS:-60}
-
-      # WebSocket auth
-      S43_WS_REQUIRE_AUTH: ${S43_WS_REQUIRE_AUTH:-true}
-
-      # CORS
-      S43_ALLOWED_ORIGINS: ${S43_ALLOWED_ORIGINS}
-
-      # Governance
-      S43_GOVERNANCE_ENABLED: ${S43_GOVERNANCE_ENABLED:-false}
-      S43_DEFAULT_MODE: ${S43_DEFAULT_MODE:-HUMAN_GATED}
-
-      # Fenrir
-      S43_FENRIR_ENABLED: ${S43_FENRIR_ENABLED:-true}
-      S43_FENRIR_NODE_ID: ${S43_FENRIR_NODE_ID:-sentinel-43-primary}
-      S43_FENRIR_MIN_SEVERITY: ${S43_FENRIR_MIN_SEVERITY:-MEDIUM}
-      S43_FENRIR_ANOMALY_ZSCORE: ${S43_FENRIR_ANOMALY_ZSCORE:-2.5}
-      S43_FENRIR_ANOMALY_DECAY: ${S43_FENRIR_ANOMALY_DECAY:-0.002}
-      S43_FENRIR_MAX_HONEYPOT_EVENTS: ${S43_FENRIR_MAX_HONEYPOT_EVENTS:-500}
-
-      # Optional observational subsystems
-      S43_SPARTA_ENABLED: ${S43_SPARTA_ENABLED:-false}
-      S43_JORM_ENABLED: ${S43_JORM_ENABLED:-false}
-
-      # Local-only test hook. Production bootstrap must reject true.
-      S43_ENABLE_TEST_INJECTION: ${S43_ENABLE_TEST_INJECTION:-false}
-
-      # Audit authority
-      S43_AUDIT_HMAC_KEY: ${S43_AUDIT_HMAC_KEY}
-
-    volumes:
-      - sentinel43_state:/app/sentinel43_state
-
-    depends_on:
-      s43-migrate:
-        condition: service_completed_successfully
-
-      s43-core:
-        condition: service_started
-
-      s43-db:
-        condition: service_healthy
-
-    networks:
-      - s43_net
-
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - >-
-          python -c "import urllib.request;
-          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
-
-
-  # ---------------------------------------------------------------------------
-  # Reverse proxy / TLS terminator
-  # ---------------------------------------------------------------------------
-  s43-proxy:
-    image: nginx:1.27-alpine
-    restart: unless-stopped
-
-    ports:
-      - "80:80"
-      - "443:443"
-
-    volumes:
-      - ./deploy/proxy/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./deploy/proxy/certs:/etc/nginx/certs:ro
-
-    depends_on:
-      s43-api:
-        condition: service_healthy
-
-    networks:
-      s43_net:
-        ipv4_address: 172.28.0.250
-
-
-  # ---------------------------------------------------------------------------
-  # Setup / secret generation
-  # ---------------------------------------------------------------------------
-  s43-setup:
-    build:
-      context: .
-      dockerfile: core/api/Dockerfile
-
-    entrypoint:
-      - python
-      - scripts/generate_secrets.py
-
-    command: []
-
-    volumes:
-      - type: bind
-        source: .
-        target: /app
-
-    profiles:
-      - setup
-
-    environment:
-      S43_ENV: development
-
-    network_mode: none
-    restart: "no"
-
-
-volumes:
-  s43_pgdata:
-  sentinel43_state:
-
-
-networks:
-  s43_net:
-    driver: bridge
-
-    ipam:
-      config:
-        - subnet: 172.28.0.0/24
+# =============================================================================
+# Dependency stage
+# =============================================================================
+
+FROM python:3.13-alpine AS dependencies
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+
+RUN python -m pip install --upgrade pip \
+    && python -m pip install --no-cache-dir -r /app/requirements.txt
+
+
+# =============================================================================
+# Test stage
+# =============================================================================
+
+FROM dependencies AS test
+
+RUN python -m pip install --no-cache-dir pytest requests
+
+COPY . /app
+
+ENV S43_WATCHTOWER_URL=http://127.0.0.1:19100 \
+    S43_WATCHTOWER_TIMEOUT=0.1
+
+
+# =============================================================================
+# Runtime stage
+# =============================================================================
+
+FROM dependencies AS runtime
+
+RUN addgroup -S -g 65532 s43 \
+    && adduser -S -D -H -u 65532 -G s43 -s /sbin/nologin s43 \
+    && mkdir -p /app/logs /app/sentinel43_state \
+    && chown -R 65532:65532 /app/logs /app/sentinel43_state
+
+COPY . /app
+
+# Runtime dependencies are already installed.
+# Remove package-management tooling so the running container cannot mutate
+# its Python environment.
+RUN python -m pip uninstall -y pip \
+    && python -c "import pathlib, shutil, sysconfig; p = pathlib.Path(sysconfig.get_path('stdlib')) / 'ensurepip'; shutil.rmtree(p, ignore_errors=True)"
+
+USER 65532:65532
+
+EXPOSE 8000
+
+VOLUME ["/app/logs", "/app/sentinel43_state"]
+
+# Default runtime command.
+#
+# Docker Compose may override this command for specialized services such as
+# Watchtower or Alembic migrations.
+#
+# Proxy trust remains intentionally restricted. Do not replace
+# 127.0.0.1 with "*" here.
+CMD ["python", "-m", "uvicorn", "core.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--forwarded-allow-ips", "127.0.0.1"]
