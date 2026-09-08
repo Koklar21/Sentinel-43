@@ -4,39 +4,19 @@
 # Copyright (c) 2026 Justin Armstrong
 # All Rights Reserved.
 #
-# This file is part of the Sentinel-43 platform and constitutes original
-# intellectual property of the copyright holder.
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
 #
-# Sentinel-43 is distributed under a dual-license model:
-#
-# 1. GNU Affero General Public License (AGPL v3.0)
-# for open-source use, modification, and distribution.
-#
-# 2. Commercial License
-# for proprietary, enterprise, government, or other commercial use
-# not permitted under the AGPL v3.0.
-#
-# Use, modification, redistribution, and commercial use are governed by
-# the terms of the applicable license. Any use outside those terms is
-# prohibited.
-#
-# By accessing, modifying, distributing, or using this software, you agree
-# to comply with the terms of the applicable license.
-#
-# License Information:
-# AGPL v3.0: https://www.gnu.org/licenses/agpl-3.0.en.html
-#
-# Commercial Licensing:
-# Contact the copyright holder for commercial licensing terms.
-#
-# Sentinel-43™
-# Original Work and Protected Intellectual Property.
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
+
+"""Expectation validation helpers for Sentinel-43."""
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Iterable, Sequence
 
 from .contracts import (
     ExpectationContract,
@@ -44,14 +24,12 @@ from .contracts import (
     ExpectationResult,
     ExpectationSeverity,
 )
-from .expectations import BaseExpectation, get_default_expectations
+from .expectations import get_default_expectations
+from .exceptions import ExpectationFailed
 
 
-@dataclass(slots=True, frozen=True)
+@dataclass(frozen=True, slots=True)
 class ValidationSummary:
-    """
-    Aggregated result for a batch of expectation validations.
-    """
     passed: bool
     total: int
     passed_count: int
@@ -60,186 +38,426 @@ class ValidationSummary:
     high_failures: int
     medium_failures: int
     low_failures: int
-    results: tuple[ExpectationResult, ...] = field(default_factory=tuple)
+    results: tuple[ExpectationResult, ...] = field(
+        default_factory=tuple
+    )
+
+    def __post_init__(self) -> None:
+        if self.total < 0:
+            raise ValueError(
+                "total must be >= 0"
+            )
+
+        if any(
+            value < 0
+            for value in (
+                self.passed_count,
+                self.failed_count,
+                self.critical_failures,
+                self.high_failures,
+                self.medium_failures,
+                self.low_failures,
+            )
+        ):
+            raise ValueError(
+                "summary counts must be >= 0"
+            )
+
+        if (
+            self.passed_count
+            + self.failed_count
+            != self.total
+        ):
+            raise ValueError(
+                "passed_count + failed_count must equal total"
+            )
+
+        if (
+            self.critical_failures
+            + self.high_failures
+            + self.medium_failures
+            + self.low_failures
+            != self.failed_count
+        ):
+            raise ValueError(
+                "severity failure counts must equal failed_count"
+            )
+
+        if self.passed != (
+            self.failed_count == 0
+        ):
+            raise ValueError(
+                "passed must reflect failed_count == 0"
+            )
+
+        if len(
+            self.results
+        ) != self.total:
+            raise ValueError(
+                "results length must equal total"
+            )
 
     @property
-    def failures(self) -> tuple[ExpectationResult, ...]:
-        return tuple(result for result in self.results if not result.passed)
+    def failures(
+        self,
+    ) -> tuple[ExpectationResult, ...]:
+        return tuple(
+            result
+            for result in self.results
+            if not result.passed
+        )
 
     @property
-    def successes(self) -> tuple[ExpectationResult, ...]:
-        return tuple(result for result in self.results if result.passed)
+    def successes(
+        self,
+    ) -> tuple[ExpectationResult, ...]:
+        return tuple(
+            result
+            for result in self.results
+            if result.passed
+        )
 
 
 class ExpectationValidator:
-    """
-    Runs one or more expectations against a runtime context.
-    """
+    """Run a deterministic set of expectations against one context."""
 
-    def __init__(self, expectations: Iterable[ExpectationContract] | None = None) -> None:
-        self._expectations: list[ExpectationContract] = list(expectations or [])
+    def __init__(
+        self,
+        expectations: Iterable[
+            ExpectationContract
+        ] | None = None,
+    ) -> None:
+        self._expectations: list[
+            ExpectationContract
+        ] = []
+
+        if expectations is not None:
+            self.register_many(
+                expectations
+            )
 
     @property
-    def expectations(self) -> tuple[ExpectationContract, ...]:
-        return tuple(self._expectations)
+    def expectations(
+        self,
+    ) -> tuple[
+        ExpectationContract,
+        ...
+    ]:
+        return tuple(
+            self._expectations
+        )
 
-    def register(self, expectation: ExpectationContract) -> None:
-        """
-        Register a single expectation.
-        """
-        self._expectations.append(expectation)
+    def register(
+        self,
+        expectation: ExpectationContract,
+    ) -> None:
+        name = str(
+            expectation.name
+        ).strip()
 
-    def register_many(self, expectations: Iterable[ExpectationContract]) -> None:
-        """
-        Register multiple expectations.
-        """
-        self._expectations.extend(expectations)
+        if not name:
+            raise ValueError(
+                "expectation.name must not be empty"
+            )
 
-    def clear(self) -> None:
-        """
-        Remove all registered expectations.
-        """
+        if any(
+            existing.name == name
+            for existing in self._expectations
+        ):
+            raise ValueError(
+                f"expectation {name!r} is already registered"
+            )
+
+        self._expectations.append(
+            expectation
+        )
+
+    def register_many(
+        self,
+        expectations: Iterable[
+            ExpectationContract
+        ],
+    ) -> None:
+        materialized = list(
+            expectations
+        )
+
+        batch_names: set[str] = set()
+
+        for expectation in materialized:
+            name = str(
+                expectation.name
+            ).strip()
+
+            if not name:
+                raise ValueError(
+                    "expectation.name must not be empty"
+                )
+
+            if name in batch_names:
+                raise ValueError(
+                    f"duplicate expectation {name!r} in batch"
+                )
+
+            batch_names.add(
+                name
+            )
+
+        existing_names = {
+            expectation.name
+            for expectation in self._expectations
+        }
+
+        collisions = sorted(
+            batch_names
+            & existing_names
+        )
+
+        if collisions:
+            raise ValueError(
+                "expectations already registered: "
+                + ", ".join(
+                    repr(
+                        name
+                    )
+                    for name in collisions
+                )
+            )
+
+        self._expectations.extend(
+            materialized
+        )
+
+    def clear(
+        self,
+    ) -> None:
         self._expectations.clear()
 
-    def validate(self, context: ExpectationContext) -> tuple[ExpectationResult, ...]:
-        """
-        Run all registered expectations against the provided context.
-        """
-        results: list[ExpectationResult] = []
-
-        for expectation in self._expectations:
-            result = expectation.validate(context)
-            results.append(result)
-
-        return tuple(results)
+    def validate(
+        self,
+        context: ExpectationContext,
+    ) -> tuple[
+        ExpectationResult,
+        ...
+    ]:
+        return tuple(
+            expectation.validate(
+                context
+            )
+            for expectation
+            in self._expectations
+        )
 
     def validate_or_raise(
         self,
         context: ExpectationContext,
         *,
         stop_on_first_failure: bool = False,
-    ) -> tuple[ExpectationResult, ...]:
-        """
-        Run validations and raise an exception if any expectation fails.
-
-        Uses the expectation's own validation result but raises a generic
-        RuntimeError wrapper here so the caller can decide how to translate
-        failures into domain-specific exceptions.
-        """
-        results: list[ExpectationResult] = []
+    ) -> tuple[
+        ExpectationResult,
+        ...
+    ]:
+        results: list[
+            ExpectationResult
+        ] = []
 
         for expectation in self._expectations:
-            result = expectation.validate(context)
-            results.append(result)
-
-            if not result.passed and stop_on_first_failure:
-                raise RuntimeError(
-                    f"Expectation validation failed early: "
-                    f"{result.expectation_name} [{result.severity.value}] - {result.message}"
-                )
-
-        failed = [result for result in results if not result.passed]
-        if failed:
-            failed_names = ", ".join(result.expectation_name for result in failed)
-            raise RuntimeError(
-                f"Expectation validation failed for: {failed_names}"
+            result = expectation.validate(
+                context
             )
 
-        return tuple(results)
+            results.append(
+                result
+            )
+
+            if (
+                not result.passed
+                and stop_on_first_failure
+            ):
+                raise ExpectationFailed(
+                    "expectation validation failed",
+                    details={
+                        "expectation_name": result.expectation_name,
+                        "severity": result.severity.value,
+                    },
+                )
+
+        failures = [
+            result
+            for result in results
+            if not result.passed
+        ]
+
+        if failures:
+            raise ExpectationFailed(
+                "one or more expectations failed",
+                details={
+                    "failed_expectations": [
+                        result.expectation_name
+                        for result in failures
+                    ],
+                    "failure_count": len(
+                        failures
+                    ),
+                },
+            )
+
+        return tuple(
+            results
+        )
 
 
-def summarize_results(results: Sequence[ExpectationResult]) -> ValidationSummary:
-    """
-    Produce an aggregated summary from raw expectation results.
-    """
-    passed_count = 0
-    failed_count = 0
-    critical_failures = 0
-    high_failures = 0
-    medium_failures = 0
-    low_failures = 0
+def summarize_results(
+    results: Sequence[
+        ExpectationResult
+    ],
+) -> ValidationSummary:
+    materialized = tuple(
+        results
+    )
 
-    for result in results:
-        if result.passed:
-            passed_count += 1
-            continue
+    passed_count = sum(
+        1
+        for result in materialized
+        if result.passed
+    )
 
-        failed_count += 1
+    failed_results = [
+        result
+        for result in materialized
+        if not result.passed
+    ]
 
-        if result.severity is ExpectationSeverity.CRITICAL:
-            critical_failures += 1
-        elif result.severity is ExpectationSeverity.HIGH:
-            high_failures += 1
-        elif result.severity is ExpectationSeverity.MEDIUM:
-            medium_failures += 1
-        elif result.severity is ExpectationSeverity.LOW:
-            low_failures += 1
+    critical_failures = sum(
+        1
+        for result in failed_results
+        if result.severity
+        is ExpectationSeverity.CRITICAL
+    )
+
+    high_failures = sum(
+        1
+        for result in failed_results
+        if result.severity
+        is ExpectationSeverity.HIGH
+    )
+
+    medium_failures = sum(
+        1
+        for result in failed_results
+        if result.severity
+        is ExpectationSeverity.MEDIUM
+    )
+
+    low_failures = sum(
+        1
+        for result in failed_results
+        if result.severity
+        is ExpectationSeverity.LOW
+    )
 
     return ValidationSummary(
-        passed=failed_count == 0,
-        total=len(results),
+        passed=not failed_results,
+        total=len(
+            materialized
+        ),
         passed_count=passed_count,
-        failed_count=failed_count,
+        failed_count=len(
+            failed_results
+        ),
         critical_failures=critical_failures,
         high_failures=high_failures,
         medium_failures=medium_failures,
         low_failures=low_failures,
-        results=tuple(results),
+        results=materialized,
     )
 
 
 def validate_expectations(
     context: ExpectationContext,
-    expectations: Iterable[ExpectationContract],
+    expectations: Iterable[
+        ExpectationContract
+    ],
 ) -> ValidationSummary:
-    """
-    Validate an explicit expectation set against a context and return a summary.
-    """
-    validator = ExpectationValidator(expectations)
-    results = validator.validate(context)
-    return summarize_results(results)
+    validator = ExpectationValidator(
+        expectations
+    )
+
+    return summarize_results(
+        validator.validate(
+            context
+        )
+    )
 
 
-def validate_default_expectations(context: ExpectationContext) -> ValidationSummary:
-    """
-    Validate the built-in Sentinel-43 default expectation set.
-    """
-    validator = ExpectationValidator(get_default_expectations())
-    results = validator.validate(context)
-    return summarize_results(results)
+def validate_default_expectations(
+    context: ExpectationContext,
+) -> ValidationSummary:
+    return validate_expectations(
+        context,
+        get_default_expectations(),
+    )
 
 
-def has_critical_failures(results: Sequence[ExpectationResult]) -> bool:
-    """
-    Fast check for critical failures in a result set.
-    """
+def has_critical_failures(
+    results: Sequence[
+        ExpectationResult
+    ],
+) -> bool:
     return any(
-        (not result.passed) and result.severity is ExpectationSeverity.CRITICAL
+        not result.passed
+        and result.severity
+        is ExpectationSeverity.CRITICAL
         for result in results
     )
 
 
 def filter_failed_results(
-    results: Sequence[ExpectationResult],
-) -> tuple[ExpectationResult, ...]:
-    """
-    Return only failed expectation results.
-    """
-    return tuple(result for result in results if not result.passed)
+    results: Sequence[
+        ExpectationResult
+    ],
+) -> tuple[
+        ExpectationResult,
+        ...
+    ]:
+    return tuple(
+        result
+        for result in results
+        if not result.passed
+    )
 
 
 def filter_results_by_severity(
-    results: Sequence[ExpectationResult],
+    results: Sequence[
+        ExpectationResult
+    ],
     severity: ExpectationSeverity,
-) -> tuple[ExpectationResult, ...]:
-    """
-    Return results matching a specific severity.
-    """
-    return tuple(result for result in results if result.severity is severity)
+) -> tuple[
+        ExpectationResult,
+        ...
+    ]:
+    return tuple(
+        result
+        for result in results
+        if result.severity is severity
+    )
 
 
-def build_default_validator() -> ExpectationValidator:
-    """
-    Construct a validator preloaded with the default expectations.
-    """
-    return ExpectationValidator(get_default_expectations())
+def build_default_validator(
+) -> ExpectationValidator:
+    return ExpectationValidator(
+        get_default_expectations()
+    )
+
+
+__all__ = [
+    "ExpectationValidator",
+    "ValidationSummary",
+    "build_default_validator",
+    "filter_failed_results",
+    "filter_results_by_severity",
+    "has_critical_failures",
+    "summarize_results",
+    "validate_default_expectations",
+    "validate_expectations",
+]
