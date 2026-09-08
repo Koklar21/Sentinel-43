@@ -1,19 +1,27 @@
-# =============================================================================
-# Copyright (c) 2026 Justin [LastName or Entity]
+from pathlib import Path
+
+code = r'''# =============================================================================
+# Copyright (c) 2026 Justin Armstrong
 #
-# Sentinel is dual-licensed:
+# Sentinel-43 is dual-licensed:
 #   (1) AGPL-3.0-or-later, or
 #   (2) a commercial license (see COMMERCIAL_LICENSE.md).
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
 
-"""Sentinel-43 API configuration."""
+"""Sentinel-43 API configuration.
+
+Configuration parsing is intentionally deterministic and side-effect free.
+Watchtower reporting is best-effort and happens only after a complete config
+object has been built and validated.
+"""
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Final
@@ -22,333 +30,536 @@ from ...monitoring.watchtower_client import watchtower_request
 
 logger = logging.getLogger(__name__)
 
-_VALID_LOG_LEVELS: Final[set[str]] = {
-    "DEBUG",
-    "INFO",
-    "WARNING",
-    "ERROR",
-    "CRITICAL",
-}
+# =============================================================================
+# Constants
+# =============================================================================
 
-_TRUE_VALUES: Final[set[str]] = {"1", "true", "t", "yes", "y", "on"}
-_FALSE_VALUES: Final[set[str]] = {"0", "false", "f", "no", "n", "off"}
+_VALID_LOG_LEVELS: Final[frozenset[str]] = frozenset(
+    {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+)
+
+_TRUE_VALUES: Final[frozenset[str]] = frozenset(
+    {"1", "true", "t", "yes", "y", "on"}
+)
+
+_FALSE_VALUES: Final[frozenset[str]] = frozenset(
+    {"0", "false", "f", "no", "n", "off"}
+)
+
+_LOCAL_ENVIRONMENTS: Final[frozenset[str]] = frozenset(
+    {"development", "dev", "local", "test"}
+)
+
+_PRODUCTION_ENVIRONMENTS: Final[frozenset[str]] = frozenset(
+    {"production", "prod", "staging", "stage"}
+)
+
+_FACTORY_RE: Final[re.Pattern[str]] = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$"
+)
 
 DEFAULT_ENGINE_FACTORY: Final[str] = "core.api.deps:dev_engine_factory"
 DEFAULT_STORE_FACTORY: Final[str] = "core.api.deps:dev_store_factory"
 
-CONFIG_MODULE_ID: Final[str] = os.getenv("S43_CONFIG_MODULE_ID", "sentinel43-api-config")
-CONFIG_VERSION: Final[str] = os.getenv("SENTINEL_VERSION", "0.1.0")
+CONFIG_MODULE_ID: Final[str] = "sentinel43-api-config"
+DEFAULT_CONFIG_VERSION: Final[str] = "0.1.0"
 
+DEFAULT_LOCAL_CORS: Final[tuple[str, ...]] = (
+    "http://127.0.0.1:5500",
+    "http://localhost:5500",
+    "http://127.0.0.1:8000",
+    "http://localhost:8000",
+)
+
+
+# =============================================================================
+# Errors
+# =============================================================================
+
+class ConfigError(RuntimeError):
+    """Raised when Sentinel-43 configuration is invalid."""
+
+
+# =============================================================================
+# Utility helpers
+# =============================================================================
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _watchtower_request(
+def _env(name: str, default: str | None = None) -> str | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    value = raw.strip()
+    return value if value else default
+
+
+def _parse_bool(
+    name: str,
+    *,
+    default: bool,
+    strict: bool,
+) -> bool:
+    raw = _env(name)
+    if raw is None:
+        return default
+
+    normalized = raw.lower()
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+
+    if strict:
+        raise ConfigError(
+            f"{name} must be a boolean value; got {raw!r}. "
+            f"Accepted true values={sorted(_TRUE_VALUES)}, "
+            f"false values={sorted(_FALSE_VALUES)}"
+        )
+
+    logger.warning(
+        "Invalid boolean for %s=%r; using default %s",
+        name,
+        raw,
+        default,
+    )
+    return default
+
+
+def _parse_int(
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+    strict: bool,
+) -> int:
+    raw = _env(name)
+    if raw is None:
+        return default
+
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        if strict:
+            raise ConfigError(
+                f"{name} must be an integer; got {raw!r}"
+            ) from exc
+
+        logger.warning(
+            "Invalid integer for %s=%r; using default %d",
+            name,
+            raw,
+            default,
+        )
+        return default
+
+    if not minimum <= value <= maximum:
+        if strict:
+            raise ConfigError(
+                f"{name} must be between {minimum} and {maximum}; got {value}"
+            )
+
+        logger.warning(
+            "%s=%d is outside allowed range %d..%d; using default %d",
+            name,
+            value,
+            minimum,
+            maximum,
+            default,
+        )
+        return default
+
+    return value
+
+
+def _normalize_environment(value: str | None) -> str:
+    normalized = (value or "development").strip().lower()
+
+    aliases = {
+        "dev": "development",
+        "local": "development",
+        "test": "test",
+        "stage": "staging",
+        "prod": "production",
+    }
+    return aliases.get(normalized, normalized or "development")
+
+
+def _normalize_log_level(
+    value: str | None,
+    *,
+    strict: bool,
+    default: str = "INFO",
+) -> str:
+    level = (value or default).strip().upper()
+
+    if level in _VALID_LOG_LEVELS:
+        return level
+
+    if strict:
+        raise ConfigError(
+            f"SENTINEL_LOG_LEVEL={value!r} is invalid; "
+            f"allowed={sorted(_VALID_LOG_LEVELS)}"
+        )
+
+    logger.warning(
+        "Invalid log level %r; using default %s",
+        value,
+        default,
+    )
+    return default
+
+
+def _normalize_cors_origins(
+    value: str | None,
+    *,
+    environment: str,
+) -> tuple[str, ...]:
+    raw = (value or "").strip()
+
+    if not raw:
+        if environment in _LOCAL_ENVIRONMENTS:
+            return DEFAULT_LOCAL_CORS
+        raise ConfigError(
+            "SENTINEL_CORS_ALLOW_ORIGINS must be explicitly configured "
+            "outside development/test"
+        )
+
+    if raw == "*":
+        if environment in _LOCAL_ENVIRONMENTS:
+            return ("*",)
+        raise ConfigError(
+            "Wildcard CORS origin '*' is not permitted outside "
+            "development/test"
+        )
+
+    origins = tuple(
+        dict.fromkeys(
+            item.strip()
+            for item in raw.split(",")
+            if item.strip()
+        )
+    )
+
+    if not origins:
+        raise ConfigError(
+            "SENTINEL_CORS_ALLOW_ORIGINS did not contain any valid origins"
+        )
+
+    if environment not in _LOCAL_ENVIRONMENTS:
+        insecure = [
+            origin
+            for origin in origins
+            if origin.startswith("http://")
+            and not origin.startswith("http://localhost")
+            and not origin.startswith("http://127.0.0.1")
+        ]
+        if insecure:
+            raise ConfigError(
+                "Non-local environments require HTTPS CORS origins; "
+                f"found plaintext origins={insecure}"
+            )
+
+    return origins
+
+
+def _validate_factory(name: str, value: str) -> str:
+    cleaned = value.strip()
+    if not _FACTORY_RE.fullmatch(cleaned):
+        raise ConfigError(
+            f"{name} must use 'module.path:callable' syntax; got {value!r}"
+        )
+    return cleaned
+
+
+# =============================================================================
+# Configuration model
+# =============================================================================
+
+@dataclass(frozen=True, slots=True)
+class ApiConfig:
+    service_name: str
+    version: str
+
+    host: str
+    port: int
+
+    log_level: str
+    docs_enabled: bool
+    cors_allow_origins: tuple[str, ...]
+
+    engine_factory: str
+    store_factory: str
+
+    environment: str
+
+    @property
+    def is_local(self) -> bool:
+        return self.environment in _LOCAL_ENVIRONMENTS
+
+    @property
+    def is_production_like(self) -> bool:
+        return self.environment in _PRODUCTION_ENVIRONMENTS
+
+    def safe_dict(self) -> dict[str, Any]:
+        """Return configuration safe for logs/status reporting.
+
+        Internal factory paths are deliberately omitted because they expose
+        implementation details without helping operators assess runtime health.
+        """
+        return {
+            "service_name": self.service_name,
+            "version": self.version,
+            "host": self.host,
+            "port": self.port,
+            "log_level": self.log_level,
+            "docs_enabled": self.docs_enabled,
+            "cors_allow_origins": list(self.cors_allow_origins),
+            "environment": self.environment,
+        }
+
+
+# =============================================================================
+# Validation
+# =============================================================================
+
+def _validate_config(config: ApiConfig) -> None:
+    if not config.service_name.strip():
+        raise ConfigError("SENTINEL_SERVICE_NAME must not be empty")
+
+    if not config.version.strip():
+        raise ConfigError("SENTINEL_VERSION must not be empty")
+
+    if not config.host.strip():
+        raise ConfigError("SENTINEL_HOST must not be empty")
+
+    if config.is_production_like:
+        if config.docs_enabled:
+            raise ConfigError(
+                "Interactive API documentation must be disabled in "
+                "production-like environments. Set "
+                "SENTINEL_DOCS_ENABLED=false."
+            )
+
+        if config.engine_factory == DEFAULT_ENGINE_FACTORY:
+            raise ConfigError(
+                "Production-like environments may not use "
+                "DEFAULT_ENGINE_FACTORY/dev_engine_factory"
+            )
+
+        if config.store_factory == DEFAULT_STORE_FACTORY:
+            raise ConfigError(
+                "Production-like environments may not use "
+                "DEFAULT_STORE_FACTORY/dev_store_factory"
+            )
+
+        if config.cors_allow_origins == ("*",):
+            raise ConfigError(
+                "Wildcard CORS is not permitted in production-like environments"
+            )
+
+
+# =============================================================================
+# Watchtower telemetry
+# =============================================================================
+
+def _watchtower_request_best_effort(
     method: str,
     path: str,
     payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    # DEFECT_INVENTORY.md D-16: this used to build the request without the
-    # internal service token, so every call here 401'd against Watchtower.
-    # (This module is not currently imported by any live code path — fixed
-    # for consistency with the other 11 call sites.)
-    return watchtower_request(method, path, payload)
+) -> dict[str, Any] | None:
+    try:
+        return watchtower_request(method, path, payload)
+    except Exception:
+        logger.warning(
+            "Config Watchtower telemetry failed: %s %s",
+            method,
+            path,
+            exc_info=True,
+        )
+        return None
 
 
-def _register_config_with_watchtower() -> None:
-    payload = {
-        "module_id": CONFIG_MODULE_ID,
+def _report_loaded_config(config: ApiConfig) -> None:
+    """Register and report one coherent config-load event.
+
+    Telemetry failure must never mutate the already-validated configuration
+    result or cause configuration parsing to recurse into additional reports.
+    """
+    module_id = _env("S43_CONFIG_MODULE_ID", CONFIG_MODULE_ID) or CONFIG_MODULE_ID
+    version = config.version or DEFAULT_CONFIG_VERSION
+    timestamp = utc_now()
+
+    register_payload = {
+        "module_id": module_id,
         "module_type": "api-config",
-        "version": CONFIG_VERSION,
+        "version": version,
         "endpoint": None,
         "capabilities": [
             "environment_loading",
             "env_validation",
             "log_level_validation",
             "cors_normalization",
-            "production_safety_warning",
+            "production_fail_closed_validation",
             "config_drift_reporting",
         ],
         "metadata": {
-            "timestamp": utc_now(),
+            "timestamp": timestamp,
+            "environment": config.environment,
         },
     }
 
-    _watchtower_request("POST", "/watchtower/modules/register", payload)
+    _watchtower_request_best_effort(
+        "POST",
+        "/watchtower/modules/register",
+        register_payload,
+    )
 
-
-def _report_config_status(
-    status: str,
-    event: str,
-    details: dict[str, Any] | None = None,
-) -> None:
-    _register_config_with_watchtower()
-
-    payload = {
-        "name": CONFIG_MODULE_ID,
-        "status": status,
-        "version": CONFIG_VERSION,
+    dependency_payload = {
+        "name": module_id,
+        "status": "online",
+        "version": version,
         "details": {
-            "event": event,
-            "timestamp": utc_now(),
-            **(details or {}),
+            "event": "config_loaded",
+            "timestamp": timestamp,
+            "config": config.safe_dict(),
         },
     }
 
-    _watchtower_request("POST", "/watchtower/dependencies/report", payload)
+    _watchtower_request_best_effort(
+        "POST",
+        "/watchtower/dependencies/report",
+        dependency_payload,
+    )
 
-
-def _report_config_event(
-    status: str,
-    event: str,
-    details: dict[str, Any] | None = None,
-) -> None:
-    payload = {
+    analyze_payload = {
         "event": {
             "kind": "config",
-            "source": CONFIG_MODULE_ID,
-            "status": status,
-            "drift_detected": status in {"degraded", "failed"},
+            "source": module_id,
+            "status": "online",
+            "drift_detected": False,
             "details": {
-                "event": event,
-                "timestamp": utc_now(),
-                **(details or {}),
+                "event": "config_loaded",
+                "timestamp": timestamp,
+                "config": config.safe_dict(),
             },
         }
     }
 
-    _watchtower_request("POST", "/watchtower/analyze", payload)
-
-
-def _env(name: str, default: str | None = None) -> str | None:
-    value = os.getenv(name)
-    if value is None:
-        return default
-
-    value = value.strip()
-    return value if value else default
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    value = _env(name)
-    if value is None:
-        return default
-
-    normalized = value.lower()
-
-    if normalized in _TRUE_VALUES:
-        return True
-
-    if normalized in _FALSE_VALUES:
-        return False
-
-    logger.warning(
-        "Invalid boolean for %s=%r; using default %s",
-        name,
-        value,
-        default,
+    _watchtower_request_best_effort(
+        "POST",
+        "/watchtower/analyze",
+        analyze_payload,
     )
 
-    _report_config_status(
-        status="degraded",
-        event="invalid_boolean_env",
-        details={
-            "env_name": name,
-            "raw_value": value,
-            "default_used": default,
-        },
+
+# =============================================================================
+# Public loader
+# =============================================================================
+
+def load_config(*, report_to_watchtower: bool = True) -> ApiConfig:
+    """Load and validate Sentinel-43 API configuration.
+
+    Local/test environments are forgiving for malformed booleans/integers and
+    use documented defaults. Production-like environments fail closed rather
+    than silently replacing invalid operator input with defaults.
+    """
+    environment = _normalize_environment(
+        _env("SENTINEL_ENVIRONMENT", "development")
+    )
+    strict = environment not in _LOCAL_ENVIRONMENTS
+
+    service_name = _env(
+        "SENTINEL_SERVICE_NAME",
+        "sentinel-43-api",
+    ) or "sentinel-43-api"
+
+    version = _env(
+        "SENTINEL_VERSION",
+        DEFAULT_CONFIG_VERSION,
+    ) or DEFAULT_CONFIG_VERSION
+
+    host = _env(
+        "SENTINEL_HOST",
+        "0.0.0.0",
+    ) or "0.0.0.0"
+
+    port = _parse_int(
+        "SENTINEL_PORT",
+        default=8000,
+        minimum=1,
+        maximum=65535,
+        strict=strict,
     )
 
-    _report_config_event(
-        status="degraded",
-        event="invalid_boolean_env",
-        details={
-            "env_name": name,
-            "raw_value": value,
-            "default_used": default,
-        },
+    log_level = _normalize_log_level(
+        _env("SENTINEL_LOG_LEVEL", "INFO"),
+        strict=strict,
     )
 
-    return default
+    docs_enabled = _parse_bool(
+        "SENTINEL_DOCS_ENABLED",
+        default=environment in _LOCAL_ENVIRONMENTS,
+        strict=strict,
+    )
 
+    cors_allow_origins = _normalize_cors_origins(
+        _env("SENTINEL_CORS_ALLOW_ORIGINS"),
+        environment=environment,
+    )
 
-def _env_int(name: str, default: int) -> int:
-    value = _env(name)
-    if value is None:
-        return default
-
-    try:
-        return int(value)
-    except ValueError:
-        logger.warning(
-            "Invalid integer for %s=%r; using default %d",
-            name,
-            value,
-            default,
+    engine_factory = _validate_factory(
+        "SENTINEL_ENGINE_FACTORY",
+        _env(
+            "SENTINEL_ENGINE_FACTORY",
+            DEFAULT_ENGINE_FACTORY,
         )
-
-        _report_config_status(
-            status="degraded",
-            event="invalid_integer_env",
-            details={
-                "env_name": name,
-                "raw_value": value,
-                "default_used": default,
-            },
-        )
-
-        _report_config_event(
-            status="degraded",
-            event="invalid_integer_env",
-            details={
-                "env_name": name,
-                "raw_value": value,
-                "default_used": default,
-            },
-        )
-
-        return default
-
-
-def _normalize_log_level(value: str | None, default: str = "INFO") -> str:
-    level = (value or "").strip().upper()
-
-    if level in _VALID_LOG_LEVELS:
-        return level
-
-    logger.warning("Invalid log level %r; using default %s", value, default)
-
-    _report_config_status(
-        status="degraded",
-        event="invalid_log_level",
-        details={
-            "raw_value": value,
-            "default_used": default,
-            "valid_levels": sorted(_VALID_LOG_LEVELS),
-        },
+        or DEFAULT_ENGINE_FACTORY,
     )
 
-    _report_config_event(
-        status="degraded",
-        event="invalid_log_level",
-        details={
-            "raw_value": value,
-            "default_used": default,
-            "valid_levels": sorted(_VALID_LOG_LEVELS),
-        },
-    )
-
-    return default
-
-
-def _normalize_environment(value: str | None) -> str:
-    environment = (value or "development").strip().lower()
-    return environment or "development"
-
-
-def _normalize_cors_origins(value: str | None) -> tuple[str, ...]:
-    raw = (value or "").strip()
-
-    if not raw or raw == "*":
-        return ("*",)
-
-    origins = tuple(item.strip() for item in raw.split(",") if item.strip())
-    return origins if origins else ("*",)
-
-
-@dataclass(frozen=True, slots=True)
-class ApiConfig:
-    service_name: str = "sentinel-43-api"
-    version: str = "0.1.0"
-
-    host: str = "0.0.0.0"
-    port: int = 8000
-
-    log_level: str = "INFO"
-    docs_enabled: bool = True
-    cors_allow_origins: tuple[str, ...] = ("*",)
-
-    engine_factory: str = DEFAULT_ENGINE_FACTORY
-    store_factory: str = DEFAULT_STORE_FACTORY
-
-    environment: str = "development"
-
-    def safe_dict(self) -> dict[str, Any]:
-        return {
-            "service_name": self.service_name,
-            "version": self.version,
-            "port": self.port,
-            "log_level": self.log_level,
-            "docs_enabled": self.docs_enabled,
-            "cors_allow_origins": self.cors_allow_origins,
-            "engine_factory": self.engine_factory,
-            "store_factory": self.store_factory,
-            "environment": self.environment,
-        }
-
-
-def load_config() -> ApiConfig:
-    _report_config_status(
-        status="online",
-        event="config_load_started",
-        details={},
+    store_factory = _validate_factory(
+        "SENTINEL_STORE_FACTORY",
+        _env(
+            "SENTINEL_STORE_FACTORY",
+            DEFAULT_STORE_FACTORY,
+        )
+        or DEFAULT_STORE_FACTORY,
     )
 
     config = ApiConfig(
-        service_name=_env("SENTINEL_SERVICE_NAME", "sentinel-43-api"),
-        version=_env("SENTINEL_VERSION", "0.1.0"),
-        host=_env("SENTINEL_HOST", "0.0.0.0"),
-        port=_env_int("SENTINEL_PORT", 8000),
-        log_level=_normalize_log_level(_env("SENTINEL_LOG_LEVEL", "INFO")),
-        docs_enabled=_env_bool("SENTINEL_DOCS_ENABLED", True),
-        cors_allow_origins=_normalize_cors_origins(
-            _env("SENTINEL_CORS_ALLOW_ORIGINS", "*")
-        ),
-        engine_factory=_env("SENTINEL_ENGINE_FACTORY", DEFAULT_ENGINE_FACTORY),
-        store_factory=_env("SENTINEL_STORE_FACTORY", DEFAULT_STORE_FACTORY),
-        environment=_normalize_environment(
-            _env("SENTINEL_ENVIRONMENT", "development")
-        ),
+        service_name=service_name,
+        version=version,
+        host=host,
+        port=port,
+        log_level=log_level,
+        docs_enabled=docs_enabled,
+        cors_allow_origins=cors_allow_origins,
+        engine_factory=engine_factory,
+        store_factory=store_factory,
+        environment=environment,
     )
 
-    if config.environment == "production" and config.docs_enabled:
-        logger.warning(
-            "Docs are enabled in production; set SENTINEL_DOCS_ENABLED=false"
-        )
+    _validate_config(config)
 
-        _report_config_status(
-            status="degraded",
-            event="docs_enabled_in_production",
-            details={
-                "environment": config.environment,
-                "docs_enabled": config.docs_enabled,
-            },
-        )
-
-        _report_config_event(
-            status="degraded",
-            event="docs_enabled_in_production",
-            details={
-                "environment": config.environment,
-                "docs_enabled": config.docs_enabled,
-            },
-        )
-
-    _report_config_status(
-        status="online",
-        event="config_loaded",
-        details={
-            "config": config.safe_dict(),
-        },
-    )
+    if report_to_watchtower:
+        _report_loaded_config(config)
 
     return config
 
 
 __all__ = [
     "ApiConfig",
-    "load_config",
+    "ConfigError",
     "DEFAULT_ENGINE_FACTORY",
     "DEFAULT_STORE_FACTORY",
+    "load_config",
 ]
+'''
+
+path = Path("/mnt/data/sentinel43_api_config_recode.py")
+path.write_text(code, encoding="utf-8")
+print(path)
