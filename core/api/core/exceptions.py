@@ -1,59 +1,47 @@
 # =============================================================================
-# Sentinel-43 Exception Definitions
+# Sentinel-43
+#
+# Copyright (c) 2026 Justin Armstrong
+# All Rights Reserved.
+#
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
+
+"""Sentinel-43 exception hierarchy."""
 
 from __future__ import annotations
 
 
 class SentinelError(Exception):
-    """
-    Base Sentinel exception.
-    All Sentinel-specific exceptions inherit from this.
-    """
+    """Base exception for Sentinel-43 application errors."""
 
-
-# --------------------------------------------------
-# Configuration Errors
-# --------------------------------------------------
 
 class ConfigurationError(SentinelError):
-    pass
+    """Raised when Sentinel-43 configuration is invalid."""
 
-
-# --------------------------------------------------
-# Authentication Errors
-# --------------------------------------------------
 
 class AuthenticationError(SentinelError):
-    pass
+    """Raised when authentication fails."""
 
 
 class AuthorizationError(SentinelError):
-    pass
+    """Raised when an authenticated identity lacks required permission."""
 
-
-# --------------------------------------------------
-# Runtime Errors
-# --------------------------------------------------
 
 class RuntimeStateError(SentinelError):
-    pass
+    """Raised when an operation is invalid for the current runtime state."""
 
-
-# --------------------------------------------------
-# Database Errors
-# --------------------------------------------------
 
 class DatabaseError(SentinelError):
-    pass
+    """Raised for Sentinel-43 database-layer failures."""
 
-
-# --------------------------------------------------
-# Audit Integrity Errors
-# --------------------------------------------------
 
 class AuditIntegrityError(SentinelError):
-    pass
+    """Raised when audit-record integrity validation fails."""
 
 
 __all__ = [
