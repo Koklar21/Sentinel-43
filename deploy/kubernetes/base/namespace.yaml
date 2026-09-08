@@ -1,12 +1,14 @@
 apiVersion: v1
 kind: Namespace
+
 metadata:
   name: sentinel43
+
   labels:
     app.kubernetes.io/part-of: sentinel43
-    # Enforced by the built-in Pod Security admission controller on any
-    # cluster running it (k8s 1.25+). Belt-and-suspenders alongside the
-    # explicit per-container securityContext blocks on every workload.
+
+    # Enforce the Kubernetes Restricted Pod Security Standard.
+    # Workloads also define explicit securityContext settings.
     pod-security.kubernetes.io/enforce: restricted
     pod-security.kubernetes.io/audit: restricted
     pod-security.kubernetes.io/warn: restricted
