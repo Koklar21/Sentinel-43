@@ -1,96 +1,131 @@
 # Controlled, single-execution schema migration.
 #
-# Alembic is Sentinel-43's authoritative production schema mechanism
-# (MIGRATION_ARCHITECTURE_PASS5AM.md). This Job is the single migration actor
-# for a Kubernetes deployment: exactly one pod runs `alembic upgrade head`,
-# and the API Deployment must not be rolled out until it reports Complete.
+# Alembic is Sentinel-43's authoritative production schema mechanism.
+# This Job is the only Kubernetes actor authorized to run:
 #
-#   * FRESH database  -> 0001_baseline creates `users`, then 0002_sessions.
-#   * EXISTING pre-Alembic database -> run `alembic stamp 0001_baseline` once
-#     (env.py runs migrations/baseline.py's semantic compatibility check and
-#     REFUSES, exit 1, on any incompatibility), then this Job's `upgrade head`.
-#   * Incompatible schema -> `alembic` exits non-zero, the Job fails its
-#     backoffLimit, and the operator does not proceed to the API Deployment.
+#     alembic upgrade head
 #
-# The API workers never migrate (they only check the schema version on
-# readiness — core/auth/schema_version.py). See deploy/kubernetes/README.md's
-# "Migration process" section for the exact command and ordering.
+# IMPORTANT:
+# Kubernetes does not make Deployments wait for Jobs merely because both
+# resources are present in one Kustomization. Deployment automation must:
 #
-# alembic.ini carries no connection string; env.py reads DATABASE_URL from the
-# Secret (envFrom below). The sqlalchemy.engine logger is pinned at WARN so no
-# connection string or SQL parameters are echoed into the Job's logs.
+#   1. apply/run this migration Job,
+#   2. wait for condition=complete,
+#   3. only then apply or roll out the API Deployment.
+#
+# API workers must never perform production migrations. They may only verify
+# schema readiness/version during startup/readiness checks.
+#
+# DATABASE_URL is supplied by sentinel43-secrets. alembic.ini must not contain
+# credentials or a connection string.
+
 apiVersion: batch/v1
 kind: Job
+
 metadata:
   name: s43-migration
   namespace: sentinel43
-  labels: {app: s43-migration}
+  labels:
+    app: s43-migration
+
 spec:
   backoffLimit: 3
   activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 3600
+
   template:
     metadata:
       labels:
         app: s43-migration
         network/s43-db-client: "true"
+
     spec:
       serviceAccountName: s43-migration
       automountServiceAccountToken: false
       restartPolicy: Never
       terminationGracePeriodSeconds: 10
+
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
         fsGroup: 65532
-        seccompProfile: {type: RuntimeDefault}
+        seccompProfile:
+          type: RuntimeDefault
+
       containers:
         - name: migrate
-          image: sentinel43-api:base-placeholder  # overridden by every overlay, same image as s43-api
+          image: sentinel43-api:base-placeholder
           imagePullPolicy: IfNotPresent
-          # Alembic is the schema authority. `upgrade head` is idempotent
-          # (a DB already at head is a no-op) and never runs a destructive
-          # downgrade. On an incompatible/ambiguous schema env.py raises and
-          # `alembic` exits non-zero -> this Job fails -> rollout is blocked.
-          command: ["alembic", "upgrade", "head"]
+
+          command:
+            - alembic
+            - upgrade
+            - head
+
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+
           envFrom:
-            - configMapRef: {name: sentinel43-config}
-            - secretRef: {name: sentinel43-secrets}
+            - configMapRef:
+                name: sentinel43-config
+            - secretRef:
+                name: sentinel43-secrets
+
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             privileged: false
-            capabilities: {drop: ["ALL"]}
-            seccompProfile: {type: RuntimeDefault}
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+
           volumeMounts:
-            - {name: tmp, mountPath: /tmp}
+            - name: tmp
+              mountPath: /tmp
+
           resources:
-            requests: {cpu: 50m, memory: 128Mi}
-            limits: {cpu: 500m, memory: 256Mi}
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
       volumes:
         - name: tmp
           emptyDir: {}
+
 ---
-# Grants the migration Job's own pods egress to Postgres + DNS. It also
-# carries network/s43-db-client: "true" (see the pod template above), which
-# is what actually gets it past networkpolicy-db.yaml's ingress rule on the
-# Postgres side — this policy is the other half, opening egress from the Job
-# itself (default-deny-all blocks all egress otherwise).
+# Migration-specific database egress.
+#
+# DNS egress is intentionally not duplicated here. It is provided by the
+# shared networkpolicy-dns.yaml policy in the Kubernetes base.
+
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
+
 metadata:
   name: s43-migration-egress
   namespace: sentinel43
+
 spec:
   podSelector:
     matchLabels:
       app: s43-migration
+
   policyTypes:
     - Egress
+
   egress:
     - to:
         - podSelector:
             matchLabels:
               app: s43-db
+
       ports:
-        - {protocol: TCP, port: 5432}
+        - protocol: TCP
+          port: 5432
