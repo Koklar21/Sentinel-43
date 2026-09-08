@@ -1,18 +1,30 @@
-"""
-File: core/security/jwt_constants.py
+# =============================================================================
+# Sentinel-43
+#
+# Copyright (c) 2026 Justin Armstrong
+# All Rights Reserved.
+#
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
+# =============================================================================
 
-Single source of truth for the JWT signing-algorithm allowlist.
-
-This module intentionally has zero dependencies on core.bootstrap,
-core.api.main, or any router, so it can be imported from any of them
-without risking a circular or partially-initialized import. Only HS256
-is permitted today; core/bootstrap.py, core/api/main.py,
-core/api/deps/deps.py, and core/api/routers/auth.py must all import
-APPROVED_JWT_ALGORITHMS from here rather than hardcoding their own copies.
-"""
+"""Canonical JWT signing-algorithm allowlist."""
 
 from __future__ import annotations
 
 from typing import Final
 
-APPROVED_JWT_ALGORITHMS: Final[frozenset[str]] = frozenset({"HS256"})
+
+APPROVED_JWT_ALGORITHMS: Final[frozenset[str]] = frozenset(
+    {
+        "HS256",
+    }
+)
+
+
+__all__ = [
+    "APPROVED_JWT_ALGORITHMS",
+]
