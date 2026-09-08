@@ -96,6 +96,8 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import jwt as pyjwt
+from argon2 import Type as _Argon2Type
+from argon2 import extract_parameters as _argon2_extract_parameters
 from fastapi import APIRouter, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 
@@ -299,6 +301,7 @@ def _jwt_algorithm() -> str:
 
 def _valid_argon2_hash(value: str) -> bool:
     """
+<<<<<<< Updated upstream
     Return True iff value is a well-formed Argon2id encoded hash this
     deployment would accept as S43_OPERATOR_PASSWORD_HASH.
 
@@ -314,6 +317,46 @@ def _valid_argon2_hash(value: str) -> bool:
     from ...auth.users import is_valid_argon2id_hash
 
     return is_valid_argon2id_hash(value)
+=======
+    Return True if value is a genuinely well-formed Argon2id hash produced
+    by argon2-cffi, e.g.
+    "$argon2id$v=19$m=65536,t=3,p=4$<salt>$<hash>".
+
+    A prior revision of this function only checked shape (prefix, "$"
+    count, overall length) and never actually parsed the encoded hash. That
+    let a malformed-but-shape-valid value through, e.g.
+    "$argon2id$v=19$m=65536,t=3,p=4$$" (empty salt AND empty digest —
+    argon2.extract_parameters() happily parses this as salt_len=0,
+    hash_len=0 rather than raising). A value like that would pass this
+    check yet can never verify a real password, so the operator effectively
+    loses break-glass access without a loud failure at startup — this is
+    real parsing, not shape-sniffing, specifically to close that gap.
+
+    Real parsing via argon2.extract_parameters(): rejects anything that
+    isn't decodable as an Argon2 hash at all, and additionally requires
+    type=argon2id (rejects a syntactically-valid argon2i/argon2d hash — this
+    deployment only ever produces argon2id) and non-degenerate salt/digest
+    lengths (rejects the zero-length-salt/hash case above, and anything
+    below a sane security floor). hash_password() (core.auth.users) is
+    still what actually produces and verifies hashes; this stays a
+    config-sanity gate, not a re-implementation of verification.
+    """
+    if not isinstance(value, str) or len(value) > 512:
+        return False
+    # Cheap reject before invoking the parser: extract_parameters() does not
+    # itself enforce the algorithm name in the way we need (see below).
+    if not value.startswith("$argon2id$"):
+        return False
+    try:
+        params = _argon2_extract_parameters(value)
+    except Exception:
+        return False
+    return (
+        params.type == _Argon2Type.ID
+        and params.salt_len >= 16
+        and params.hash_len >= 16
+    )
+>>>>>>> Stashed changes
 
 
 # =============================================================================
