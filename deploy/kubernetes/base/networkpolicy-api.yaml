@@ -1,41 +1,42 @@
-# Egress only. Ingress to s43-api is deliberately NOT opened here — base has
-# no opinion on who's allowed to reach the public API, because that's
-# environment-specific (an Ingress controller in beta, kubectl port-forward
-# in dev). Each overlay adds its own ingress-allow NetworkPolicy on top of
-# this one (they combine additively, not by replacement) — see
-# overlays/beta/networkpolicy-ingress.yaml. Until an overlay adds that
-# allow, default-deny-all leaves s43-api completely unreachable except via
-# kubectl port-forward, which several CNIs exempt from NetworkPolicy
-# enforcement because it's proxied through the kubelet rather than the pod
-# network data path — confirmed for this deployment's target CNI during
-# integration testing, not assumed.
+# API ingress is intentionally not granted by the base.
+# Environment overlays define their own ingress policy.
+# Egress rules are additive with the shared DNS policy.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
+
 metadata:
   name: s43-api-egress
   namespace: sentinel43
+
 spec:
   podSelector:
     matchLabels:
       app: s43-api
+
   policyTypes:
     - Egress
+
   egress:
     - to:
         - podSelector:
             matchLabels:
               app: s43-db
       ports:
-        - {protocol: TCP, port: 5432}
+        - protocol: TCP
+          port: 5432
+
     - to:
         - podSelector:
             matchLabels:
               app: s43-redis
       ports:
-        - {protocol: TCP, port: 6379}
+        - protocol: TCP
+          port: 6379
+
     - to:
         - podSelector:
             matchLabels:
               app: s43-core
       ports:
-        - {protocol: TCP, port: 9100}
+        - protocol: TCP
+          port: 9100
