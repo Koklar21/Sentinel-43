@@ -310,15 +310,28 @@ jobs:
         run: |
           set -euo pipefail
           kubectl create namespace sentinel43 --dry-run=client -o yaml | kubectl apply -f -
-          gen() { python -c "import secrets; print(secrets.token_urlsafe(32))"; }
-          PG_PW=$(gen); REDIS_PW=$(gen)
+          gen() { python3 -c "import secrets; print(secrets.token_urlsafe(32))"; }
+          # S43_OPERATOR_PASSWORD_HASH must be a real Argon2id hash -- core.api.main
+          # ._validate_security_config() refuses to start otherwise outside
+          # local/dev/test, which is exactly the failure this smoke deploy is
+          # meant to catch, not paper over with a random token. Generated via the
+          # already-built CI image (has argon2-cffi from requirements.txt) rather
+          # than adding a separate Python/pip setup step to this job.
+          gen_operator_hash() {
+            docker run --rm sentinel43-api:ci python -c "
+import secrets
+from core.auth.users import hash_password
+print(hash_password(secrets.token_urlsafe(32)))
+"
+          }
+          PG_PW=$(gen); REDIS_PW=$(gen); OPERATOR_HASH=$(gen_operator_hash)
           kubectl create secret generic sentinel43-secrets -n sentinel43 \
             --from-literal=POSTGRES_PASSWORD="$PG_PW" \
             --from-literal=REDIS_PASSWORD="$REDIS_PW" \
             --from-literal=DATABASE_URL="postgresql+asyncpg://s43:${PG_PW}@s43-db:5432/s43" \
             --from-literal=REDIS_URL="redis://:${REDIS_PW}@s43-redis:6379/0" \
             --from-literal=S43_JWT_SECRET="$(gen)" \
-            --from-literal=S43_OPERATOR_PASSWORD_HASH="$(gen)" \
+            --from-literal=S43_OPERATOR_PASSWORD_HASH="$OPERATOR_HASH" \
             --from-literal=S43_AUTH_PEPPER="$(gen)" \
             --from-literal=S43_WATCHTOWER_SERVICE_TOKEN="$(gen)" \
             --from-literal=SENTINEL_LOG_SALT="$(gen)" \
