@@ -1,5 +1,8 @@
 # =============================================================================
-# Copyright (c) 2026 Justin [LastName or Entity]
+# Sentinel-43
+#
+# Copyright (c) 2026 Justin Armstrong
+# All Rights Reserved.
 #
 # Sentinel-43 is dual-licensed:
 #   (1) AGPL-3.0-or-later, or
@@ -8,18 +11,33 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
 
-"""Sentinel-43 Watchgate API routes."""
+"""Sentinel-43 Watchgate API routes.
+
+The router is intentionally thin:
+    - request validation is owned by Pydantic models
+    - authentication is owned by dependency wiring
+    - business behavior is delegated to engine/store interfaces
+    - authoritative action state comes from the store
+    - route code never fabricates a successful ledger state when the store is
+      unavailable or returns malformed data
+"""
 
 from __future__ import annotations
 
 import logging
 import re
 import uuid
-from typing import Any
+from typing import Any, Final
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 
-from core.api.deps import get_engine, get_store, require_operator
+from core.api.deps import (
+    EngineProtocol,
+    StoreProtocol,
+    get_engine,
+    get_store,
+    require_operator,
+)
 from core.api.models import (
     ActionDecision,
     ActionListResponse,
@@ -27,58 +45,97 @@ from core.api.models import (
     ActionResponse,
     ActionStatus,
     ApiStatus,
+    ErrorDetail,
     HealthResponse,
     ThreatAssessmentIn,
     ThreatAssessmentOut,
     utc_now_iso,
 )
 
-S43_API_NAME = "Sentinel-43 Watchgate API"
-S43_API_VERSION = "v1"
-S43_CORE_PRINCIPLE = (
+logger = logging.getLogger("sentinel43.watchgate.api")
+
+
+S43_API_NAME: Final[str] = "Sentinel-43 Watchgate API"
+S43_API_VERSION: Final[str] = "v1"
+S43_CORE_PRINCIPLE: Final[str] = (
     "Advisory-first. Human-gated. Audit-backed. "
     "No autonomous enforcement in core."
 )
 
-S43_ERR_ASSESSMENT_PIPELINE_FAILURE = "S43_ASSESSMENT_PIPELINE_FAILURE"
-S43_ERR_APPROVAL_PIPELINE_FAILURE = "S43_APPROVAL_PIPELINE_FAILURE"
-S43_ERR_VETO_PIPELINE_FAILURE = "S43_VETO_PIPELINE_FAILURE"
-S43_ERR_ACTION_LEDGER_QUERY_FAILURE = "S43_ACTION_LEDGER_QUERY_FAILURE"
-S43_ERR_ACTION_ID_MISMATCH = "S43_ACTION_ID_MISMATCH"
-S43_ERR_VETO_REASON_REQUIRED = "S43_VETO_REASON_REQUIRED"
-S43_ERR_ACTION_LEDGER_UNAVAILABLE = "S43_ACTION_LEDGER_UNAVAILABLE"
+S43_ERR_ASSESSMENT_PIPELINE_FAILURE: Final[str] = (
+    "S43_ASSESSMENT_PIPELINE_FAILURE"
+)
+S43_ERR_APPROVAL_PIPELINE_FAILURE: Final[str] = (
+    "S43_APPROVAL_PIPELINE_FAILURE"
+)
+S43_ERR_VETO_PIPELINE_FAILURE: Final[str] = (
+    "S43_VETO_PIPELINE_FAILURE"
+)
+S43_ERR_ACTION_LEDGER_QUERY_FAILURE: Final[str] = (
+    "S43_ACTION_LEDGER_QUERY_FAILURE"
+)
+S43_ERR_ACTION_ID_MISMATCH: Final[str] = (
+    "S43_ACTION_ID_MISMATCH"
+)
+S43_ERR_ACTION_LEDGER_UNAVAILABLE: Final[str] = (
+    "S43_ACTION_LEDGER_UNAVAILABLE"
+)
+S43_ERR_ACTION_STATUS_INVALID: Final[str] = (
+    "S43_ACTION_STATUS_INVALID"
+)
+S43_ERR_ASSESSMENT_RESULT_INVALID: Final[str] = (
+    "S43_ASSESSMENT_RESULT_INVALID"
+)
 
-logger = logging.getLogger("sentinel43.watchgate.api")
-
-_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+_REQUEST_ID_RE: Final[re.Pattern[str]] = re.compile(
+    r"^[A-Za-z0-9_.:-]{1,64}$"
+)
 
 router = APIRouter()
-v1 = APIRouter(prefix="/v1", dependencies=[Depends(require_operator)])
+v1 = APIRouter(
+    prefix="/v1",
+    dependencies=[Depends(require_operator)],
+)
 
 
-def dep_engine(engine: Any = Depends(get_engine)) -> Any:
+# =============================================================================
+# Dependency adapters
+# =============================================================================
+
+def dep_engine(
+    engine: EngineProtocol = Depends(get_engine),
+) -> EngineProtocol:
     return engine
 
 
-def dep_store(store: Any = Depends(get_store)) -> Any:
+def dep_store(
+    store: StoreProtocol = Depends(get_store),
+) -> StoreProtocol:
     return store
 
 
 def dep_request_id(
-    x_request_id: str | None = Header(default=None, alias="X-Request-ID"),
+    x_request_id: str | None = Header(
+        default=None,
+        alias="X-Request-ID",
+    ),
 ) -> str:
     if x_request_id:
-        candidate = str(x_request_id).strip()
+        candidate = x_request_id.strip()
+
         if _REQUEST_ID_RE.fullmatch(candidate):
             return candidate
-        logger.warning("Rejected unsafe X-Request-ID header.")
+
+        logger.warning(
+            "Rejected unsafe X-Request-ID header"
+        )
 
     return str(uuid.uuid4())
 
 
-def _api_status_value(status: Any) -> Any:
-    return status.value if hasattr(status, "value") else status
-
+# =============================================================================
+# Error helpers
+# =============================================================================
 
 def _http_error(
     status_code: int,
@@ -90,7 +147,7 @@ def _http_error(
     return HTTPException(
         status_code=status_code,
         detail={
-            "status": _api_status_value(ApiStatus.error),
+            "status": ApiStatus.ERROR.value,
             "request_id": request_id,
             "ts": utc_now_iso(),
             "service": S43_API_NAME,
@@ -103,306 +160,539 @@ def _http_error(
     )
 
 
-def _http_500(code: str, *, request_id: str | None = None) -> HTTPException:
+def _http_500(
+    code: str,
+    *,
+    request_id: str | None = None,
+) -> HTTPException:
     return _http_error(
-        500,
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
         code,
         "Sentinel-43 Watchgate pipeline failure.",
         request_id=request_id,
     )
 
 
-def _safe_int(value: Any, default: int = 0, *, field_name: str = "value") -> int:
-    if value is None:
-        return default
-
-    if isinstance(value, bool):
-        logger.warning("Invalid bool for numeric field %s=%r; using %d", field_name, value, default)
-        return default
-
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        logger.warning("Invalid integer for %s=%r; using %d", field_name, value, default)
-        return default
-
+# =============================================================================
+# Normalization helpers
+# =============================================================================
 
 def _model_to_dict(model: Any) -> dict[str, Any]:
     if hasattr(model, "model_dump"):
         return dict(model.model_dump())
-    if hasattr(model, "dict"):
-        return dict(model.dict())
+
     if isinstance(model, dict):
         return dict(model)
-    return dict(vars(model))
 
-
-def _with_request_id(model: Any, request_id: str | None) -> Any:
-    if not request_id:
-        return model
-
-    if hasattr(model, "model_copy"):
-        return model.model_copy(update={"request_id": request_id})
-
-    if hasattr(model, "copy"):
-        return model.copy(update={"request_id": request_id})
-
-    logger.warning(
-        "Could not attach request_id to unsupported model type: %s",
-        type(model).__name__,
+    raise TypeError(
+        f"Unsupported model payload type: {type(model).__name__}"
     )
-    return model
+
+
+def _normalize_decision(value: Any) -> ActionDecision:
+    if isinstance(value, ActionDecision):
+        return value
+
+    normalized = str(value or "").strip().lower()
+
+    try:
+        return ActionDecision(normalized)
+    except ValueError as exc:
+        raise ValueError(
+            f"Unrecognized action decision {value!r}"
+        ) from exc
 
 
 def _as_action_status(raw: Any) -> ActionStatus:
     if isinstance(raw, ActionStatus):
         return raw
 
-    if isinstance(raw, dict):
-        decision = raw.get("decision") or raw.get("status") or "unknown"
-
-        try:
-            decision_enum = ActionDecision(decision)
-        except Exception:
-            logger.warning("Unrecognized Sentinel-43 action decision: %r", decision)
-            decision_enum = ActionDecision.unknown
-
-        return ActionStatus(
-            action_id=str(raw.get("action_id") or raw.get("id") or ""),
-            decision=decision_enum,
-            decided_by=raw.get("decided_by"),
-            decided_ts=raw.get("decided_ts") or raw.get("ts"),
-            reason=raw.get("reason"),
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Unsupported action status payload type: "
+            f"{type(raw).__name__}"
         )
 
-    logger.warning("Unexpected action status payload type: %s", type(raw).__name__)
-    return ActionStatus(action_id=str(raw), decision=ActionDecision.unknown)
+    action_id = str(
+        raw.get("action_id")
+        or raw.get("id")
+        or ""
+    ).strip()
+
+    if not action_id:
+        raise ValueError(
+            "Action status payload is missing action_id"
+        )
+
+    decision = _normalize_decision(
+        raw.get("decision")
+        or raw.get("status")
+        or ActionDecision.UNKNOWN.value
+    )
+
+    return ActionStatus(
+        action_id=action_id,
+        decision=decision,
+        decided_by=raw.get("decided_by"),
+        decided_ts=(
+            raw.get("decided_ts")
+            or raw.get("ts")
+        ),
+        reason=raw.get("reason"),
+    )
+
+
+def _safe_score(
+    value: Any,
+    *,
+    field_name: str,
+) -> int:
+    if isinstance(value, bool):
+        raise ValueError(
+            f"{field_name} must be numeric"
+        )
+
+    try:
+        score = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{field_name} must be numeric"
+        ) from exc
+
+    if not 0 <= score <= 100:
+        raise ValueError(
+            f"{field_name} must be between 0 and 100"
+        )
+
+    return score
 
 
 def _as_assessment_out(
     result: Any,
     *,
-    request_id: str | None = None,
+    request_id: str,
 ) -> ThreatAssessmentOut:
     if isinstance(result, ThreatAssessmentOut):
-        return _with_request_id(result, request_id)
-
-    if isinstance(result, dict):
-        return ThreatAssessmentOut(
-            status=ApiStatus.ok,
-            request_id=request_id,
-            assessment_id=str(result.get("assessment_id") or result.get("id") or ""),
-            severity=_safe_int(result.get("severity", 0), field_name="severity"),
-            confidence=_safe_int(result.get("confidence", 0), field_name="confidence"),
-            summary=str(result.get("summary") or result.get("message") or ""),
-            tags=list(result.get("tags") or []),
-            raw=result,
+        return result.model_copy(
+            update={"request_id": request_id}
         )
 
+    if not isinstance(result, dict):
+        raise ValueError(
+            "Assessment engine returned unsupported payload type"
+        )
+
+    assessment_id = str(
+        result.get("assessment_id")
+        or result.get("id")
+        or ""
+    ).strip()
+
+    summary = str(
+        result.get("summary")
+        or result.get("message")
+        or ""
+    ).strip()
+
+    if not assessment_id:
+        raise ValueError(
+            "Assessment result missing assessment_id"
+        )
+
+    if not summary:
+        raise ValueError(
+            "Assessment result missing summary"
+        )
+
+    tags_raw = result.get("tags") or []
+
+    if not isinstance(tags_raw, list):
+        raise ValueError(
+            "Assessment result tags must be a list"
+        )
+
+    metadata: dict[str, Any] = {}
+
+    for key, value in result.items():
+        if key not in {
+            "assessment_id",
+            "id",
+            "severity",
+            "confidence",
+            "summary",
+            "message",
+            "tags",
+        }:
+            metadata[key] = value
+
     return ThreatAssessmentOut(
-        status=ApiStatus.ok,
+        status=ApiStatus.OK,
         request_id=request_id,
-        assessment_id="",
-        severity=0,
-        confidence=0,
-        summary=str(result),
-        tags=[],
-        raw=None,
+        assessment_id=assessment_id,
+        severity=_safe_score(
+            result.get("severity"),
+            field_name="severity",
+        ),
+        confidence=_safe_score(
+            result.get("confidence"),
+            field_name="confidence",
+        ),
+        summary=summary,
+        tags=tags_raw,
+        metadata=metadata or None,
     )
 
 
-def _store_status_or_default(
+def _read_authoritative_action_status(
     *,
-    store: Any,
+    store: StoreProtocol,
     action_id: str,
-    fallback_decision: ActionDecision,
-    operator_id: str,
-    reason: str,
+    request_id: str,
 ) -> ActionStatus:
     try:
-        status_raw = store.get_status(action_id)
-    except Exception:
-        logger.exception("Sentinel-43 action ledger status read failed.")
-        status_raw = None
+        raw = store.get_status(action_id)
+    except Exception as exc:
+        logger.exception(
+            "Sentinel-43 action ledger read failed. "
+            "action_id=%s request_id=%s",
+            action_id,
+            request_id,
+        )
+        raise _http_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            S43_ERR_ACTION_LEDGER_UNAVAILABLE,
+            "Authoritative action state is unavailable.",
+            request_id=request_id,
+        ) from exc
 
-    if status_raw is not None:
-        return _as_action_status(status_raw)
+    if raw is None:
+        raise _http_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            S43_ERR_ACTION_LEDGER_UNAVAILABLE,
+            "Authoritative action state is unavailable.",
+            request_id=request_id,
+        )
 
-    return ActionStatus(
-        action_id=action_id,
-        decision=fallback_decision,
-        decided_by=operator_id,
-        decided_ts=utc_now_iso(),
-        reason=reason,
+    try:
+        action = _as_action_status(raw)
+    except Exception as exc:
+        logger.exception(
+            "Sentinel-43 action ledger returned invalid state. "
+            "action_id=%s request_id=%s",
+            action_id,
+            request_id,
+        )
+        raise _http_error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            S43_ERR_ACTION_STATUS_INVALID,
+            "Authoritative action state is invalid.",
+            request_id=request_id,
+        ) from exc
+
+    if action.action_id != action_id:
+        raise _http_error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            S43_ERR_ACTION_STATUS_INVALID,
+            "Authoritative action state does not match requested action.",
+            request_id=request_id,
+        )
+
+    return action
+
+
+# =============================================================================
+# Health
+# =============================================================================
+
+@router.get(
+    "/health",
+    response_model=HealthResponse,
+    tags=["system"],
+)
+def health(
+    request_id: str = Depends(dep_request_id),
+) -> HealthResponse:
+    return HealthResponse(
+        status=ApiStatus.OK,
+        request_id=request_id,
+        service=S43_API_NAME,
+        version=S43_API_VERSION,
+        principle=S43_CORE_PRINCIPLE,
     )
 
 
-def _health_response(request_id: str) -> HealthResponse:
-    base = {
-        "status": ApiStatus.ok,
-        "request_id": request_id,
-    }
+# =============================================================================
+# Assessment
+# =============================================================================
 
-    extended = {
-        **base,
-        "service": S43_API_NAME,
-        "version": S43_API_VERSION,
-        "principle": S43_CORE_PRINCIPLE,
-    }
-
-    try:
-        return HealthResponse(**extended)
-    except Exception:
-        return HealthResponse(**base)
-
-
-@router.get("/health", response_model=HealthResponse, tags=["system"])
-def health(request_id: str = Depends(dep_request_id)) -> HealthResponse:
-    return _health_response(request_id)
-
-
-@v1.post("/assess", response_model=ThreatAssessmentOut, tags=["assessment"])
+@v1.post(
+    "/assess",
+    response_model=ThreatAssessmentOut,
+    tags=["assessment"],
+)
 def assess(
     payload: ThreatAssessmentIn,
     request_id: str = Depends(dep_request_id),
-    engine: Any = Depends(dep_engine),
+    engine: EngineProtocol = Depends(dep_engine),
 ) -> ThreatAssessmentOut:
     try:
         payload_dict = _model_to_dict(payload)
-        mode = payload.mode.value if hasattr(payload.mode, "value") else str(payload.mode)
 
-        result = engine.handle_assessment(mode, payload_dict)
-        return _as_assessment_out(result, request_id=request_id)
+        result = engine.handle_assessment(
+            payload.mode.value,
+            payload_dict,
+        )
+
+        return _as_assessment_out(
+            result,
+            request_id=request_id,
+        )
 
     except HTTPException:
         raise
-    except Exception:
-        logger.exception("Assessment failed. request_id=%s", request_id)
-        raise _http_500(S43_ERR_ASSESSMENT_PIPELINE_FAILURE, request_id=request_id)
+
+    except ValueError as exc:
+        logger.warning(
+            "Assessment engine returned invalid result. "
+            "request_id=%s error=%s",
+            request_id,
+            type(exc).__name__,
+        )
+        raise _http_error(
+            status.HTTP_502_BAD_GATEWAY,
+            S43_ERR_ASSESSMENT_RESULT_INVALID,
+            "Assessment engine returned an invalid result.",
+            request_id=request_id,
+        ) from exc
+
+    except Exception as exc:
+        logger.exception(
+            "Assessment failed. request_id=%s",
+            request_id,
+        )
+        raise _http_500(
+            S43_ERR_ASSESSMENT_PIPELINE_FAILURE,
+            request_id=request_id,
+        ) from exc
 
 
-@v1.post("/actions/{action_id}/approve", response_model=ActionResponse, tags=["actions"])
+# =============================================================================
+# Actions
+# =============================================================================
+
+def _validate_action_id_match(
+    *,
+    path_action_id: str,
+    body_action_id: str | None,
+    request_id: str,
+) -> None:
+    if (
+        body_action_id is not None
+        and body_action_id != path_action_id
+    ):
+        raise _http_error(
+            status.HTTP_400_BAD_REQUEST,
+            S43_ERR_ACTION_ID_MISMATCH,
+            "Body action_id does not match path.",
+            request_id=request_id,
+        )
+
+
+@v1.post(
+    "/actions/{action_id}/approve",
+    response_model=ActionResponse,
+    tags=["actions"],
+)
 def approve_action(
     action_id: str,
     body: ActionRequest,
     request_id: str = Depends(dep_request_id),
-    engine: Any = Depends(dep_engine),
-    store: Any = Depends(dep_store),
+    engine: EngineProtocol = Depends(dep_engine),
+    store: StoreProtocol = Depends(dep_store),
 ) -> ActionResponse:
-    if body.action_id and body.action_id != action_id:
-        raise _http_error(
-            400,
-            S43_ERR_ACTION_ID_MISMATCH,
-            "Body action_id does not match path.",
-            request_id=request_id,
-        )
+    _validate_action_id_match(
+        path_action_id=action_id,
+        body_action_id=body.action_id,
+        request_id=request_id,
+    )
 
     try:
-        reason = body.reason or ""
-        ok = bool(engine.approve_action(action_id, body.operator_id, reason=reason))
-
-        action = _store_status_or_default(
-            store=store,
-            action_id=action_id,
-            fallback_decision=ActionDecision.approved,
-            operator_id=body.operator_id,
-            reason=reason,
+        ok = bool(
+            engine.approve_action(
+                action_id,
+                body.operator_id,
+                reason=body.reason,
+            )
         )
 
-        return ActionResponse(
-            status=ApiStatus.ok,
+        if not ok:
+            raise _http_error(
+                status.HTTP_409_CONFLICT,
+                S43_ERR_APPROVAL_PIPELINE_FAILURE,
+                "Approval was not accepted.",
+                request_id=request_id,
+            )
+
+        action = _read_authoritative_action_status(
+            store=store,
+            action_id=action_id,
             request_id=request_id,
-            result=ok,
+        )
+
+        if action.decision is not ActionDecision.APPROVED:
+            raise _http_error(
+                status.HTTP_409_CONFLICT,
+                S43_ERR_ACTION_STATUS_INVALID,
+                "Approval did not produce an approved ledger state.",
+                request_id=request_id,
+            )
+
+        return ActionResponse(
+            status=ApiStatus.OK,
+            request_id=request_id,
+            result=True,
             action=action,
         )
 
     except HTTPException:
         raise
-    except Exception:
-        logger.exception("Approval failed. action_id=%s request_id=%s", action_id, request_id)
-        raise _http_500(S43_ERR_APPROVAL_PIPELINE_FAILURE, request_id=request_id)
+
+    except Exception as exc:
+        logger.exception(
+            "Approval failed. action_id=%s request_id=%s",
+            action_id,
+            request_id,
+        )
+        raise _http_500(
+            S43_ERR_APPROVAL_PIPELINE_FAILURE,
+            request_id=request_id,
+        ) from exc
 
 
-@v1.post("/actions/{action_id}/veto", response_model=ActionResponse, tags=["actions"])
+@v1.post(
+    "/actions/{action_id}/veto",
+    response_model=ActionResponse,
+    tags=["actions"],
+)
 def veto_action(
     action_id: str,
     body: ActionRequest,
     request_id: str = Depends(dep_request_id),
-    engine: Any = Depends(dep_engine),
-    store: Any = Depends(dep_store),
+    engine: EngineProtocol = Depends(dep_engine),
+    store: StoreProtocol = Depends(dep_store),
 ) -> ActionResponse:
-    if body.action_id and body.action_id != action_id:
-        raise _http_error(
-            400,
-            S43_ERR_ACTION_ID_MISMATCH,
-            "Body action_id does not match path.",
-            request_id=request_id,
-        )
-
-    reason = (body.reason or "").strip()
-    if not reason:
-        raise _http_error(
-            400,
-            S43_ERR_VETO_REASON_REQUIRED,
-            "Sentinel-43 veto requires a human-readable reason.",
-            request_id=request_id,
-        )
+    _validate_action_id_match(
+        path_action_id=action_id,
+        body_action_id=body.action_id,
+        request_id=request_id,
+    )
 
     try:
-        ok = bool(engine.veto_action(action_id, body.operator_id, reason=reason))
-
-        action = _store_status_or_default(
-            store=store,
-            action_id=action_id,
-            fallback_decision=ActionDecision.vetoed,
-            operator_id=body.operator_id,
-            reason=reason,
+        ok = bool(
+            engine.veto_action(
+                action_id,
+                body.operator_id,
+                reason=body.reason,
+            )
         )
 
-        return ActionResponse(
-            status=ApiStatus.ok,
+        if not ok:
+            raise _http_error(
+                status.HTTP_409_CONFLICT,
+                S43_ERR_VETO_PIPELINE_FAILURE,
+                "Veto was not accepted.",
+                request_id=request_id,
+            )
+
+        action = _read_authoritative_action_status(
+            store=store,
+            action_id=action_id,
             request_id=request_id,
-            result=ok,
+        )
+
+        if action.decision is not ActionDecision.VETOED:
+            raise _http_error(
+                status.HTTP_409_CONFLICT,
+                S43_ERR_ACTION_STATUS_INVALID,
+                "Veto did not produce a vetoed ledger state.",
+                request_id=request_id,
+            )
+
+        return ActionResponse(
+            status=ApiStatus.OK,
+            request_id=request_id,
+            result=True,
             action=action,
         )
 
     except HTTPException:
         raise
-    except Exception:
-        logger.exception("Veto failed. action_id=%s request_id=%s", action_id, request_id)
-        raise _http_500(S43_ERR_VETO_PIPELINE_FAILURE, request_id=request_id)
+
+    except Exception as exc:
+        logger.exception(
+            "Veto failed. action_id=%s request_id=%s",
+            action_id,
+            request_id,
+        )
+        raise _http_500(
+            S43_ERR_VETO_PIPELINE_FAILURE,
+            request_id=request_id,
+        ) from exc
 
 
-@v1.get("/actions", response_model=ActionListResponse, tags=["actions"])
+@v1.get(
+    "/actions",
+    response_model=ActionListResponse,
+    tags=["actions"],
+)
 def list_actions(
-    status: str | None = Query(default=None, description="Filter by Sentinel-43 decision/status"),
-    limit: int = Query(default=50, ge=1, le=500),
-    cursor: str | None = Query(default=None),
+    decision: ActionDecision | None = Query(
+        default=None,
+        alias="status",
+        description="Filter by Sentinel-43 decision/status",
+    ),
+    limit: int = Query(
+        default=50,
+        ge=1,
+        le=500,
+    ),
+    cursor: str | None = Query(
+        default=None,
+        max_length=512,
+    ),
     request_id: str = Depends(dep_request_id),
-    store: Any = Depends(dep_store),
+    store: StoreProtocol = Depends(dep_store),
 ) -> ActionListResponse:
     try:
-        if not hasattr(store, "list_actions"):
-            raise _http_error(
-                501,
-                S43_ERR_ACTION_LEDGER_UNAVAILABLE,
-                "Sentinel-43 action ledger does not implement list_actions().",
-                request_id=request_id,
-            )
+        items_raw = store.list_actions(
+            status=(
+                decision.value
+                if decision is not None
+                else None
+            ),
+            limit=limit,
+            cursor=cursor,
+        )
 
-        items_raw = store.list_actions(status=status, limit=limit, cursor=cursor)
-
-        next_cursor = None
         if isinstance(items_raw, dict):
-            next_cursor = items_raw.get("next_cursor")
             raw_items = items_raw.get("items") or []
+            next_cursor = items_raw.get("next_cursor")
         else:
             raw_items = items_raw or []
+            next_cursor = None
 
-        items = [_as_action_status(item) for item in raw_items]
+        if not isinstance(raw_items, list):
+            raise ValueError(
+                "Action ledger items must be a list"
+            )
+
+        items = [
+            _as_action_status(item)
+            for item in raw_items
+        ]
 
         return ActionListResponse(
-            status=ApiStatus.ok,
+            status=ApiStatus.OK,
             request_id=request_id,
             items=items,
             next_cursor=next_cursor,
@@ -410,9 +700,34 @@ def list_actions(
 
     except HTTPException:
         raise
-    except Exception:
-        logger.exception("Action ledger query failed. request_id=%s", request_id)
-        raise _http_500(S43_ERR_ACTION_LEDGER_QUERY_FAILURE, request_id=request_id)
+
+    except ValueError as exc:
+        logger.exception(
+            "Action ledger returned invalid data. "
+            "request_id=%s",
+            request_id,
+        )
+        raise _http_error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            S43_ERR_ACTION_STATUS_INVALID,
+            "Action ledger returned invalid data.",
+            request_id=request_id,
+        ) from exc
+
+    except Exception as exc:
+        logger.exception(
+            "Action ledger query failed. request_id=%s",
+            request_id,
+        )
+        raise _http_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            S43_ERR_ACTION_LEDGER_QUERY_FAILURE,
+            "Action ledger is unavailable.",
+            request_id=request_id,
+        ) from exc
 
 
 router.include_router(v1)
+
+
+__all__ = ["router"]
