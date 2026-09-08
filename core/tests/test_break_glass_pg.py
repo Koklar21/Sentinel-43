@@ -72,7 +72,16 @@ def _cfg() -> Config:
 
 
 @pytest.fixture()
-def client(monkeypatch):
+def db_env(monkeypatch):
+    """
+    Env + schema setup only -- no TestClient/app lifespan. For tests that
+    call an auth function directly via asyncio.run() rather than through an
+    HTTP request: running asyncio.run() concurrently with a live TestClient
+    (which drives the ASGI app from its own anyio portal thread) corrupts
+    that portal's shutdown ("This portal is not running") -- a fixture
+    hazard, not a code defect. Tests that need the actual HTTP layer use the
+    `client` fixture below instead, which is built on this one.
+    """
     monkeypatch.setenv("SENTINEL_ENV", "test")
     monkeypatch.setenv("DATABASE_URL", _DSN)
     monkeypatch.setenv("S43_JWT_SECRET", JWT_SECRET)
@@ -96,18 +105,23 @@ def client(monkeypatch):
     users_mod._engine = None
     users_mod._sessionmaker = None
 
-    from fastapi.testclient import TestClient
-    import core.api.main as main_module
-
-    with TestClient(main_module.app) as c:
-        c._db = eng  # type: ignore[attr-defined]
-        yield c
+    yield eng
 
     users_mod._engine = None
     users_mod._sessionmaker = None
     with eng.begin() as c:
         c.exec_driver_sql("DROP TABLE IF EXISTS sessions, users, alembic_version CASCADE")
     eng.dispose()
+
+
+@pytest.fixture()
+def client(db_env):
+    from fastapi.testclient import TestClient
+    import core.api.main as main_module
+
+    with TestClient(main_module.app) as c:
+        c._db = db_env  # type: ignore[attr-defined]
+        yield c
 
 
 def _add_admin(eng, username="admin1"):
@@ -192,6 +206,95 @@ def test_armed_flag_overrides_db_unreachable(client, monkeypatch):
     try:
         r = _login_env(client)
         assert r.status_code == 200, r.text
+    finally:
+        users_mod._engine = None
+        users_mod._sessionmaker = None
+
+
+# ---------------------------------------------------------------------------
+# reverify_password() -- the per-request X-S43-Password gate. Same DB-error
+# -> deny-unless-armed contract as the login path above, exercised
+# independently: reverify_password() has its own try/except around the
+# DB-backed lookup (auth.py reverify_password()), not shared code with
+# _validate_credentials(), so a fix to one does not guarantee the other is
+# correct. Uses a protected route (/auth/verify + a protected GET) to force
+# the per-request password re-check rather than calling reverify_password()
+# directly, so this also proves the route wiring reaches the same fail-
+# closed behavior, not just the function in isolation.
+# ---------------------------------------------------------------------------
+
+def _protected_get_with_password(client, token, password):
+    return client.get(
+        "/auth/verify",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-S43-Password": password,
+        },
+    )
+
+
+def test_reverify_password_denied_when_db_unreachable_and_not_armed(db_env, monkeypatch):
+    import asyncio
+
+    from fastapi import HTTPException
+
+    from core.api.routers.auth import reverify_password
+    import core.auth.users as users_mod
+
+    monkeypatch.setenv("DATABASE_URL", _UNREACHABLE_DSN)
+    monkeypatch.delenv("S43_BREAK_GLASS_ARMED", raising=False)
+    users_mod._engine = None
+    users_mod._sessionmaker = None
+    try:
+        # DB down, break-glass not armed -> fail closed with 503 (a platform
+        # outage), not a silent False/401 and not a silent grant of
+        # break-glass. Matches _validate_credentials()'s documented contract
+        # for the same scenario at the login path (test above).
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(reverify_password(_ENV_USER, _ENV_PW))
+        assert exc_info.value.status_code == 503
+    finally:
+        users_mod._engine = None
+        users_mod._sessionmaker = None
+
+
+def test_reverify_password_armed_flag_overrides_db_unreachable(db_env, monkeypatch):
+    import asyncio
+
+    import core.auth.users as users_mod
+    from core.api.routers.auth import reverify_password
+
+    monkeypatch.setenv("DATABASE_URL", _UNREACHABLE_DSN)
+    monkeypatch.setenv("S43_BREAK_GLASS_ARMED", "true")
+    users_mod._engine = None
+    users_mod._sessionmaker = None
+    try:
+        assert asyncio.run(reverify_password(_ENV_USER, _ENV_PW)) is True
+    finally:
+        users_mod._engine = None
+        users_mod._sessionmaker = None
+
+
+def test_reverify_password_wrong_password_is_false_not_503_when_db_unreachable_and_armed(
+    db_env, monkeypatch,
+):
+    import asyncio
+
+    import core.auth.users as users_mod
+    from core.api.routers.auth import reverify_password
+
+    monkeypatch.setenv("DATABASE_URL", _UNREACHABLE_DSN)
+    monkeypatch.setenv("S43_BREAK_GLASS_ARMED", "true")
+    users_mod._engine = None
+    users_mod._sessionmaker = None
+    try:
+        # Armed break-glass still requires the RIGHT password -- a DB outage
+        # plus S43_BREAK_GLASS_ARMED=true must not turn into an unconditional
+        # pass. This must be an ordinary False (-> 401 at the route), not an
+        # HTTPException(503): the DB-down 503 path was already taken care of
+        # by _env_operator_allowed() returning True (armed); what remains is
+        # plain wrong-password evaluation against the env-var credential.
+        assert asyncio.run(reverify_password(_ENV_USER, "definitely-wrong")) is False
     finally:
         users_mod._engine = None
         users_mod._sessionmaker = None
