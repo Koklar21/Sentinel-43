@@ -1,418 +1,296 @@
 # =============================================================================
 # Sentinel-43 — Docker Compose
 #
-# Required .env variables
-# -----------------------
-# Infrastructure:
-#   POSTGRES_PASSWORD          strong random password for Postgres
-#   REDIS_PASSWORD             strong random password for Redis
-#   DATABASE_URL               postgresql+asyncpg://s43:<POSTGRES_PASSWORD>@s43-db:5432/s43
+# Local / single-host deployment.
 #
-# Auth / JWT:
-#   S43_JWT_SECRET             output of: python -c "import secrets; print(secrets.token_urlsafe(32))"
-#   S43_JWT_ALGORITHM          HS256
-#   S43_JWT_ISSUER             sentinel-43
-#   S43_JWT_AUDIENCE           sentinel-43-dashboard
-#   S43_AUTH_PEPPER            output of: python -c "import secrets; print(secrets.token_hex(32))"
-#   S43_WS_REQUIRE_AUTH        true
-#   S43_OPERATOR_USERNAME      operator  (or your chosen username)
-#   S43_OPERATOR_PASSWORD_HASH output of: python core/scripts/generate_secrets.py --password-hash
-#
-# Internal service auth:
-#   S43_WATCHTOWER_SERVICE_TOKEN  output of: python -c "import secrets; print(secrets.token_urlsafe(32))"
-#                                 shared by s43-api and s43-core; the Watchtower
-#                                 rejects every non-probe route without it
-#
-# Log pseudonymization:
-#   SENTINEL_LOG_SALT          output of: python -c "import secrets; print(secrets.token_hex(32))"
-#
-# Remote gateway:
-#   SENTINEL_REMOTE_TOKEN_OWNER    output of: python -c "import secrets; print(secrets.token_urlsafe(32))"
-#   SENTINEL_REMOTE_TOKEN_ADMIN    (same)
-#   SENTINEL_REMOTE_TOKEN_AUDITOR  (same)
-#
-# Fenrir (required when S43_FENRIR_ENABLED=true):
-#   S43_FENRIR_API_TOKEN       output of: python -c "import secrets; print(secrets.token_urlsafe(32))"
-#
-# Generate all of the above in one step:
-#   python core/scripts/generate_secrets.py --write .env
-#   python core/scripts/generate_secrets.py --password-hash   (then paste the output into .env)
-#
-# Or via Docker (no Python required on host):
-#   docker compose --profile setup run --rm s43-setup --write /app/.env
-#
-# Production — also set in .env:
-#   SENTINEL_ENV               production
-#   S43_ALLOWED_ORIGINS        https://yourdomain.com
-#   S43_ENABLE_TEST_INJECTION  false  (or omit entirely)
+# Production-like invariants:
+#   - Postgres is the only database service in the base stack.
+#   - Alembic is the only schema migration authority.
+#   - s43-api does not start until migration completes successfully.
+#   - s43-core is not host-published.
+#   - s43-api is not host-published.
+#   - s43-proxy is the only host-facing service.
+#   - canonical configuration uses the S43_ namespace.
+#   - canonical Sentinel-43 auth owns JWT/session identity.
 # =============================================================================
 
 services:
 
   # ---------------------------------------------------------------------------
-  # Postgres
+  # PostgreSQL
   # ---------------------------------------------------------------------------
   s43-db:
     image: postgres:16.3
-    container_name: s43_postgres
     restart: unless-stopped
+
     environment:
-      POSTGRES_DB:       s43
-      POSTGRES_USER:     s43
+      POSTGRES_DB: s43
+      POSTGRES_USER: s43
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U s43 -d s43"]
+      test:
+        - CMD-SHELL
+        - 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -h 127.0.0.1'
       interval: 5s
       timeout: 5s
       retries: 10
+
     volumes:
       - s43_pgdata:/var/lib/postgresql/data
+
     networks:
       - s43_net
 
-  # ---------------------------------------------------------------------------
-  # Redis
-  # ---------------------------------------------------------------------------
-  s43-redis:
-    image: redis:7.2
-    container_name: s43_redis
-    restart: unless-stopped
-    command: redis-server --requirepass ${REDIS_PASSWORD}
-    healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-    networks:
-      - s43_net
 
   # ---------------------------------------------------------------------------
-  # Watchtower (core monitoring node)
-  # Runs the same image as s43-api but with the Watchtower entrypoint.
+  # Watchtower / core monitoring service
   # ---------------------------------------------------------------------------
   s43-core:
     build:
       context: .
       dockerfile: core/api/Dockerfile
-    container_name: s43_core
+
     restart: unless-stopped
-    command: uvicorn core.monitoring.watchtower:app --host 0.0.0.0 --port 9100
-    # No host port publication (Pass 1 — direct Watchtower exposure).
-    # Only s43-api needs to reach the Watchtower, and it does so over the
-    # s43_net bridge at http://s43-core:9100. This matches the Kubernetes
-    # posture, where the s43-core Service is ClusterIP with a NetworkPolicy
-    # that only admits s43-api. To reach it from the host for local
-    # debugging, add a docker-compose.override.yml with:
-    #   services: {s43-core: {ports: ["127.0.0.1:9100:9100"]}}
-    # and remember every operational route now needs
-    # `Authorization: Bearer $S43_WATCHTOWER_SERVICE_TOKEN`.
+
+    command:
+      - uvicorn
+      - core.monitoring.watchtower:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9100"
+
     environment:
-      # --- Runtime ---
-      SENTINEL_ENV:       ${SENTINEL_ENV}
-      S43_LOG_LEVEL:      INFO
+      S43_ENV: ${S43_ENV:-production}
+      S43_LOG_LEVEL: ${S43_LOG_LEVEL:-INFO}
 
-      # --- Watchtower bind ---
-      S43_WATCHTOWER_HOST:    0.0.0.0
-      S43_WATCHTOWER_PORT:    9100
-      S43_EXPOSE_BIND_HOST:   "true"
+      S43_WATCHTOWER_HOST: 0.0.0.0
+      S43_WATCHTOWER_PORT: "9100"
+      S43_WATCHTOWER_SERVICE_TOKEN: ${S43_WATCHTOWER_SERVICE_TOKEN}
 
-      # --- Storage ---
-      DATABASE_URL:       ${DATABASE_URL}
-      REDIS_URL:          redis://:${REDIS_PASSWORD}@s43-redis:6379/0
+      DATABASE_URL: ${DATABASE_URL}
 
-      # --- Hardening ---
-      S43_AUTH_PEPPER:                ${S43_AUTH_PEPPER}
-      SENTINEL_LOG_SALT:              ${SENTINEL_LOG_SALT}
-      # Internal-service token the Watchtower requires on every operational
-      # and mutation route (/status, /modules*, /dependencies*,
-      # /events/recent, /analyze, /state/*). /watchtower/health and
-      # /watchtower/ready stay open for probes. Must match s43-api's value.
-      S43_WATCHTOWER_SERVICE_TOKEN:   ${S43_WATCHTOWER_SERVICE_TOKEN}
-    volumes:
-      - ./logs:/app/logs
+      S43_AUDIT_HMAC_KEY: ${S43_AUDIT_HMAC_KEY}
+      S43_SESSION_HASH_PEPPER: ${S43_SESSION_HASH_PEPPER}
+
     depends_on:
       s43-db:
         condition: service_healthy
-      s43-redis:
-        condition: service_healthy
+
+    volumes:
+      - sentinel43_state:/app/sentinel43_state
+
     networks:
       - s43_net
 
+
   # ---------------------------------------------------------------------------
-  # Schema migration (one-shot)
-  #
-  # Alembic is Sentinel-43's authoritative production schema mechanism
-  # (MIGRATION_ARCHITECTURE_PASS5AM.md). This service runs `alembic upgrade
-  # head` once, to completion, BEFORE s43-api starts — s43-api's depends_on
-  # below waits for `service_completed_successfully`. `upgrade head` is
-  # idempotent: on a database already at head it is a no-op, so it is safe to
-  # leave in every `docker compose up`.
-  #
-  #   FRESH database (new s43_pgdata volume): 0001_baseline creates `users`,
-  #   then 0002_sessions creates `sessions`. Nothing else to do.
-  #
-  #   EXISTING pre-Alembic database (a volume whose `users` table was created
-  #   by the old init_models()/create_all path, before Alembic): this service
-  #   will FAIL — 0001_baseline refuses to CREATE an existing `users` table.
-  #   Adopt it once, then bring the stack up:
-  #     docker compose run --rm s43-migrate alembic stamp 0001_baseline
-  #       (env.py runs migrations/baseline.py's semantic compatibility check
-  #        first and refuses, exit 1, on any incompatibility — it never
-  #        blindly stamps)
-  #     docker compose up -d
-  #
-  # alembic.ini has no connection string; env.py reads DATABASE_URL from the
-  # environment below. The sqlalchemy.engine logger is pinned WARN so no
-  # connection string is echoed.
+  # Schema migration
   # ---------------------------------------------------------------------------
   s43-migrate:
     build:
       context: .
       dockerfile: core/api/Dockerfile
-    container_name: s43_migrate
-    command: ["alembic", "upgrade", "head"]
+
+    command:
+      - alembic
+      - upgrade
+      - head
+
     restart: "no"
+
     environment:
-      SENTINEL_ENV: ${SENTINEL_ENV}
+      S43_ENV: ${S43_ENV:-production}
+      S43_LOG_LEVEL: ${S43_LOG_LEVEL:-INFO}
       DATABASE_URL: ${DATABASE_URL}
-      S43_LOG_LEVEL: INFO
+
     depends_on:
       s43-db:
         condition: service_healthy
+
     networks:
       - s43_net
 
+
   # ---------------------------------------------------------------------------
-  # API (FastAPI)
+  # API
   # ---------------------------------------------------------------------------
   s43-api:
     build:
       context: .
       dockerfile: core/api/Dockerfile
-    container_name: s43_api
+
     restart: unless-stopped
-    # --forwarded-allow-ips pins uvicorn's own default (127.0.0.1) so a
-    # FORWARDED_ALLOW_IPS=* env can't make uvicorn rewrite the client IP from
-    # X-Forwarded-For for any peer and bypass SentinelFirewall. The real
-    # proxy-trust knob is S43_TRUSTED_PROXIES. See
-    # docs/security/trusted_proxy_handling.md.
-    command: uvicorn core.api.main:app --host 0.0.0.0 --port 8000 --forwarded-allow-ips 127.0.0.1
-    # NOT host-published. The only way in is through s43-proxy (TLS). For
-    # direct backend access while debugging, copy
-    # docker-compose.override.yml.example to docker-compose.override.yml.
+
+    command:
+      - uvicorn
+      - core.api.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --forwarded-allow-ips
+      - 127.0.0.1
+
     expose:
       - "8000"
-    environment:
-      # --- Runtime environment ---
-      SENTINEL_ENV:              ${SENTINEL_ENV}
-      S43_ENV:                   ${SENTINEL_ENV}
-      S43_LOG_LEVEL:             INFO
 
-      # --- Reverse proxy / transport (beta-execution Phase 2, F-TLS-1) ---
-      # s43-proxy has a fixed IP on s43_net (see the networks section); the
-      # app trusts X-Forwarded-For / X-Forwarded-Proto only from it. uvicorn
-      # still ignores forwarded headers itself (--forwarded-allow-ips above).
-      S43_TRUSTED_PROXIES:       ${S43_TRUSTED_PROXIES:-172.28.0.250/32}
-      # Comma-separated exact Host values this deployment answers on. Set to
-      # your real hostname(s) for a public beta; the default covers local
-      # https://localhost testing through s43-proxy.
-      S43_TRUSTED_HOSTS:        ${S43_TRUSTED_HOSTS:-localhost,127.0.0.1}
-      # Set true ONLY for a TLS terminator on a trusted private network that
-      # keeps http:// origins. Normally leave unset -- non-local startup
-      # refuses a plaintext non-loopback origin.
+    environment:
+      # Runtime
+      S43_ENV: ${S43_ENV:-production}
+      S43_LOG_LEVEL: ${S43_LOG_LEVEL:-INFO}
+
+      # Transport / trusted proxy boundary
+      S43_TRUSTED_PROXIES: ${S43_TRUSTED_PROXIES:-172.28.0.250/32}
+      S43_TRUSTED_HOSTS: ${S43_TRUSTED_HOSTS:-localhost,127.0.0.1}
       S43_ALLOW_INSECURE_ORIGINS: ${S43_ALLOW_INSECURE_ORIGINS:-}
 
-      # --- Service endpoints ---
-      S43_WATCHTOWER_URL:        http://s43-core:9100
-      # Must match s43-core's value — the API presents this on every
-      # service-to-service call to the Watchtower (Pass 1).
+      # Internal services
+      S43_WATCHTOWER_URL: http://s43-core:9100
       S43_WATCHTOWER_SERVICE_TOKEN: ${S43_WATCHTOWER_SERVICE_TOKEN}
-      DATABASE_URL:              ${DATABASE_URL}
-      REDIS_URL:                 redis://:${REDIS_PASSWORD}@s43-redis:6379/0
+      S43_WATCHTOWER_TIMEOUT: ${S43_WATCHTOWER_TIMEOUT:-2.0}
 
-      # --- JWT authentication ---
-      S43_JWT_SECRET:            ${S43_JWT_SECRET}
-      S43_JWT_ALGORITHM:         ${S43_JWT_ALGORITHM:-HS256}
-      S43_JWT_ISSUER:            ${S43_JWT_ISSUER:-sentinel-43}
-      S43_JWT_AUDIENCE:          ${S43_JWT_AUDIENCE:-sentinel-43-dashboard}
-      S43_JWT_TTL_SECONDS:       ${S43_JWT_TTL_SECONDS:-28800}
+      # Database
+      DATABASE_URL: ${DATABASE_URL}
+      S43_DB_PATH: /app/sentinel43_state/sentinel43.sqlite3
 
-      # --- Operator credentials ---
-      S43_OPERATOR_USERNAME:     ${S43_OPERATOR_USERNAME:-operator}
+      # Canonical JWT authentication
+      S43_JWT_SECRET: ${S43_JWT_SECRET}
+      S43_JWT_ALGORITHM: ${S43_JWT_ALGORITHM:-HS256}
+      S43_JWT_ISSUER: ${S43_JWT_ISSUER:-sentinel-43}
+      S43_JWT_AUDIENCE: ${S43_JWT_AUDIENCE:-sentinel-43-dashboard}
+      S43_JWT_TTL_SECONDS: ${S43_JWT_TTL_SECONDS:-28800}
+
+      # Operator credentials
+      S43_OPERATOR_USERNAME: ${S43_OPERATOR_USERNAME:-operator}
       S43_OPERATOR_PASSWORD_HASH: ${S43_OPERATOR_PASSWORD_HASH}
 
-      # --- Auth key-store hardening ---
-      S43_AUTH_PEPPER:           ${S43_AUTH_PEPPER}
-      # Secret-rotation freshness gate (core/bootstrap.py). The secret
-      # generator writes S43_SECRETS_ROTATED_AT into .env; a non-local API
-      # refuses to start without it (finding #13 — it was previously not
-      # forwarded here). S43_SECRET_MAX_AGE_DAYS overrides the default cap.
-      S43_SECRETS_ROTATED_AT:    ${S43_SECRETS_ROTATED_AT}
-      # S43_SECRET_MAX_AGE_DAYS: add to .env only to override the code default
-      # (an empty value fails strict int parsing, so it is not defaulted here).
+      # Auth/session integrity
+      S43_AUTH_PEPPER: ${S43_AUTH_PEPPER}
+      S43_SESSION_HASH_PEPPER: ${S43_SESSION_HASH_PEPPER}
+      S43_SESSION_ACCESS_TTL_SECONDS: ${S43_SESSION_ACCESS_TTL_SECONDS:-900}
+      S43_SESSION_REFRESH_TTL_SECONDS: ${S43_SESSION_REFRESH_TTL_SECONDS:-604800}
+      S43_WS_SESSION_RECHECK_SECONDS: ${S43_WS_SESSION_RECHECK_SECONDS:-60}
 
-      # --- Browser session (beta) ---
-      S43_SESSION_ACCESS_TTL_SECONDS:   ${S43_SESSION_ACCESS_TTL_SECONDS:-900}
-      S43_SESSION_REFRESH_TTL_SECONDS:  ${S43_SESSION_REFRESH_TTL_SECONDS:-604800}
-      S43_WS_SESSION_RECHECK_SECONDS:   ${S43_WS_SESSION_RECHECK_SECONDS:-60}
-      # #11 break-glass + X-S43-Password cutover — see AUTH_SESSION_BETA.md.
-      S43_BREAK_GLASS_ARMED:     ${S43_BREAK_GLASS_ARMED:-}
-      S43_REJECT_LEGACY_AUTH:    ${S43_REJECT_LEGACY_AUTH:-}
+      # WebSocket auth
+      S43_WS_REQUIRE_AUTH: ${S43_WS_REQUIRE_AUTH:-true}
 
-      # --- Log pseudonymization ---
-      SENTINEL_LOG_SALT:         ${SENTINEL_LOG_SALT}
+      # CORS
+      S43_ALLOWED_ORIGINS: ${S43_ALLOWED_ORIGINS}
 
-      # --- WebSocket auth ---
-      S43_WS_REQUIRE_AUTH:       ${S43_WS_REQUIRE_AUTH:-true}
+      # Governance
+      S43_GOVERNANCE_ENABLED: ${S43_GOVERNANCE_ENABLED:-false}
+      S43_DEFAULT_MODE: ${S43_DEFAULT_MODE:-HUMAN_GATED}
 
-      # --- CORS ---
-      S43_ALLOWED_ORIGINS:       ${S43_ALLOWED_ORIGINS}
-
-      # --- Remote gateway operator tokens ---
-      SENTINEL_REMOTE_TOKEN_OWNER:    ${SENTINEL_REMOTE_TOKEN_OWNER}
-      SENTINEL_REMOTE_TOKEN_ADMIN:    ${SENTINEL_REMOTE_TOKEN_ADMIN}
-      SENTINEL_REMOTE_TOKEN_AUDITOR:  ${SENTINEL_REMOTE_TOKEN_AUDITOR}
-
-      # --- Fenrir threat detection ---
-      S43_FENRIR_ENABLED:            ${S43_FENRIR_ENABLED:-true}
-      SENTINEL_FENRIR_ENABLED:       ${SENTINEL_FENRIR_ENABLED:-true}
-      FENRIR_ENABLED:                ${FENRIR_ENABLED:-true}
-      S43_FENRIR_NODE_ID:            ${S43_FENRIR_NODE_ID:-sentinel-43-primary}
-      S43_FENRIR_MIN_SEVERITY:       ${S43_FENRIR_MIN_SEVERITY:-MEDIUM}
-      S43_FENRIR_ANOMALY_ZSCORE:     ${S43_FENRIR_ANOMALY_ZSCORE:-2.5}
-      S43_FENRIR_ANOMALY_DECAY:      ${S43_FENRIR_ANOMALY_DECAY:-0.002}
+      # Fenrir
+      S43_FENRIR_ENABLED: ${S43_FENRIR_ENABLED:-true}
+      S43_FENRIR_NODE_ID: ${S43_FENRIR_NODE_ID:-sentinel-43-primary}
+      S43_FENRIR_MIN_SEVERITY: ${S43_FENRIR_MIN_SEVERITY:-MEDIUM}
+      S43_FENRIR_ANOMALY_ZSCORE: ${S43_FENRIR_ANOMALY_ZSCORE:-2.5}
+      S43_FENRIR_ANOMALY_DECAY: ${S43_FENRIR_ANOMALY_DECAY:-0.002}
       S43_FENRIR_MAX_HONEYPOT_EVENTS: ${S43_FENRIR_MAX_HONEYPOT_EVENTS:-500}
-      # Fenrir reports findings through the API bridge, which authenticates
-      # them with the Fenrir service token and forwards to the Watchtower's
-      # /watchtower/analyze. It is NOT s43-core:9100/watchtower/events —
-      # that route has never existed on the Watchtower service (F-06).
-      S43_FENRIR_WATCHTOWER_URL:     http://s43-api:8000/watchtower/events
-      S43_FENRIR_BROADCAST_URL:      http://s43-api:8000/internal/events/broadcast
-      S43_FENRIR_REPORT_TIMEOUT:     ${S43_FENRIR_REPORT_TIMEOUT:-2.0}
-      S43_FENRIR_API_TOKEN:          ${S43_FENRIR_API_TOKEN}
 
-      # --- Feature flags ---
+      # Optional observational subsystems
+      S43_SPARTA_ENABLED: ${S43_SPARTA_ENABLED:-false}
+      S43_JORM_ENABLED: ${S43_JORM_ENABLED:-false}
+
+      # Local-only test hook. Production bootstrap must reject true.
       S43_ENABLE_TEST_INJECTION: ${S43_ENABLE_TEST_INJECTION:-false}
-      S43_GOVERNANCE_ENABLED:    ${S43_GOVERNANCE_ENABLED:-false}
-      S43_SPARTA_ENABLED:        ${S43_SPARTA_ENABLED:-false}
-      S43_JORM_ENABLED:          ${S43_JORM_ENABLED:-false}
 
-      # --- Persistent state ---
-      # Fix: was SENTINEL43_DB_PATH (not read by the app).
-      # core/cli code reads SENTINEL_DB_PATH via _env("SENTINEL_DB_PATH", ...).
-      SENTINEL_DB_PATH:          /app/sentinel43_state/sentinel43.sqlite3
+      # Audit authority
+      S43_AUDIT_HMAC_KEY: ${S43_AUDIT_HMAC_KEY}
 
     volumes:
       - sentinel43_state:/app/sentinel43_state
-      - ./logs:/app/logs
+
     depends_on:
       s43-migrate:
         condition: service_completed_successfully
+
       s43-core:
         condition: service_started
+
       s43-db:
         condition: service_healthy
-      s43-redis:
-        condition: service_healthy
+
     networks:
       - s43_net
+
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 20s
 
+
   # ---------------------------------------------------------------------------
-  # Reverse proxy / TLS terminator (beta-execution Phase 2, F-TLS-1)
-  #
-  # The ONLY host-published service. Terminates TLS on :443, 308-redirects
-  # :80 -> https, sets X-Forwarded-Proto/-For, sends HSTS, upgrades /ws, and
-  # forwards to the internal s43-api:8000. Compose counterpart of
-  # deploy/kubernetes/overlays/beta/ingress.yaml.
-  #
-  # Certs: mount a real PEM pair at deploy/proxy/certs/s43.{crt,key}. For
-  # local testing run deploy/proxy/generate-dev-cert.sh first (self-signed).
-  # See deploy/proxy/README.md.
+  # Reverse proxy / TLS terminator
   # ---------------------------------------------------------------------------
   s43-proxy:
     image: nginx:1.27-alpine
-    container_name: s43_proxy
     restart: unless-stopped
+
     ports:
       - "80:80"
       - "443:443"
+
     volumes:
       - ./deploy/proxy/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./deploy/proxy/certs:/etc/nginx/certs:ro
+
     depends_on:
       s43-api:
-        condition: service_started
+        condition: service_healthy
+
     networks:
       s43_net:
-        # Fixed IP so s43-api's S43_TRUSTED_PROXIES can be a /32.
         ipv4_address: 172.28.0.250
 
+
   # ---------------------------------------------------------------------------
-  # Setup (one-shot secret generator)
-  #
-  # Runs only when the "setup" profile is requested.
-  # Never starts during a normal `docker compose up`.
-  #
-  # Usage:
-  #   Print secrets to stdout (review before writing):
-  #     docker compose --profile setup run --rm s43-setup
-  #
-  #   Write missing secrets to .env:
-  #     docker compose --profile setup run --rm s43-setup --write /app/.env
-  #
-  #   Rotate all generated secrets:
-  #     docker compose --profile setup run --rm s43-setup --write /app/.env --force
-  #
-  #   Validate .env for missing or placeholder values:
-  #     docker compose --profile setup run --rm s43-setup --check /app/.env
-  #
-  #   Generate operator password hash interactively:
-  #     docker compose --profile setup run --rm -it s43-setup --password-hash
+  # Setup / secret generation
   # ---------------------------------------------------------------------------
   s43-setup:
     build:
       context: .
       dockerfile: core/api/Dockerfile
-    container_name: s43_setup
-    # Override uvicorn — this container runs the generator and exits.
-    entrypoint: ["python", "core/scripts/generate_secrets.py"]
-    # Default: print to stdout. Override with --write /app/.env on the command line.
+
+    entrypoint:
+      - python
+      - scripts/generate_secrets.py
+
     command: []
+
     volumes:
-      # Bind-mount the repo root so --write can update the host .env file.
       - type: bind
         source: .
         target: /app
+
     profiles:
       - setup
+
     environment:
-      # Development mode prevents bootstrap_expectations() from demanding
-      # production secrets that don't exist yet — that's the whole point
-      # of running setup first.
-      SENTINEL_ENV: development
-    # No network access. The generator is pure filesystem I/O.
+      S43_ENV: development
+
     network_mode: none
     restart: "no"
 
-# -----------------------------------------------------------------------------
-# Volumes and Networks
-# -----------------------------------------------------------------------------
+
 volumes:
   s43_pgdata:
   sentinel43_state:
 
+
 networks:
   s43_net:
     driver: bridge
+
     ipam:
       config:
-        # Fixed subnet so s43-proxy can hold a stable IP (172.28.0.250) that
-        # s43-api trusts for X-Forwarded-* (S43_TRUSTED_PROXIES). Only
-        # Sentinel-43's own containers are ever on this network.
         - subnet: 172.28.0.0/24
