@@ -1,4 +1,6 @@
 # =============================================================================
+# Sentinel-43
+#
 # Copyright (c) 2026 Justin Armstrong
 # All Rights Reserved.
 #
@@ -11,66 +13,222 @@
 # See LICENSE.md and COMMERCIAL_LICENSE.md at the repository root.
 # =============================================================================
 
-"""Sentinel-43 API layer: dependency wiring."""
+"""Sentinel-43 API dependency wiring.
+
+This module resolves application dependencies from validated configuration,
+keeps authentication delegation centralized, and treats Watchtower telemetry
+as best-effort observability rather than part of dependency correctness.
+"""
 
 from __future__ import annotations
 
+import logging
 import os
-
-from fastapi import Depends, HTTPException, Request
-from sqlalchemy.ext.asyncio import AsyncSession
-from ...auth.deps import get_db_session
-from ...monitoring.watchtower_client import WATCHTOWER_URL, watchtower_request
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
 from importlib import import_module
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Final, Protocol, TypeVar, cast
+
+from fastapi import Depends, HTTPException, Request
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ...auth.deps import get_db_session
+from ...monitoring.watchtower_client import watchtower_request
+from .config import (
+    DEFAULT_ENGINE_FACTORY,
+    DEFAULT_STORE_FACTORY,
+    ApiConfig,
+    load_config,
+)
+
+logger = logging.getLogger(__name__)
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+ENV_DEV_ENGINE_ENABLED: Final[str] = "S43_ENABLE_DEV_ENGINE"
+ENV_DEV_STORE_ENABLED: Final[str] = "S43_ENABLE_DEV_STORE"
+
+DEPS_MODULE_ID: Final[str] = "sentinel43-api-deps"
+
+_TRUE_VALUES: Final[frozenset[str]] = frozenset(
+    {"1", "true", "yes", "on", "enabled"}
+)
+
+_FALSE_VALUES: Final[frozenset[str]] = frozenset(
+    {"0", "false", "no", "off", "disabled"}
+)
+
+_FACTORY_SPEC_RE: Final[re.Pattern[str]] = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$"
+)
+
+_ENGINE_REQUIRED_METHODS: Final[tuple[str, ...]] = (
+    "handle_assessment",
+    "approve_action",
+    "veto_action",
+)
+
+_STORE_REQUIRED_METHODS: Final[tuple[str, ...]] = (
+    "get_status",
+    "list_actions",
+)
 
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Protocols
+# =============================================================================
 
-ENV_ENGINE_FACTORY = "SENTINEL_ENGINE_FACTORY"
-ENV_STORE_FACTORY = "SENTINEL_STORE_FACTORY"
+class EngineProtocol(Protocol):
+    def handle_assessment(self, mode: str, assessment: Any) -> Any: ...
+    def approve_action(
+        self,
+        action_id: str,
+        operator_id: str,
+        *,
+        reason: str = "",
+    ) -> bool: ...
+    def veto_action(
+        self,
+        action_id: str,
+        operator_id: str,
+        *,
+        reason: str,
+    ) -> bool: ...
 
-DEFAULT_ENGINE_FACTORY = "core.api.deps:dev_engine_factory"
-DEFAULT_STORE_FACTORY = "core.api.deps:dev_store_factory"
 
-DEPS_MODULE_ID = os.getenv("S43_DEPS_MODULE_ID", "sentinel43-api-deps")
-DEPS_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
+class StoreProtocol(Protocol):
+    def get_status(self, action_id: str) -> Any: ...
+    def list_actions(
+        self,
+        *,
+        status: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> Any: ...
 
-ENV_DEV_ENGINE_ENABLED = "S43_ENABLE_DEV_ENGINE"
-ENV_DEV_STORE_ENABLED = "S43_ENABLE_DEV_STORE"
+
+T = TypeVar("T")
 
 
-# -----------------------------------------------------------------------------
-# Watchtower intercom
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Errors
+# =============================================================================
+
+class DependencyResolutionError(RuntimeError):
+    """Raised when a configured Sentinel-43 dependency cannot be resolved."""
+
+
+# =============================================================================
+# Utility helpers
+# =============================================================================
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _watchtower_request(
+def _env_bool(
+    name: str,
+    *,
+    default: bool,
+    strict: bool,
+) -> bool:
+    raw = os.getenv(name)
+
+    if raw is None:
+        return default
+
+    value = raw.strip().lower()
+
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+
+    if strict:
+        raise DependencyResolutionError(
+            f"{name} must be a boolean value; got {raw!r}"
+        )
+
+    logger.warning(
+        "Invalid boolean for %s=%r; using default %s",
+        name,
+        raw,
+        default,
+    )
+    return default
+
+
+# =============================================================================
+# Watchtower telemetry
+# =============================================================================
+
+def _watchtower_request_best_effort(
     method: str,
     path: str,
     payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    # DEFECT_INVENTORY.md D-16: this used to build the request without the
-    # internal service token, so every call here 401'd against Watchtower
-    # and the module-registration / dependency-report callers below silently
-    # believed it had succeeded. Delegates to the canonical client, which
-    # attaches Authorization and never swallows a failure without logging it.
-    return watchtower_request(method, path, payload)
+) -> dict[str, Any] | None:
+    try:
+        return watchtower_request(method, path, payload)
+    except Exception:
+        logger.warning(
+            "Dependency telemetry failed: %s %s",
+            method,
+            path,
+            exc_info=True,
+        )
+        return None
 
 
-def _register_deps_with_watchtower() -> None:
+def _report_dependency_event(
+    *,
+    status: str,
+    event: str,
+    config: ApiConfig,
+    details: dict[str, Any] | None = None,
+) -> None:
+    module_id = os.getenv("S43_DEPS_MODULE_ID", DEPS_MODULE_ID).strip() or DEPS_MODULE_ID
+    timestamp = utc_now()
+
     payload = {
-        "module_id": DEPS_MODULE_ID,
+        "event": {
+            "kind": "dependency",
+            "source": module_id,
+            "status": status,
+            "dependency_status": status,
+            "details": {
+                "event": event,
+                "timestamp": timestamp,
+                "environment": config.environment,
+                **(details or {}),
+            },
+        }
+    }
+
+    _watchtower_request_best_effort(
+        "POST",
+        "/watchtower/analyze",
+        payload,
+    )
+
+
+@lru_cache(maxsize=1)
+def register_dependencies_with_watchtower() -> None:
+    """Register this module once per process.
+
+    Registration is explicit and cached. Dependency resolution does not
+    repeatedly re-register the module on every request or every error.
+    """
+    config = load_config(report_to_watchtower=False)
+    module_id = os.getenv("S43_DEPS_MODULE_ID", DEPS_MODULE_ID).strip() or DEPS_MODULE_ID
+
+    payload = {
+        "module_id": module_id,
         "module_type": "api-dependencies",
-        "version": DEPS_VERSION,
+        "version": config.version,
         "endpoint": None,
         "capabilities": [
             "engine_factory_resolution",
@@ -79,96 +237,43 @@ def _register_deps_with_watchtower() -> None:
             "dev_engine_stub",
             "dev_store_stub",
         ],
-        "metadata": {"timestamp": utc_now()},
-    }
-
-    _watchtower_request("POST", "/watchtower/modules/register", payload)
-
-
-def _report_deps_status(
-    status: str,
-    event: str,
-    details: dict[str, Any] | None = None,
-) -> None:
-    _register_deps_with_watchtower()
-
-    payload = {
-        "name": DEPS_MODULE_ID,
-        "status": status,
-        "version": DEPS_VERSION,
-        "details": {
-            "event": event,
+        "metadata": {
             "timestamp": utc_now(),
-            **(details or {}),
+            "environment": config.environment,
         },
     }
 
-    _watchtower_request("POST", "/watchtower/dependencies/report", payload)
+    _watchtower_request_best_effort(
+        "POST",
+        "/watchtower/modules/register",
+        payload,
+    )
 
 
-def _report_deps_event(
-    status: str,
-    event: str,
-    details: dict[str, Any] | None = None,
-) -> None:
-    payload = {
-        "event": {
-            "kind": "dependency",
-            "source": DEPS_MODULE_ID,
-            "status": status,
-            "dependency_status": status,
-            "details": {
-                "event": event,
-                "timestamp": utc_now(),
-                **(details or {}),
-            },
-        }
-    }
+# =============================================================================
+# Authentication dependencies
+# =============================================================================
 
-    _watchtower_request("POST", "/watchtower/analyze", payload)
-
-
-
-# -----------------------------------------------------------------------------
-# Auth dependency
-# -----------------------------------------------------------------------------
-
-_TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
-_FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-
-    value = raw.strip().lower()
-    if value in _TRUE_VALUES:
-        return True
-    if value in _FALSE_VALUES:
-        return False
-
-    return default
-
-
-async def require_operator(request: Request) -> str:
-    """
-    Require operator authentication for /v1 routes.
-
-    Delegates JWT verification to core.api.routers.auth.verify_jwt_token() —
-    the single JWT verifier for the whole API — rather than keeping a second
-    copy here. That function only recognizes the "role" claim (no "scope"
-    fallback) and reads S43_JWT_SECRET/_ISSUER/_AUDIENCE from the environment
-    at call time, matching main.py's _get_operator()/_require_operator().
-    """
+async def _authenticate_request(
+    request: Request,
+    *,
+    legacy_metric_route: str,
+) -> tuple[str, dict[str, Any]]:
+    """Authenticate an operator/admin request using the canonical auth module."""
     auth = request.headers.get("Authorization", "").strip()
 
     if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Authentication required")
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required",
+        )
 
     token = auth[7:].strip()
     if not token:
-        raise HTTPException(status_code=401, detail="Authentication required")
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required",
+        )
 
     from ..routers.auth import (
         PASSWORD_HEADER_NAME,
@@ -182,30 +287,46 @@ async def require_operator(request: Request) -> str:
     claims = verify_jwt_token(token)
 
     subject = str(claims.get("sub") or "").strip()
-    subject = subject if subject else f"bearer:{token[:16]}"
+    if not subject:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid token",
+        )
 
-    # Phase B (beta-execution): a session-bound access token whose sid names a
-    # live session (owner still active) authenticates on its own — no
-    # X-S43-Password. resolve_session_subject() raises 401 if the session is
-    # dead / the owner is disabled.
     resolved = await resolve_session_subject(claims)
     if resolved is not None:
-        return resolved[0]
+        return resolved[0], claims
 
-    # Legacy path: old-style (sid-less) token still requires the per-request
-    # password, exactly as before.
     if legacy_auth_is_rejected():
         raise HTTPException(
             status_code=401,
             detail="Legacy authentication is no longer accepted. Log in again.",
         )
-    note_legacy_auth("/v1")
+
+    note_legacy_auth(legacy_metric_route)
+
     password = request.headers.get(PASSWORD_HEADER_NAME, "")
     if not password:
-        raise HTTPException(status_code=401, detail="Password required")
-    if not await reverify_password(subject, password):
-        raise HTTPException(status_code=401, detail="Invalid password")
+        raise HTTPException(
+            status_code=401,
+            detail="Password required",
+        )
 
+    if not await reverify_password(subject, password):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid password",
+        )
+
+    return subject, claims
+
+
+async def require_operator(request: Request) -> str:
+    """Require a valid Sentinel-43 operator/admin authentication context."""
+    subject, _claims = await _authenticate_request(
+        request,
+        legacy_metric_route="/v1",
+    )
     return subject
 
 
@@ -213,243 +334,85 @@ async def require_admin(
     request: Request,
     session: AsyncSession = Depends(get_db_session),
 ) -> str:
-    """
-    Authenticate the caller and require that they are an active 'admin' in
-    the DB-backed user store (core.auth.users). Gates the account-management
-    router (core/api/routers/users.py).
-
-    The JWT + per-request X-S43-Password check here is the same one
-    require_operator() (post-5332d54) and main.py's _get_operator() run —
-    core.api.routers.auth.verify_jwt_token() / reverify_password(), both of
-    which read their config from the environment at call time. It performs
-    that sequence inline rather than delegating to require_operator() so the
-    admin DB lookup below can reuse the get_db_session() dependency; the two
-    are equivalent post-5332d54 and this could be collapsed later.
-
-    The admin check reads the live database, not the JWT 'role' claim, so an
-    admin who is demoted or deactivated loses this access on their very next
-    request rather than whenever their current token happens to expire.
-
-    The env-var fallback operator (S43_OPERATOR_USERNAME) can never satisfy
-    this — it has no users-table row. Account management is deliberately
-    gated on a real bootstrapped admin (see core/api/routers/bootstrap.py).
-    """
-    from ..routers.auth import (
-        PASSWORD_HEADER_NAME,
-        legacy_auth_is_rejected,
-        note_legacy_auth,
-        resolve_session_subject,
-        reverify_password,
-        verify_jwt_token,
-    )
+    """Require a live, active admin account from the DB-backed user store."""
     from ...auth.users import get_user_by_username
 
-    auth = request.headers.get("Authorization", "").strip()
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Authentication required")
-
-    token = auth[7:].strip()
-    if not token:
-        raise HTTPException(status_code=401, detail="Authentication required")
-
-    # Validates signature, claims, and that role is in {operator, admin};
-    # raises HTTPException(401/403/503) itself on any failure.
-    claims = verify_jwt_token(token)
-    subject = str(claims.get("sub") or "").strip()
-    if not subject:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    # Phase B: a live session-bound token skips X-S43-Password. The live-DB
-    # admin check below still runs regardless of how the caller authenticated.
-    resolved = await resolve_session_subject(claims)
-    if resolved is not None:
-        subject = resolved[0]
-    else:
-        if legacy_auth_is_rejected():
-            raise HTTPException(
-                status_code=401,
-                detail="Legacy authentication is no longer accepted. Log in again.",
-            )
-        note_legacy_auth("/users")
-        password = request.headers.get(PASSWORD_HEADER_NAME, "")
-        if not password:
-            raise HTTPException(status_code=401, detail="Password required")
-        if not await reverify_password(subject, password):
-            raise HTTPException(status_code=401, detail="Invalid password")
+    subject, _claims = await _authenticate_request(
+        request,
+        legacy_metric_route="/users",
+    )
 
     try:
         user = await get_user_by_username(session, subject)
     except HTTPException:
         raise
-    except Exception as exc:  # DB unreachable, table missing, etc.
+    except Exception as exc:
         raise HTTPException(
             status_code=503,
             detail="User account store is unavailable.",
         ) from exc
 
-    if user is None or not user.is_active or user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin role required")
+    if user is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin role required",
+        )
+
+    if not bool(getattr(user, "is_active", False)):
+        raise HTTPException(
+            status_code=403,
+            detail="Admin role required",
+        )
+
+    if str(getattr(user, "role", "")).lower() != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Admin role required",
+        )
 
     return subject
 
 
-def _ensure_dev_factory_allowed(
-    *,
-    kind: str,
-    spec: str,
-    default_spec: str,
-    flag_name: str,
-) -> None:
-    if spec != default_spec:
-        return
+# =============================================================================
+# Factory resolution
+# =============================================================================
 
-    if _env_bool(flag_name, False):
-        return
+def _validate_factory_spec(spec: str) -> str:
+    cleaned = spec.strip()
 
-    _report_deps_status(
-        status="failed",
-        event="dev_dependency_disabled",
-        details={
-            "kind": kind,
-            "factory_spec": spec,
-            "enable_with": flag_name,
-        },
-    )
-
-    raise HTTPException(
-        status_code=503,
-        detail={
-            "error": f"S43_{kind.upper()}_DEV_FACTORY_DISABLED",
-            "message": (
-                f"{kind} is using the development factory, but {flag_name}=true "
-                "is not set."
-            ),
-            "factory_spec": spec,
-            "enable_with": flag_name,
-        },
-    )
-
-
-# -----------------------------------------------------------------------------
-# Expected interfaces
-# -----------------------------------------------------------------------------
-
-_ENGINE_REQUIRED_METHODS = (
-    "handle_assessment",
-    "approve_action",
-    "veto_action",
-)
-
-_STORE_REQUIRED_METHODS = (
-    "get_status",
-    "list_actions",
-)
-
-
-def _require_methods(obj: Any, methods: tuple[str, ...], *, kind: str, factory_spec: str) -> Any:
-    missing = [m for m in methods if not hasattr(obj, m)]
-
-    if missing:
-        _report_deps_status(
-            status="failed",
-            event="dependency_interface_validation_failed",
-            details={
-                "kind": kind,
-                "factory_spec": factory_spec,
-                "returned_type": type(obj).__name__,
-                "missing_methods": missing,
-            },
+    if not _FACTORY_SPEC_RE.fullmatch(cleaned):
+        raise DependencyResolutionError(
+            f"Invalid factory spec {spec!r}; expected 'module.path:callable'"
         )
 
-        raise ValueError(
-            f"{kind} factory '{factory_spec}' returned {type(obj).__name__} "
-            f"missing methods: {', '.join(missing)}"
-        )
+    return cleaned
 
-    _report_deps_event(
-        status="online",
-        event="dependency_interface_validated",
-        details={
-            "kind": kind,
-            "factory_spec": factory_spec,
-            "returned_type": type(obj).__name__,
-        },
-    )
-
-    return obj
-
-
-# -----------------------------------------------------------------------------
-# Utilities
-# -----------------------------------------------------------------------------
 
 def _parse_factory(spec: str) -> tuple[str, str]:
-    if ":" not in spec:
-        _report_deps_status(
-            status="failed",
-            event="invalid_factory_spec",
-            details={"factory_spec": spec},
-        )
-        raise ValueError(f"Invalid factory spec '{spec}'. Expected 'module.path:callable'.")
-
-    mod, fn = spec.split(":", 1)
-    mod = mod.strip()
-    fn = fn.strip()
-
-    if not mod or not fn:
-        _report_deps_status(
-            status="failed",
-            event="invalid_factory_spec",
-            details={"factory_spec": spec},
-        )
-        raise ValueError(f"Invalid factory spec '{spec}'. Expected 'module.path:callable'.")
-
-    return mod, fn
+    cleaned = _validate_factory_spec(spec)
+    module_name, callable_name = cleaned.split(":", 1)
+    return module_name, callable_name
 
 
 def _load_callable(spec: str) -> Callable[[], Any]:
-    mod_name, fn_name = _parse_factory(spec)
+    module_name, callable_name = _parse_factory(spec)
 
     try:
-        mod = import_module(mod_name)
+        module = import_module(module_name)
     except Exception as exc:
-        _report_deps_status(
-            status="failed",
-            event="factory_module_import_failed",
-            details={
-                "factory_spec": spec,
-                "module": mod_name,
-                "error": str(exc),
-                "exception_type": type(exc).__name__,
-            },
+        raise DependencyResolutionError(
+            f"Failed to import dependency module {module_name!r} "
+            f"for factory {spec!r}"
+        ) from exc
+
+    candidate = getattr(module, callable_name, None)
+
+    if candidate is None or not callable(candidate):
+        raise DependencyResolutionError(
+            f"Factory {spec!r} did not resolve to a callable"
         )
-        raise
 
-    fn = getattr(mod, fn_name, None)
-
-    if fn is None or not callable(fn):
-        _report_deps_status(
-            status="failed",
-            event="factory_callable_resolution_failed",
-            details={
-                "factory_spec": spec,
-                "module": mod_name,
-                "callable": fn_name,
-            },
-        )
-        raise ValueError(f"Factory '{spec}' did not resolve to a callable.")
-
-    _report_deps_event(
-        status="online",
-        event="factory_callable_resolved",
-        details={
-            "factory_spec": spec,
-            "module": mod_name,
-            "callable": fn_name,
-        },
-    )
-
-    return fn  # type: ignore[return-value]
+    return cast(Callable[[], Any], candidate)
 
 
 @lru_cache(maxsize=64)
@@ -458,21 +421,145 @@ def _cached_factory(spec: str) -> Callable[[], Any]:
 
 
 def clear_factory_caches() -> None:
-    _cached_factory.cache_clear()
+    """Clear only factory-resolution caches.
 
-    _report_deps_status(
-        status="degraded",
-        event="factory_cache_cleared",
-        details={},
+    This is intended for tests or controlled configuration reloads.
+    """
+    _cached_factory.cache_clear()
+    register_dependencies_with_watchtower.cache_clear()
+
+
+def _require_methods(
+    obj: T,
+    methods: tuple[str, ...],
+    *,
+    kind: str,
+    factory_spec: str,
+) -> T:
+    missing = [
+        method
+        for method in methods
+        if not callable(getattr(obj, method, None))
+    ]
+
+    if missing:
+        raise DependencyResolutionError(
+            f"{kind} factory {factory_spec!r} returned "
+            f"{type(obj).__name__} missing callable methods: "
+            f"{', '.join(missing)}"
+        )
+
+    return obj
+
+
+def _ensure_dev_factory_allowed(
+    *,
+    config: ApiConfig,
+    kind: str,
+    spec: str,
+    default_spec: str,
+    flag_name: str,
+) -> None:
+    if spec != default_spec:
+        return
+
+    enabled = _env_bool(
+        flag_name,
+        default=False,
+        strict=not config.is_local,
     )
 
+    if not config.is_local:
+        raise DependencyResolutionError(
+            f"{kind} development factory {spec!r} is forbidden outside "
+            "development/test"
+        )
 
-# -----------------------------------------------------------------------------
+    if not enabled:
+        raise DependencyResolutionError(
+            f"{kind} is using development factory {spec!r}, but "
+            f"{flag_name}=true is not set"
+        )
+
+
+def _resolve_dependency(
+    *,
+    config: ApiConfig,
+    kind: str,
+    spec: str,
+    required_methods: tuple[str, ...],
+    default_spec: str,
+    dev_flag: str,
+) -> Any:
+    cleaned_spec = _validate_factory_spec(spec)
+
+    _ensure_dev_factory_allowed(
+        config=config,
+        kind=kind,
+        spec=cleaned_spec,
+        default_spec=default_spec,
+        flag_name=dev_flag,
+    )
+
+    try:
+        factory = _cached_factory(cleaned_spec)
+        obj = factory()
+
+        if obj is None:
+            raise DependencyResolutionError(
+                f"{kind} factory {cleaned_spec!r} returned None"
+            )
+
+        obj = _require_methods(
+            obj,
+            required_methods,
+            kind=kind,
+            factory_spec=cleaned_spec,
+        )
+
+        _report_dependency_event(
+            status="online",
+            event=f"{kind.lower()}_resolved",
+            config=config,
+            details={
+                "factory_spec": cleaned_spec,
+                "returned_type": type(obj).__name__,
+            },
+        )
+        return obj
+
+    except Exception as exc:
+        _report_dependency_event(
+            status="failed",
+            event=f"{kind.lower()}_resolution_failed",
+            config=config,
+            details={
+                "factory_spec": cleaned_spec,
+                "exception_type": type(exc).__name__,
+            },
+        )
+
+        if isinstance(exc, DependencyResolutionError):
+            raise
+
+        raise DependencyResolutionError(
+            f"Failed to resolve {kind.lower()} dependency "
+            f"from {cleaned_spec!r}"
+        ) from exc
+
+
+# =============================================================================
 # Dev stubs
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 class DevEngine:
-    def handle_assessment(self, mode: str, assessment: Any) -> Any:
+    """Non-enforcing development engine stub."""
+
+    def handle_assessment(
+        self,
+        mode: str,
+        assessment: Any,
+    ) -> dict[str, Any]:
         return {
             "assessment_id": "dev-000",
             "severity": 0,
@@ -481,206 +568,183 @@ class DevEngine:
             "tags": ["dev"],
         }
 
-    def approve_action(self, action_id: str, operator_id: str, *, reason: str = "") -> bool:
+    def approve_action(
+        self,
+        action_id: str,
+        operator_id: str,
+        *,
+        reason: str = "",
+    ) -> bool:
+        # Dev stub acknowledges the request only. It does not execute an
+        # external action.
         return True
 
-    def veto_action(self, action_id: str, operator_id: str, *, reason: str) -> bool:
+    def veto_action(
+        self,
+        action_id: str,
+        operator_id: str,
+        *,
+        reason: str,
+    ) -> bool:
         return True
 
 
-@dataclass
+@dataclass(slots=True)
 class DevStore:
     actions: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def get_status(self, action_id: str) -> Any:
-        return self.actions.get(action_id, {"action_id": action_id, "decision": "unknown"})
+        return self.actions.get(
+            action_id,
+            {
+                "action_id": action_id,
+                "decision": "unknown",
+            },
+        )
 
     def list_actions(
         self,
         *,
-        status: Optional[str] = None,
+        status: str | None = None,
         limit: int = 50,
-        cursor: Optional[str] = None,
-    ) -> Any:
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        safe_limit = max(1, min(int(limit), 500))
         items = list(self.actions.values())
 
         if status:
             items = [
-                x for x in items
-                if x.get("decision") == status or x.get("status") == status
+                item
+                for item in items
+                if item.get("decision") == status
+                or item.get("status") == status
             ]
 
         return {
-            "items": items[:limit],
+            "items": items[:safe_limit],
             "next_cursor": None,
         }
 
 
-_DEV_STORE_SINGLETON = DevStore()
+def dev_engine_factory() -> EngineProtocol:
+    config = load_config(report_to_watchtower=False)
 
-
-def reset_dev_store_state() -> None:
-    _DEV_STORE_SINGLETON.actions.clear()
-
-    _report_deps_status(
-        status="degraded",
-        event="dev_store_reset",
-        details={},
-    )
-
-
-def dev_engine_factory() -> Any:
-    if not _env_bool(ENV_DEV_ENGINE_ENABLED, False):
-        _report_deps_status(
-            status="failed",
-            event="dev_engine_factory_disabled",
-            details={
-                "factory": "dev_engine_factory",
-                "enable_with": ENV_DEV_ENGINE_ENABLED,
-            },
-        )
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "S43_ENGINE_DEV_FACTORY_DISABLED",
-                "message": (
-                    "DevEngine is disabled. Set S43_ENABLE_DEV_ENGINE=true "
-                    "only for local development, or configure SENTINEL_ENGINE_FACTORY."
-                ),
-                "enable_with": ENV_DEV_ENGINE_ENABLED,
-            },
+    if not config.is_local:
+        raise DependencyResolutionError(
+            "DevEngine is forbidden outside development/test"
         )
 
-    _report_deps_event(
-        status="online",
-        event="dev_engine_created",
-        details={"factory": "dev_engine_factory"},
-    )
+    if not _env_bool(
+        ENV_DEV_ENGINE_ENABLED,
+        default=False,
+        strict=False,
+    ):
+        raise DependencyResolutionError(
+            f"DevEngine is disabled; set {ENV_DEV_ENGINE_ENABLED}=true "
+            "for local development only"
+        )
+
     return DevEngine()
 
 
-def dev_store_factory() -> Any:
-    if not _env_bool(ENV_DEV_STORE_ENABLED, False):
-        _report_deps_status(
-            status="failed",
-            event="dev_store_factory_disabled",
-            details={
-                "factory": "dev_store_factory",
-                "enable_with": ENV_DEV_STORE_ENABLED,
-            },
-        )
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "S43_STORE_DEV_FACTORY_DISABLED",
-                "message": (
-                    "DevStore is disabled. Set S43_ENABLE_DEV_STORE=true "
-                    "only for local development, or configure SENTINEL_STORE_FACTORY."
-                ),
-                "enable_with": ENV_DEV_STORE_ENABLED,
-            },
+def dev_store_factory() -> StoreProtocol:
+    config = load_config(report_to_watchtower=False)
+
+    if not config.is_local:
+        raise DependencyResolutionError(
+            "DevStore is forbidden outside development/test"
         )
 
-    _report_deps_event(
-        status="online",
-        event="dev_store_returned",
-        details={"factory": "dev_store_factory", "singleton": True},
-    )
-    return _DEV_STORE_SINGLETON
+    if not _env_bool(
+        ENV_DEV_STORE_ENABLED,
+        default=False,
+        strict=False,
+    ):
+        raise DependencyResolutionError(
+            f"DevStore is disabled; set {ENV_DEV_STORE_ENABLED}=true "
+            "for local development only"
+        )
+
+    # Return a fresh store per dependency resolution. Tests and local requests
+    # no longer share mutable global state by accident.
+    return DevStore()
 
 
-# -----------------------------------------------------------------------------
-# Public dependencies
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Public dependency providers
+# =============================================================================
 
-def get_engine() -> Any:
-    spec = os.getenv(ENV_ENGINE_FACTORY, DEFAULT_ENGINE_FACTORY)
+def get_engine() -> EngineProtocol:
+    """Resolve and validate the configured engine dependency."""
+    config = load_config(report_to_watchtower=False)
+    register_dependencies_with_watchtower()
 
-    _ensure_dev_factory_allowed(
-        kind="engine",
-        spec=spec,
+    obj = _resolve_dependency(
+        config=config,
+        kind="Engine",
+        spec=config.engine_factory,
+        required_methods=_ENGINE_REQUIRED_METHODS,
         default_spec=DEFAULT_ENGINE_FACTORY,
-        flag_name=ENV_DEV_ENGINE_ENABLED,
+        dev_flag=ENV_DEV_ENGINE_ENABLED,
     )
 
-    try:
-        factory = _cached_factory(spec)
-        obj = factory()
-        return _require_methods(
-            obj,
-            _ENGINE_REQUIRED_METHODS,
-            kind="Engine",
-            factory_spec=spec,
-        )
-
-    except Exception as exc:
-        _report_deps_status(
-            status="failed",
-            event="get_engine_failed",
-            details={
-                "factory_spec": spec,
-                "error": str(exc),
-                "exception_type": type(exc).__name__,
-            },
-        )
-        raise
+    return cast(EngineProtocol, obj)
 
 
-def get_store() -> Any:
-    spec = os.getenv(ENV_STORE_FACTORY, DEFAULT_STORE_FACTORY)
+def get_store() -> StoreProtocol:
+    """Resolve and validate the configured store dependency."""
+    config = load_config(report_to_watchtower=False)
+    register_dependencies_with_watchtower()
 
-    _ensure_dev_factory_allowed(
-        kind="store",
-        spec=spec,
+    obj = _resolve_dependency(
+        config=config,
+        kind="Store",
+        spec=config.store_factory,
+        required_methods=_STORE_REQUIRED_METHODS,
         default_spec=DEFAULT_STORE_FACTORY,
-        flag_name=ENV_DEV_STORE_ENABLED,
+        dev_flag=ENV_DEV_STORE_ENABLED,
     )
 
-    try:
-        factory = _cached_factory(spec)
-        obj = factory()
-        return _require_methods(
-            obj,
-            _STORE_REQUIRED_METHODS,
-            kind="Store",
-            factory_spec=spec,
-        )
-
-    except Exception as exc:
-        _report_deps_status(
-            status="failed",
-            event="get_store_failed",
-            details={
-                "factory_spec": spec,
-                "error": str(exc),
-                "exception_type": type(exc).__name__,
-            },
-        )
-        raise
+    return cast(StoreProtocol, obj)
 
 
 def deps_status() -> dict[str, Any]:
+    """Return non-sensitive dependency wiring diagnostics."""
+    config = load_config(report_to_watchtower=False)
+
     return {
-        "module_id": DEPS_MODULE_ID,
-        "version": DEPS_VERSION,
-        "engine_factory": os.getenv(ENV_ENGINE_FACTORY, DEFAULT_ENGINE_FACTORY),
-        "store_factory": os.getenv(ENV_STORE_FACTORY, DEFAULT_STORE_FACTORY),
-        "watchtower_url": WATCHTOWER_URL,
+        "module_id": (
+            os.getenv("S43_DEPS_MODULE_ID", DEPS_MODULE_ID).strip()
+            or DEPS_MODULE_ID
+        ),
+        "version": config.version,
+        "engine_factory": config.engine_factory,
+        "store_factory": config.store_factory,
         "factory_cache": _cached_factory.cache_info()._asdict(),
+        "environment": config.environment,
         "timestamp": utc_now(),
     }
 
 
 __all__ = [
-    "get_engine",
-    "get_store",
-    "require_operator",
-    "require_admin",
-    "deps_status",
-    "clear_factory_caches",
-    "reset_dev_store_state",
+    "DependencyResolutionError",
     "DevEngine",
     "DevStore",
+    "EngineProtocol",
+    "StoreProtocol",
+    "clear_factory_caches",
+    "deps_status",
     "dev_engine_factory",
     "dev_store_factory",
+    "get_engine",
+    "get_store",
+    "register_dependencies_with_watchtower",
+    "require_admin",
+    "require_operator",
 ]
+'''
+
+path = Path("/mnt/data/sentinel43_api_deps_recode.py")
+path.write_text(code, encoding="utf-8")
+compile(code, str(path), "exec")
+print(path)
