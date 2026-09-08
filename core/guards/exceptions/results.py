@@ -4,52 +4,63 @@
 # Copyright (c) 2026 Justin Armstrong
 # All Rights Reserved.
 #
-# This file is part of the Sentinel-43 platform and constitutes original
-# intellectual property of the copyright holder.
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
 #
-# Sentinel-43 is distributed under a dual-license model:
-#
-# 1. GNU Affero General Public License (AGPL v3.0)
-# for open-source use, modification, and distribution.
-#
-# 2. Commercial License
-# for proprietary, enterprise, government, or other commercial use
-# not permitted under the AGPL v3.0.
-#
-# Use, modification, redistribution, and commercial use are governed by
-# the terms of the applicable license. Any use outside those terms is
-# prohibited.
-#
-# By accessing, modifying, distributing, or using this software, you agree
-# to comply with the terms of the applicable license.
-#
-# License Information:
-# AGPL v3.0: https://www.gnu.org/licenses/agpl-3.0.en.html
-#
-# Commercial Licensing:
-# Contact the copyright holder for commercial licensing terms.
-#
-# Sentinel-43™
-# Original Work and Protected Intellectual Property.
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
+
+"""Expectation report DTO for logging and API responses."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping, Any
+from types import MappingProxyType
+from typing import Any
 
-from .contracts import ExpectationCategory, ExpectationSeverity
+from .contracts import (
+    ExpectationCategory,
+    ExpectationSeverity,
+)
 
 
-@dataclass(slots=True, frozen=True)
+@dataclass(frozen=True, slots=True)
 class ExpectationReport:
-    """
-    Lightweight report used for logging or API responses.
-    """
-
     expectation_name: str
     category: ExpectationCategory
     severity: ExpectationSeverity
     passed: bool
     message: str
     metadata: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        name = self.expectation_name.strip()
+
+        if not name:
+            raise ValueError(
+                "expectation_name must not be empty"
+            )
+
+        object.__setattr__(
+            self,
+            "expectation_name",
+            name,
+        )
+
+        if self.metadata is not None:
+            object.__setattr__(
+                self,
+                "metadata",
+                MappingProxyType(
+                    dict(
+                        self.metadata
+                    )
+                ),
+            )
+
+
+__all__ = [
+    "ExpectationReport",
+]
