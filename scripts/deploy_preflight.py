@@ -41,6 +41,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import ipaddress
 import json
@@ -83,6 +84,74 @@ INTERNAL_PORTS = (8000, 9100, 5432, 6379)
 
 def is_placeholder(value: str) -> bool:
     return bool(value) and bool(PLACEHOLDER_RE.search(value))
+
+
+# =============================================================================
+# S43_OPERATOR_PASSWORD_HASH shape check.
+#
+# Mirrors core.auth.users.is_valid_argon2id_hash()'s policy (Argon2id only,
+# version 19 only, strict unpadded base64, defensible cost bounds) without
+# importing argon2-cffi -- this script is deliberately dependency-free
+# (stdlib only) so it can run before the project's Python environment is
+# even set up. It measures salt/hash length via base64 decoding rather than
+# a real Argon2 parse, which is sufficient to catch a missing, legacy
+# SHA-256, malformed, wrong-variant, or dangerously parameterized hash
+# before deployment -- it does not (and does not need to) verify a password.
+# =============================================================================
+_ARGON2ID_STRICT_RE = re.compile(
+    r"^\$argon2id\$v=19\$m=(?P<m>[1-9][0-9]{0,9}),t=(?P<t>[1-9][0-9]{0,4}),"
+    r"p=(?P<p>[1-9][0-9]{0,3})\$(?P<salt>[A-Za-z0-9+/]{11,64})\$"
+    r"(?P<hash>[A-Za-z0-9+/]{22,86})$"
+)
+_ARGON2_MIN_MEMORY_COST_KIB = 8 * 1024
+_ARGON2_MAX_MEMORY_COST_KIB = 1024 * 1024
+_ARGON2_MIN_TIME_COST, _ARGON2_MAX_TIME_COST = 1, 32
+_ARGON2_MIN_PARALLELISM, _ARGON2_MAX_PARALLELISM = 1, 16
+_ARGON2_MIN_SALT_BYTES = 16
+_ARGON2_MIN_HASH_BYTES = 16
+_LEGACY_SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
+
+
+def _b64_segment_len(segment: str) -> int:
+    """Decoded byte length of an unpadded-base64 Argon2 salt/hash segment."""
+    padded = segment + "=" * (-len(segment) % 4)
+    return len(base64.b64decode(padded, validate=True))
+
+
+def operator_hash_status(value: str) -> tuple[str, str]:
+    """PASS/FAIL tuple for S43_OPERATOR_PASSWORD_HASH. Never raises."""
+    if not value:
+        return FAIL, "missing"
+    if is_placeholder(value):
+        return FAIL, "looks like a placeholder"
+    if len(value) > 512:
+        return FAIL, "exceeds the maximum accepted encoded length"
+    if _LEGACY_SHA256_RE.match(value):
+        return FAIL, (
+            "looks like a legacy unsalted SHA-256 digest, not Argon2id -- "
+            "rotate with: python -m core.cli.generate_secrets --password-hash"
+        )
+    match = _ARGON2ID_STRICT_RE.match(value)
+    if not match:
+        return FAIL, (
+            "not a well-formed Argon2id hash (wrong variant, unsupported "
+            "version, or malformed encoding)"
+        )
+    m, t, p = int(match["m"]), int(match["t"]), int(match["p"])
+    if not (_ARGON2_MIN_MEMORY_COST_KIB <= m <= _ARGON2_MAX_MEMORY_COST_KIB):
+        return FAIL, f"memory cost {m} KiB is outside the accepted range"
+    if not (_ARGON2_MIN_TIME_COST <= t <= _ARGON2_MAX_TIME_COST):
+        return FAIL, f"time cost {t} is outside the accepted range"
+    if not (_ARGON2_MIN_PARALLELISM <= p <= _ARGON2_MAX_PARALLELISM):
+        return FAIL, f"parallelism {p} is outside the accepted range"
+    try:
+        salt_len = _b64_segment_len(match["salt"])
+        hash_len = _b64_segment_len(match["hash"])
+    except Exception:
+        return FAIL, "salt or hash segment is not valid base64"
+    if salt_len < _ARGON2_MIN_SALT_BYTES or hash_len < _ARGON2_MIN_HASH_BYTES:
+        return FAIL, "salt or hash is shorter than the accepted minimum"
+    return PASS, f"{len(value)} chars, Argon2id, m={m} t={t} p={p}"
 
 
 # =============================================================================
@@ -499,6 +568,10 @@ def check_compose_config(rep: Report, env_file: str, hostname: str,
 
     for key in REQUIRED_SECRETS:
         val = env.get(key, "")
+        if key == "S43_OPERATOR_PASSWORD_HASH":
+            status, detail = operator_hash_status(val)
+            rep.record(status, f"{key} is a well-formed Argon2id hash", detail)
+            continue
         if not val:
             rep.record(FAIL, f"{key} present", "missing")
         elif is_placeholder(val):

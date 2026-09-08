@@ -299,25 +299,21 @@ def _jwt_algorithm() -> str:
 
 def _valid_argon2_hash(value: str) -> bool:
     """
-    Return True if value has the structural shape of an Argon2id hash
-    produced by argon2-cffi, e.g.
-    "$argon2id$v=19$m=65536,t=3,p=4$<salt>$<hash>".
+    Return True iff value is a well-formed Argon2id encoded hash this
+    deployment would accept as S43_OPERATOR_PASSWORD_HASH.
 
-    This is a cheap shape check, not a full parse — hash_password() /
-    verify_password_async() (core.auth.users) are what actually produce and
-    verify hashes. It exists so a truncated/malformed value, or a legacy
-    64-char SHA-256 hex digest, is caught as a config error (503) instead of
-    being silently accepted or misread as a wrong password. No dual-scheme
-    acceptance: anything that isn't a well-formed Argon2id hash is rejected
-    outright, including a syntactically-valid hash using a different Argon2
-    variant (argon2i/argon2d) — this deployment only ever produces argon2id.
+    Thin wrapper over core.auth.users.is_valid_argon2id_hash() — that is the
+    one canonical Argon2 acceptance policy for the whole codebase (this
+    router and core.api.main._validate_security_config() both call it; there
+    is no second copy of the parameter bounds or the base64/version checks).
+    Real parsing, not a shape check: rejects Argon2i/Argon2d, unsupported
+    versions, malformed base64, truncated or missing salt/hash, and
+    out-of-bounds cost parameters, in addition to a legacy SHA-256 hex
+    digest or garbage. No dual-scheme acceptance window.
     """
-    return (
-        isinstance(value, str)
-        and value.startswith("$argon2id$")
-        and value.count("$") == 5
-        and len(value) <= 512
-    )
+    from ...auth.users import is_valid_argon2id_hash
+
+    return is_valid_argon2id_hash(value)
 
 
 # =============================================================================

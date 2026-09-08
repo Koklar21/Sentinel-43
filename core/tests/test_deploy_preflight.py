@@ -438,3 +438,99 @@ def test_verify_without_hostname_is_incomplete_not_pass(monkeypatch):
     code = dp.main(["kube", "--phase", "verify", "--context", "c",
                     "--namespace", "n"])
     assert code == dp.EXIT_INCOMPLETE
+
+
+# --------------------------------------------------------------------------- #
+# PR #257 blocker 1: S43_OPERATOR_PASSWORD_HASH must be a real Argon2id hash
+# before deployment -- deploy_preflight.py cannot import argon2-cffi (kept
+# stdlib-only), so operator_hash_status() re-implements the same structural
+# policy as core.auth.users.is_valid_argon2id_hash() using only `re` and
+# `base64`. These pin that it actually rejects what it claims to.
+# --------------------------------------------------------------------------- #
+_REAL_SALT = "c29tZXNhbHQxeXo"  # >=16 decoded bytes
+_REAL_HASH = "RdescudvJCsgt3ub+b+dWRWJTmaaJObGRdescudvJCsg"  # >=16 decoded bytes
+
+
+def test_operator_hash_missing_fails():
+    status, _ = dp.operator_hash_status("")
+    assert status == dp.FAIL
+
+
+def test_operator_hash_placeholder_fails():
+    status, _ = dp.operator_hash_status("CHANGEME_ARGON2_HASH")
+    assert status == dp.FAIL
+
+
+def test_operator_hash_legacy_sha256_fails():
+    import hashlib
+
+    status, detail = dp.operator_hash_status(hashlib.sha256(b"x").hexdigest())
+    assert status == dp.FAIL
+    assert "SHA-256" in detail
+
+
+def test_operator_hash_wrong_variant_fails():
+    value = f"$argon2i$v=19$m=65536,t=3,p=4${_REAL_SALT}${_REAL_HASH}"
+    status, _ = dp.operator_hash_status(value)
+    assert status == dp.FAIL
+
+
+def test_operator_hash_unsupported_version_fails():
+    value = f"$argon2id$v=18$m=65536,t=3,p=4${_REAL_SALT}${_REAL_HASH}"
+    status, _ = dp.operator_hash_status(value)
+    assert status == dp.FAIL
+
+
+def test_operator_hash_malformed_base64_fails():
+    value = f"$argon2id$v=19$m=65536,t=3,p=4$!!!not-base64!!!${_REAL_HASH}"
+    status, _ = dp.operator_hash_status(value)
+    assert status == dp.FAIL
+
+
+def test_operator_hash_excessive_memory_cost_fails():
+    value = f"$argon2id$v=19$m=4294967295,t=3,p=4${_REAL_SALT}${_REAL_HASH}"
+    status, _ = dp.operator_hash_status(value)
+    assert status == dp.FAIL
+
+
+def test_operator_hash_excessive_parallelism_fails():
+    value = f"$argon2id$v=19$m=65536,t=3,p=16777215${_REAL_SALT}${_REAL_HASH}"
+    status, _ = dp.operator_hash_status(value)
+    assert status == dp.FAIL
+
+
+def test_operator_hash_undersized_salt_fails():
+    value = "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$" + _REAL_HASH
+    status, _ = dp.operator_hash_status(value)
+    assert status == dp.FAIL
+
+
+def test_operator_hash_real_generated_hash_passes():
+    import sys as _sys
+
+    _core_root = pathlib.Path(__file__).resolve().parents[2]
+    if str(_core_root) not in _sys.path:
+        _sys.path.insert(0, str(_core_root))
+    from core.auth.users import hash_password
+
+    status, _ = dp.operator_hash_status(hash_password("preflight-check-password"))
+    assert status == dp.PASS
+
+
+def test_check_compose_config_fails_closed_on_legacy_hash(tmp_path):
+    import hashlib
+
+    env = tmp_path / ".env"
+    lines = [f"{k}=placeholder-value-not-a-placeholder-string-zz" for k in dp.REQUIRED_SECRETS]
+    lines = [
+        line if not line.startswith("S43_OPERATOR_PASSWORD_HASH")
+        else f"S43_OPERATOR_PASSWORD_HASH={hashlib.sha256(b'x').hexdigest()}"
+        for line in lines
+    ]
+    env.write_text("\n".join(lines) + "\n")
+
+    rep = dp.Report(phase="prepare", target="compose")
+    dp.check_compose_config(rep, str(env), "beta.example.invalid", 443)
+    hash_results = [r for r in rep.results if "Argon2id" in r.name]
+    assert len(hash_results) == 1
+    assert hash_results[0].status == dp.FAIL

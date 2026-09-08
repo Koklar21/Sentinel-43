@@ -62,6 +62,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -69,6 +70,8 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 from argon2 import PasswordHasher
+from argon2 import Type as _Argon2Type
+from argon2 import extract_parameters as _extract_argon2_parameters
 from argon2.exceptions import InvalidHash, VerificationError
 from sqlalchemy import (
     Boolean,
@@ -312,6 +315,90 @@ async def verify_password_async(password: str, password_hash: str) -> bool:
 
 
 # =============================================================================
+# Argon2id encoded-hash validation (PR #257 blocker 1)
+#
+# Canonical validator for anything claiming to be an Argon2id encoded hash
+# that reaches this codebase from configuration (S43_OPERATOR_PASSWORD_HASH)
+# rather than from hash_password() itself. core.api.routers.auth and
+# core.api.main both call THIS function — no second copy of the policy.
+#
+# argon2.extract_parameters() alone is not a safe validator: it silently
+# drops characters outside the base64 alphabet instead of rejecting them
+# (so "!!!notbase64!!!" decodes to *something* rather than raising), accepts
+# any integer version number including ones this library has never produced
+# (v=99), and enforces no bounds at all on memory_cost / time_cost /
+# parallelism / salt_len / hash_len — a hash with m=4294967295 parses
+# without error and would then be handed straight to a real Argon2 verify,
+# which is a memory/CPU-exhaustion vector on every login attempt. The strict
+# regex below is the actual gate; extract_parameters() only runs afterward,
+# against input already known to use a clean base64 alphabet, so its
+# decoded salt_len/hash_len/cost figures can be trusted for the bounds
+# checks that follow.
+# =============================================================================
+
+_ARGON2ID_STRICT_RE = re.compile(
+    r"^\$argon2id\$v=19\$m=[1-9][0-9]{0,9},t=[1-9][0-9]{0,4},p=[1-9][0-9]{0,3}"
+    r"\$[A-Za-z0-9+/]{11,64}\$[A-Za-z0-9+/]{22,86}$"
+)
+
+# Defensible bounds, not a compatibility knob. hash_password() (PasswordHasher()
+# defaults) produces m=65536 KiB, t=3, p=4, salt_len=16, hash_len=32 --
+# comfortably inside every bound below. A configured hash outside these
+# bounds is rejected as a config error rather than accepted and run through
+# a real (and, at the extremes, resource-exhausting) Argon2 verify.
+_ARGON2_MIN_MEMORY_COST_KIB = 8 * 1024
+_ARGON2_MAX_MEMORY_COST_KIB = 1024 * 1024
+_ARGON2_MIN_TIME_COST = 1
+_ARGON2_MAX_TIME_COST = 32
+_ARGON2_MIN_PARALLELISM = 1
+_ARGON2_MAX_PARALLELISM = 16
+_ARGON2_MIN_SALT_LEN = 16
+_ARGON2_MIN_HASH_LEN = 16
+_ARGON2_MAX_ENCODED_LEN = 512
+
+
+def is_valid_argon2id_hash(value: object) -> bool:
+    """
+    True iff `value` is a well-formed Argon2id encoded hash this deployment
+    would accept as S43_OPERATOR_PASSWORD_HASH: Argon2id only (not
+    Argon2i/Argon2d), Argon2 version 19 only, a strict unpadded-base64 salt
+    and hash (no stray characters, no missing segments, no truncation), and
+    cost parameters inside defensible bounds. Never raises -- any malformed,
+    oversized, or non-string input returns False.
+
+    This is a structural/config validator, not a verifier: it says nothing
+    about whether a given plaintext password matches. Use
+    verify_password() / verify_password_async() for that, exactly as before.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    if len(value) > _ARGON2_MAX_ENCODED_LEN:
+        return False
+    if not _ARGON2ID_STRICT_RE.match(value):
+        return False
+
+    try:
+        params = _extract_argon2_parameters(value)
+    except Exception:
+        return False
+
+    if params.type is not _Argon2Type.ID:
+        return False
+    if not (_ARGON2_MIN_MEMORY_COST_KIB <= params.memory_cost <= _ARGON2_MAX_MEMORY_COST_KIB):
+        return False
+    if not (_ARGON2_MIN_TIME_COST <= params.time_cost <= _ARGON2_MAX_TIME_COST):
+        return False
+    if not (_ARGON2_MIN_PARALLELISM <= params.parallelism <= _ARGON2_MAX_PARALLELISM):
+        return False
+    if params.salt_len < _ARGON2_MIN_SALT_LEN:
+        return False
+    if params.hash_len < _ARGON2_MIN_HASH_LEN:
+        return False
+
+    return True
+
+
+# =============================================================================
 # Queries
 # =============================================================================
 
@@ -511,6 +598,7 @@ __all__ = [
     "hash_password",
     "hash_password_async",
     "init_models",
+    "is_valid_argon2id_hash",
     "list_users",
     "record_login",
     "set_user_active",

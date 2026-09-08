@@ -61,7 +61,16 @@ S43_JWT_ALGORITHM=HS256
 S43_JWT_ISSUER=sentinel-43
 S43_JWT_AUDIENCE=sentinel-43-dashboard
 S43_OPERATOR_USERNAME=browser-envop-unused
-S43_OPERATOR_PASSWORD_HASH=$(printf 'disabled-%s' "$RANDOM$RANDOM" | sha256sum | cut -d' ' -f1)
+# Compose interpolates \$VAR / \${VAR} when it reads an --env-file, so every
+# literal \$ in the Argon2id hash must be doubled to \$\$ -- otherwise
+# "\$argon2id\$v=19\$m=..." is parsed as a run of undefined variable
+# references and the container starts with a mangled, non-Argon2id value
+# (confirmed via `docker compose config` while fixing this).
+S43_OPERATOR_PASSWORD_HASH=$(PYTHONPATH=. python -c "
+import secrets
+from core.auth.users import hash_password
+print(hash_password(secrets.token_urlsafe(32)).replace('\$', '\$\$'))
+")
 S43_WS_REQUIRE_AUTH=true
 S43_ALLOWED_ORIGINS=https://s43.beta.test:8443
 S43_TRUSTED_HOSTS=s43.beta.test

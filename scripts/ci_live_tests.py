@@ -6,7 +6,6 @@ Never points the bootstrap tests at a user-supplied deployment.
 
 from __future__ import annotations
 
-import hashlib
 import os
 from pathlib import Path
 import secrets
@@ -20,6 +19,9 @@ from urllib.request import urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from core.auth.users import hash_password  # noqa: E402 (sys.path must be set first)
 
 
 def wait_ready(process: subprocess.Popen, url: str) -> None:
@@ -52,7 +54,14 @@ def main() -> int:
     jwt_secret = secrets.token_urlsafe(32)
     pepper = secrets.token_urlsafe(32)
     service_token = secrets.token_urlsafe(32)
-    sensitive = [database_url, password, jwt_secret, pepper, service_token]
+    # P0-1: the break-glass operator hash must be Argon2id, produced by the
+    # project's own canonical generator, exactly like a real deployment's
+    # S43_OPERATOR_PASSWORD_HASH — not the retired unsalted SHA-256 digest
+    # of a random token, which core.api.main._validate_security_config()
+    # correctly refuses to start on in SENTINEL_ENV=production (as set
+    # below), which is exactly why this fixture was failing CI.
+    operator_hash = hash_password(password)
+    sensitive = [database_url, password, jwt_secret, pepper, service_token, operator_hash]
     for value in sensitive:
         print(f"::add-mask::{value}", flush=True)
 
@@ -71,7 +80,7 @@ def main() -> int:
         "S43_ENABLE_TEST_INJECTION": "false",
         "S43_SECRETS_ROTATED_AT": datetime.now(timezone.utc).isoformat(),
         "S43_OPERATOR_USERNAME": "ci-live-operator",
-        "S43_OPERATOR_PASSWORD_HASH": hashlib.sha256(password.encode()).hexdigest(),
+        "S43_OPERATOR_PASSWORD_HASH": operator_hash,
         # The env-var operator is scoped break-glass now (RELEASE_FINDINGS #11)
         # -- inert once a DB admin exists. test_bootstrap.py creates one in
         # this same run, so arm break-glass explicitly for the disposable CI
