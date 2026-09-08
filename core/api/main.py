@@ -354,6 +354,7 @@ class RuntimeState:
     heartbeat_task: asyncio.Task[None] | None = None
 
     monitoring_manager: Any | None = None
+    audit_store: Any | None = None
     orchestrator: Any | None = None
     sparta_instance: Any | None = None
     sparta_task: asyncio.Task[Any] | None = None
@@ -480,6 +481,25 @@ def _validate_security_config() -> None:
                 "S43_TLS_TERMINATED_AT_TRUSTED_EDGE=true. This confirms the "
                 "deployment terminates HTTPS/WSS before traffic reaches the API."
             )
+
+
+def _bootstrap_settings() -> dict[str, Any]:
+    """Snapshot the startup security inputs core.bootstrap validates.
+
+    core.bootstrap.validate_bootstrap_expectations() is deliberately env-free
+    and validates an already-loaded settings mapping. This composition root
+    owns the environment reads.
+    """
+    return {
+        "env": SENTINEL_ENV,
+        "jwt_secret": JWT_SECRET,
+        "jwt_algorithm": JWT_ALGORITHM,
+        "jwt_issuer": _env_str("S43_JWT_ISSUER", "sentinel-43"),
+        "jwt_audience": _env_str("S43_JWT_AUDIENCE", "sentinel-43-dashboard"),
+        "auth_pepper": _env_str("S43_AUTH_PEPPER"),
+        "ws_require_auth": WS_REQUIRE_AUTH,
+        "enable_test_injection": TEST_INJECTION_ENABLED,
+    }
 
 
 # =============================================================================
@@ -1173,9 +1193,72 @@ async def _start_fenrir() -> None:
         logger.error("FenrirHunter failed to start", exc_info=True)
 
 
+async def _start_audit_store() -> None:
+    """Construct and initialize the authoritative HMAC-chained audit store.
+
+    The audit store is a hard dependency of governance: SystemOrchestrator
+    records every human decision through it. It is also the canonical local
+    audit ledger for the rest of the API. S43_AUDIT_HMAC_KEY keys the HMAC
+    chain; when it is absent the store cannot be built. That is fatal outside
+    development/local/test and whenever governance is enabled.
+    """
+    from pathlib import Path
+
+    from core.audit import AuditConfig, AuditStore
+
+    signing_key = _env_str("S43_AUDIT_HMAC_KEY")
+    required = _env_bool("S43_GOVERNANCE_ENABLED", False) or not IS_LOCAL_ENV
+
+    if not signing_key:
+        if required:
+            raise RuntimeError(
+                "S43_AUDIT_HMAC_KEY is required: the authoritative audit "
+                "store cannot be keyed. It is mandatory outside "
+                "development/local/test and whenever S43_GOVERNANCE_ENABLED=true."
+            )
+        logger.warning(
+            "S43_AUDIT_HMAC_KEY is not set; authoritative audit store is "
+            "disabled (development/local/test only)."
+        )
+        return
+
+    sqlite_path = Path(
+        _env_str("S43_AUDIT_SQLITE_PATH", "sentinel43_state/audit.sqlite3")
+    )
+    jsonl_raw = _env_str("S43_AUDIT_JSONL_PATH", "logs/audit.jsonl")
+
+    try:
+        store = AuditStore(
+            AuditConfig(
+                sqlite_path=sqlite_path,
+                signing_key=signing_key,
+                jsonl_path=Path(jsonl_raw) if jsonl_raw else None,
+            )
+        )
+        # initialize() creates the schema and runs full-chain integrity
+        # verification, raising on any tamper/inconsistency.
+        await asyncio.to_thread(store.initialize)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Authoritative audit store failed to initialize: {exc}"
+        ) from exc
+
+    runtime.audit_store = store
+    logger.info(
+        "Authoritative audit store initialized (%s)",
+        sqlite_path,
+    )
+
+
 async def _start_governance() -> None:
     if not _env_bool("S43_GOVERNANCE_ENABLED", False):
         return
+
+    if runtime.audit_store is None:
+        raise RuntimeError(
+            "Governance requires an initialized authoritative audit store. "
+            "Refusing to start SystemOrchestrator without one."
+        )
 
     try:
         from core.governance import build_orchestrator_from_settings
@@ -1418,12 +1501,13 @@ async def _shutdown_runtime() -> None:
 @asynccontextmanager
 async def lifespan(api: FastAPI):
     _validate_security_config()
-    bootstrap_expectations()
+    bootstrap_expectations(_bootstrap_settings())
 
     try:
         await _start_monitoring_manager()
         await _start_sparta()
         await _start_fenrir()
+        await _start_audit_store()
         await _start_governance()
         await _register_remote_dispatch_handlers()
 
