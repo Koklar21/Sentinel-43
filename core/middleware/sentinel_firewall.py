@@ -3,227 +3,261 @@
 #
 # Copyright (c) 2026 Justin Armstrong
 # All Rights Reserved.
+#
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
 
-"""
-Sentinel-43 firewall middleware compatibility module.
+"""Canonical Sentinel-43 firewall middleware exports.
 
-This file is the canonical import location used by:
-
-    from core.middleware import SentinelFirewall, FirewallConfig, BlockReason
-
-The relocated implementation currently lives at:
-
-    core.api.middleware.sentinel_firewall_middleware
-
-That relocated copy is usable, but its FirewallConfig does not expose the
-from_env() classmethod expected by core.api.main. This module restores that
-interface at the original import location without changing router behavior or
-rewiring unrelated middleware.
+This module owns environment parsing for FirewallConfig and re-exports the
+firewall middleware implementation without runtime monkey-patching.
 """
 
 from __future__ import annotations
 
-import inspect
 import ipaddress
 import logging
 import os
-from typing import Any
+from dataclasses import replace
+from typing import Final
 
-from core.api.middleware.sentinel_firewall_middleware import (  # noqa: F401
+from core.api.middleware.sentinel_firewall_middleware import (
     BlockReason,
-    FirewallConfig,
+    FirewallConfig as _FirewallConfig,
     SentinelFirewall,
 )
 
-logger = logging.getLogger("SentinelFirewall")
+
+logger = logging.getLogger("sentinel43.firewall")
 
 
-_TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
-_FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
+_TRUE_VALUES: Final[frozenset[str]] = frozenset(
+    {"1", "true", "yes", "on", "enabled"}
+)
 
-
-def _env_str(name: str, default: str = "") -> str:
-    return os.getenv(name, default).strip()
-
-
-def _env_bool(name: str) -> bool:
-    """
-    Parse a set env var as a bool. Caller must only invoke this when the var
-    is actually present (os.getenv(name) is not None). A malformed value is a
-    hard error, not a silent fall-back to a default: this shim exists to stop
-    the firewall silently weakening, and "S43_FIREWALL_ENABLED=maybe quietly
-    becomes True" is exactly that failure mode. The error propagates through
-    FirewallConfig.from_env() to core/api/main.py, which fails startup closed
-    outside local/test environments.
-    """
-    raw = os.getenv(name, "")
-    value = raw.strip().lower()
-    if value in _TRUE_VALUES:
-        return True
-    if value in _FALSE_VALUES:
-        return False
-    raise ValueError(
-        f"SentinelFirewall: {name}={raw!r} is not a valid boolean "
-        f"(expected one of {sorted(_TRUE_VALUES | _FALSE_VALUES)})"
-    )
-
-
-def _env_int(name: str) -> int:
-    """As _env_bool: only call when the var is set; malformed => hard error."""
-    raw = os.getenv(name, "")
-    try:
-        return int(raw.strip())
-    except (ValueError, TypeError) as exc:
-        raise ValueError(
-            f"SentinelFirewall: {name}={raw!r} is not a valid integer"
-        ) from exc
-
-
-def _env_csv(name: str) -> tuple[str, ...]:
-    """Split a set env var on commas. '' -> (). Only call when the var is set."""
-    raw = os.getenv(name, "")
-    return tuple(part.strip() for part in raw.split(",") if part.strip())
-
-
-def _env_cidr_csv(name: str) -> tuple[str, ...]:
-    """
-    As _env_csv, but every entry must parse as an IP or CIDR now, at config
-    load time -- not silently later. A malformed entry in an IP allow/block or
-    trusted-proxy list changes security behavior in every direction; catching
-    it here means it surfaces as a fail-closed startup error (via
-    core/api/main.py) rather than a warning nobody reads. SentinelFirewall's
-    own _parse_networks() re-validates as defense-in-depth for callers that
-    build FirewallConfig directly.
-    """
-    values = _env_csv(name)
-    for value in values:
-        try:
-            ipaddress.ip_network(value, strict=False)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(
-                f"SentinelFirewall: {name} contains an invalid IP/CIDR "
-                f"{value!r}: {exc}"
-            ) from exc
-    return values
-
-
-def _constructor_accepts(cls: type[Any], field: str) -> bool:
-    try:
-        return field in inspect.signature(cls).parameters
-    except (TypeError, ValueError):
-        return False
-
-
-# (FirewallConfig constructor field, env var, parser kind). The field names
-# are the *actual* dataclass parameters — see
-# core/api/middleware/sentinel_firewall_middleware.py. Earlier versions of
-# this table guessed plausible-sounding names ("enable_firewall",
-# "max_body_bytes", "blocked_paths", "trusted_proxies", ...) that never
-# matched the real fields; 3f65ca1 corrected the names. "allowed_origins" is
-# not here — it's a CORS setting (S43_ALLOWED_ORIGINS in core/api/main.py),
-# not a FirewallConfig field.
-# (FirewallConfig field, env var, parser kind, keep_default_when_blank).
-# keep_default_when_blank=True: a set-but-empty value ("", whitespace, ",")
-# is treated as "not configured" and FirewallConfig's built-in default is
-# kept, with a warning. Only blocked_path_prefixes needs this — its default
-# is a non-empty security baseline and there is no legitimate reason to want
-# zero path prefixes with the firewall otherwise on (use S43_FIREWALL_ENABLED
-# =false for that). For the other CSV fields an empty value == the default
-# (empty) anyway, so the flag is a no-op.
-_ENV_FIELD_MAP: tuple[tuple[str, str, str, bool], ...] = (
-    ("enabled", "S43_FIREWALL_ENABLED", "bool", False),
-    ("max_content_length_bytes", "S43_FIREWALL_MAX_BODY_BYTES", "int", False),
-    ("max_total_header_bytes", "S43_FIREWALL_MAX_HEADER_BYTES", "int", False),
-    ("allowed_ip_cidrs", "S43_FIREWALL_ALLOWED_IP_CIDRS", "cidr_csv", False),
-    ("blocked_ip_cidrs", "S43_FIREWALL_BLOCKED_IPS", "cidr_csv", False),
-    ("blocked_path_prefixes", "S43_FIREWALL_BLOCKED_PATHS", "csv", True),
-    ("trusted_proxy_cidrs", "S43_TRUSTED_PROXIES", "cidr_csv", False),
+_FALSE_VALUES: Final[frozenset[str]] = frozenset(
+    {"0", "false", "no", "off", "disabled"}
 )
 
 
-def _build_config_kwargs(cls: type[Any]) -> dict[str, Any]:
-    """
-    Build FirewallConfig kwargs ONLY for env vars that are actually set (and,
-    for blocked_path_prefixes, only when set to a non-empty value).
+def _env_bool(
+    name: str,
+) -> bool:
+    raw = os.getenv(
+        name
+    )
 
-    Invariant: an absent or blank environment variable must never override a
-    FirewallConfig default. Previously every field was passed
-    unconditionally, so an unset S43_FIREWALL_BLOCKED_PATHS handed
-    FirewallConfig `blocked_path_prefixes=()` — silently replacing the
-    built-in list of dangerous path prefixes (/.git, /.env, /wp-admin,
-    /actuator, ...) with nothing. Now an absent var is skipped, a blank
-    blocked_path_prefixes is skipped with a warning, and a present-but-
-    malformed bool/int raises (see _env_bool / _env_int) rather than falling
-    back to a default.
+    if raw is None:
+        raise RuntimeError(
+            f"{name} is not set"
+        )
 
-    _constructor_accepts() still guards each field so the shim tolerates the
-    relocated FirewallConfig renaming a field later.
-    """
-    kwargs: dict[str, Any] = {}
+    normalized = raw.strip().lower()
 
-    for field, env_var, kind, keep_default_when_blank in _ENV_FIELD_MAP:
-        if os.getenv(env_var) is None:
-            continue
-        if not _constructor_accepts(cls, field):
-            continue
-        if kind == "bool":
-            kwargs[field] = _env_bool(env_var)
-        elif kind == "int":
-            kwargs[field] = _env_int(env_var)
-        else:
-            value = _env_cidr_csv(env_var) if kind == "cidr_csv" else _env_csv(env_var)
-            if not value and keep_default_when_blank:
-                logger.warning(
-                    "%s is set but empty -- keeping FirewallConfig's built-in "
-                    "%s default. Unset the variable to silence this, or give a "
-                    "real comma-separated value to replace the default list.",
-                    env_var,
-                    field,
-                )
-                continue
-            kwargs[field] = value
+    if normalized in _TRUE_VALUES:
+        return True
 
-    return kwargs
+    if normalized in _FALSE_VALUES:
+        return False
 
-
-def _firewall_config_from_env(cls: type[Any]) -> Any:
-    """
-    Recreate the expected FirewallConfig.from_env() classmethod.
-
-    Prefer constructor kwargs when the relocated config supports known field
-    names. If it does not, fall back to the class defaults. If required
-    constructor arguments exist with no defaults, raise a clear ImportError
-    instead of failing later during FastAPI middleware registration.
-    """
-    kwargs = _build_config_kwargs(cls)
-
-    try:
-        return cls(**kwargs)
-    except TypeError as first_error:
-        try:
-            return cls()
-        except TypeError as second_error:
-            raise ImportError(
-                "FirewallConfig.from_env() compatibility shim could not "
-                "construct FirewallConfig from the relocated implementation. "
-                f"Constructor kwargs attempted: {sorted(kwargs)}. "
-                f"First error: {first_error}. Second error: {second_error}."
-            ) from second_error
-
-
-if not hasattr(FirewallConfig, "from_env"):
-    setattr(FirewallConfig, "from_env", classmethod(_firewall_config_from_env))
-
-
-if not hasattr(FirewallConfig, "from_env"):
-    raise ImportError(
-        "FirewallConfig compatibility repair failed: from_env() is still missing."
+    raise ValueError(
+        f"{name}={raw!r} is not a valid boolean"
     )
 
 
+def _env_int(
+    name: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw = os.getenv(
+        name
+    )
+
+    if raw is None:
+        raise RuntimeError(
+            f"{name} is not set"
+        )
+
+    try:
+        value = int(
+            raw.strip()
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"{name}={raw!r} is not a valid integer"
+        ) from exc
+
+    if not minimum <= value <= maximum:
+        raise ValueError(
+            f"{name} must be between {minimum} and {maximum}"
+        )
+
+    return value
+
+
+def _env_csv(
+    name: str,
+) -> tuple[str, ...]:
+    raw = os.getenv(
+        name
+    )
+
+    if raw is None:
+        raise RuntimeError(
+            f"{name} is not set"
+        )
+
+    return tuple(
+        part.strip()
+        for part in raw.split(",")
+        if part.strip()
+    )
+
+
+def _env_cidrs(
+    name: str,
+) -> tuple[str, ...]:
+    values = _env_csv(
+        name
+    )
+
+    normalized: list[str] = []
+
+    for value in values:
+        try:
+            network = ipaddress.ip_network(
+                value,
+                strict=False,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"{name} contains invalid IP/CIDR {value!r}"
+            ) from exc
+
+        normalized.append(
+            str(
+                network
+            )
+        )
+
+    return tuple(
+        normalized
+    )
+
+
+def firewall_config_from_env(
+) -> _FirewallConfig:
+    """Build FirewallConfig from explicitly set Sentinel-43 environment values.
+
+    Unset values preserve the implementation's own safe defaults.
+    """
+    config = _FirewallConfig()
+
+    updates: dict[
+        str,
+        object,
+    ] = {}
+
+    if os.getenv(
+        "S43_FIREWALL_ENABLED"
+    ) is not None:
+        updates[
+            "enabled"
+        ] = _env_bool(
+            "S43_FIREWALL_ENABLED"
+        )
+
+    if os.getenv(
+        "S43_FIREWALL_MAX_BODY_BYTES"
+    ) is not None:
+        updates[
+            "max_content_length_bytes"
+        ] = _env_int(
+            "S43_FIREWALL_MAX_BODY_BYTES",
+            minimum=1,
+            maximum=1024 * 1024 * 1024,
+        )
+
+    if os.getenv(
+        "S43_FIREWALL_MAX_HEADER_BYTES"
+    ) is not None:
+        updates[
+            "max_total_header_bytes"
+        ] = _env_int(
+            "S43_FIREWALL_MAX_HEADER_BYTES",
+            minimum=1,
+            maximum=16 * 1024 * 1024,
+        )
+
+    if os.getenv(
+        "S43_FIREWALL_ALLOWED_IP_CIDRS"
+    ) is not None:
+        updates[
+            "allowed_ip_cidrs"
+        ] = _env_cidrs(
+            "S43_FIREWALL_ALLOWED_IP_CIDRS"
+        )
+
+    if os.getenv(
+        "S43_FIREWALL_BLOCKED_IPS"
+    ) is not None:
+        updates[
+            "blocked_ip_cidrs"
+        ] = _env_cidrs(
+            "S43_FIREWALL_BLOCKED_IPS"
+        )
+
+    if os.getenv(
+        "S43_TRUSTED_PROXIES"
+    ) is not None:
+        updates[
+            "trusted_proxy_cidrs"
+        ] = _env_cidrs(
+            "S43_TRUSTED_PROXIES"
+        )
+
+    if os.getenv(
+        "S43_FIREWALL_BLOCKED_PATHS"
+    ) is not None:
+        blocked_paths = _env_csv(
+            "S43_FIREWALL_BLOCKED_PATHS"
+        )
+
+        if blocked_paths:
+            updates[
+                "blocked_path_prefixes"
+            ] = blocked_paths
+        else:
+            logger.warning(
+                "S43_FIREWALL_BLOCKED_PATHS is set but empty; "
+                "preserving FirewallConfig's built-in blocked-path defaults."
+            )
+
+    try:
+        return replace(
+            config,
+            **updates,
+        )
+
+    except TypeError as exc:
+        raise ImportError(
+            "FirewallConfig no longer matches the canonical Sentinel-43 "
+            "firewall configuration contract."
+        ) from exc
+
+
+FirewallConfig = _FirewallConfig
+
+
 __all__ = [
-    "SentinelFirewall",
-    "FirewallConfig",
     "BlockReason",
+    "FirewallConfig",
+    "SentinelFirewall",
+    "firewall_config_from_env",
 ]
