@@ -1,103 +1,44 @@
 # =============================================================================
-# Sentinel-43 Remote Gateway
+# Sentinel-43
 #
-# Scope:
-#   Authorized remote operations gateway.
+# Copyright (c) 2026 Justin Armstrong
+# All Rights Reserved.
 #
-# This module does NOT:
-#   - Provide arbitrary URL forwarding
-#   - Provide covert backdoor access
-#   - Handle payment enforcement
-#   - Bypass tenant/client authorization
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
 #
-# This module DOES:
-#   - Validate approved operators via per-role bearer tokens
-#   - Validate approved targets
-#   - Validate approved remote event types
-#   - Require reason + correlation ID
-#   - Support dry-run validation
-#   - Produce bounded audit records
-#   - Use constant-time token comparison
-#   - Enforce payload key/depth/byte limits
-#   - Rate-limit repeated authentication failures
-#   - Fail CLOSED if no operator tokens are configured
-#   - Best-effort report security-relevant events to Watchtower
-#   - Route security events through MonitoringManager for threat scoring
-#
-# Changelog
-# ---------
-# v2 (security hardening):
-#   - SENTINEL_REMOTE_OWNER_TOKEN (and friends) no longer optional-with-warning.
-#     If no operator tokens are configured at all, the gateway returns 503
-#     for every authenticated route instead of running open.
-#   - operator_role is resolved server-side from the bearer token, not
-#     trusted from the request body. A mismatched body.operator_role is a
-#     403 (and is reported to Watchtower as a possible privilege-escalation
-#     signal - see v3 below).
-#   - Non-dry-run event activation now requires SENTINEL_REMOTE_LIVE_DISPATCH_ENABLED;
-#     otherwise it returns 501 instead of falsely reporting success.
-#   - Added a simple per-client rate limit on authentication failures.
-#   - ROTATE_REMOTE_TOKEN is now reachable (added to local-sentinel's
-#     allowed_events) since OWNER is the only role permitted to use it.
-#   - Config is loaded lazily via get_config()/reload_config() instead of
-#     a module-level singleton computed at import time.
-#
-# v3 (Watchtower integration):
-#   - Authentication failures, rate-limit (429) hits, operator-role
-#     mismatches, and event-activation audit records are now reported,
-#     best-effort, to Watchtower's /analyze endpoint
-#     (SENTINEL_WATCHTOWER_URL). Reporting failures never block or fail
-#     the gateway request.
-#   - Role mismatches are reported with privilege_escalation=True, which
-#     Watchtower's SECURITY_BASELINE tower treats as a CRITICAL alert.
-#
-# v4 (correctness hardening):
-#   - Fix #1: AUDIT_LOG no longer calls get_config() at import time.
-#     _AuditLog proxy lazy-initializes on first use, keeping maxlen in
-#     sync with reload_config().
-#   - Fix #2: _payload_depth rewritten as iterative stack traversal --
-#     deeply nested payloads no longer cause RecursionError DoS.
-#   - Fix #3: _dispatch_remote_event raises NotImplementedError so the
-#     caller cannot claim success before a real broker is wired up.
-#   - Fix #4+5: _AUTH_FAILURES protected by a lock; check+record are
-#     atomic; periodic GC prevents unbounded dict growth under IP churn.
-#   - Fix #6: audit endpoint scoped by role -- AUDITOR sees only auditor
-#     records, ADMIN sees admin+auditor, OWNER sees all.
-#   - Fix #7: reason max_length enforced via validator that reads live
-#     config, not a hardcoded Field() constant that diverges silently.
-#   - Fix #8: /audit/{correlation_id} path param validated for length
-#     and control characters.
-#   - Fix #9: set_monitoring_manager() wires in MonitoringManager so
-#     gateway security events populate the SentinelWindowStore and get
-#     threat-scored alongside events from other entry points.
-#   - Fix #10: APPROVE_DECISION / VETO_DECISION event types added for
-#     mobile companion app HUMAN_GATED approve/veto workflow.
-#   - Fix #11: removed dead double-default for gateway_name.
-#   - Fix #12: auth_failure_window_seconds uses _env_float() directly.
-#   - Fix #13: redundant get_remote_gateway_router() removed.
-#
-# v5 (live dispatch — callback registry):
-#   - Fix #14: _dispatch_remote_event() is now fully implemented via an
-#     in-process callback registry. register_dispatch_handler() lets
-#     main.py wire in per-event handlers at lifespan startup without
-#     creating a circular import or an HTTP loopback dependency.
-#   - APPROVE_DECISION and VETO_DECISION route through registered async
-#     handlers; if no handler is registered they return 501 with a clear
-#     message rather than silently succeeding or crashing.
-#   - FORCE_HEALTH_CHECK, FORCE_SYNC, and REQUEST_DIAGNOSTIC_SNAPSHOT
-#     have sensible in-process defaults (Watchtower ping + log) but can
-#     also be overridden via the registry.
-#   - ROTATE_REMOTE_TOKEN remains 501 until a key-rotation subsystem is
-#     integrated; it is the only event type with no in-process default.
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
+
+"""Sentinel-43 authorized remote operations gateway.
+
+The gateway is intentionally narrow. It does not provide arbitrary forwarding,
+shell access, tenant bypass, or autonomous enforcement.
+
+Security properties:
+    - bearer token resolves the effective server-side role
+    - no configured tokens => authenticated routes fail closed
+    - live dispatch is disabled by default
+    - live dispatch requires an explicitly registered in-process handler
+    - human-gated approve/veto payloads require both action_id and decision_id
+    - payload size/key/depth limits are enforced before dispatch
+    - correlation IDs are replay-protected within a bounded retention window
+    - authentication-failure state is bounded
+    - monitoring/Watchtower reporting is best-effort and off the critical path
+    - the in-memory event buffer is operational telemetry, not a durable audit
+      ledger and must not be treated as authoritative security evidence
+"""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -105,61 +46,198 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Final
 from uuid import uuid4
 
-import httpx
 from fastapi import APIRouter, Header, HTTPException, Request, status
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ...monitoring.watchtower_client import watchtower_request
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/remote-gateway", tags=["remote-gateway"])
+router = APIRouter(
+    prefix="/remote-gateway",
+    tags=["remote-gateway"],
+)
+
+_TRUE_VALUES: Final[frozenset[str]] = frozenset(
+    {"1", "true", "yes", "on", "enabled"}
+)
+_FALSE_VALUES: Final[frozenset[str]] = frozenset(
+    {"0", "false", "no", "off", "disabled"}
+)
+_LOCAL_ENVIRONMENTS: Final[frozenset[str]] = frozenset(
+    {"development", "dev", "local", "test"}
+)
+_SAFE_ID_RE: Final[re.Pattern[str]] = re.compile(
+    r"^[A-Za-z0-9_.:@/-]{2,160}$"
+)
+_MAX_DISPATCH_MESSAGE: Final[int] = 1024
 
 
 # =============================================================================
-# Env helpers
+# Configuration helpers
 # =============================================================================
 
 def _env(name: str, default: str | None = None) -> str | None:
-    value = os.getenv(name)
-    if value is None or value.strip() == "":
-        return default
-    return value.strip()
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    value = _env(name)
-    if value is None:
-        return default
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-def _env_int(name: str, default: int) -> int:
-    value = _env(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        logger.warning("Invalid integer for %s=%r; using default %s", name, value, default)
+    raw = os.getenv(name)
+    if raw is None:
         return default
 
+    value = raw.strip()
+    return value if value else default
 
-def _env_float(name: str, default: float) -> float:
-    value = _env(name)
-    if value is None:
+
+def _environment() -> str:
+    value = (
+        _env("SENTINEL_ENV")
+        or _env("S43_ENV")
+        or "production"
+    ).lower()
+
+    aliases = {
+        "dev": "development",
+        "local": "development",
+        "prod": "production",
+        "stage": "staging",
+    }
+    return aliases.get(value, value)
+
+
+def _is_local() -> bool:
+    return _environment() in _LOCAL_ENVIRONMENTS
+
+
+def _env_bool(
+    name: str,
+    default: bool,
+    *,
+    strict: bool,
+) -> bool:
+    raw = _env(name)
+    if raw is None:
         return default
-    try:
-        return float(value)
-    except ValueError:
-        logger.warning("Invalid float for %s=%r; using default %s", name, value, default)
+
+    normalized = raw.lower()
+
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+
+    if strict:
+        raise RuntimeError(
+            f"{name} must be boolean; got {raw!r}"
+        )
+
+    logger.warning(
+        "RemoteGateway: invalid boolean for %s=%r; using default %s",
+        name,
+        raw,
+        default,
+    )
+    return default
+
+
+def _env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+    strict: bool,
+) -> int:
+    raw = _env(name)
+
+    if raw is None:
+        value = default
+    else:
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            if strict:
+                raise RuntimeError(
+                    f"{name} must be integer; got {raw!r}"
+                ) from exc
+
+            logger.warning(
+                "RemoteGateway: invalid integer for %s=%r; using default %s",
+                name,
+                raw,
+                default,
+            )
+            return default
+
+    if not minimum <= value <= maximum:
+        if strict:
+            raise RuntimeError(
+                f"{name} must be between {minimum} and {maximum}; got {value}"
+            )
+
+        logger.warning(
+            "RemoteGateway: %s=%s outside %s..%s; using default %s",
+            name,
+            value,
+            minimum,
+            maximum,
+            default,
+        )
         return default
+
+    return value
+
+
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    minimum: float,
+    maximum: float,
+    strict: bool,
+) -> float:
+    raw = _env(name)
+
+    if raw is None:
+        value = default
+    else:
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            if strict:
+                raise RuntimeError(
+                    f"{name} must be numeric; got {raw!r}"
+                ) from exc
+
+            logger.warning(
+                "RemoteGateway: invalid number for %s=%r; using default %s",
+                name,
+                raw,
+                default,
+            )
+            return default
+
+    if not minimum <= value <= maximum:
+        if strict:
+            raise RuntimeError(
+                f"{name} must be between {minimum} and {maximum}; got {value}"
+            )
+
+        logger.warning(
+            "RemoteGateway: %s=%s outside %s..%s; using default %s",
+            name,
+            value,
+            minimum,
+            maximum,
+            default,
+        )
+        return default
+
+    return value
 
 
 # =============================================================================
-# Enums / Policy
+# Policy
 # =============================================================================
 
 class RemoteGatewayState(str, Enum):
@@ -178,59 +256,59 @@ class RemoteEventType(str, Enum):
     FORCE_SYNC = "force_sync"
     ROTATE_REMOTE_TOKEN = "rotate_remote_token"
     REQUEST_DIAGNOSTIC_SNAPSHOT = "request_diagnostic_snapshot"
-    # Fix #10: human-gated governance decisions for the mobile companion
-    # app HUMAN_GATED approve/veto workflow. Restricted to OWNER and ADMIN
-    # -- AUDITOR is read-only and cannot approve or veto decisions.
-    # Payload must include "decision_id" (the pending governance decision
-    # to act on). See RemoteEventActivationRequest.validate_governance_payload.
     APPROVE_DECISION = "approve_decision"
     VETO_DECISION = "veto_decision"
 
 
-ROLE_EVENT_POLICY: dict[OperatorRole, set[RemoteEventType]] = {
-    OperatorRole.OWNER: {
-        RemoteEventType.FORCE_HEALTH_CHECK,
-        RemoteEventType.FORCE_SYNC,
-        RemoteEventType.ROTATE_REMOTE_TOKEN,
-        RemoteEventType.REQUEST_DIAGNOSTIC_SNAPSHOT,
-        RemoteEventType.APPROVE_DECISION,
-        RemoteEventType.VETO_DECISION,
-    },
-    OperatorRole.ADMIN: {
-        RemoteEventType.FORCE_HEALTH_CHECK,
-        RemoteEventType.FORCE_SYNC,
-        RemoteEventType.REQUEST_DIAGNOSTIC_SNAPSHOT,
-        RemoteEventType.APPROVE_DECISION,
-        RemoteEventType.VETO_DECISION,
-    },
-    OperatorRole.AUDITOR: {
-        RemoteEventType.REQUEST_DIAGNOSTIC_SNAPSHOT,
-    },
-}
-
-# Audit scoping: which operator_role values each role can see in the audit log.
-# OWNER sees all; ADMIN sees admin+auditor records; AUDITOR sees only their own.
-_AUDIT_VISIBLE_ROLES: dict[OperatorRole, set[str]] = {
-    OperatorRole.OWNER: {"owner", "admin", "auditor"},
-    OperatorRole.ADMIN: {"admin", "auditor"},
-    OperatorRole.AUDITOR: {"auditor"},
-}
-
-
-REGISTERED_TARGETS: dict[str, dict[str, Any]] = {
-    "local-sentinel": {
-        "name": "Local Sentinel-43 Instance",
-        "enabled": True,
-        "environment": "development",
-        "allowed_events": {
+ROLE_EVENT_POLICY: Final[dict[OperatorRole, frozenset[RemoteEventType]]] = {
+    OperatorRole.OWNER: frozenset(
+        {
+            RemoteEventType.FORCE_HEALTH_CHECK,
+            RemoteEventType.FORCE_SYNC,
+            RemoteEventType.ROTATE_REMOTE_TOKEN,
+            RemoteEventType.REQUEST_DIAGNOSTIC_SNAPSHOT,
+            RemoteEventType.APPROVE_DECISION,
+            RemoteEventType.VETO_DECISION,
+        }
+    ),
+    OperatorRole.ADMIN: frozenset(
+        {
             RemoteEventType.FORCE_HEALTH_CHECK,
             RemoteEventType.FORCE_SYNC,
             RemoteEventType.REQUEST_DIAGNOSTIC_SNAPSHOT,
-            RemoteEventType.ROTATE_REMOTE_TOKEN,
             RemoteEventType.APPROVE_DECISION,
             RemoteEventType.VETO_DECISION,
-        },
-    }
+        }
+    ),
+    OperatorRole.AUDITOR: frozenset(
+        {
+            RemoteEventType.REQUEST_DIAGNOSTIC_SNAPSHOT,
+        }
+    ),
+}
+
+_AUDIT_VISIBLE_ROLES: Final[dict[OperatorRole, frozenset[str]]] = {
+    OperatorRole.OWNER: frozenset({"owner", "admin", "auditor"}),
+    OperatorRole.ADMIN: frozenset({"admin", "auditor"}),
+    OperatorRole.AUDITOR: frozenset({"auditor"}),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class TargetPolicy:
+    target_id: str
+    name: str
+    enabled: bool
+    allowed_events: frozenset[RemoteEventType]
+
+
+REGISTERED_TARGETS: Final[dict[str, TargetPolicy]] = {
+    "local-sentinel": TargetPolicy(
+        target_id="local-sentinel",
+        name="Local Sentinel-43 Instance",
+        enabled=True,
+        allowed_events=frozenset(RemoteEventType),
+    )
 }
 
 
@@ -238,229 +316,356 @@ REGISTERED_TARGETS: dict[str, dict[str, Any]] = {
 # Config
 # =============================================================================
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class RemoteGatewayConfig:
     enabled: bool
     gateway_name: str
-    operator_tokens: dict[str, OperatorRole] = field(default_factory=dict)
+    operator_tokens: dict[bytes, OperatorRole] = field(default_factory=dict)
+
     live_dispatch_enabled: bool = False
+
     max_payload_keys: int = 50
     max_payload_depth: int = 6
     max_payload_bytes: int = 65_536
     max_reason_length: int = 500
-    max_audit_records: int = 10_000
+
+    max_event_records: int = 10_000
+
     auth_failure_limit: int = 5
     auth_failure_window_seconds: float = 60.0
-    watchtower_url: str | None = None
-    watchtower_timeout_seconds: float = 1.5
+    auth_failure_max_clients: int = 10_000
+
+    replay_window_seconds: float = 86_400.0
+    replay_max_entries: int = 50_000
+
+    monitoring_timeout_seconds: float = 1.5
+
+
+def _token_digest(value: str) -> bytes:
+    return hashlib.sha256(
+        value.encode("utf-8")
+    ).digest()
 
 
 def _build_config() -> RemoteGatewayConfig:
-    operator_tokens: dict[str, OperatorRole] = {}
+    strict = not _is_local()
 
-    owner_token = _env("SENTINEL_REMOTE_TOKEN_OWNER") or _env("SENTINEL_REMOTE_OWNER_TOKEN")
-    admin_token = _env("SENTINEL_REMOTE_TOKEN_ADMIN")
-    auditor_token = _env("SENTINEL_REMOTE_TOKEN_AUDITOR")
+    tokens: dict[bytes, OperatorRole] = {}
 
-    if owner_token:
-        operator_tokens[owner_token] = OperatorRole.OWNER
-    if admin_token:
-        operator_tokens[admin_token] = OperatorRole.ADMIN
-    if auditor_token:
-        operator_tokens[auditor_token] = OperatorRole.AUDITOR
+    token_values = (
+        (
+            _env("SENTINEL_REMOTE_TOKEN_OWNER")
+            or _env("SENTINEL_REMOTE_OWNER_TOKEN"),
+            OperatorRole.OWNER,
+        ),
+        (
+            _env("SENTINEL_REMOTE_TOKEN_ADMIN"),
+            OperatorRole.ADMIN,
+        ),
+        (
+            _env("SENTINEL_REMOTE_TOKEN_AUDITOR"),
+            OperatorRole.AUDITOR,
+        ),
+    )
+
+    seen_raw: set[str] = set()
+
+    for token, role in token_values:
+        if not token:
+            continue
+
+        if token in seen_raw:
+            raise RuntimeError(
+                "Remote gateway tokens must be unique across roles"
+            )
+
+        if len(token) < 32:
+            raise RuntimeError(
+                f"Remote gateway {role.value} token must be at least 32 characters"
+            )
+
+        seen_raw.add(token)
+        tokens[_token_digest(token)] = role
 
     return RemoteGatewayConfig(
-        enabled=_env_bool("SENTINEL_REMOTE_GATEWAY_ENABLED", True),
-        # Fix #11: removed dead double-default; _env() already returns the
-        # default when the var is missing or blank.
-        gateway_name=_env("SENTINEL_REMOTE_GATEWAY_NAME", "sentinel-43-remote-gateway"),
-        operator_tokens=operator_tokens,
-        live_dispatch_enabled=_env_bool("SENTINEL_REMOTE_LIVE_DISPATCH_ENABLED", False),
-        max_payload_keys=_env_int("SENTINEL_REMOTE_MAX_PAYLOAD_KEYS", 50),
-        max_payload_depth=_env_int("SENTINEL_REMOTE_MAX_PAYLOAD_DEPTH", 6),
-        max_payload_bytes=_env_int("SENTINEL_REMOTE_MAX_PAYLOAD_BYTES", 65_536),
-        max_reason_length=_env_int("SENTINEL_REMOTE_MAX_REASON_LENGTH", 500),
-        max_audit_records=_env_int("SENTINEL_REMOTE_MAX_AUDIT_RECORDS", 10_000),
-        auth_failure_limit=_env_int("SENTINEL_REMOTE_AUTH_FAILURE_LIMIT", 5),
-        # Fix #12: was float(_env_int(...)), silently truncating fractional
-        # seconds before casting to float. Use _env_float() directly.
-        auth_failure_window_seconds=_env_float("SENTINEL_REMOTE_AUTH_FAILURE_WINDOW_SECONDS", 60.0),
-        watchtower_url=_env("SENTINEL_WATCHTOWER_URL"),
-        watchtower_timeout_seconds=_env_float("SENTINEL_WATCHTOWER_TIMEOUT_SECONDS", 1.5),
+        enabled=_env_bool(
+            "SENTINEL_REMOTE_GATEWAY_ENABLED",
+            False,
+            strict=strict,
+        ),
+        gateway_name=(
+            _env(
+                "SENTINEL_REMOTE_GATEWAY_NAME",
+                "sentinel-43-remote-gateway",
+            )
+            or "sentinel-43-remote-gateway"
+        ),
+        operator_tokens=tokens,
+        live_dispatch_enabled=_env_bool(
+            "SENTINEL_REMOTE_LIVE_DISPATCH_ENABLED",
+            False,
+            strict=strict,
+        ),
+        max_payload_keys=_env_int(
+            "SENTINEL_REMOTE_MAX_PAYLOAD_KEYS",
+            50,
+            minimum=1,
+            maximum=500,
+            strict=strict,
+        ),
+        max_payload_depth=_env_int(
+            "SENTINEL_REMOTE_MAX_PAYLOAD_DEPTH",
+            6,
+            minimum=1,
+            maximum=32,
+            strict=strict,
+        ),
+        max_payload_bytes=_env_int(
+            "SENTINEL_REMOTE_MAX_PAYLOAD_BYTES",
+            65_536,
+            minimum=256,
+            maximum=1_048_576,
+            strict=strict,
+        ),
+        max_reason_length=_env_int(
+            "SENTINEL_REMOTE_MAX_REASON_LENGTH",
+            500,
+            minimum=10,
+            maximum=4096,
+            strict=strict,
+        ),
+        max_event_records=_env_int(
+            "SENTINEL_REMOTE_MAX_AUDIT_RECORDS",
+            10_000,
+            minimum=100,
+            maximum=100_000,
+            strict=strict,
+        ),
+        auth_failure_limit=_env_int(
+            "SENTINEL_REMOTE_AUTH_FAILURE_LIMIT",
+            5,
+            minimum=1,
+            maximum=100,
+            strict=strict,
+        ),
+        auth_failure_window_seconds=_env_float(
+            "SENTINEL_REMOTE_AUTH_FAILURE_WINDOW_SECONDS",
+            60.0,
+            minimum=1.0,
+            maximum=3600.0,
+            strict=strict,
+        ),
+        auth_failure_max_clients=_env_int(
+            "SENTINEL_REMOTE_AUTH_FAILURE_MAX_CLIENTS",
+            10_000,
+            minimum=100,
+            maximum=1_000_000,
+            strict=strict,
+        ),
+        replay_window_seconds=_env_float(
+            "SENTINEL_REMOTE_REPLAY_WINDOW_SECONDS",
+            86_400.0,
+            minimum=60.0,
+            maximum=604_800.0,
+            strict=strict,
+        ),
+        replay_max_entries=_env_int(
+            "SENTINEL_REMOTE_REPLAY_MAX_ENTRIES",
+            50_000,
+            minimum=100,
+            maximum=1_000_000,
+            strict=strict,
+        ),
+        monitoring_timeout_seconds=_env_float(
+            "SENTINEL_REMOTE_MONITORING_TIMEOUT_SECONDS",
+            1.5,
+            minimum=0.1,
+            maximum=30.0,
+            strict=strict,
+        ),
     )
 
 
 @lru_cache(maxsize=1)
 def get_config() -> RemoteGatewayConfig:
-    """
-    Lazily load (and cache) the remote gateway config.
-
-    Using a function instead of a module-level constant means env vars
-    are read on first use rather than at import time, which matters for
-    test setups and for Docker contexts where env injection can happen
-    after the module graph is imported.
-    """
     return _build_config()
 
 
 def reload_config() -> RemoteGatewayConfig:
-    """Clear the cached config and reload from the environment. Mainly for tests."""
     get_config.cache_clear()
     cfg = get_config()
-    # Keep the audit log's maxlen in sync with the reloaded config.
-    AUDIT_LOG.reset()
+
+    EVENT_BUFFER.reset()
+    _reset_auth_failures()
+    _reset_replay_guard()
+
     return cfg
-
-
-# =============================================================================
-# Audit log
-# =============================================================================
-
-class _AuditLog:
-    """
-    Fix #1: the original code had:
-
-        AUDIT_LOG: deque[...] = deque(maxlen=get_config().max_audit_records)
-
-    This called get_config() at module import time, defeating the lazy-load
-    design the changelog describes (env vars may not be injected yet in
-    Docker / test contexts). It also meant reload_config() didn't update
-    the deque's maxlen -- the live config and AUDIT_LOG could silently
-    diverge unless reset_audit_log() was also called, but nothing enforced
-    that pairing.
-
-    This proxy lazily initializes the inner deque on first access and
-    re-reads config.max_audit_records in reset(), keeping them in sync
-    automatically when reload_config() calls AUDIT_LOG.reset().
-    """
-
-    def __init__(self) -> None:
-        self._deque: deque[dict[str, Any]] | None = None
-        self._lock = threading.Lock()
-
-    def _ensure(self) -> deque[dict[str, Any]]:
-        if self._deque is None:
-            with self._lock:
-                if self._deque is None:
-                    self._deque = deque(maxlen=get_config().max_audit_records)
-        return self._deque
-
-    def append(self, record: dict[str, Any]) -> None:
-        self._ensure().append(record)
-
-    def reset(self) -> None:
-        with self._lock:
-            self._deque = deque(maxlen=get_config().max_audit_records)
-
-    def __iter__(self):
-        return iter(self._ensure())
-
-    def __len__(self) -> int:
-        return len(self._ensure())
-
-
-AUDIT_LOG = _AuditLog()
-
-
-def reset_audit_log() -> None:
-    """Reset the audit log using the current config's max_audit_records. For tests."""
-    AUDIT_LOG.reset()
 
 
 # =============================================================================
 # Models
 # =============================================================================
 
-class RemoteHealthResponse(BaseModel):
+class StrictModel(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+        validate_assignment=True,
+    )
+
+
+class RemoteHealthResponse(StrictModel):
     gateway: str
     state: RemoteGatewayState
     enabled: bool
     registered_targets: int
     available_events: list[str]
-    audit_buffer_max: int
+    event_buffer_max: int
+    event_buffer_durable: bool = False
 
 
-class RemoteTargetResponse(BaseModel):
+class RemoteTargetResponse(StrictModel):
     target_id: str
     name: str
     enabled: bool
-    environment: str
     allowed_events: list[str]
 
 
-class RemoteEventActivationRequest(BaseModel):
-    operator_id: str = Field(..., min_length=2, max_length=80)
-    operator_role: OperatorRole
-    target_id: str = Field(..., min_length=2, max_length=120)
-    event_type: RemoteEventType
-    # Fix #7: previously Field(..., max_length=500) hardcoded 500 independently
-    # from config.max_reason_length. If SENTINEL_REMOTE_MAX_REASON_LENGTH was
-    # changed, the Pydantic Field would still enforce 500 while the config said
-    # something else. Max is now enforced in the validator below which reads
-    # the live config value.
-    reason: str = Field(..., min_length=10)
-    correlation_id: str = Field(..., min_length=8, max_length=160)
-    dry_run: bool = True
-    payload: dict[str, Any] = Field(default_factory=dict)
+class RemoteEventActivationRequest(StrictModel):
+    operator_id: str = Field(
+        ...,
+        min_length=2,
+        max_length=80,
+    )
 
-    @field_validator("operator_id", "target_id", "correlation_id")
+    # Compatibility-only claim. Authorization always uses the bearer token's
+    # server-side role. If present and mismatched, the request is rejected.
+    operator_role: OperatorRole | None = Field(
+        default=None
+    )
+
+    target_id: str = Field(
+        ...,
+        min_length=2,
+        max_length=120,
+    )
+    event_type: RemoteEventType
+
+    reason: str = Field(
+        ...,
+        min_length=10,
+    )
+    correlation_id: str = Field(
+        ...,
+        min_length=8,
+        max_length=160,
+    )
+    dry_run: bool = True
+    payload: dict[str, Any] = Field(
+        default_factory=dict,
+    )
+
+    @field_validator(
+        "operator_id",
+        "target_id",
+        "correlation_id",
+    )
     @classmethod
-    def no_blank_or_control_chars(cls, value: str) -> str:
+    def validate_identifier(
+        cls,
+        value: str,
+    ) -> str:
         cleaned = value.strip()
-        if not cleaned:
-            raise ValueError("value cannot be blank")
-        if any(ord(char) < 32 for char in cleaned):
-            raise ValueError("control characters are not allowed")
+
+        if not _SAFE_ID_RE.fullmatch(cleaned):
+            raise ValueError(
+                "value contains unsupported characters"
+            )
+
         return cleaned
 
     @field_validator("reason")
     @classmethod
-    def reason_must_be_clean(cls, value: str) -> str:
+    def validate_reason(
+        cls,
+        value: str,
+    ) -> str:
         cleaned = value.strip()
+
         if len(cleaned) < 10:
-            raise ValueError("reason must be at least 10 characters")
-        # Fix #7: read max from live config, not from a hardcoded constant.
-        max_len = get_config().max_reason_length
-        if len(cleaned) > max_len:
-            raise ValueError(f"reason must be at most {max_len} characters")
+            raise ValueError(
+                "reason must be at least 10 characters"
+            )
+
+        max_length = get_config().max_reason_length
+        if len(cleaned) > max_length:
+            raise ValueError(
+                f"reason must be at most {max_length} characters"
+            )
+
         if any(ord(char) < 32 for char in cleaned):
-            raise ValueError("control characters are not allowed")
+            raise ValueError(
+                "control characters are not allowed"
+            )
+
         return cleaned
 
     @model_validator(mode="after")
-    def validate_governance_payload(self) -> "RemoteEventActivationRequest":
-        """
-        Fix #10: APPROVE_DECISION and VETO_DECISION require a non-empty
-        'decision_id' in the payload identifying the pending governance
-        decision to act on. Validated here rather than in a field_validator
-        so we have access to both event_type and payload simultaneously.
-        """
-        governance_events = {RemoteEventType.APPROVE_DECISION, RemoteEventType.VETO_DECISION}
-        if self.event_type in governance_events:
-            decision_id = self.payload.get("decision_id", "")
-            if not decision_id or not str(decision_id).strip():
-                raise ValueError(
-                    f"{self.event_type.value} requires a non-empty 'decision_id' "
-                    "in the payload identifying the pending governance decision."
-                )
+    def validate_governance_payload(
+        self,
+    ) -> "RemoteEventActivationRequest":
+        if self.event_type not in {
+            RemoteEventType.APPROVE_DECISION,
+            RemoteEventType.VETO_DECISION,
+        }:
+            return self
+
+        action_id = str(
+            self.payload.get("action_id") or ""
+        ).strip()
+        decision_id = str(
+            self.payload.get("decision_id") or ""
+        ).strip()
+
+        if not action_id:
+            raise ValueError(
+                f"{self.event_type.value} requires payload.action_id"
+            )
+
+        if not decision_id:
+            raise ValueError(
+                f"{self.event_type.value} requires payload.decision_id"
+            )
+
+        if not _SAFE_ID_RE.fullmatch(action_id):
+            raise ValueError(
+                "payload.action_id contains unsupported characters"
+            )
+
+        if not _SAFE_ID_RE.fullmatch(decision_id):
+            raise ValueError(
+                "payload.decision_id contains unsupported characters"
+            )
+
         return self
 
 
-class RemoteEventActivationResponse(BaseModel):
+class RemoteEventActivationResponse(StrictModel):
     ok: bool
     dry_run: bool
     gateway: str
     target_id: str
     event_type: str
     correlation_id: str
-    audit_id: str
+    event_record_id: str
     message: str
     elapsed_ms: float
 
 
-class RemoteAuditRecord(BaseModel):
-    audit_id: str
+class RemoteEventRecord(StrictModel):
+    event_record_id: str
     timestamp_unix: float
+    principal_id: str
     operator_id: str
     operator_role: str
     target_id: str
@@ -473,257 +678,394 @@ class RemoteAuditRecord(BaseModel):
 
 
 # =============================================================================
-# Monitoring pipeline integration (Fix #9)
+# Operational event buffer
 # =============================================================================
 
-# Optional MonitoringManager injected at app startup via set_monitoring_manager().
-# When set, gateway security events are routed through the monitoring pipeline
-# (including SentinelWindowStore / threat scoring) rather than being siloed in
-# a separate raw httpx POST to Watchtower.
+class _EventBuffer:
+    """Bounded process-local operational record buffer.
+
+    This is not a durable audit ledger.
+    """
+
+    def __init__(self) -> None:
+        self._records: deque[dict[str, Any]] | None = None
+        self._lock = threading.RLock()
+
+    def _ensure(
+        self,
+    ) -> deque[dict[str, Any]]:
+        with self._lock:
+            if self._records is None:
+                self._records = deque(
+                    maxlen=get_config().max_event_records
+                )
+            return self._records
+
+    def append(
+        self,
+        record: dict[str, Any],
+    ) -> None:
+        with self._lock:
+            self._ensure().append(
+                dict(record)
+            )
+
+    def snapshot(
+        self,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                dict(record)
+                for record in self._ensure()
+            ]
+
+    def reset(self) -> None:
+        with self._lock:
+            self._records = deque(
+                maxlen=get_config().max_event_records
+            )
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._ensure())
+
+
+EVENT_BUFFER = _EventBuffer()
+
+# Backward-compatible name. It is intentionally documented as non-durable.
+AUDIT_LOG = EVENT_BUFFER
+
+
+def reset_audit_log() -> None:
+    EVENT_BUFFER.reset()
+
+
+# =============================================================================
+# Monitoring integration
+# =============================================================================
+
 _monitoring_manager: Any | None = None
 
 
-def set_monitoring_manager(manager: Any) -> None:
-    """
-    Wire a MonitoringManager instance into the gateway.
-
-    When set, security events (auth failures, rate-limit hits, role mismatches,
-    event activations) are also routed through MonitoringManager.analyze_event()
-    so they populate the SentinelWindowStore rolling buffer and contribute to
-    threat scoring alongside events from other entry points.
-
-    Call this from the application's lifespan startup handler, after the
-    MonitoringManager itself has been started:
-
-        @asynccontextmanager
-        async def lifespan(app: FastAPI):
-            mm = MonitoringManager(config, window_store=ws, threat_detector=td)
-            mm.start()
-            remote_gateway.set_monitoring_manager(mm)
-            yield
-            mm.stop()
-    """
+def set_monitoring_manager(
+    manager: Any | None,
+) -> None:
     global _monitoring_manager
     _monitoring_manager = manager
-    logger.info(
-        "RemoteGateway: MonitoringManager wired in -- security events will "
-        "now route through the monitoring pipeline."
-    )
 
 
 async def _notify_monitoring_pipeline(
-    event_dict: dict[str, Any],
+    event: dict[str, Any],
     *,
     source_ip: str | None,
 ) -> None:
-    """
-    Route a security event through the monitoring pipeline.
-
-    Runs MonitoringManager.analyze_event() in a thread-pool executor to
-    avoid blocking the event loop with its synchronous urllib calls.
-    Best-effort: any exception is logged and swallowed.
-    """
-    if _monitoring_manager is None:
+    manager = _monitoring_manager
+    if manager is None:
         return
 
-    try:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: _monitoring_manager.analyze_event(event_dict, source_ip=source_ip),
-        )
-    except Exception as exc:
-        logger.debug(
-            "MonitoringManager notification failed for gateway security event: %s", exc
-        )
+    result = manager.analyze_event(
+        event,
+        source_ip=source_ip,
+    )
+
+    if inspect.isawaitable(result):
+        await result
 
 
-# =============================================================================
-# Watchtower reporting (best-effort, never blocks the request)
-# =============================================================================
-
-async def _report_to_watchtower(
+async def _report_security_event(
     event: dict[str, Any],
     *,
     source_ip: str | None = None,
 ) -> None:
-    """
-    Best-effort POST of a security event to Watchtower and optionally
-    through the monitoring pipeline for window store / threat scoring.
-
-    Failures are logged and swallowed -- monitoring must never become a
-    hard dependency for the gateway's own availability.
-    """
     config = get_config()
 
-    # Route through the monitoring pipeline first so the event reaches
-    # the window store (and accumulates toward threat scores) regardless
-    # of whether the raw Watchtower POST succeeds.
-    await _notify_monitoring_pipeline(event, source_ip=source_ip)
+    async def report() -> None:
+        if _monitoring_manager is not None:
+            try:
+                await _notify_monitoring_pipeline(
+                    event,
+                    source_ip=source_ip,
+                )
+            except Exception:
+                logger.debug(
+                    "RemoteGateway monitoring notification failed",
+                    exc_info=True,
+                )
 
-    if not config.watchtower_url:
-        return
-
-    url = config.watchtower_url.rstrip("/") + "/analyze"
+        try:
+            await asyncio.to_thread(
+                watchtower_request,
+                "POST",
+                "/watchtower/analyze",
+                {"event": event},
+            )
+        except Exception:
+            logger.debug(
+                "RemoteGateway Watchtower notification failed",
+                exc_info=True,
+            )
 
     try:
-        async with httpx.AsyncClient(timeout=config.watchtower_timeout_seconds) as client:
-            response = await client.post(url, json={"event": event})
-            if response.status_code >= 400:
-                logger.warning(
-                    "Watchtower /analyze returned %s for event kind=%s",
-                    response.status_code,
-                    event.get("kind"),
-                )
-    except httpx.HTTPError as exc:
-        logger.warning("Failed to report event to Watchtower (%s): %s", url, exc)
+        await asyncio.wait_for(
+            report(),
+            timeout=config.monitoring_timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        logger.debug(
+            "RemoteGateway security-event reporting timed out"
+        )
+
+
+def _schedule_security_event(
+    event: dict[str, Any],
+    *,
+    source_ip: str | None = None,
+) -> None:
+    try:
+        asyncio.create_task(
+            _report_security_event(
+                event,
+                source_ip=source_ip,
+            ),
+            name="s43-remote-gateway-telemetry",
+        )
+    except RuntimeError:
+        logger.debug(
+            "RemoteGateway telemetry task could not be scheduled",
+            exc_info=True,
+        )
 
 
 # =============================================================================
 # Authentication / rate limiting
 # =============================================================================
 
-# Fix #4+5: protect _AUTH_FAILURES with a lock so check and record are
-# atomic. Add periodic GC to prevent unbounded growth under IP churn.
+@dataclass(frozen=True, slots=True)
+class AuthPrincipal:
+    role: OperatorRole
+    principal_id: str
+
+
 _AUTH_FAILURES: dict[str, deque[float]] = {}
 _AUTH_FAILURES_LOCK = threading.Lock()
-_auth_gc_counter: int = 0
-_AUTH_GC_EVERY: int = 50  # run GC pass every N total calls
 
 
-def _client_id(request: Request) -> str:
-    if request.client is not None and request.client.host:
+def _reset_auth_failures() -> None:
+    with _AUTH_FAILURES_LOCK:
+        _AUTH_FAILURES.clear()
+
+
+def _client_id(
+    request: Request,
+) -> str:
+    # Prefer the firewall's trusted-proxy-resolved client identity.
+    state = getattr(request, "state", None)
+    resolved = getattr(
+        state,
+        "s43_client_ip",
+        None,
+    )
+
+    if resolved:
+        return str(resolved)
+
+    if (
+        request.client is not None
+        and request.client.host
+    ):
         return request.client.host
+
     return "unknown"
 
 
-def _check_auth_rate_limit(client_id: str) -> None:
-    """
-    Thread-safe rate limit check. Raises HTTP 429 if the client has
-    exceeded the configured auth failure limit within the window.
-    """
+def _check_auth_rate_limit(
+    client_id: str,
+) -> None:
     config = get_config()
     now = time.monotonic()
-    cutoff = now - config.auth_failure_window_seconds
-    global _auth_gc_counter
+    cutoff = (
+        now
+        - config.auth_failure_window_seconds
+    )
 
     with _AUTH_FAILURES_LOCK:
-        window = _AUTH_FAILURES.get(client_id, deque())
-
-        # Prune expired entries from this client's window
-        while window and window[0] < cutoff:
-            window.popleft()
-
-        over_limit = len(window) >= config.auth_failure_limit
-
-        # GC: remove stale client entries periodically to prevent
-        # unbounded dict growth when many distinct IPs fail auth once
-        # and never return.
-        _auth_gc_counter += 1
-        if _auth_gc_counter >= _AUTH_GC_EVERY:
-            _auth_gc_counter = 0
-            stale = [
-                cid for cid, w in _AUTH_FAILURES.items()
-                if not w or (w and w[-1] < cutoff)
-            ]
-            for cid in stale:
-                _AUTH_FAILURES.pop(cid, None)
-
-    if over_limit:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many failed authentication attempts. Try again later.",
+        window = _AUTH_FAILURES.get(
+            client_id
         )
 
+        if window is None:
+            return
 
-def _record_auth_failure(client_id: str) -> None:
-    """Thread-safe auth failure recording."""
+        while window and window[0] <= cutoff:
+            window.popleft()
+
+        if not window:
+            _AUTH_FAILURES.pop(
+                client_id,
+                None,
+            )
+            return
+
+        if len(window) >= config.auth_failure_limit:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=(
+                    "Too many failed authentication attempts. "
+                    "Try again later."
+                ),
+            )
+
+
+def _record_auth_failure(
+    client_id: str,
+) -> None:
+    config = get_config()
+    now = time.monotonic()
+    cutoff = (
+        now
+        - config.auth_failure_window_seconds
+    )
+
     with _AUTH_FAILURES_LOCK:
-        _AUTH_FAILURES.setdefault(client_id, deque()).append(time.monotonic())
+        window = _AUTH_FAILURES.setdefault(
+            client_id,
+            deque(),
+        )
+
+        while window and window[0] <= cutoff:
+            window.popleft()
+
+        window.append(now)
+
+        if len(_AUTH_FAILURES) <= config.auth_failure_max_clients:
+            return
+
+        stale = [
+            key
+            for key, values in _AUTH_FAILURES.items()
+            if not values
+            or values[-1] <= cutoff
+        ]
+
+        for key in stale:
+            _AUTH_FAILURES.pop(
+                key,
+                None,
+            )
+
+        while len(_AUTH_FAILURES) > config.auth_failure_max_clients:
+            oldest = min(
+                _AUTH_FAILURES,
+                key=lambda key: (
+                    _AUTH_FAILURES[key][-1]
+                    if _AUTH_FAILURES[key]
+                    else float("-inf")
+                ),
+            )
+            _AUTH_FAILURES.pop(
+                oldest,
+                None,
+            )
 
 
-def _token_digest(value: str) -> bytes:
-    """Return a fixed-width digest for timing-safe token comparison."""
-    return hashlib.sha256(value.encode("utf-8")).digest()
-
-
-def _resolve_operator_role(authorization: str | None) -> OperatorRole:
-    """
-    Resolve the operator role from a bearer token.
-
-    Fails CLOSED: if no operator tokens are configured at all, every
-    authenticated route is unavailable rather than open.
-    """
+def _resolve_principal(
+    authorization: str | None,
+) -> AuthPrincipal:
     config = get_config()
 
     if not config.operator_tokens:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                "Remote gateway has no operator tokens configured. "
-                "Set SENTINEL_REMOTE_TOKEN_OWNER (and optionally "
-                "SENTINEL_REMOTE_TOKEN_ADMIN / SENTINEL_REMOTE_TOKEN_AUDITOR)."
+                "Remote gateway has no operator tokens configured."
             ),
         )
 
     if authorization is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or malformed Authorization header.",
+            detail="Authentication required.",
         )
 
     parts = authorization.strip().split()
-    if len(parts) != 2 or parts[0].lower() != "bearer":
+
+    if (
+        len(parts) != 2
+        or parts[0].lower() != "bearer"
+        or not parts[1].strip()
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or malformed Authorization header.",
+            detail="Authentication required.",
         )
 
-    token = parts[1].strip()
-    if not token:
+    raw_token = parts[1].strip()
+    digest = _token_digest(raw_token)
+
+    matched_role: OperatorRole | None = None
+
+    for candidate_digest, role in config.operator_tokens.items():
+        if secrets.compare_digest(
+            digest,
+            candidate_digest,
+        ):
+            matched_role = role
+
+    if matched_role is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or malformed Authorization header.",
+            detail="Invalid remote gateway token.",
         )
 
-    token_digest = _token_digest(token)
+    principal_id = (
+        "remote:"
+        + hashlib.sha256(
+            raw_token.encode("utf-8")
+        ).hexdigest()[:16]
+    )
 
-    for candidate, role in config.operator_tokens.items():
-        if secrets.compare_digest(token_digest, _token_digest(candidate)):
-            return role
-
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid remote gateway token.",
+    return AuthPrincipal(
+        role=matched_role,
+        principal_id=principal_id,
     )
 
 
-async def _authenticate(request: Request, authorization: str | None) -> OperatorRole:
+async def _authenticate(
+    request: Request,
+    authorization: str | None,
+) -> AuthPrincipal:
     client_id = _client_id(request)
 
     try:
-        _check_auth_rate_limit(client_id)
-    except HTTPException as exc:
-        if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
-            await _report_to_watchtower(
-                {
-                    "kind": "security",
-                    "event_category": "remote_gateway_rate_limited",
-                    "gateway": get_config().gateway_name,
-                    "client_id": client_id,
-                    "path": request.url.path,
-                    "rate_limited": True,
-                },
-                source_ip=client_id,
-            )
+        _check_auth_rate_limit(
+            client_id
+        )
+    except HTTPException:
+        _schedule_security_event(
+            {
+                "kind": "security",
+                "event_category": "remote_gateway_rate_limited",
+                "gateway": get_config().gateway_name,
+                "client_id": client_id,
+                "path": request.url.path,
+                "rate_limited": True,
+            },
+            source_ip=client_id,
+        )
         raise
 
     try:
-        return _resolve_operator_role(authorization)
+        return _resolve_principal(
+            authorization
+        )
+
     except HTTPException as exc:
         if exc.status_code == status.HTTP_401_UNAUTHORIZED:
-            _record_auth_failure(client_id)
-            await _report_to_watchtower(
+            _record_auth_failure(
+                client_id
+            )
+
+            _schedule_security_event(
                 {
                     "kind": "security",
                     "event_category": "remote_gateway_auth_failure",
@@ -734,54 +1076,88 @@ async def _authenticate(request: Request, authorization: str | None) -> Operator
                 },
                 source_ip=client_id,
             )
+
         raise
 
 
 # =============================================================================
-# Dispatch handler registry (Fix #14)
-# =============================================================================
-#
-# In-process callback registry for live event dispatch. Eliminates the HTTP
-# loopback dependency that Option B (self-call) would have introduced.
-#
-# main.py registers handlers at lifespan startup:
-#
-#     from core.api.routers import remote_gateway
-#
-#     async def _handle_approve(body: RemoteEventActivationRequest) -> str:
-#         decision_id = body.payload["decision_id"]
-#         await asyncio.to_thread(
-#             _orchestrator.resolve_human_decision,
-#             decision_id, approved=True,
-#             operator_id=body.operator_id, reason=body.reason,
-#         )
-#         _update_action_status(
-#             decision_id,
-#             allowed_statuses={"STAGED"},
-#             new_status="APPROVED",
-#             reason=body.reason,
-#             operator=body.operator_id,
-#         )
-#         return f"Decision {decision_id} approved by {body.operator_id}."
-#
-#     remote_gateway.register_dispatch_handler(
-#         remote_gateway.RemoteEventType.APPROVE_DECISION, _handle_approve
-#     )
-#
-# Handler signature:
-#     async def handler(body: RemoteEventActivationRequest) -> str
-#     Return value is used as the activation message in the audit record
-#     and the response. Raise HTTPException to surface errors to the caller.
-#
+# Replay protection
 # =============================================================================
 
-# Type alias for handler callables.
+_REPLAY_GUARD: dict[str, float] = {}
+_REPLAY_LOCK = threading.Lock()
+
+
+def _reset_replay_guard() -> None:
+    with _REPLAY_LOCK:
+        _REPLAY_GUARD.clear()
+
+
+def _reserve_correlation_id(
+    correlation_id: str,
+) -> None:
+    config = get_config()
+    now = time.monotonic()
+    cutoff = now - config.replay_window_seconds
+
+    with _REPLAY_LOCK:
+        stale = [
+            key
+            for key, seen_at in _REPLAY_GUARD.items()
+            if seen_at <= cutoff
+        ]
+
+        for key in stale:
+            _REPLAY_GUARD.pop(
+                key,
+                None,
+            )
+
+        if correlation_id in _REPLAY_GUARD:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "correlation_id has already been used within "
+                    "the replay-protection window."
+                ),
+            )
+
+        if len(_REPLAY_GUARD) >= config.replay_max_entries:
+            oldest = min(
+                _REPLAY_GUARD,
+                key=_REPLAY_GUARD.__getitem__,
+            )
+            _REPLAY_GUARD.pop(
+                oldest,
+                None,
+            )
+
+        _REPLAY_GUARD[correlation_id] = now
+
+
+def _release_correlation_id(
+    correlation_id: str,
+) -> None:
+    with _REPLAY_LOCK:
+        _REPLAY_GUARD.pop(
+            correlation_id,
+            None,
+        )
+
+
+# =============================================================================
+# Dispatch registry
+# =============================================================================
+
 DispatchHandler = Callable[
-    ["RemoteEventActivationRequest"],
+    [RemoteEventActivationRequest],
     Awaitable[str],
 ]
 
-_dispatch_registry: dict[RemoteEventType, DispatchHandler] = {}
+_dispatch_registry: dict[
+    RemoteEventType,
+    DispatchHandler,
+] = {}
 _dispatch_registry_lock = threading.Lock()
 
 
@@ -789,217 +1165,62 @@ def register_dispatch_handler(
     event_type: RemoteEventType,
     handler: DispatchHandler,
 ) -> None:
-    """
-    Register an async dispatch handler for a specific RemoteEventType.
+    if not callable(handler):
+        raise TypeError(
+            "dispatch handler must be callable"
+        )
 
-    Thread-safe. Later registrations overwrite earlier ones (useful for
-    testing with mock handlers).
-
-    Call this from main.py's lifespan startup block, after any required
-    singletons (orchestrator, action store helpers) are ready.
-    """
     with _dispatch_registry_lock:
-        _dispatch_registry[event_type] = handler
-    logger.info(
-        "RemoteGateway: dispatch handler registered for event_type=%s handler=%s",
-        event_type.value,
-        getattr(handler, "__name__", repr(handler)),
-    )
+        if event_type in _dispatch_registry:
+            raise RuntimeError(
+                f"Dispatch handler already registered for {event_type.value}"
+            )
+
+        _dispatch_registry[
+            event_type
+        ] = handler
 
 
 def clear_dispatch_handlers() -> None:
-    """Remove all registered dispatch handlers. Primarily for test teardown."""
     with _dispatch_registry_lock:
         _dispatch_registry.clear()
-    logger.debug("RemoteGateway: all dispatch handlers cleared.")
 
 
-# =============================================================================
-# Routes
-# =============================================================================
-
-@router.get("/health", response_model=RemoteHealthResponse)
-async def remote_gateway_health(
-    request: Request,
-    authorization: str | None = Header(default=None),
-) -> RemoteHealthResponse:
-    _require_gateway_enabled()
-    await _authenticate(request, authorization)
-
-    config = get_config()
-
-    return RemoteHealthResponse(
-        gateway=config.gateway_name,
-        state=RemoteGatewayState.ONLINE if config.enabled else RemoteGatewayState.DISABLED,
-        enabled=config.enabled,
-        registered_targets=len(REGISTERED_TARGETS),
-        available_events=[event.value for event in RemoteEventType],
-        audit_buffer_max=config.max_audit_records,
-    )
-
-
-@router.get("/targets", response_model=list[RemoteTargetResponse])
-async def list_remote_targets(
-    request: Request,
-    authorization: str | None = Header(default=None),
-) -> list[RemoteTargetResponse]:
-    _require_gateway_enabled()
-    await _authenticate(request, authorization)
-
-    return [
-        RemoteTargetResponse(
-            target_id=target_id,
-            name=str(target["name"]),
-            enabled=bool(target["enabled"]),
-            environment=str(target["environment"]),
-            allowed_events=sorted(event.value for event in target["allowed_events"]),
-        )
-        for target_id, target in REGISTERED_TARGETS.items()
-    ]
-
-
-@router.post("/events/activate", response_model=RemoteEventActivationResponse)
-async def activate_remote_event(
-    request: Request,
+async def _dispatch_remote_event(
     body: RemoteEventActivationRequest,
-    authorization: str | None = Header(default=None),
-) -> RemoteEventActivationResponse:
-    started = time.perf_counter()
-    config = get_config()
-    client_id = _client_id(request)
-
-    _require_gateway_enabled()
-    effective_role = await _authenticate(request, authorization)
-
-    if body.operator_role != effective_role:
-        await _report_to_watchtower(
-            {
-                "kind": "security",
-                "event_category": "remote_gateway_role_mismatch",
-                "gateway": config.gateway_name,
-                "client_id": client_id,
-                "operator_id": body.operator_id,
-                "claimed_role": body.operator_role.value,
-                "token_role": effective_role.value,
-                "correlation_id": body.correlation_id,
-                # Watchtower's SECURITY_BASELINE tower treats this as CRITICAL.
-                "privilege_escalation": True,
-            },
-            source_ip=client_id,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                "operator_role does not match the role associated with the "
-                "provided token."
-            ),
+) -> str:
+    with _dispatch_registry_lock:
+        handler = _dispatch_registry.get(
+            body.event_type
         )
 
-    _validate_payload(body.payload)
-    target = _validate_target(body.target_id)
-    _validate_role_event_permission(effective_role, body.event_type)
-    _validate_target_event_permission(target, body.event_type)
-
-    if body.dry_run:
-        message = "Dry-run accepted. No remote event was activated."
-    elif not config.live_dispatch_enabled:
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail=(
-                "Live dispatch is not enabled on this gateway. Set "
-                "SENTINEL_REMOTE_LIVE_DISPATCH_ENABLED=true once an event "
-                "broker is wired up, or use dry_run=true."
-            ),
+    if handler is None:
+        raise NotImplementedError(
+            f"No dispatch handler registered for "
+            f"event_type={body.event_type.value!r}"
         )
-    else:
-        try:
-            message = await _dispatch_remote_event(body)
-        except NotImplementedError as exc:
-            logger.error(
-                "Live dispatch enabled but _dispatch_remote_event has no "
-                "handler for event_type=%s: %s",
-                body.event_type.value,
-                exc,
-            )
-            raise HTTPException(
-                status_code=status.HTTP_501_NOT_IMPLEMENTED,
-                detail=(
-                    f"Live dispatch is enabled but no handler is registered for "
-                    f"event type '{body.event_type.value}'. "
-                    "Contact the system administrator."
-                ),
-            ) from exc
 
-    audit_id = _write_audit_record(
-        body=body,
-        accepted=True,
-        message=message,
-    )
+    message = await handler(body)
 
-    await _report_to_watchtower(
-        {
-            "kind": "log",
-            "event_category": "remote_gateway_event_activation",
-            "gateway": config.gateway_name,
-            "audit_id": audit_id,
-            "operator_id": body.operator_id,
-            "operator_role": body.operator_role.value,
-            "target_id": body.target_id,
-            "event_type": body.event_type.value,
-            "correlation_id": body.correlation_id,
-            "dry_run": body.dry_run,
-        },
-        source_ip=client_id,
-    )
+    if not isinstance(message, str):
+        raise RuntimeError(
+            "Remote dispatch handler must return a string message"
+        )
 
-    elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+    cleaned = message.strip()
 
-    return RemoteEventActivationResponse(
-        ok=True,
-        dry_run=body.dry_run,
-        gateway=config.gateway_name,
-        target_id=body.target_id,
-        event_type=body.event_type.value,
-        correlation_id=body.correlation_id,
-        audit_id=audit_id,
-        message=message,
-        elapsed_ms=elapsed_ms,
-    )
-
-
-@router.get("/audit/{correlation_id}", response_model=list[RemoteAuditRecord])
-async def get_remote_audit_records(
-    request: Request,
-    correlation_id: str,
-    authorization: str | None = Header(default=None),
-) -> list[RemoteAuditRecord]:
-    _require_gateway_enabled()
-    # Fix #6: resolve the authenticated role for audit scoping below.
-    effective_role = await _authenticate(request, authorization)
-
-    # Fix #8: path param was only .strip()'d, with no length or character
-    # validation -- unlike correlation_id in the request body which has
-    # min/max length and control-character checks. Enforce the same rules.
-    cleaned = correlation_id.strip()
     if not cleaned:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="correlation_id cannot be blank.")
-    if len(cleaned) > 160:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="correlation_id exceeds maximum length.")
-    if any(ord(c) < 32 for c in cleaned):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="correlation_id contains control characters.")
+        raise RuntimeError(
+            "Remote dispatch handler returned an empty message"
+        )
 
-    # Fix #6: scope results to what this role is permitted to see.
-    # OWNER sees all records; ADMIN sees admin+auditor; AUDITOR sees only
-    # their own tier. This prevents lower-privilege roles from reading
-    # audit records for operations above their level.
-    visible_roles = _AUDIT_VISIBLE_ROLES.get(effective_role, set())
+    if len(cleaned) > _MAX_DISPATCH_MESSAGE:
+        cleaned = (
+            cleaned[:_MAX_DISPATCH_MESSAGE]
+            + "…"
+        )
 
-    return [
-        RemoteAuditRecord(**record)
-        for record in AUDIT_LOG
-        if record["correlation_id"] == cleaned
-        and record.get("operator_role") in visible_roles
-    ]
+    return cleaned
 
 
 # =============================================================================
@@ -1014,22 +1235,64 @@ def _require_gateway_enabled() -> None:
         )
 
 
-def _validate_payload(payload: dict[str, Any]) -> None:
+def _payload_depth(
+    value: Any,
+    *,
+    max_allowed: int,
+) -> int:
+    stack: list[tuple[Any, int]] = [
+        (value, 1)
+    ]
+    maximum = 0
+
+    while stack:
+        node, depth = stack.pop()
+
+        if depth > max_allowed:
+            return depth
+
+        maximum = max(
+            maximum,
+            depth,
+        )
+
+        if isinstance(node, dict):
+            stack.extend(
+                (child, depth + 1)
+                for child in node.values()
+            )
+
+        elif isinstance(node, list):
+            stack.extend(
+                (child, depth + 1)
+                for child in node
+            )
+
+    return maximum
+
+
+def _validate_payload(
+    payload: dict[str, Any],
+) -> None:
     config = get_config()
 
-    if len(payload.keys()) > config.max_payload_keys:
+    if len(payload) > config.max_payload_keys:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail="Payload contains too many top-level keys.",
         )
 
     try:
-        raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    except (TypeError, ValueError):
+        raw = json.dumps(
+            payload,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Payload must be JSON serializable.",
-        ) from None
+        ) from exc
 
     if len(raw) > config.max_payload_bytes:
         raise HTTPException(
@@ -1037,48 +1300,22 @@ def _validate_payload(payload: dict[str, Any]) -> None:
             detail="Payload exceeds configured byte limit.",
         )
 
-    depth = _payload_depth(payload, max_allowed=config.max_payload_depth)
-
-    if depth > config.max_payload_depth:
+    if _payload_depth(
+        payload,
+        max_allowed=config.max_payload_depth,
+    ) > config.max_payload_depth:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail="Payload exceeds configured nesting depth.",
         )
 
 
-def _payload_depth(value: Any, *, max_allowed: int) -> int:
-    """
-    Fix #2: the original implementation was recursive. A malicious payload
-    nested ~1000 levels deep would hit Python's call stack limit and raise
-    RecursionError *before* the depth check ran, producing an unhandled 500
-    from a security validation boundary.
-
-    Rewritten as an iterative stack traversal that short-circuits as soon
-    as max_allowed+1 is exceeded, so deeply nested payloads are rejected
-    cheaply without ever triggering RecursionError.
-    """
-    stack: list[tuple[Any, int]] = [(value, 1)]
-    max_seen = 0
-
-    while stack:
-        node, depth = stack.pop()
-        if depth > max_allowed:
-            # Already over limit -- return immediately without scanning deeper.
-            return depth
-        if depth > max_seen:
-            max_seen = depth
-        if isinstance(node, dict):
-            for child in node.values():
-                stack.append((child, depth + 1))
-        elif isinstance(node, list):
-            for child in node:
-                stack.append((child, depth + 1))
-
-    return max_seen
-
-
-def _validate_target(target_id: str) -> dict[str, Any]:
-    target = REGISTERED_TARGETS.get(target_id)
+def _validate_target(
+    target_id: str,
+) -> TargetPolicy:
+    target = REGISTERED_TARGETS.get(
+        target_id
+    )
 
     if target is None:
         raise HTTPException(
@@ -1086,7 +1323,7 @@ def _validate_target(target_id: str) -> dict[str, Any]:
             detail="Unknown remote target.",
         )
 
-    if not bool(target.get("enabled", False)):
+    if not target.enabled:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Remote target is disabled.",
@@ -1099,182 +1336,48 @@ def _validate_role_event_permission(
     role: OperatorRole,
     event_type: RemoteEventType,
 ) -> None:
-    allowed_events = ROLE_EVENT_POLICY.get(role, set())
-
-    if event_type not in allowed_events:
+    if event_type not in ROLE_EVENT_POLICY.get(
+        role,
+        frozenset(),
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Role {role.value!r} is not allowed to activate {event_type.value!r}.",
+            detail="Role is not permitted to activate this event.",
         )
 
 
 def _validate_target_event_permission(
-    target: dict[str, Any],
+    target: TargetPolicy,
     event_type: RemoteEventType,
 ) -> None:
-    allowed_events: set[RemoteEventType] = target.get("allowed_events", set())
-
-    if event_type not in allowed_events:
+    if event_type not in target.allowed_events:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Target does not allow event {event_type.value!r}.",
+            detail="Target does not permit this event.",
         )
 
 
 # =============================================================================
-# Event Dispatch (Fix #14 — in-process callback registry)
+# Event record
 # =============================================================================
 
-async def _dispatch_remote_event(body: RemoteEventActivationRequest) -> str:
-    """
-    Dispatch a live remote event through the in-process callback registry.
-
-    Routing logic:
-      APPROVE_DECISION / VETO_DECISION
-        → Must have a registered handler (wired from main.py lifespan).
-          Raises NotImplementedError if no handler is found so the caller
-          returns 501 rather than a false success.
-
-      FORCE_HEALTH_CHECK / FORCE_SYNC / REQUEST_DIAGNOSTIC_SNAPSHOT
-        → Uses registered handler if present; falls back to a sensible
-          in-process default (Watchtower ping + log) so these work
-          immediately without requiring main.py wiring.
-
-      ROTATE_REMOTE_TOKEN
-        → Always NotImplementedError until a key-rotation subsystem is
-          integrated. It is the only event type with no default.
-    """
-    event_type = body.event_type
-
-    # --- Check registry first for all event types ---
-    with _dispatch_registry_lock:
-        handler = _dispatch_registry.get(event_type)
-
-    if handler is not None:
-        logger.info(
-            "RemoteGateway: dispatching event_type=%s via registered handler "
-            "operator=%s correlation=%s",
-            event_type.value,
-            body.operator_id,
-            body.correlation_id,
-        )
-        return await handler(body)
-
-    # --- In-process defaults for informational events ---
-
-    if event_type == RemoteEventType.FORCE_HEALTH_CHECK:
-        # Ping Watchtower best-effort; log the trigger.
-        config = get_config()
-        logger.info(
-            "RemoteGateway: FORCE_HEALTH_CHECK triggered by operator=%s correlation=%s",
-            body.operator_id,
-            body.correlation_id,
-        )
-        await _report_to_watchtower(
-            {
-                "kind": "log",
-                "event_category": "remote_gateway_force_health_check",
-                "gateway": config.gateway_name,
-                "operator_id": body.operator_id,
-                "correlation_id": body.correlation_id,
-                "reason": body.reason,
-            }
-        )
-        return (
-            f"FORCE_HEALTH_CHECK accepted. Watchtower pinged. "
-            f"operator={body.operator_id} correlation={body.correlation_id}"
-        )
-
-    if event_type == RemoteEventType.FORCE_SYNC:
-        config = get_config()
-        logger.info(
-            "RemoteGateway: FORCE_SYNC triggered by operator=%s correlation=%s",
-            body.operator_id,
-            body.correlation_id,
-        )
-        await _report_to_watchtower(
-            {
-                "kind": "log",
-                "event_category": "remote_gateway_force_sync",
-                "gateway": config.gateway_name,
-                "operator_id": body.operator_id,
-                "correlation_id": body.correlation_id,
-                "reason": body.reason,
-            }
-        )
-        return (
-            f"FORCE_SYNC accepted and logged. "
-            f"operator={body.operator_id} correlation={body.correlation_id}"
-        )
-
-    if event_type == RemoteEventType.REQUEST_DIAGNOSTIC_SNAPSHOT:
-        config = get_config()
-        logger.info(
-            "RemoteGateway: REQUEST_DIAGNOSTIC_SNAPSHOT triggered by operator=%s correlation=%s",
-            body.operator_id,
-            body.correlation_id,
-        )
-        await _report_to_watchtower(
-            {
-                "kind": "log",
-                "event_category": "remote_gateway_diagnostic_snapshot",
-                "gateway": config.gateway_name,
-                "operator_id": body.operator_id,
-                "correlation_id": body.correlation_id,
-                "reason": body.reason,
-                "audit_log_depth": len(AUDIT_LOG),
-            }
-        )
-        return (
-            f"Diagnostic snapshot requested and logged. "
-            f"audit_log_depth={len(AUDIT_LOG)} "
-            f"operator={body.operator_id} correlation={body.correlation_id}"
-        )
-
-    # --- Events with no default --- require main.py handler registration ---
-
-    if event_type == RemoteEventType.APPROVE_DECISION:
-        raise NotImplementedError(
-            "APPROVE_DECISION requires a registered dispatch handler. "
-            "Wire one at lifespan startup via remote_gateway.register_dispatch_handler("
-            "RemoteEventType.APPROVE_DECISION, handler)."
-        )
-
-    if event_type == RemoteEventType.VETO_DECISION:
-        raise NotImplementedError(
-            "VETO_DECISION requires a registered dispatch handler. "
-            "Wire one at lifespan startup via remote_gateway.register_dispatch_handler("
-            "RemoteEventType.VETO_DECISION, handler)."
-        )
-
-    if event_type == RemoteEventType.ROTATE_REMOTE_TOKEN:
-        raise NotImplementedError(
-            "ROTATE_REMOTE_TOKEN is not yet implemented. "
-            "Integrate a key-rotation subsystem and register a handler via "
-            "remote_gateway.register_dispatch_handler(RemoteEventType.ROTATE_REMOTE_TOKEN, handler)."
-        )
-
-    # Catch-all for any future event types added to the enum before a
-    # handler is registered. Prevents silent no-ops on unknown events.
-    raise NotImplementedError(
-        f"No dispatch handler registered for event_type={event_type.value!r}. "
-        "Register one via remote_gateway.register_dispatch_handler()."
-    )
-
-
-def _write_audit_record(
+def _write_event_record(
     *,
+    principal: AuthPrincipal,
     body: RemoteEventActivationRequest,
     accepted: bool,
     message: str,
 ) -> str:
-    audit_id = str(uuid4())
+    event_record_id = str(
+        uuid4()
+    )
 
     record = {
-        "audit_id": audit_id,
+        "event_record_id": event_record_id,
         "timestamp_unix": time.time(),
+        "principal_id": principal.principal_id,
         "operator_id": body.operator_id,
-        "operator_role": body.operator_role.value,
+        "operator_role": principal.role.value,
         "target_id": body.target_id,
         "event_type": body.event_type.value,
         "reason": body.reason,
@@ -1284,14 +1387,292 @@ def _write_audit_record(
         "message": message,
     }
 
-    AUDIT_LOG.append(record)
-
-    logger.info(
-        "Remote gateway audit record created: audit_id=%s correlation_id=%s dry_run=%s accepted=%s",
-        audit_id,
-        body.correlation_id,
-        body.dry_run,
-        accepted,
+    EVENT_BUFFER.append(
+        record
     )
 
-    return audit_id
+    return event_record_id
+
+
+# =============================================================================
+# Routes
+# =============================================================================
+
+@router.get(
+    "/health",
+    response_model=RemoteHealthResponse,
+)
+async def remote_gateway_health(
+    request: Request,
+    authorization: str | None = Header(
+        default=None,
+    ),
+) -> RemoteHealthResponse:
+    _require_gateway_enabled()
+    await _authenticate(
+        request,
+        authorization,
+    )
+
+    config = get_config()
+
+    return RemoteHealthResponse(
+        gateway=config.gateway_name,
+        state=RemoteGatewayState.ONLINE,
+        enabled=True,
+        registered_targets=len(
+            REGISTERED_TARGETS
+        ),
+        available_events=[
+            event.value
+            for event in RemoteEventType
+        ],
+        event_buffer_max=config.max_event_records,
+        event_buffer_durable=False,
+    )
+
+
+@router.get(
+    "/targets",
+    response_model=list[RemoteTargetResponse],
+)
+async def list_remote_targets(
+    request: Request,
+    authorization: str | None = Header(
+        default=None,
+    ),
+) -> list[RemoteTargetResponse]:
+    _require_gateway_enabled()
+    await _authenticate(
+        request,
+        authorization,
+    )
+
+    return [
+        RemoteTargetResponse(
+            target_id=target.target_id,
+            name=target.name,
+            enabled=target.enabled,
+            allowed_events=sorted(
+                event.value
+                for event in target.allowed_events
+            ),
+        )
+        for target in REGISTERED_TARGETS.values()
+    ]
+
+
+@router.post(
+    "/events/activate",
+    response_model=RemoteEventActivationResponse,
+)
+async def activate_remote_event(
+    request: Request,
+    body: RemoteEventActivationRequest,
+    authorization: str | None = Header(
+        default=None,
+    ),
+) -> RemoteEventActivationResponse:
+    started = time.perf_counter()
+    config = get_config()
+    client_id = _client_id(
+        request
+    )
+
+    _require_gateway_enabled()
+
+    principal = await _authenticate(
+        request,
+        authorization,
+    )
+
+    if (
+        body.operator_role is not None
+        and body.operator_role is not principal.role
+    ):
+        _schedule_security_event(
+            {
+                "kind": "security",
+                "event_category": "remote_gateway_role_mismatch",
+                "gateway": config.gateway_name,
+                "client_id": client_id,
+                "operator_id": body.operator_id,
+                "claimed_role": body.operator_role.value,
+                "token_role": principal.role.value,
+                "correlation_id": body.correlation_id,
+                "privilege_escalation": True,
+            },
+            source_ip=client_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="operator_role does not match authenticated role.",
+        )
+
+    _validate_payload(
+        body.payload
+    )
+
+    target = _validate_target(
+        body.target_id
+    )
+
+    _validate_role_event_permission(
+        principal.role,
+        body.event_type,
+    )
+
+    _validate_target_event_permission(
+        target,
+        body.event_type,
+    )
+
+    _reserve_correlation_id(
+        body.correlation_id
+    )
+
+    try:
+        if body.dry_run:
+            message = (
+                "Dry-run accepted. No remote event was activated."
+            )
+
+        else:
+            if not config.live_dispatch_enabled:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Live remote dispatch is disabled.",
+                )
+
+            try:
+                message = await _dispatch_remote_event(
+                    body
+                )
+
+            except NotImplementedError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                    detail=(
+                        "No live dispatch handler is registered "
+                        "for this event type."
+                    ),
+                ) from exc
+
+        event_record_id = _write_event_record(
+            principal=principal,
+            body=body,
+            accepted=True,
+            message=message,
+        )
+
+    except Exception:
+        # Validation/availability failures should not permanently consume the
+        # replay key. Once a handler starts and returns successfully, the key
+        # remains reserved for the configured replay window.
+        _release_correlation_id(
+            body.correlation_id
+        )
+        raise
+
+    _schedule_security_event(
+        {
+            "kind": "log",
+            "event_category": "remote_gateway_event_activation",
+            "gateway": config.gateway_name,
+            "event_record_id": event_record_id,
+            "principal_id": principal.principal_id,
+            "operator_id": body.operator_id,
+            "operator_role": principal.role.value,
+            "target_id": body.target_id,
+            "event_type": body.event_type.value,
+            "correlation_id": body.correlation_id,
+            "dry_run": body.dry_run,
+        },
+        source_ip=client_id,
+    )
+
+    elapsed_ms = round(
+        (
+            time.perf_counter()
+            - started
+        )
+        * 1000,
+        3,
+    )
+
+    return RemoteEventActivationResponse(
+        ok=True,
+        dry_run=body.dry_run,
+        gateway=config.gateway_name,
+        target_id=body.target_id,
+        event_type=body.event_type.value,
+        correlation_id=body.correlation_id,
+        event_record_id=event_record_id,
+        message=message,
+        elapsed_ms=elapsed_ms,
+    )
+
+
+@router.get(
+    "/audit/{correlation_id}",
+    response_model=list[RemoteEventRecord],
+)
+async def get_remote_event_records(
+    request: Request,
+    correlation_id: str,
+    authorization: str | None = Header(
+        default=None,
+    ),
+) -> list[RemoteEventRecord]:
+    _require_gateway_enabled()
+
+    principal = await _authenticate(
+        request,
+        authorization,
+    )
+
+    cleaned = correlation_id.strip()
+
+    if not _SAFE_ID_RE.fullmatch(
+        cleaned
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid correlation_id.",
+        )
+
+    visible_roles = _AUDIT_VISIBLE_ROLES.get(
+        principal.role,
+        frozenset(),
+    )
+
+    return [
+        RemoteEventRecord(
+            **record
+        )
+        for record in EVENT_BUFFER.snapshot()
+        if record.get("correlation_id") == cleaned
+        and record.get("operator_role") in visible_roles
+    ]
+
+
+__all__ = [
+    "AUDIT_LOG",
+    "EVENT_BUFFER",
+    "OperatorRole",
+    "REGISTERED_TARGETS",
+    "RemoteEventActivationRequest",
+    "RemoteEventActivationResponse",
+    "RemoteEventRecord",
+    "RemoteEventType",
+    "RemoteGatewayConfig",
+    "RemoteGatewayState",
+    "clear_dispatch_handlers",
+    "get_config",
+    "register_dispatch_handler",
+    "reload_config",
+    "reset_audit_log",
+    "router",
+    "set_monitoring_manager",
+]
