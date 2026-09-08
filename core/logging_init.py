@@ -4,177 +4,262 @@
 # Copyright (c) 2026 Justin Armstrong
 # All Rights Reserved.
 #
-# This file is part of the Sentinel-43 platform and constitutes original
-# intellectual property of the copyright holder.
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
 #
-# Sentinel-43 is distributed under a dual-license model:
-#
-#   1. GNU Affero General Public License (AGPL v3.0)
-#      for open-source use, modification, and distribution.
-#
-#   2. Commercial License
-#      for proprietary, enterprise, government, or other commercial use
-#      not permitted under the AGPL v3.0.
-#
-# Unauthorized copying, redistribution, relicensing, reverse engineering,
-# or commercial exploitation outside the terms of the applicable license
-# is strictly prohibited.
-#
-# By accessing, modifying, distributing, or using this software, you agree
-# to comply with the terms of the applicable license.
-#
-# License Information:
-# AGPL v3.0: https://www.gnu.org/licenses/agpl-3.0.en.html
-#
-# Commercial Licensing:
-# Contact the copyright holder for commercial licensing terms.
-#
-# Sentinel-43™
-# Original Work and Protected Intellectual Property.
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
+
+"""Sentinel-43 logging configuration.
+
+Explicit configuration only.
+
+No environment reads.
+No Watchtower/network reporting.
+No import-time configuration.
+No implicit initialization from get_logger().
+"""
 
 from __future__ import annotations
 
 import logging
-import os
 import sys
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Final
 
 
-LOGGING_MODULE_ID = os.getenv("S43_LOGGING_MODULE_ID", "sentinel43-logging")
-LOGGING_VERSION = os.getenv("SENTINEL_VERSION", "0.1.0")
-
-_VALID_LEVELS = {
-    "DEBUG",
-    "INFO",
-    "WARNING",
-    "ERROR",
-    "CRITICAL",
-}
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _watchtower_report(status: str, event: str, details: dict[str, Any] | None = None) -> None:
-    # DEFECT_INVENTORY.md D-16: this used to build the request without the
-    # internal service token, so it 401'd against Watchtower on every call
-    # and the bare `except Exception: pass` swallowed that silently — an
-    # invalid SENTINEL_LOG_LEVEL never actually reached Watchtower. Deferred
-    # import: this module initializes logging very early in process startup
-    # and must not take on an import-time dependency on core.monitoring.
-    from core.monitoring.watchtower_client import watchtower_request
-
-    payload = {
-        "name": LOGGING_MODULE_ID,
-        "status": status,
-        "version": LOGGING_VERSION,
-        "details": {
-            "event": event,
-            "timestamp": utc_now(),
-            **(details or {}),
-        },
+_VALID_LEVELS: Final[frozenset[str]] = frozenset(
+    {
+        "DEBUG",
+        "INFO",
+        "WARNING",
+        "ERROR",
+        "CRITICAL",
     }
-    watchtower_request("POST", "/watchtower/dependencies/report", payload)
+)
+
+_SENTINEL_HANDLER_MARKER: Final[str] = "_s43_owned_handler"
+
+_DEFAULT_FORMAT: Final[str] = (
+    "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
 
 
-def _normalize_log_level(value: str | None) -> int:
-    level = (value or os.getenv("SENTINEL_LOG_LEVEL", "INFO")).strip().upper()
+@dataclass(frozen=True, slots=True)
+class LoggingConfig:
+    level: str = "INFO"
+    log_to_file: bool = False
+    log_file: Path | None = None
+    max_bytes: int = 5 * 1024 * 1024
+    backup_count: int = 5
 
-    if level not in _VALID_LEVELS:
-        _watchtower_report(
-            "degraded",
-            "invalid_log_level",
-            {
-                "raw_value": value,
-                "default_used": "INFO",
-            },
+    def __post_init__(self) -> None:
+        normalized_level = str(
+            self.level
+        ).strip().upper()
+
+        if normalized_level not in _VALID_LEVELS:
+            raise ValueError(
+                f"invalid log level {self.level!r}; "
+                f"expected one of {sorted(_VALID_LEVELS)}"
+            )
+
+        if self.log_to_file and self.log_file is None:
+            raise ValueError(
+                "log_file is required when log_to_file is true"
+            )
+
+        if not 1024 <= self.max_bytes <= 1024 * 1024 * 1024:
+            raise ValueError(
+                "max_bytes must be between 1024 and 1073741824"
+            )
+
+        if not 0 <= self.backup_count <= 100:
+            raise ValueError(
+                "backup_count must be between 0 and 100"
+            )
+
+        object.__setattr__(
+            self,
+            "level",
+            normalized_level,
         )
-        level = "INFO"
 
-    return getattr(logging, level)
+        if self.log_file is not None:
+            object.__setattr__(
+                self,
+                "log_file",
+                Path(
+                    self.log_file
+                ),
+            )
 
 
-def init_logging(
-    *,
-    level: str | None = None,
-    log_dir: str | Path | None = None,
-    log_to_file: bool | None = None,
+def _mark_sentinel_handler(
+    handler: logging.Handler,
+) -> logging.Handler:
+    setattr(
+        handler,
+        _SENTINEL_HANDLER_MARKER,
+        True,
+    )
+    return handler
+
+
+def _is_sentinel_handler(
+    handler: logging.Handler,
+) -> bool:
+    return bool(
+        getattr(
+            handler,
+            _SENTINEL_HANDLER_MARKER,
+            False,
+        )
+    )
+
+
+def configure_logging(
+    config: LoggingConfig,
 ) -> None:
+    """Configure Sentinel-owned root handlers.
+
+    Existing non-Sentinel handlers are preserved. Existing Sentinel-owned
+    handlers are replaced so repeated explicit configuration is deterministic.
+    """
+    if not isinstance(
+        config,
+        LoggingConfig,
+    ):
+        raise TypeError(
+            "config must be LoggingConfig"
+        )
+
     root = logging.getLogger()
-
-    if root.handlers:
-        return
-
-    resolved_level = _normalize_log_level(level)
+    level = getattr(
+        logging,
+        config.level,
+    )
 
     formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+        _DEFAULT_FORMAT
     )
 
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setLevel(resolved_level)
-    stream_handler.setFormatter(formatter)
+    for handler in tuple(
+        root.handlers
+    ):
+        if _is_sentinel_handler(
+            handler
+        ):
+            root.removeHandler(
+                handler
+            )
+            try:
+                handler.close()
+            except Exception:
+                pass
 
-    root.setLevel(resolved_level)
-    root.addHandler(stream_handler)
-
-    should_log_to_file = (
-        str(os.getenv("SENTINEL_LOG_TO_FILE", "true")).strip().lower()
-        in {"1", "true", "yes", "y", "on"}
-        if log_to_file is None
-        else log_to_file
+    stream_handler = _mark_sentinel_handler(
+        logging.StreamHandler(
+            sys.stdout
+        )
+    )
+    stream_handler.setLevel(
+        level
+    )
+    stream_handler.setFormatter(
+        formatter
     )
 
-    if should_log_to_file:
-        try:
-            target_dir = Path(log_dir or os.getenv("SENTINEL_LOG_DIR", "./logs"))
-            target_dir.mkdir(parents=True, exist_ok=True)
+    root.setLevel(
+        level
+    )
+    root.addHandler(
+        stream_handler
+    )
 
-            file_handler = RotatingFileHandler(
-                target_dir / "sentinel43.log",
-                maxBytes=int(os.getenv("SENTINEL_LOG_MAX_BYTES", "5242880")),
-                backupCount=int(os.getenv("SENTINEL_LOG_BACKUP_COUNT", "5")),
+    if not config.log_to_file:
+        return
+
+    assert config.log_file is not None
+
+    try:
+        file_handler = _mark_sentinel_handler(
+            RotatingFileHandler(
+                config.log_file,
+                maxBytes=config.max_bytes,
+                backupCount=config.backup_count,
                 encoding="utf-8",
             )
-            file_handler.setLevel(resolved_level)
-            file_handler.setFormatter(formatter)
-            root.addHandler(file_handler)
+        )
 
-        except Exception as exc:
-            root.warning("File logging setup failed: %s", exc)
+        file_handler.setLevel(
+            level
+        )
+        file_handler.setFormatter(
+            formatter
+        )
+        root.addHandler(
+            file_handler
+        )
 
-            _watchtower_report(
-                "degraded",
-                "file_logging_setup_failed",
-                {
-                    "error": str(exc),
-                    "exception_type": type(exc).__name__,
-                },
-            )
+    except OSError:
+        # Console logging remains available. Startup policy may choose whether
+        # inability to open the configured file is fatal.
+        root.exception(
+            "Sentinel file logging could not be configured"
+        )
 
-    _watchtower_report(
-        "online",
-        "logging_initialized",
-        {
-            "level": logging.getLevelName(resolved_level),
-            "file_logging": should_log_to_file,
-        },
+
+def reset_logging() -> None:
+    """Remove and close only Sentinel-owned handlers."""
+    root = logging.getLogger()
+
+    for handler in tuple(
+        root.handlers
+    ):
+        if not _is_sentinel_handler(
+            handler
+        ):
+            continue
+
+        root.removeHandler(
+            handler
+        )
+
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+
+def get_logger(
+    name: str,
+) -> logging.Logger:
+    """Return a logger without configuring global logging as a side effect."""
+    if not isinstance(
+        name,
+        str,
+    ) or not name.strip():
+        raise ValueError(
+            "logger name must not be empty"
+        )
+
+    return logging.getLogger(
+        name.strip()
     )
 
 
-def get_logger(name: str) -> logging.Logger:
-    if not logging.getLogger().handlers:
-        init_logging()
-
-    return logging.getLogger(name)
+# Compatibility alias for older callers.
+init_logging = configure_logging
 
 
 __all__ = [
-    "init_logging",
+    "LoggingConfig",
+    "configure_logging",
     "get_logger",
+    "init_logging",
+    "reset_logging",
 ]
