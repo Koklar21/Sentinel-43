@@ -4,76 +4,108 @@
 # Copyright (c) 2026 Justin Armstrong
 # All Rights Reserved.
 #
-# This file is part of the Sentinel-43 platform and constitutes original
-# intellectual property of the copyright holder.
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
 #
-# Sentinel-43 is distributed under a dual-license model:
-#
-#   1. GNU Affero General Public License (AGPL v3.0)
-#      for open-source use, modification, and distribution.
-#
-#   2. Commercial License
-#      for proprietary, enterprise, government, or other commercial use
-#      not permitted under the AGPL v3.0.
-#
-# Unauthorized copying, redistribution, relicensing, reverse engineering,
-# or commercial exploitation outside the terms of the applicable license
-# is strictly prohibited.
-#
-# By accessing, modifying, distributing, or using this software, you agree
-# to comply with the terms of the applicable license.
-#
-# License Information:
-# AGPL v3.0: https://www.gnu.org/licenses/agpl-3.0.en.html
-#
-# Commercial Licensing:
-# Contact the copyright holder for commercial licensing terms.
-#
-# Sentinel-43™
-# Original Work and Protected Intellectual Property.
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
+
+"""Bounded rolling memory for short-term Sentinel-43 detection context."""
 
 from __future__ import annotations
 
-import time
 import threading
+import time
 from collections import deque
-from dataclasses import dataclass
-from typing import Deque, Dict, List, Optional
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Final
 
 
-@dataclass(frozen=True)
+_MAX_ENTRIES: Final[int] = 1_000_000
+_MAX_TTL_SECONDS: Final[float] = 7 * 24 * 3600.0
+
+
+@dataclass(frozen=True, slots=True)
 class MemoryEvent:
-    timestamp: float
+    timestamp_monotonic: float
     source: str
     event_type: str
     severity: int
-    metadata: Dict[str, str]
+    metadata: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        source = self.source.strip()
+        event_type = self.event_type.strip()
+
+        if not source:
+            raise ValueError(
+                "source must not be empty"
+            )
+
+        if not event_type:
+            raise ValueError(
+                "event_type must not be empty"
+            )
+
+        if self.severity < 0:
+            raise ValueError(
+                "severity must be >= 0"
+            )
+
+        object.__setattr__(
+            self,
+            "source",
+            source,
+        )
+
+        object.__setattr__(
+            self,
+            "event_type",
+            event_type,
+        )
+
+        object.__setattr__(
+            self,
+            "metadata",
+            MappingProxyType(
+                dict(self.metadata)
+            ),
+        )
 
 
 class RollingMemory:
-    """
-    Bounded, time-windowed rolling memory for detection systems.
-
-    Purpose:
-      - Preserve short-term behavioral context
-      - Enable pattern-based escalation
-      - Prevent single-event false positives
-    """
+    """Thread-safe bounded memory for recent detection events."""
 
     def __init__(
         self,
         *,
         max_entries: int = 1000,
-        ttl_seconds: int = 900,  # 15 minutes
-    ):
-        self._memory: Deque[MemoryEvent] = deque(maxlen=max_entries)
-        self._ttl = ttl_seconds
-        self._lock = threading.Lock()
+        ttl_seconds: float = 900.0,
+    ) -> None:
+        if not 1 <= max_entries <= _MAX_ENTRIES:
+            raise ValueError(
+                f"max_entries must be between 1 and {_MAX_ENTRIES}"
+            )
 
-    # ----------------------------
-    # Core Operations
-    # ----------------------------
+        if not 0 < ttl_seconds <= _MAX_TTL_SECONDS:
+            raise ValueError(
+                f"ttl_seconds must be > 0 and <= {_MAX_TTL_SECONDS:g}"
+            )
+
+        self._memory: deque[
+            MemoryEvent
+        ] = deque(
+            maxlen=max_entries
+        )
+
+        self._ttl_seconds = float(
+            ttl_seconds
+        )
+
+        self._lock = threading.Lock()
 
     def add_event(
         self,
@@ -81,68 +113,144 @@ class RollingMemory:
         source: str,
         event_type: str,
         severity: int,
-        metadata: Optional[Dict[str, str]] = None,
+        metadata: Mapping[str, str] | None = None,
     ) -> None:
         event = MemoryEvent(
-            timestamp=time.time(),
+            timestamp_monotonic=time.monotonic(),
             source=source,
             event_type=event_type,
-            severity=severity,
+            severity=int(severity),
             metadata=metadata or {},
         )
 
         with self._lock:
-            self._memory.append(event)
-            self._prune_locked()
+            self._prune_locked(
+                now=time.monotonic()
+            )
+
+            self._memory.append(
+                event
+            )
 
     def get_recent_events(
         self,
         *,
-        since_seconds: Optional[int] = None,
-        source: Optional[str] = None,
-        event_type: Optional[str] = None,
-        min_severity: Optional[int] = None,
-    ) -> List[MemoryEvent]:
-        now = time.time()
-        cutoff = now - since_seconds if since_seconds else None
+        since_seconds: float | None = None,
+        source: str | None = None,
+        event_type: str | None = None,
+        min_severity: int | None = None,
+    ) -> list[MemoryEvent]:
+        if (
+            since_seconds is not None
+            and since_seconds < 0
+        ):
+            raise ValueError(
+                "since_seconds must be >= 0"
+            )
+
+        if (
+            min_severity is not None
+            and min_severity < 0
+        ):
+            raise ValueError(
+                "min_severity must be >= 0"
+            )
+
+        normalized_source = (
+            source.strip()
+            if source is not None
+            else None
+        )
+
+        normalized_event_type = (
+            event_type.strip()
+            if event_type is not None
+            else None
+        )
+
+        now = time.monotonic()
+
+        cutoff = (
+            now - since_seconds
+            if since_seconds is not None
+            else None
+        )
 
         with self._lock:
-            self._prune_locked()
-            events = list(self._memory)
+            self._prune_locked(
+                now=now
+            )
 
-        filtered: List[MemoryEvent] = []
+            events = tuple(
+                self._memory
+            )
 
-        for e in events:
-            if cutoff and e.timestamp < cutoff:
-                continue
-            if source and e.source != source:
-                continue
-            if event_type and e.event_type != event_type:
-                continue
-            if min_severity and e.severity < min_severity:
-                continue
-            filtered.append(e)
+        return [
+            event
+            for event in events
+            if (
+                cutoff is None
+                or event.timestamp_monotonic
+                >= cutoff
+            )
+            and (
+                normalized_source is None
+                or event.source
+                == normalized_source
+            )
+            and (
+                normalized_event_type is None
+                or event.event_type
+                == normalized_event_type
+            )
+            and (
+                min_severity is None
+                or event.severity
+                >= min_severity
+            )
+        ]
 
-        return filtered
+    def _prune_locked(
+        self,
+        *,
+        now: float,
+    ) -> None:
+        cutoff = (
+            now
+            - self._ttl_seconds
+        )
 
-    # ----------------------------
-    # Internal Maintenance
-    # ----------------------------
-
-    def _prune_locked(self) -> None:
-        """Remove expired entries based on TTL."""
-        cutoff = time.time() - self._ttl
-        while self._memory and self._memory[0].timestamp < cutoff:
+        while (
+            self._memory
+            and self._memory[0].timestamp_monotonic
+            < cutoff
+        ):
             self._memory.popleft()
 
-    # ----------------------------
-    # Introspection (Safe)
-    # ----------------------------
-
-    def stats(self) -> Dict[str, int]:
+    def stats(
+        self,
+    ) -> dict[str, int | float]:
         with self._lock:
             return {
-                "current_entries": len(self._memory),
-                "max_entries": self._memory.maxlen or 0,
-                "ttl_seconds": self._ttl,
+                "current_entries": len(
+                    self._memory
+                ),
+                "max_entries": (
+                    self._memory.maxlen
+                    or 0
+                ),
+                "ttl_seconds": self._ttl_seconds,
             }
+
+    def clear(
+        self,
+    ) -> None:
+        """Discard all rolling-memory state."""
+        with self._lock:
+            self._memory.clear()
+
+
+__all__ = [
+    "MemoryEvent",
+    "RollingMemory",
+]
