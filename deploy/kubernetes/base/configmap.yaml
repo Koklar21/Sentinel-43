@@ -1,72 +1,69 @@
-# Non-secret configuration only. Sensitive values live in the
-# sentinel43-secrets Secret (see secret.example.yaml — never applied as-is;
-# real values are supplied at deploy time, see deploy/kubernetes/README.md).
+# Non-secret configuration only.
+# Sensitive values belong in the sentinel43-secrets Secret.
+# Never apply example secret manifests as-is.
+
 apiVersion: v1
 kind: ConfigMap
+
 metadata:
   name: sentinel43-config
   namespace: sentinel43
+
 data:
-  SENTINEL_ENV: "production"
+  # Environment / logging
   S43_ENV: "production"
   S43_LOG_LEVEL: "INFO"
 
+  # Database
   POSTGRES_DB: "s43"
   POSTGRES_USER: "s43"
+  S43_DB_PATH: "/app/sentinel43_state/sentinel43.sqlite3"
 
+  # Watchtower / internal service routing
   S43_WATCHTOWER_HOST: "0.0.0.0"
   S43_WATCHTOWER_PORT: "9100"
-  S43_EXPOSE_BIND_HOST: "true"
   S43_WATCHTOWER_URL: "http://s43-core:9100"
+  S43_WATCHTOWER_TIMEOUT: "2.0"
 
+  # Canonical JWT configuration
   S43_JWT_ALGORITHM: "HS256"
   S43_JWT_ISSUER: "sentinel-43"
   S43_JWT_AUDIENCE: "sentinel-43-dashboard"
   S43_JWT_TTL_SECONDS: "28800"
 
+  # Operator / session configuration
   S43_OPERATOR_USERNAME: "operator"
-
   S43_WS_REQUIRE_AUTH: "true"
-
-  # Browser session (beta-execution Phase 3).
   S43_SESSION_ACCESS_TTL_SECONDS: "900"
   S43_SESSION_REFRESH_TTL_SECONDS: "604800"
   S43_WS_SESSION_RECHECK_SECONDS: "60"
 
-  # CHANGEME: secret-rotation freshness gate (core/bootstrap.py). A non-local
-  # API refuses to start without S43_SECRETS_ROTATED_AT (finding #13 -- it was
-  # previously in neither the ConfigMap nor the Secret). Set it to the
-  # ISO-8601 UTC timestamp the secret generator emitted alongside the values
-  # you provisioned into `sentinel43-secrets`, e.g.
-  #   S43_SECRETS_ROTATED_AT: "2026-09-02T00:00:00+00:00"
-  S43_SECRETS_ROTATED_AT: "CHANGEME_ISO8601_UTC_WHEN_SECRETS_WERE_GENERATED"
-
-  # Empty by default: the firewall trusts NO X-Forwarded-For source unless
-  # explicitly configured (fail-safe — see
-  # docs/security/trusted_proxy_handling.md). The beta overlay sets this to
-  # the real ingress-controller network; dev overlay leaves it empty (no
-  # ingress in dev, access is via kubectl port-forward).
+  # Trusted proxy handling
+  # Empty means trust no proxy-provided forwarding headers.
+  # Production overlays must explicitly set the ingress-controller network.
   S43_TRUSTED_PROXIES: ""
 
+  # Fenrir
+  # Fenrir uses canonical Sentinel-43 authentication. It does not own a
+  # separate JWT secret, issuer, audience, or auth-disable switch.
   S43_FENRIR_ENABLED: "true"
-  SENTINEL_FENRIR_ENABLED: "true"
-  FENRIR_ENABLED: "true"
   S43_FENRIR_NODE_ID: "sentinel-43-primary"
   S43_FENRIR_MIN_SEVERITY: "MEDIUM"
   S43_FENRIR_ANOMALY_ZSCORE: "2.5"
   S43_FENRIR_ANOMALY_DECAY: "0.002"
   S43_FENRIR_MAX_HONEYPOT_EVENTS: "500"
-  # Fenrir reports through the API bridge (s43-api authenticates with the
-  # Fenrir service token and forwards to the Watchtower's /watchtower/analyze).
-  # Not s43-core:9100/watchtower/events — no such route on the Watchtower (F-06).
   S43_FENRIR_WATCHTOWER_URL: "http://s43-api:8000/watchtower/events"
   S43_FENRIR_BROADCAST_URL: "http://s43-api:8000/internal/events/broadcast"
   S43_FENRIR_REPORT_TIMEOUT: "2.0"
 
-  # Never true outside dev — same rule docker-compose.yml documents.
+  # Feature gates
+  # Never true outside local/dev/test.
   S43_ENABLE_TEST_INJECTION: "false"
+
+  # Only SHADOW and HUMAN_GATED are valid governance modes.
   S43_GOVERNANCE_ENABLED: "false"
+  S43_DEFAULT_MODE: "HUMAN_GATED"
+
+  # Optional subsystems
   S43_SPARTA_ENABLED: "false"
   S43_JORM_ENABLED: "false"
-
-  SENTINEL_DB_PATH: "/app/sentinel43_state/sentinel43.sqlite3"
