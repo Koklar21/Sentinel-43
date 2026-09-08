@@ -1,24 +1,34 @@
-# DNS egress for every pod in the namespace. Without this, default-deny
-# blocks even service-name resolution and nothing else in this directory
-# would work. Restricted to the kube-system namespace (not a bare
-# "allow port 53 everywhere") — CoreDNS's exact pod labels vary across
-# distros (kind, Docker Desktop, EKS, GKE all differ), so this scopes by
-# namespace only rather than guessing a pod label that might not match on
-# every cluster and silently break DNS.
+# DNS egress for every pod in the namespace.
+#
+# The namespace-wide default-deny policy otherwise blocks service-name
+# resolution. This policy allows UDP/TCP 53 only to pods in kube-system.
+#
+# Pod labels for cluster DNS vary across Kubernetes distributions, so the
+# base policy avoids depending on a CoreDNS-specific label. This means any
+# kube-system pod listening on port 53 is reachable; deployments with a
+# stable DNS pod label may further restrict this in an overlay.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
+
 metadata:
   name: allow-dns-egress
   namespace: sentinel43
+
 spec:
   podSelector: {}
+
   policyTypes:
     - Egress
+
   egress:
     - to:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
+
       ports:
-        - {protocol: UDP, port: 53}
-        - {protocol: TCP, port: 53}
+        - protocol: UDP
+          port: 53
+
+        - protocol: TCP
+          port: 53
