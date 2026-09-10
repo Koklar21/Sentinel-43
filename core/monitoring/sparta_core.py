@@ -408,16 +408,52 @@ class SpartaCore:
             except Exception:
                 pass
 
+        self._notify_monitoring(event, payload)
+
+    def _notify_monitoring(
+        self,
+        event: IntegrityEvent,
+        payload: dict[str, Any],
+    ) -> None:
+        """Forward one integrity event to MonitoringManager, if wired.
+
+        MonitoringManager normalizes through ``core.monitoring.event_types``,
+        which keeps only the fields declared on the typed event for the given
+        ``kind`` and drops the rest. A raw ``IntegrityEvent.to_dict()`` has no
+        ``kind``, so it normalized to a bare ``BaseEvent`` and every piece of
+        Sparta provenance was silently discarded. Integrity findings are
+        therefore emitted as a typed ``log`` event carrying
+        ``integrity_status``, with the full detail preserved under
+        ``details`` for sinks that accept unknown fields.
+
+        Observational only: a monitoring failure never changes the integrity
+        outcome, and Sparta takes no action on the result.
+        """
         manager = self._monitoring_manager
-        if manager is not None:
-            analyze = getattr(manager, "analyze_event", None)
-            if callable(analyze):
-                try:
-                    analyze(payload)
-                except Exception:
-                    logger.debug(
-                        "MonitoringManager notification failed", exc_info=True
-                    )
+        if manager is None:
+            return
+
+        analyze = getattr(manager, "analyze_event", None)
+        if not callable(analyze):
+            return
+
+        compromised = event.state_at_event is SpartaState.COMPROMISED
+        monitoring_event = {
+            "kind": "log",
+            "integrity_status": "compromised" if compromised else "ok",
+            "missing_required_fields": False,
+            "source": event.source or "SpartaCore",
+            "node": self._config.node_signature or "sparta-core",
+            "event_type": event.event_type,
+            "details": payload,
+        }
+
+        try:
+            analyze(monitoring_event)
+        except Exception:
+            logger.debug(
+                "MonitoringManager notification failed", exc_info=True
+            )
 
     @staticmethod
     def _calculate_sha256(
@@ -659,8 +695,21 @@ class SpartaCore:
     def get_status(
         self,
     ) -> dict[str, Any]:
+        """Authenticated status snapshot.
+
+        The field set is the contract consumed by
+        ``core.monitoring.rules.sparta_core_rule``: ``state``,
+        ``tamper_count``, ``blocked_clients``, ``tracked_auth_clients``,
+        ``watched_file_count`` and ``total_checks``.
+        """
+        now = time.monotonic()
+
+        with self._auth_guard_lock:
+            self._gc_auth_guard_locked(now)
+            blocked_clients = len(self._blocked_clients)
+            tracked_auth_clients = len(self._auth_failures)
+
         with self._lock:
-            blocked = len(self._blocked_clients)
             return {
                 "state": self._state.value,
                 "node_signature": self._config.node_signature,
@@ -672,7 +721,8 @@ class SpartaCore:
                 "event_log_entries": len(
                     self._event_log
                 ),
-                "blocked_clients": blocked,
+                "blocked_clients": blocked_clients,
+                "tracked_auth_clients": tracked_auth_clients,
                 "timestamp": utc_now(),
             }
 
@@ -958,26 +1008,46 @@ def create_node_router(
 ) -> APIRouter:
     """FastAPI router for the authenticated Sentinel-43 node mesh.
 
-    ``sparta`` is resolved lazily on every request (it may be a late-bound
-    proxy that is not backed by a live SpartaCore at mount time). Mount it on
-    the API app: ``app.include_router(create_node_router(sparta))``.
+    ``sparta`` is resolved lazily on every request: the router is mounted at
+    import time, but the backing SpartaCore is built during lifespan startup,
+    so the caller may pass a late-bound proxy. Such a proxy signals "not
+    backed yet" by raising ``RuntimeError`` on attribute access; every route
+    turns that into a 503, never a 500 -- the node must report itself
+    unavailable rather than leak an unhandled error from ``/node/health``,
+    which is public.
+
+    Mount it on the API app:
+    ``app.include_router(create_node_router(sparta))``.
     """
     router = APIRouter(prefix=prefix, tags=["node"])
 
-    def _guard(request: Request, authorization: str | None) -> None:
-        sparta.require_node_auth(request, authorization)
+    def _resolve() -> Any:
+        """Return the live SpartaCore, or fail closed with 503."""
+        try:
+            # Force a late-bound proxy to resolve before any route logic runs.
+            sparta.get_public_health
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="SpartaCore is not running on this node.",
+            ) from exc
+        return sparta
+
+    def _guard(request: Request, authorization: str | None) -> Any:
+        core = _resolve()
+        core.require_node_auth(request, authorization)
+        return core
 
     @router.get("/health")
     def node_health() -> dict[str, Any]:
-        return sparta.get_public_health()
+        return _resolve().get_public_health()
 
     @router.get("/status")
     def node_status(
         request: Request,
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        _guard(request, authorization)
-        return sparta.get_status()
+        return _guard(request, authorization).get_status()
 
     @router.get("/events")
     def node_events(
@@ -985,9 +1055,9 @@ def create_node_router(
         authorization: str | None = Header(default=None),
         limit: int = 50,
     ) -> dict[str, Any]:
-        _guard(request, authorization)
+        core = _guard(request, authorization)
         limit = max(1, min(int(limit), 500))
-        events = list(sparta.get_event_log(limit=limit))
+        events = list(core.get_event_log(limit=limit))
         return {"count": len(events), "limit": limit, "events": events}
 
     @router.post("/auth", status_code=status.HTTP_200_OK)
@@ -996,12 +1066,12 @@ def create_node_router(
         body: NodeAuthRequest,
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        _guard(request, authorization)
-        cfg = sparta._config
+        core = _guard(request, authorization)
+        cfg = core._config
 
         if not secrets.compare_digest(body.credential, cfg.node_api_token):
-            sparta._record_auth_failure(
-                sparta.get_client_id(request), "invalid_body_credential"
+            core._record_auth_failure(
+                core.get_client_id(request), "invalid_body_credential"
             )
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -1031,16 +1101,16 @@ def create_node_router(
         body: NodeRegisterRequest,
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        _guard(request, authorization)
-        cfg = sparta._config
+        core = _guard(request, authorization)
+        cfg = core._config
         _json_size_guard(body.capabilities, cfg.max_node_payload_bytes)
         _json_size_guard(body.metadata, cfg.max_node_payload_bytes)
 
-        sparta._emit(
+        core._emit(
             IntegrityEvent(
                 event_type="NodeRegistered",
                 file_path="",
-                state_at_event=SpartaState(sparta.get_status()["state"]),
+                state_at_event=SpartaState(core.get_status()["state"]),
                 source="NodeAPI",
                 details={
                     "node_id": body.node_id,
@@ -1065,15 +1135,15 @@ def create_node_router(
         body: NodeHeartbeatRequest,
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        _guard(request, authorization)
-        cfg = sparta._config
+        core = _guard(request, authorization)
+        cfg = core._config
         _json_size_guard(body.metrics, cfg.max_node_payload_bytes)
 
-        sparta._emit(
+        core._emit(
             IntegrityEvent(
                 event_type="NodeHeartbeat",
                 file_path="",
-                state_at_event=SpartaState(sparta.get_status()["state"]),
+                state_at_event=SpartaState(core.get_status()["state"]),
                 source="NodeAPI",
                 details={
                     "node_id": body.node_id,
@@ -1095,13 +1165,13 @@ def create_node_router(
         body: NodeUnlockRequest,
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        _guard(request, authorization)
-        changed = sparta.unlock_lockdown(
+        core = _guard(request, authorization)
+        changed = core.unlock_lockdown(
             operator=body.operator, reason=body.reason
         )
         return {
             "status": "unlocked" if changed else "no_change",
-            "state": sparta.get_status()["state"],
+            "state": core.get_status()["state"],
             "operator": body.operator,
             "timestamp": utc_now(),
         }
