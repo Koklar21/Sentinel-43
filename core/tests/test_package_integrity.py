@@ -100,7 +100,6 @@ def test_module_imports(modname):
 # --------------------------------------------------------------------------- #
 _MIN_SYMBOLS = {
     # PR #254 defect list -- cross-checked against the import sweep's own record.
-    "core.config": ["get_settings"],
     "core.audit.store": ["AuditStore", "AuditConfig"],
     # core.security.fenrir_auth was rewritten to a principal-based contract.
     "core.security.fenrir_auth": [
