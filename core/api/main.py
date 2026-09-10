@@ -1183,7 +1183,7 @@ async def _start_sparta() -> None:
         return
 
     try:
-        from core.monitoring import IntegrityConfig, SpartaCore
+        from core.monitoring import build_sparta_core
 
         watched_files: dict[str, str] = {}
         for key, value in os.environ.items():
@@ -1200,9 +1200,12 @@ async def _start_sparta() -> None:
                 "S43_SPARTA_ENABLED=true but no S43_SPARTA_HASH_* values exist"
             )
 
-        config = IntegrityConfig.from_env(watched_files)
-        runtime.sparta_instance = SpartaCore(
-            config,
+        # build_sparta_core() is the canonical Sparta factory: it owns the
+        # IntegrityConfig.from_env() read and the SpartaCore construction.
+        # Duplicating that here was a second composition path for the same
+        # object.
+        runtime.sparta_instance = build_sparta_core(
+            watched_files,
             monitoring_manager=runtime.monitoring_manager,
         )
         runtime.sparta_task = asyncio.create_task(
@@ -1488,6 +1491,8 @@ async def _shutdown_runtime() -> None:
             )
         except Exception:
             logger.warning("FenrirHunter shutdown error", exc_info=True)
+        finally:
+            runtime.fenrir_instance = None
 
     if runtime.sparta_instance is not None:
         try:
@@ -1500,6 +1505,19 @@ async def _shutdown_runtime() -> None:
             await asyncio.wait_for(runtime.sparta_task, timeout=5.0)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             runtime.sparta_task.cancel()
+        finally:
+            runtime.sparta_task = None
+
+    # close() after the watchdog task has drained: stop() asks the loop to
+    # exit, close() releases the instance's resources. Both are part of the
+    # SpartaCore shutdown contract (see setup_signal_handlers).
+    if runtime.sparta_instance is not None:
+        try:
+            runtime.sparta_instance.close()
+        except Exception:
+            logger.warning("SpartaCore close error", exc_info=True)
+        finally:
+            runtime.sparta_instance = None
 
     if runtime.monitoring_manager is not None:
         try:
@@ -1509,6 +1527,20 @@ async def _shutdown_runtime() -> None:
                 "MonitoringManager stop error",
                 exc_info=True,
             )
+        finally:
+            runtime.monitoring_manager = None
+            # Deregister from the canonical registry too, so late callers
+            # (remote gateway, firewall) see "no manager" rather than a
+            # stopped one that would raise on analyze_event().
+            try:
+                from core.monitoring import set_monitoring_manager
+
+                set_monitoring_manager(None)
+            except Exception:
+                logger.debug(
+                    "MonitoringManager deregistration failed",
+                    exc_info=True,
+                )
 
     async with runtime.ws_lock:
         clients = list(runtime.ws_clients.values())

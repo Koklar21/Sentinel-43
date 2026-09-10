@@ -750,8 +750,39 @@ _monitoring_manager: Any | None = None
 def set_monitoring_manager(
     manager: Any | None,
 ) -> None:
+    """Override the MonitoringManager this router reports through.
+
+    Optional. When unset, ``_resolve_monitoring_manager()`` falls back to the
+    canonical registry in ``core.monitoring``, which the API composition root
+    populates at startup.
+    """
     global _monitoring_manager
     _monitoring_manager = manager
+
+
+def _resolve_monitoring_manager() -> Any | None:
+    """The active MonitoringManager, local override first.
+
+    Nothing ever called this module's ``set_monitoring_manager()``, so the
+    local global stayed None and every remote-gateway monitoring
+    notification silently no-opped. The composition root registers the
+    manager with ``core.monitoring.set_monitoring_manager()``; read that
+    registry rather than keeping a second, unwired one. Imported lazily so
+    core.api.routers does not import core.monitoring at module scope.
+    """
+    if _monitoring_manager is not None:
+        return _monitoring_manager
+
+    try:
+        from core.monitoring import get_monitoring_manager
+
+        return get_monitoring_manager()
+    except Exception:  # pragma: no cover - registry must never break dispatch
+        logger.debug(
+            "MonitoringManager registry lookup failed",
+            exc_info=True,
+        )
+        return None
 
 
 async def _notify_monitoring_pipeline(
@@ -759,7 +790,7 @@ async def _notify_monitoring_pipeline(
     *,
     source_ip: str | None,
 ) -> None:
-    manager = _monitoring_manager
+    manager = _resolve_monitoring_manager()
     if manager is None:
         return
 
@@ -780,17 +811,16 @@ async def _report_security_event(
     config = get_config()
 
     async def report() -> None:
-        if _monitoring_manager is not None:
-            try:
-                await _notify_monitoring_pipeline(
-                    event,
-                    source_ip=source_ip,
-                )
-            except Exception:
-                logger.debug(
-                    "RemoteGateway monitoring notification failed",
-                    exc_info=True,
-                )
+        try:
+            await _notify_monitoring_pipeline(
+                event,
+                source_ip=source_ip,
+            )
+        except Exception:
+            logger.debug(
+                "RemoteGateway monitoring notification failed",
+                exc_info=True,
+            )
 
         try:
             await asyncio.to_thread(
