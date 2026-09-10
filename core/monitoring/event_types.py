@@ -30,6 +30,16 @@ from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Final
 
 
+# Subclasses below chain to BaseEvent.__post_init__ by explicit class
+# reference, never zero-arg super(). @dataclass(slots=True) cannot add
+# __slots__ in place, so it builds and returns a *new* class object; the
+# __class__ cell that zero-arg super() closes over still points at the
+# original, discarded class. Every such call raised
+# "super(type, obj): obj is not an instance or subtype of type" at
+# construction time, which normalize_event() surfaced as
+# "invalid <kind> event" -- silently disabling 8 of the 9 typed event kinds
+# (only SecurityEvent, which declares no __post_init__, and BaseEvent
+# itself were unaffected).
 @dataclass(slots=True)
 class BaseEvent:
     id: str = field(
@@ -73,7 +83,7 @@ class RequestEvent(BaseEvent):
     latency_ms: int = 0
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        BaseEvent.__post_init__(self)
 
         if not 100 <= int(self.status_code) <= 599:
             raise ValueError(
@@ -101,7 +111,7 @@ class ExpectationEvent(BaseEvent):
     failed_checks: int = 0
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        BaseEvent.__post_init__(self)
 
         self.expectation_status = str(
             self.expectation_status
@@ -129,7 +139,7 @@ class ConfigEvent(BaseEvent):
     config_age_seconds: int = 0
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        BaseEvent.__post_init__(self)
 
         if int(self.config_age_seconds) < 0:
             raise ValueError(
@@ -148,7 +158,7 @@ class LogEvent(BaseEvent):
     integrity_status: str = "ok"
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        BaseEvent.__post_init__(self)
 
         self.integrity_status = str(
             self.integrity_status
@@ -167,7 +177,7 @@ class RuntimeEvent(BaseEvent):
     crash_loop: bool = False
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        BaseEvent.__post_init__(self)
 
         value = float(
             self.error_rate_percent
@@ -188,7 +198,7 @@ class DependencyEvent(BaseEvent):
     version_mismatch: bool = False
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        BaseEvent.__post_init__(self)
 
         self.dependency_status = str(
             self.dependency_status
@@ -208,7 +218,7 @@ class ResourceEvent(BaseEvent):
     disk_percent: int | float = 0
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        BaseEvent.__post_init__(self)
 
         for field_name in (
             "cpu_percent",
@@ -263,7 +273,7 @@ class MobileEvent(BaseEvent):
     )
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        BaseEvent.__post_init__(self)
 
         self.source_identity = str(
             self.source_identity
