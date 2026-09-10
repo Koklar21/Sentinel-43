@@ -15,9 +15,11 @@
 
 from __future__ import annotations
 
-from core.exceptions import (
-    MonitoringError,
-)
+
+class MonitoringError(Exception):
+    """Base exception for the Sentinel-43 monitoring subsystem."""
+
+    code = "MONITORING_ERROR"
 
 
 class MonitoringConfigError(MonitoringError):

@@ -65,7 +65,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from ..bootstrap import bootstrap_expectations
 from ..logging.health_check_filter import install_health_check_access_filter
 from ..monitoring.watchtower_client import (
-    WATCHTOWER_URL,
+    configure as _configure_watchtower_client,
     watchtower_request as _canonical_watchtower_request,
 )
 from ..security.jwt_constants import APPROVED_JWT_ALGORITHMS
@@ -95,6 +95,10 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     normalized = raw.strip().lower()
+    # An env var set to an empty/whitespace string (Compose's `${VAR:-}`
+    # pass-through idiom) is treated as unset.
+    if not normalized:
+        return default
     if normalized in _TRUE_VALUES:
         return True
     if normalized in _FALSE_VALUES:
@@ -107,7 +111,8 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def _env_any_bool(names: tuple[str, ...], default: bool = False) -> bool:
     for name in names:
-        if os.getenv(name) is not None:
+        raw = os.getenv(name)
+        if raw is not None and raw.strip():
             return _env_bool(name, default)
     return default
 
@@ -120,13 +125,36 @@ def _env_int(
     maximum: int | None = None,
 ) -> int:
     raw = os.getenv(name)
-    if raw is None:
+    if raw is None or not raw.strip():
         value = default
     else:
         try:
             value = int(raw.strip())
         except ValueError as exc:
             raise RuntimeError(f"{name} must be an integer; got {raw!r}") from exc
+
+    if minimum is not None and value < minimum:
+        raise RuntimeError(f"{name} must be >= {minimum}; got {value}")
+    if maximum is not None and value > maximum:
+        raise RuntimeError(f"{name} must be <= {maximum}; got {value}")
+    return value
+
+
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        value = default
+    else:
+        try:
+            value = float(raw.strip())
+        except ValueError as exc:
+            raise RuntimeError(f"{name} must be a number; got {raw!r}") from exc
 
     if minimum is not None and value < minimum:
         raise RuntimeError(f"{name} must be >= {minimum}; got {value}")
@@ -146,7 +174,12 @@ def _env_frozenset(name: str, default: str = "") -> frozenset[str]:
 
 APP_NAME = "sentinel-43-api"
 APP_VERSION = _env_str("SENTINEL_VERSION", "0.1.0")
-SENTINEL_ENV = _env_str("SENTINEL_ENV", "production").lower()
+# SENTINEL_ENV is canonical here; S43_ENV is the alias Fenrir/Sparta/Watchtower
+# read. Accept either so a deployment that only sets one cannot leave this
+# process silently defaulting to "production".
+SENTINEL_ENV = (
+    _env_str("SENTINEL_ENV") or _env_str("S43_ENV", "production")
+).lower()
 
 LOCAL_TEST_ENVIRONMENTS = frozenset({"development", "dev", "local", "test"})
 IS_LOCAL_ENV = SENTINEL_ENV in LOCAL_TEST_ENVIRONMENTS
@@ -156,6 +189,18 @@ WATCHTOWER_HEARTBEAT_SECONDS = _env_int(
     15,
     minimum=5,
     maximum=3600,
+)
+
+# Watchtower connection settings are owned here (the composition root) and
+# injected into the canonical client via configure() during lifespan startup.
+WATCHTOWER_URL = _env_str(
+    "S43_WATCHTOWER_URL", "http://s43-core:9100"
+).rstrip("/")
+WATCHTOWER_TIMEOUT = _env_float(
+    "S43_WATCHTOWER_TIMEOUT",
+    2.0,
+    minimum=0.1,
+    maximum=300.0,
 )
 
 MAX_WS_CLIENTS = _env_int(
@@ -1111,12 +1156,18 @@ async def _start_monitoring_manager() -> None:
         from core.monitoring import (
             MonitoringManager,
             WatchtowerConfig,
+            WatchtowerNode,
+            WatchtowerNodeScanner,
             set_monitoring_manager,
         )
 
-        manager = MonitoringManager(
-            WatchtowerConfig.default_sentinel_octagon("sentinel43-api")
+        node = WatchtowerNode(
+            WatchtowerConfig.default_sentinel_octagon(
+                _env_str("S43_WATCHTOWER_NODE_ID", "sentinel43-api")
+            )
         )
+
+        manager = MonitoringManager(WatchtowerNodeScanner(node))
         await asyncio.to_thread(manager.start)
         set_monitoring_manager(manager)
         runtime.monitoring_manager = manager
@@ -1263,35 +1314,17 @@ async def _start_governance() -> None:
     try:
         from core.governance import build_orchestrator_from_settings
 
-        default_mode = _env_str(
+        # Mode validation (SHADOW | HUMAN_GATED, never ACTIVE) is enforced in
+        # core.governance.composition. The composition root only reads the
+        # environment and passes concrete values down.
+        resolved_default_mode = _env_str(
             "S43_GOVERNANCE_DEFAULT_MODE",
-            "SHADOW",
+            _env_str("S43_DEFAULT_MODE", "HUMAN_GATED"),
         ).upper()
 
-        allowed_modes = _env_frozenset(
-            "S43_GOVERNANCE_ALLOWED_MODES",
-            "SHADOW,REVIEW",
-        )
-        if default_mode not in allowed_modes:
-            raise RuntimeError(
-                f"Unsupported governance mode {default_mode!r}; "
-                f"allowed={sorted(allowed_modes)}"
-            )
-
         class Settings:
-            env = SENTINEL_ENV
-            strict_mode = _env_bool("S43_GOVERNANCE_STRICT", True)
-            data_dir = _env_str(
-                "S43_DATA_DIR",
-                "/var/sentinel43/data",
-            )
-            audit_signing_key = _env_str(
-                "S43_GOVERNANCE_SIGNING_KEY",
-            )
-            audit_jsonl_path = _env_str(
-                "S43_GOVERNANCE_JSONL_PATH",
-            )
-            default_mode = default_mode
+            environment = SENTINEL_ENV
+            default_mode = resolved_default_mode
             hash_device_ids = _env_bool(
                 "S43_GOVERNANCE_HASH_DEVICE_IDS",
                 False,
@@ -1314,7 +1347,7 @@ async def _start_governance() -> None:
                 minimum=5,
                 maximum=86_400,
             )
-            velocity_max_entries_per_user = _env_int(
+            velocity_max_tracked_users = _env_int(
                 "S43_VELOCITY_MAX_ENTRIES",
                 1000,
                 minimum=1,
@@ -1323,11 +1356,12 @@ async def _start_governance() -> None:
 
         runtime.orchestrator = build_orchestrator_from_settings(
             Settings(),
+            audit_store=runtime.audit_store,
             monitoring_manager=runtime.monitoring_manager,
         )
         logger.info(
             "SystemOrchestrator started (mode=%s)",
-            default_mode,
+            resolved_default_mode,
         )
     except Exception:
         runtime.orchestrator = None
@@ -1502,6 +1536,13 @@ async def _shutdown_runtime() -> None:
 async def lifespan(api: FastAPI):
     _validate_security_config()
     bootstrap_expectations(_bootstrap_settings())
+
+    # Inject the Watchtower connection settings into the canonical client
+    # before any subsystem can call it.
+    _configure_watchtower_client(
+        base_url=WATCHTOWER_URL,
+        timeout_seconds=WATCHTOWER_TIMEOUT,
+    )
 
     try:
         await _start_monitoring_manager()

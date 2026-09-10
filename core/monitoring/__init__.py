@@ -441,7 +441,7 @@ def __getattr__(name: str) -> Any:
     if name in {"RuleRegistry", "registry"}:
         return _load_rules_export(name)
 
-    if name == "MonitoringManager":
+    if name in {"MonitoringManager", "WatchtowerNodeScanner"}:
         return _load_manager_export(name)
 
     if name in {"SentinelWindowStore", "SentinelWindowConfig"}:

@@ -55,6 +55,33 @@ class EventScanner(Protocol):
     def stop(self) -> None: ...
 
 
+class WatchtowerNodeScanner:
+    """Canonical EventScanner binding for a WatchtowerNode.
+
+    A WatchtowerNode is the embedded scanner for MonitoringManager, but its
+    ``scan_event()`` returns a rich ``ScanResult`` (``.alerts`` plus the
+    tower ``decision`` / ``accepted`` fields the s43-core Watchtower service
+    needs). MonitoringManager only consumes the alert mappings, so this
+    adapter projects the result down to ``list[dict]`` and forwards the
+    lifecycle calls unchanged.
+    """
+
+    def __init__(self, node: Any) -> None:
+        self._node = node
+
+    def start(self) -> None:
+        self._node.start()
+
+    def stop(self) -> None:
+        self._node.stop()
+
+    def get_status(self) -> dict[str, Any]:
+        return self._node.get_status()
+
+    def scan_event(self, event: dict[str, Any]) -> list[dict[str, Any]]:
+        return list(self._node.scan_event(event).alerts)
+
+
 @runtime_checkable
 class WindowStore(Protocol):
     """Minimal rolling-window store interface."""
@@ -422,5 +449,6 @@ __all__ = [
     "MonitoringResult",
     "MonitoringTelemetrySink",
     "ThreatDetector",
+    "WatchtowerNodeScanner",
     "WindowStore",
 ]
