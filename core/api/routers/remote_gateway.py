@@ -1165,15 +1165,23 @@ def register_dispatch_handler(
     event_type: RemoteEventType,
     handler: DispatchHandler,
 ) -> None:
+    """Register (or replace) the dispatch handler for ``event_type``.
+
+    Idempotent: re-registering an event type replaces the prior handler
+    rather than raising. The API lifespan registers handlers on every
+    startup, so a second lifespan pass (test clients, a module reload)
+    must not fail on an already-populated registry. Last writer wins.
+    """
     if not callable(handler):
         raise TypeError(
             "dispatch handler must be callable"
         )
 
     with _dispatch_registry_lock:
-        if event_type in _dispatch_registry:
-            raise RuntimeError(
-                f"Dispatch handler already registered for {event_type.value}"
+        existing = _dispatch_registry.get(event_type)
+        if existing is not None and existing is not handler:
+            logger.debug(
+                "Replacing dispatch handler for %s", event_type.value
             )
 
         _dispatch_registry[
