@@ -1195,9 +1195,35 @@ def get_node() -> WatchtowerNode:
 # =============================================================================
 
 def _require_admin_token(token: str | None) -> None:
-    expected = os.getenv("S43_ADMIN_TOKEN")
-    if not expected or not token or not secrets.compare_digest(token, expected):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized.")
+    """Authenticate a Watchtower admin operator via ``X-S43-Admin-Token``.
+
+    A distinct identity from ``_require_service_token``: the admin token
+    (``S43_ADMIN_TOKEN``) is never interchangeable with the internal service
+    token, and neither accepts a human JWT/session credential.
+
+    Follows the same fail-closed contract as ``_require_service_token``
+    below: 503 when the token is not configured on this server (so a
+    misconfigured deployment reports missing configuration rather than
+    disguising it as a credential failure), 401 for a missing or wrong
+    token. Compared as bytes -- ``secrets.compare_digest`` raises TypeError
+    on a str containing non-ASCII characters, which a client could
+    previously send to force a 500.
+    """
+    expected = (os.getenv("S43_ADMIN_TOKEN") or "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Watchtower admin authentication is not configured on this server.",
+        )
+
+    supplied = (token or "").strip()
+    if not supplied or not secrets.compare_digest(
+        supplied.encode("utf-8"), expected.encode("utf-8")
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized.",
+        )
 
 
 # =============================================================================
