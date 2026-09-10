@@ -66,7 +66,7 @@ from typing import Any, Optional
 _monitoring_manager: Optional[Any] = None
 
 
-def set_monitoring_manager(manager: Any) -> None:
+def set_monitoring_manager(manager: Any | None) -> None:
     """
     Register the active MonitoringManager for modules that need late wiring.
 
@@ -252,7 +252,6 @@ _LAZY_EXPORTS: set[str] = {
     # Cryptographic audit node
     "JormungandrNode",
     "JormungandrConfig",
-    "build_jormungandr",
 }
 
 
@@ -411,10 +410,15 @@ def _load_jormungandr_export(name: str) -> Any:
         try:
             mod = importlib.import_module(module_name)
 
+            # No build_jormungandr factory: jormungandr.py is deliberately
+            # env-free ("no environment reads") and JormungandrNode requires
+            # an injected root_key, so the composition root constructs it
+            # directly. The symmetric factory this loader used to demand was
+            # never implemented, and requiring it here made the two real
+            # exports below unresolvable.
             exports = {
                 "JormungandrNode": mod.JormungandrNode,
                 "JormungandrConfig": mod.JormungandrConfig,
-                "build_jormungandr": mod.build_jormungandr,
             }
 
             globals().update(exports)
@@ -465,7 +469,7 @@ def __getattr__(name: str) -> Any:
     if name in {"BlockReason", "FirewallConfig", "SentinelFirewall"}:
         return _load_firewall_export(name)
 
-    if name in {"JormungandrNode", "JormungandrConfig", "build_jormungandr"}:
+    if name in {"JormungandrNode", "JormungandrConfig"}:
         return _load_jormungandr_export(name)
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -552,5 +556,4 @@ __all__ = [
 
     "JormungandrNode",
     "JormungandrConfig",
-    "build_jormungandr",
 ]

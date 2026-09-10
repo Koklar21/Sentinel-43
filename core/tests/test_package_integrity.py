@@ -165,7 +165,8 @@ def test_core_monitoring_lazy_exports_resolve():
     import core.monitoring as cm
 
     for name in ("SpartaCore", "IntegrityConfig", "create_node_router",
-                 "build_jormungandr", "SentinelWindowStore", "SentinelWindowConfig"):
+                 "JormungandrNode", "JormungandrConfig",
+                 "SentinelWindowStore", "SentinelWindowConfig"):
         assert getattr(cm, name) is not None, f"core.monitoring.{name} did not resolve"
 
 
