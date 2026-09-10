@@ -35,7 +35,7 @@ from core.governance.orchestrator import (
     ReasonCode,
     SystemOrchestrator,
 )
-from core.governance.velocity_guard import (
+from core.guards.velocity import (
     VelocityConfig,
     VelocityGuard,
 )
@@ -119,6 +119,21 @@ def main() -> int:
             caller_roles=frozenset(
                 {"admin"}
             ),
+            authenticated_at=now,
+        )
+
+        # The current orchestrator authorizes a non-admin caller only for
+        # their own user_id, so self-transaction scenarios need a caller
+        # whose caller_id matches the target user_id.
+        caller_velocity = CallerContext(
+            caller_id="velocity-user",
+            caller_roles=frozenset({"user"}),
+            authenticated_at=now,
+        )
+
+        caller_mode = CallerContext(
+            caller_id="mode-user",
+            caller_roles=frozenset({"user"}),
             authenticated_at=now,
         )
 
@@ -211,7 +226,7 @@ def main() -> int:
             10,
         ):
             decision = orch.process_transaction(
-                caller=caller_user,
+                caller=caller_velocity,
                 user_id="velocity-user",
                 amount_str="1.0000",
                 metadata=metadata,
@@ -244,7 +259,7 @@ def main() -> int:
         )
 
         d5 = orch.process_transaction(
-            caller=caller_user,
+            caller=caller_mode,
             user_id="mode-user",
             amount_str="25.00",
             metadata=metadata,

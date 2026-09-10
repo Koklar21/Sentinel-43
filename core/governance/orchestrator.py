@@ -647,7 +647,6 @@ class SystemOrchestrator:
         allowed, velocity_reason = (
             self.velocity_guard.allow(
                 user_id,
-                now,
             )
         )
 
