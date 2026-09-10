@@ -35,7 +35,7 @@ from fastapi import Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...auth.deps import get_db_session
-from ...monitoring.watchtower_client import watchtower_request
+from ...monitoring.watchtower_client import watchtower_report
 from .config import (
     DEFAULT_ENGINE_FACTORY,
     DEFAULT_STORE_FACTORY,
@@ -166,23 +166,6 @@ def _env_bool(
 # Watchtower telemetry
 # =============================================================================
 
-def _watchtower_request_best_effort(
-    method: str,
-    path: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any] | None:
-    try:
-        return watchtower_request(method, path, payload)
-    except Exception:
-        logger.warning(
-            "Dependency telemetry failed: %s %s",
-            method,
-            path,
-            exc_info=True,
-        )
-        return None
-
-
 def _report_dependency_event(
     *,
     status: str,
@@ -208,7 +191,7 @@ def _report_dependency_event(
         }
     }
 
-    _watchtower_request_best_effort(
+    watchtower_report(
         "POST",
         "/watchtower/analyze",
         payload,
@@ -222,7 +205,7 @@ def register_dependencies_with_watchtower() -> None:
     Registration is explicit and cached. Dependency resolution does not
     repeatedly re-register the module on every request or every error.
     """
-    config = load_config(report_to_watchtower=False)
+    config = load_config()
     module_id = os.getenv("S43_DEPS_MODULE_ID", DEPS_MODULE_ID).strip() or DEPS_MODULE_ID
 
     payload = {
@@ -243,7 +226,7 @@ def register_dependencies_with_watchtower() -> None:
         },
     }
 
-    _watchtower_request_best_effort(
+    watchtower_report(
         "POST",
         "/watchtower/modules/register",
         payload,
@@ -627,7 +610,7 @@ class DevStore:
 
 
 def dev_engine_factory() -> EngineProtocol:
-    config = load_config(report_to_watchtower=False)
+    config = load_config()
 
     if not config.is_local:
         raise DependencyResolutionError(
@@ -648,7 +631,7 @@ def dev_engine_factory() -> EngineProtocol:
 
 
 def dev_store_factory() -> StoreProtocol:
-    config = load_config(report_to_watchtower=False)
+    config = load_config()
 
     if not config.is_local:
         raise DependencyResolutionError(
@@ -676,7 +659,7 @@ def dev_store_factory() -> StoreProtocol:
 
 def get_engine() -> EngineProtocol:
     """Resolve and validate the configured engine dependency."""
-    config = load_config(report_to_watchtower=False)
+    config = load_config()
     register_dependencies_with_watchtower()
 
     obj = _resolve_dependency(
@@ -693,7 +676,7 @@ def get_engine() -> EngineProtocol:
 
 def get_store() -> StoreProtocol:
     """Resolve and validate the configured store dependency."""
-    config = load_config(report_to_watchtower=False)
+    config = load_config()
     register_dependencies_with_watchtower()
 
     obj = _resolve_dependency(
@@ -710,7 +693,7 @@ def get_store() -> StoreProtocol:
 
 def deps_status() -> dict[str, Any]:
     """Return non-sensitive dependency wiring diagnostics."""
-    config = load_config(report_to_watchtower=False)
+    config = load_config()
 
     return {
         "module_id": (
@@ -742,9 +725,3 @@ __all__ = [
     "require_admin",
     "require_operator",
 ]
-'''
-
-path = Path("/mnt/data/sentinel43_api_deps_recode.py")
-path.write_text(code, encoding="utf-8")
-compile(code, str(path), "exec")
-print(path)

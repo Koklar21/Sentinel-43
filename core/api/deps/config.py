@@ -14,26 +14,21 @@
 """Sentinel-43 API dependency configuration.
 
 Scope is deliberately narrow: the environment (local vs production-like) and
-the engine/store factory specs that ``core.api.deps.deps`` resolves. Parsing is
-deterministic and side-effect free. Watchtower reporting is best-effort and
-happens only after a complete, validated config object exists.
+the engine/store factory specs that ``core.api.deps.deps`` resolves. Parsing
+is deterministic and side-effect free -- no Watchtower calls, no logging, no
+filesystem. Watchtower module/dependency registration for this process is
+owned by ``core.api.main`` and ``core.api.deps.deps``, not here.
 
-Broader API configuration (host/port/CORS/docs/logging) is owned elsewhere and
-is intentionally not duplicated here.
+Broader API configuration (host/port/CORS/docs/logging) is owned elsewhere
+and is intentionally not duplicated here.
 """
 
 from __future__ import annotations
 
-import logging
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Final
-
-from ...monitoring.watchtower_client import watchtower_request
-
-logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Constants
@@ -54,7 +49,6 @@ _FACTORY_RE: Final[re.Pattern[str]] = re.compile(
 DEFAULT_ENGINE_FACTORY: Final[str] = "core.api.deps:dev_engine_factory"
 DEFAULT_STORE_FACTORY: Final[str] = "core.api.deps:dev_store_factory"
 
-CONFIG_MODULE_ID: Final[str] = "sentinel43-api-deps-config"
 DEFAULT_CONFIG_VERSION: Final[str] = "0.1.0"
 
 
@@ -70,10 +64,6 @@ class ConfigError(RuntimeError):
 # Helpers
 # =============================================================================
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def _env(name: str, default: str | None = None) -> str | None:
     raw = os.getenv(name)
     if raw is None:
@@ -87,12 +77,11 @@ def _resolve_environment_name() -> str:
     """Read the deployment environment from the same variables the API
     composition root uses.
 
-    core/api/main.py reads SENTINEL_ENV; Fenrir/Sparta/Watchtower read S43_ENV;
-    an older draft of this module read SENTINEL_ENVIRONMENT. All three are
-    accepted so the dependency layer's local/production decision cannot
-    silently disagree with the rest of the process. The default is
-    "production" so an unset environment fails closed (dev factories
-    forbidden) rather than open.
+    core/api/main.py reads SENTINEL_ENV; Fenrir/Sparta/Watchtower read
+    S43_ENV. Both are accepted so the dependency layer's local/production
+    decision cannot silently disagree with the rest of the process. The
+    default is "production" so an unset environment fails closed (dev
+    factories forbidden) rather than open.
     """
     for name in ("SENTINEL_ENV", "SENTINEL_ENVIRONMENT", "S43_ENV"):
         value = _env(name)
@@ -171,76 +160,15 @@ def _validate_config(config: ApiConfig) -> None:
 
 
 # =============================================================================
-# Watchtower telemetry (best-effort)
-# =============================================================================
-
-def _watchtower_request_best_effort(
-    method: str,
-    path: str,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any] | None:
-    try:
-        return watchtower_request(method, path, payload)
-    except Exception:
-        logger.warning(
-            "Dependency-config Watchtower telemetry failed: %s %s",
-            method,
-            path,
-            exc_info=True,
-        )
-        return None
-
-
-def _report_loaded_config(config: ApiConfig) -> None:
-    module_id = _env("S43_DEPS_CONFIG_MODULE_ID", CONFIG_MODULE_ID) or CONFIG_MODULE_ID
-    version = config.version or DEFAULT_CONFIG_VERSION
-    timestamp = utc_now()
-
-    _watchtower_request_best_effort(
-        "POST",
-        "/watchtower/modules/register",
-        {
-            "module_id": module_id,
-            "module_type": "api-deps-config",
-            "version": version,
-            "endpoint": None,
-            "capabilities": [
-                "environment_loading",
-                "factory_spec_validation",
-                "production_fail_closed_validation",
-            ],
-            "metadata": {
-                "timestamp": timestamp,
-                "environment": config.environment,
-            },
-        },
-    )
-
-    _watchtower_request_best_effort(
-        "POST",
-        "/watchtower/dependencies/report",
-        {
-            "name": module_id,
-            "status": "online",
-            "version": version,
-            "details": {
-                "event": "config_loaded",
-                "timestamp": timestamp,
-                "config": config.safe_dict(),
-            },
-        },
-    )
-
-
-# =============================================================================
 # Public loader
 # =============================================================================
 
-def load_config(*, report_to_watchtower: bool = True) -> ApiConfig:
+def load_config() -> ApiConfig:
     """Load and validate Sentinel-43 API dependency configuration.
 
-    Production-like environments fail closed on an invalid factory spec or a
-    development factory rather than silently falling back to a stub.
+    Deterministic and side-effect free. Production-like environments fail
+    closed on an invalid factory spec or a development factory rather than
+    silently falling back to a stub.
     """
     environment = _normalize_environment(_resolve_environment_name())
 
@@ -266,10 +194,6 @@ def load_config(*, report_to_watchtower: bool = True) -> ApiConfig:
     )
 
     _validate_config(config)
-
-    if report_to_watchtower:
-        _report_loaded_config(config)
-
     return config
 
 
