@@ -254,7 +254,9 @@ def fresh_user_store(monkeypatch) -> _FakeUserStore:
 
     monkeypatch.setattr(bootstrap_module, "count_active_admins", store.count_active_admins)
     monkeypatch.setattr(bootstrap_module, "create_first_admin", store.create_first_admin)
-    monkeypatch.setattr(bootstrap_module, "init_models", store.init_models)
+    # The bootstrap router no longer performs schema creation -- Alembic is the
+    # sole schema authority -- so there is no init_models to patch here.
+    monkeypatch.setattr(bootstrap_module, "init_models", store.init_models, raising=False)
     monkeypatch.setattr(users_module, "authenticate_user", store.authenticate_user)
     monkeypatch.setattr(users_module, "record_login", store.record_login)
     monkeypatch.setattr(users_module, "get_sessionmaker", _fake_get_sessionmaker)

@@ -36,9 +36,15 @@ _ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 def _cfg(monkeypatch, *, env, origins, insecure=None):
     monkeypatch.setattr(m, "SENTINEL_ENV", env)
+    # IS_LOCAL_ENV is frozen from SENTINEL_ENV at import; _validate_security_config()
+    # gates the non-local checks on it, so a production simulation must patch it too.
+    monkeypatch.setattr(m, "IS_LOCAL_ENV", env in m.LOCAL_TEST_ENVIRONMENTS)
     monkeypatch.setattr(m, "JWT_SECRET", "x" * 16)
     monkeypatch.setattr(m, "WS_REQUIRE_AUTH", True)
+    monkeypatch.setattr(m, "ALLOW_DEV_OPERATOR_FALLBACK", False)
     monkeypatch.setattr(m, "_ALLOWED_ORIGINS", frozenset(origins))
+    monkeypatch.setattr(m, "_TRUSTED_HOSTS", ["beta.example.com"])
+    monkeypatch.setenv("S43_TLS_TERMINATED_AT_TRUSTED_EDGE", "true")
     if insecure is None:
         monkeypatch.delenv("S43_ALLOW_INSECURE_ORIGINS", raising=False)
     else:
@@ -47,7 +53,7 @@ def _cfg(monkeypatch, *, env, origins, insecure=None):
 
 def test_nonlocal_plaintext_origin_refuses_startup(monkeypatch):
     _cfg(monkeypatch, env="production", origins={"http://beta.example.com"})
-    with pytest.raises(RuntimeError, match="HTTPS origins"):
+    with pytest.raises(RuntimeError, match="HTTPS browser origins"):
         m._validate_security_config()
 
 

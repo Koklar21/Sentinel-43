@@ -129,13 +129,20 @@ def _make_token(
     subject: str | None = "operator-1",
     role: str | None = "operator",
     exp_offset_seconds: int | None = 3600,
+    include_iat: bool = True,
+    include_nbf: bool = True,
     extra_claims: dict | None = None,
 ) -> str:
     """
     Build a JWT with the given claims. Pass None for issuer / audience /
-    subject / exp_offset_seconds to omit that claim entirely (used for
-    "missing required claim" test cases).
+    subject / exp_offset_seconds (or include_iat / include_nbf = False) to
+    omit that claim entirely (used for "missing required claim" test cases).
+
+    verify_jwt_token() requires sub, exp, iss, aud, iat, nbf and role -- the
+    canonical Sentinel-43 access-token claim set -- so a well-formed token
+    carries iat and nbf by default.
     """
+    now = int(time.time())
     claims: dict = {}
 
     if issuer is not None:
@@ -147,7 +154,11 @@ def _make_token(
     if role is not None:
         claims["role"] = role
     if exp_offset_seconds is not None:
-        claims["exp"] = int(time.time()) + exp_offset_seconds
+        claims["exp"] = now + exp_offset_seconds
+    if include_iat:
+        claims["iat"] = now
+    if include_nbf:
+        claims["nbf"] = now
 
     if extra_claims:
         claims.update(extra_claims)
@@ -351,10 +362,23 @@ class TestGetOperatorDevEnvironment:
 
         assert _run(jwt_env._get_operator(request)) == "alice"
 
-    def test_no_token_returns_dev_operator(self, jwt_env):
+    def test_no_token_returns_dev_operator(self, jwt_env, monkeypatch):
+        # The dev-operator fallback is now opt-in: it needs both the caller to
+        # pass allow_local_fallback=True and S43_ALLOW_DEV_OPERATOR_FALLBACK.
+        monkeypatch.setattr(jwt_env, "ALLOW_DEV_OPERATOR_FALLBACK", True)
         request = _bearer_request(None)
 
-        assert _run(jwt_env._get_operator(request)) == "dev-operator"
+        assert (
+            _run(jwt_env._get_operator(request, allow_local_fallback=True))
+            == "dev-operator"
+        )
+
+    def test_no_token_without_fallback_opt_in_is_401(self, jwt_env):
+        # Default: no token and no explicit fallback opt-in -> rejected.
+        request = _bearer_request(None)
+        with pytest.raises(HTTPException) as exc_info:
+            _run(jwt_env._get_operator(request))
+        assert exc_info.value.status_code == 401
 
     def test_valid_token_missing_password_returns_401(self, jwt_env):
         """A valid, correctly-scoped JWT with no X-S43-Password header must
@@ -417,11 +441,11 @@ class TestGetOperatorDevEnvironment:
         assert exc_info.value.status_code == 401
         assert "audience" in exc_info.value.detail.lower()
 
-    def test_missing_role_claim_returns_403(self, jwt_env):
+    def test_missing_role_claim_is_rejected(self, jwt_env):
         """
-        A valid, correctly signed token with no role/scope claim must be
-        rejected with 403 — authentication succeeded but authorization
-        did not.
+        `role` is a required JWT claim (verify_jwt_token's `require` list), so a
+        token without it is not a legitimately-issued Sentinel-43 token: it is
+        rejected as an invalid token (401), not merely unauthorized (403).
         """
         token = _make_token(role=None)
         request = _bearer_request(token)
@@ -429,8 +453,7 @@ class TestGetOperatorDevEnvironment:
         with pytest.raises(HTTPException) as exc_info:
             _run(jwt_env._get_operator(request))
 
-        assert exc_info.value.status_code == 403
-        assert "role" in exc_info.value.detail.lower()
+        assert exc_info.value.status_code == 401
 
     def test_unapproved_role_returns_403(self, jwt_env):
         """A role outside {operator, admin} must be rejected."""
@@ -507,21 +530,44 @@ class TestGetOperatorProductionEnvironment:
 
 # =============================================================================
 # Bootstrap fail-closed gate tests
+#
+# core.bootstrap.validate_bootstrap_expectations() was made environment-free:
+# it validates an already-loaded settings mapping (the composition root owns
+# the env reads -- see core.api.main._bootstrap_settings()). These tests build
+# that mapping the same way and assert on the canonical field names.
 # =============================================================================
+
+_TRUE = {"1", "true", "yes", "on"}
+
+
+def _bootstrap_from_env() -> dict:
+    """Mirror core.api.main._bootstrap_settings(): env -> settings mapping."""
+    def _b(name: str) -> bool:
+        return os.getenv(name, "").strip().lower() in _TRUE
+
+    return {
+        "env": os.getenv("SENTINEL_ENV", "production"),
+        "jwt_secret": os.getenv("S43_JWT_SECRET", ""),
+        "jwt_algorithm": os.getenv("S43_JWT_ALGORITHM", "HS256"),
+        "jwt_issuer": os.getenv("S43_JWT_ISSUER", "sentinel-43"),
+        "jwt_audience": os.getenv("S43_JWT_AUDIENCE", "sentinel-43-dashboard"),
+        "auth_pepper": os.getenv("S43_AUTH_PEPPER", ""),
+        "ws_require_auth": _b("S43_WS_REQUIRE_AUTH"),
+        "enable_test_injection": _b("S43_ENABLE_TEST_INJECTION"),
+    }
+
 
 class TestBootstrapExpectations:
 
     def test_passes_in_test_environment_with_no_config(self, monkeypatch):
         """LOCAL_TEST_ENVIRONMENTS must remain permissive even with zero JWT config."""
         monkeypatch.setenv("SENTINEL_ENV", "test")
-        monkeypatch.delenv("S43_JWT_SECRET",    raising=False)
-        monkeypatch.delenv("S43_JWT_ALGORITHM", raising=False)
-        monkeypatch.delenv("S43_JWT_ISSUER",    raising=False)
-        monkeypatch.delenv("S43_JWT_AUDIENCE",  raising=False)
-        monkeypatch.delenv("S43_WS_REQUIRE_AUTH", raising=False)
+        for v in ("S43_JWT_SECRET", "S43_JWT_ALGORITHM", "S43_JWT_ISSUER",
+                  "S43_JWT_AUDIENCE", "S43_WS_REQUIRE_AUTH", "S43_AUTH_PEPPER"):
+            monkeypatch.delenv(v, raising=False)
 
-        from core.bootstrap import bootstrap_expectations
-        bootstrap_expectations()  # must not raise
+        from core.bootstrap import validate_bootstrap_expectations
+        validate_bootstrap_expectations(_bootstrap_from_env())  # must not raise
 
     def test_production_with_no_jwt_secret_raises(self, monkeypatch):
         monkeypatch.setenv("SENTINEL_ENV", "production")
@@ -530,13 +576,14 @@ class TestBootstrapExpectations:
         monkeypatch.setenv("S43_JWT_ISSUER",    TEST_ISSUER)
         monkeypatch.setenv("S43_JWT_AUDIENCE",  TEST_AUDIENCE)
         monkeypatch.setenv("S43_WS_REQUIRE_AUTH", "true")
+        monkeypatch.setenv("S43_AUTH_PEPPER", "a" * 64)
 
-        from core.bootstrap import bootstrap_expectations
+        from core.bootstrap import validate_bootstrap_expectations
 
         with pytest.raises(RuntimeError) as exc_info:
-            bootstrap_expectations()
+            validate_bootstrap_expectations(_bootstrap_from_env())
 
-        assert "S43_JWT_SECRET" in str(exc_info.value)
+        assert "jwt_secret" in str(exc_info.value)
 
     def test_production_with_short_secret_raises(self, monkeypatch):
         monkeypatch.setenv("SENTINEL_ENV", "production")
@@ -545,11 +592,12 @@ class TestBootstrapExpectations:
         monkeypatch.setenv("S43_JWT_ISSUER",    TEST_ISSUER)
         monkeypatch.setenv("S43_JWT_AUDIENCE",  TEST_AUDIENCE)
         monkeypatch.setenv("S43_WS_REQUIRE_AUTH", "true")
+        monkeypatch.setenv("S43_AUTH_PEPPER", "a" * 64)
 
-        from core.bootstrap import bootstrap_expectations
+        from core.bootstrap import validate_bootstrap_expectations
 
         with pytest.raises(RuntimeError) as exc_info:
-            bootstrap_expectations()
+            validate_bootstrap_expectations(_bootstrap_from_env())
 
         assert "32 bytes" in str(exc_info.value)
 
@@ -560,13 +608,14 @@ class TestBootstrapExpectations:
         monkeypatch.setenv("S43_JWT_ISSUER",    TEST_ISSUER)
         monkeypatch.setenv("S43_JWT_AUDIENCE",  TEST_AUDIENCE)
         monkeypatch.setenv("S43_WS_REQUIRE_AUTH", "false")
+        monkeypatch.setenv("S43_AUTH_PEPPER", "a" * 64)
 
-        from core.bootstrap import bootstrap_expectations
+        from core.bootstrap import validate_bootstrap_expectations
 
         with pytest.raises(RuntimeError) as exc_info:
-            bootstrap_expectations()
+            validate_bootstrap_expectations(_bootstrap_from_env())
 
-        assert "S43_WS_REQUIRE_AUTH" in str(exc_info.value)
+        assert "ws_require_auth" in str(exc_info.value)
 
     def test_production_with_test_injection_enabled_raises(self, monkeypatch):
         monkeypatch.setenv("SENTINEL_ENV", "production")
@@ -576,13 +625,14 @@ class TestBootstrapExpectations:
         monkeypatch.setenv("S43_JWT_AUDIENCE",  TEST_AUDIENCE)
         monkeypatch.setenv("S43_WS_REQUIRE_AUTH", "true")
         monkeypatch.setenv("S43_ENABLE_TEST_INJECTION", "true")
+        monkeypatch.setenv("S43_AUTH_PEPPER", "a" * 64)
 
-        from core.bootstrap import bootstrap_expectations
+        from core.bootstrap import validate_bootstrap_expectations
 
         with pytest.raises(RuntimeError) as exc_info:
-            bootstrap_expectations()
+            validate_bootstrap_expectations(_bootstrap_from_env())
 
-        assert "S43_ENABLE_TEST_INJECTION" in str(exc_info.value)
+        assert "enable_test_injection" in str(exc_info.value)
 
     def test_production_with_unapproved_algorithm_raises(self, monkeypatch):
         monkeypatch.setenv("SENTINEL_ENV", "production")
@@ -591,13 +641,14 @@ class TestBootstrapExpectations:
         monkeypatch.setenv("S43_JWT_ISSUER",    TEST_ISSUER)
         monkeypatch.setenv("S43_JWT_AUDIENCE",  TEST_AUDIENCE)
         monkeypatch.setenv("S43_WS_REQUIRE_AUTH", "true")
+        monkeypatch.setenv("S43_AUTH_PEPPER", "a" * 64)
 
-        from core.bootstrap import bootstrap_expectations
+        from core.bootstrap import validate_bootstrap_expectations
 
         with pytest.raises(RuntimeError) as exc_info:
-            bootstrap_expectations()
+            validate_bootstrap_expectations(_bootstrap_from_env())
 
-        assert "S43_JWT_ALGORITHM" in str(exc_info.value)
+        assert "jwt_algorithm" in str(exc_info.value)
 
     def test_production_with_full_valid_config_passes(self, monkeypatch):
         monkeypatch.setenv("SENTINEL_ENV", "production")
@@ -607,11 +658,7 @@ class TestBootstrapExpectations:
         monkeypatch.setenv("S43_JWT_AUDIENCE",  TEST_AUDIENCE)
         monkeypatch.setenv("S43_WS_REQUIRE_AUTH", "true")
         monkeypatch.setenv("S43_ENABLE_TEST_INJECTION", "false")
-        monkeypatch.setenv("S43_AUTH_PEPPER", "a" * 64)  # FIX: pepper required in production
-        monkeypatch.setenv(
-            "S43_SECRETS_ROTATED_AT",
-            datetime.now(timezone.utc).isoformat(),
-        )
+        monkeypatch.setenv("S43_AUTH_PEPPER", "a" * 64)
 
-        from core.bootstrap import bootstrap_expectations
-        bootstrap_expectations()  # must not raise
+        from core.bootstrap import validate_bootstrap_expectations
+        validate_bootstrap_expectations(_bootstrap_from_env())  # must not raise

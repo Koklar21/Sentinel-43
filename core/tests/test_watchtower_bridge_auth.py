@@ -110,9 +110,13 @@ def allow_operator_and_trace(monkeypatch):
         calls.append(("watchtower_request", method, path))
         return {"traced": True, "status_code": 200}
 
+    async def _traced_health_check():  # main.py awaits watchtower_health_check()
+        calls.append(("watchtower_health_check", None, None))
+        return {"reachable": True, "response": {}}
+
     monkeypatch.setattr(main_module, "_require_operator", _allow)
     monkeypatch.setattr(main_module, "_watchtower_request", _traced_request)
-    monkeypatch.setattr(main_module, "watchtower_health_check", lambda: {"reachable": True, "response": {}})
+    monkeypatch.setattr(main_module, "watchtower_health_check", _traced_health_check)
     return calls
 
 

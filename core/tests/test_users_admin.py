@@ -206,6 +206,21 @@ class _FakeSession:
     async def flush(self) -> None: ...
     async def refresh(self, _obj) -> None: ...
 
+    async def execute(self, *_args, **_kwargs):
+        """The dict-backed fake store keeps no session rows, so the account
+        mutation handlers' revoke_all_user_sessions() call finds nothing to
+        revoke -- return an empty result rather than AttributeError."""
+        class _EmptyResult:
+            def scalars(self):
+                return self
+
+            def all(self):
+                return []
+
+            rowcount = 0
+
+        return _EmptyResult()
+
     def get_bind(self):  # noqa: ANN201
         raise RuntimeError("fake session has no bind")
 

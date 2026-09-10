@@ -114,6 +114,9 @@ def _bearer(token: str, password: str | None = None) -> dict[str, str]:
 def test_disabled_in_production_regardless_of_auth(client: TestClient, monkeypatch):
     """Even a valid operator token must not bypass the env/flag gate."""
     monkeypatch.setattr(main_module, "SENTINEL_ENV", "production")
+    # IS_LOCAL_ENV is frozen from SENTINEL_ENV at import; the inject route
+    # gates on it directly.
+    monkeypatch.setattr(main_module, "IS_LOCAL_ENV", False)
     monkeypatch.setattr(main_module, "TEST_INJECTION_ENABLED", True)
 
     response = client.post(

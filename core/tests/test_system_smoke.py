@@ -42,6 +42,23 @@ import requests
 
 API_URL = os.getenv("S43_TEST_API_URL", "http://localhost:8000").rstrip("/")
 
+
+def _live_target_reachable() -> bool:
+    try:
+        requests.get(f"{API_URL}/health", timeout=2)
+        return True
+    except requests.RequestException:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _live_target_reachable(),
+    reason=(
+        f"no live Sentinel-43 API at {API_URL}; set S43_TEST_API_URL to a "
+        "running instance to run the system smoke tests"
+    ),
+)
+
 SMOKE_ENDPOINTS = [
     "/health",
     "/ready",

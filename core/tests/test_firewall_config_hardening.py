@@ -13,17 +13,18 @@
 #
 # Pass 2 — firewall configuration defaults + fail-closed configuration/startup.
 #
-#   * An absent or blank env var must NEVER replace a FirewallConfig security
-#     default. In particular an unset/empty S43_FIREWALL_BLOCKED_PATHS must
-#     keep the built-in dangerous-path prefix list, not wipe it to ().
 #   * A present-but-malformed security value (bad bool / int / CIDR) is a hard
 #     error, not a silent fall-back to a default.
+#   * blocked_path_prefixes / blocked_path_contains are NOT env-configurable
+#     via FirewallConfig.from_env() -- they are always the built-in
+#     dangerous-path lists, so an operator can never accidentally wipe them.
 #   * SentinelFirewall is a required control: a failure to import / configure /
 #     register it fails startup closed outside development/local/test.
 #
-# from_env() is exercised through core.middleware.sentinel_firewall (the shim
-# path core.api.main uses). Registration behavior is exercised in a subprocess
-# because the try/except runs once at core.api.main import time.
+# from_env() here is the canonical FirewallConfig.from_env() classmethod that
+# core.api.main uses (via `from core.middleware import FirewallConfig`).
+# Registration behavior is exercised in a subprocess because the try/except
+# runs once at core.api.main import time.
 # =============================================================================
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ import pathlib
 import subprocess
 import sys
 import textwrap
+from typing import Any
 
 import pytest
 
@@ -41,11 +43,10 @@ from core.api.middleware.sentinel_firewall_middleware import SentinelFirewall
 
 _FW_ENV_VARS = (
     "S43_FIREWALL_ENABLED",
-    "S43_FIREWALL_MAX_BODY_BYTES",
+    "S43_FIREWALL_MAX_CONTENT_LENGTH",
     "S43_FIREWALL_MAX_HEADER_BYTES",
-    "S43_FIREWALL_ALLOWED_IP_CIDRS",
+    "S43_FIREWALL_ALLOWED_IPS",
     "S43_FIREWALL_BLOCKED_IPS",
-    "S43_FIREWALL_BLOCKED_PATHS",
     "S43_TRUSTED_PROXIES",
 )
 
@@ -62,10 +63,11 @@ _DEFAULTS = FirewallConfig()
 
 
 # ---------------------------------------------------------------------------
-# blocked_path_prefixes default must survive absent / blank config
+# blocked_path_prefixes / blocked_path_contains are NOT env-configurable via
+# from_env() -- always the built-in dangerous-path lists.
 # ---------------------------------------------------------------------------
 
-def test_blocked_paths_absent_keeps_builtin_default():
+def test_blocked_path_prefixes_are_the_builtin_default():
     cfg = FirewallConfig.from_env()
     assert tuple(cfg.blocked_path_prefixes) == tuple(_DEFAULTS.blocked_path_prefixes)
     assert "/.git" in cfg.blocked_path_prefixes
@@ -73,20 +75,7 @@ def test_blocked_paths_absent_keeps_builtin_default():
     assert len(cfg.blocked_path_prefixes) >= 10
 
 
-@pytest.mark.parametrize("blank", ["", "   ", ",", " , ,  "])
-def test_blocked_paths_blank_keeps_builtin_default(monkeypatch, blank):
-    monkeypatch.setenv("S43_FIREWALL_BLOCKED_PATHS", blank)
-    cfg = FirewallConfig.from_env()
-    assert tuple(cfg.blocked_path_prefixes) == tuple(_DEFAULTS.blocked_path_prefixes)
-
-
-def test_blocked_paths_explicit_value_replaces_default(monkeypatch):
-    monkeypatch.setenv("S43_FIREWALL_BLOCKED_PATHS", "/secret,/internal")
-    cfg = FirewallConfig.from_env()
-    assert tuple(cfg.blocked_path_prefixes) == ("/secret", "/internal")
-
-
-def test_blocked_path_contains_is_never_env_wiped():
+def test_blocked_path_contains_is_the_builtin_default():
     # Not env-configurable at all -> always the built-in traversal/secret list.
     cfg = FirewallConfig.from_env()
     assert tuple(cfg.blocked_path_contains) == tuple(_DEFAULTS.blocked_path_contains)
@@ -110,9 +99,9 @@ def test_all_defaults_when_no_env():
 
 def test_present_values_are_applied(monkeypatch):
     monkeypatch.setenv("S43_FIREWALL_ENABLED", "false")
-    monkeypatch.setenv("S43_FIREWALL_MAX_BODY_BYTES", "2048")
+    monkeypatch.setenv("S43_FIREWALL_MAX_CONTENT_LENGTH", "2048")
     monkeypatch.setenv("S43_FIREWALL_MAX_HEADER_BYTES", "4096")
-    monkeypatch.setenv("S43_FIREWALL_ALLOWED_IP_CIDRS", "10.0.0.0/8")
+    monkeypatch.setenv("S43_FIREWALL_ALLOWED_IPS", "10.0.0.0/8")
     monkeypatch.setenv("S43_FIREWALL_BLOCKED_IPS", "6.6.6.6/32,7.7.7.0/24")
     monkeypatch.setenv("S43_TRUSTED_PROXIES", "192.168.0.0/16")
     cfg = FirewallConfig.from_env()
@@ -139,13 +128,13 @@ def test_enabled_true_variants(monkeypatch):
 
 def test_malformed_enabled_raises(monkeypatch):
     monkeypatch.setenv("S43_FIREWALL_ENABLED", "maybe")
-    with pytest.raises(ValueError, match="not a valid boolean"):
+    with pytest.raises(ValueError, match="must be boolean"):
         FirewallConfig.from_env()
 
 
 def test_malformed_int_raises(monkeypatch):
-    monkeypatch.setenv("S43_FIREWALL_MAX_BODY_BYTES", "10MB")
-    with pytest.raises(ValueError, match="not a valid integer"):
+    monkeypatch.setenv("S43_FIREWALL_MAX_CONTENT_LENGTH", "10MB")
+    with pytest.raises(ValueError, match="must be integer"):
         FirewallConfig.from_env()
 
 
@@ -153,11 +142,12 @@ def test_malformed_int_raises(monkeypatch):
     ("S43_TRUSTED_PROXIES", "not-a-cidr"),
     ("S43_TRUSTED_PROXIES", "10.0.0.0/99"),
     ("S43_FIREWALL_BLOCKED_IPS", "999.1.1.1"),
-    ("S43_FIREWALL_ALLOWED_IP_CIDRS", "10.0.0.0/8,garbage"),
+    ("S43_FIREWALL_ALLOWED_IPS", "10.0.0.0/8,garbage"),
 ])
 def test_invalid_cidr_in_env_fails_from_env(monkeypatch, var, bad):
+    # from_env() runs config.validate(), which parses every CIDR list.
     monkeypatch.setenv(var, bad)
-    with pytest.raises(ValueError, match="invalid IP/CIDR"):
+    with pytest.raises(ValueError, match="invalid CIDR"):
         FirewallConfig.from_env()
 
 
@@ -209,7 +199,7 @@ def test_registration_failure_is_fatal_outside_local():
     r = _import_main({"SENTINEL_ENV": "production", "S43_FIREWALL_ENABLED": "not-a-bool"})
     assert r.returncode != 0, r.stdout + r.stderr
     combined = r.stdout + r.stderr
-    assert "required security control" in combined
+    assert "SentinelFirewall is required" in combined
     assert "FIREWALL_PRESENT=True" not in combined
 
 
@@ -228,7 +218,7 @@ def test_registration_succeeds_by_default():
 def test_invalid_cidr_is_fatal_startup_outside_local():
     r = _import_main({"SENTINEL_ENV": "production", "S43_TRUSTED_PROXIES": "nonsense"})
     assert r.returncode != 0, r.stdout + r.stderr
-    assert "required security control" in (r.stdout + r.stderr)
+    assert "SentinelFirewall is required" in (r.stdout + r.stderr)
 
 
 # ---------------------------------------------------------------------------

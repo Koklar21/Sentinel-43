@@ -100,19 +100,23 @@ class TestRefreshSecret:
     def test_optional_pepper_changes_the_digest(self, monkeypatch):
         secret = S.generate_refresh_secret()
         plain = S.hash_refresh_secret(secret)
-        monkeypatch.setenv("S43_SESSION_HASH_PEPPER", "a-server-side-pepper-value")
+        # S43_SESSION_HASH_PEPPER must supply at least 32 bytes of material.
+        monkeypatch.setenv("S43_SESSION_HASH_PEPPER", "a-server-side-pepper-value-well-over-32-bytes-long")
         peppered = S.hash_refresh_secret(secret)
         assert peppered != plain
         # still self-consistent under the pepper
         assert S.verify_refresh_hash(secret, peppered) is True
 
-    def test_refresh_ttl_env_clamped(self, monkeypatch):
+    def test_refresh_ttl_env_out_of_range_falls_back_to_default(self, monkeypatch):
+        default = 7 * 24 * 3600
         monkeypatch.delenv("S43_SESSION_REFRESH_TTL_SECONDS", raising=False)
-        assert S.refresh_ttl_seconds() == 7 * 24 * 3600
+        assert S.refresh_ttl_seconds() == default
+        # Below the floor or above the ceiling -> reject the operator value and
+        # use the documented default (it does not silently clamp).
         monkeypatch.setenv("S43_SESSION_REFRESH_TTL_SECONDS", "1")
-        assert S.refresh_ttl_seconds() == 300           # floor
+        assert S.refresh_ttl_seconds() == default
         monkeypatch.setenv("S43_SESSION_REFRESH_TTL_SECONDS", "99999999")
-        assert S.refresh_ttl_seconds() == 30 * 24 * 3600  # ceiling
+        assert S.refresh_ttl_seconds() == default
         monkeypatch.setenv("S43_SESSION_REFRESH_TTL_SECONDS", "not-an-int")
         assert S.refresh_ttl_seconds() == 7 * 24 * 3600   # fallback
 
@@ -156,18 +160,20 @@ class TestClaimHelpers:
         assert len({S.new_jti() for _ in range(500)}) == 500
 
     def test_claims_are_session_bound(self):
-        assert S.claims_are_session_bound({"sid": S.new_sid()}) is True
-        assert S.claims_are_session_bound({"sid": "not-a-uuid"}) is False
-        assert S.claims_are_session_bound({"jti": S.new_jti()}) is False  # jti alone
+        # A session-bound token carries BOTH a valid sid and a valid jti.
+        assert S.claims_are_session_bound({"sid": S.new_sid(), "jti": S.new_jti()}) is True
+        assert S.claims_are_session_bound({"sid": S.new_sid()}) is False        # sid alone
+        assert S.claims_are_session_bound({"sid": "not-a-uuid", "jti": S.new_jti()}) is False
+        assert S.claims_are_session_bound({"jti": S.new_jti()}) is False        # jti alone
         assert S.claims_are_session_bound({}) is False
         assert S.claims_are_session_bound("nonsense") is False
         assert S.claims_are_session_bound(None) is False
 
     def test_router_and_module_discriminator_agree(self):
-        sid = S.new_sid()
-        assert auth_module.token_is_session_bound({"sid": sid}) is True
-        assert S.claims_are_session_bound({"sid": sid}) is True
-        assert auth_module.token_is_session_bound({"sid": "x"}) is False
+        bound = {"sid": S.new_sid(), "jti": S.new_jti()}
+        assert auth_module.token_is_session_bound(bound) is True
+        assert S.claims_are_session_bound(bound) is True
+        assert auth_module.token_is_session_bound({"sid": "x", "jti": "y"}) is False
 
 
 # ---------------------------------------------------------------------------
@@ -194,11 +200,12 @@ class TestTokenIssuanceBackCompat:
 
     def test_new_style_token_carries_sid_and_jti(self, jwt_env):
         sid = S.new_sid()
-        token, _ = auth_module._issue_token("operator", "admin", "uid-1", sid=sid)
+        uid = str(uuid_mod.uuid4())  # _issue_token requires a UUID user_id
+        token, _ = auth_module._issue_token("operator", "admin", uid, sid=sid)
         claims = auth_module.verify_jwt_token(token)
         assert claims["sid"] == sid
         assert claims["jti"]
-        assert claims["user_id"] == "uid-1"
+        assert claims["user_id"] == uid
         assert claims["role"] == "admin"
         assert auth_module.token_is_session_bound(claims) is True
 
@@ -245,19 +252,22 @@ class TestTokenIssuanceBackCompat:
             auth_module.verify_jwt_token(forged)
         assert ei.value.status_code == 401
 
-    def test_verify_accepts_wellformed_jti_only_token(self, jwt_env):
-        """A token with jti but no sid is legal (not session-bound)."""
-        ok = pyjwt.encode(
+    def test_verify_rejects_jti_without_sid(self, jwt_env):
+        """`jti` is only valid as part of a session-bound token (sid + jti).
+        A token carrying jti but no sid is malformed and rejected."""
+        _now = int(time.time())
+        forged = pyjwt.encode(
             {
                 "sub": "operator", "role": "operator",
                 "iss": TEST_ISSUER, "aud": TEST_AUDIENCE,
-                "exp": int(time.time()) + 3600, "jti": "abc_DEF-123",
+                "iat": _now, "nbf": _now, "exp": _now + 3600,
+                "jti": "abc_DEF-123",
             },
             TEST_SECRET, algorithm="HS256",
         )
-        claims = auth_module.verify_jwt_token(ok)
-        assert claims["jti"] == "abc_DEF-123"
-        assert auth_module.token_is_session_bound(claims) is False
+        with pytest.raises(HTTPException) as ei:
+            auth_module.verify_jwt_token(forged)
+        assert ei.value.status_code == 401
 
     def test_session_bound_token_has_short_ttl(self, jwt_env, monkeypatch):
         """Approved target: session-bound access token TTL = 15 min (default

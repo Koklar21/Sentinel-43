@@ -57,7 +57,9 @@ def client() -> Generator[TestClient, None, None]:
 
 
 def _broadcast_body() -> dict:
-    return {"event_type": "fenrir_finding", "channel": "security", "data": {"score": 91}}
+    # The route restricts the Fenrir service token to its own "fenrir.*"
+    # event namespace (core.api.main.internal_broadcast_event).
+    return {"event_type": "fenrir.finding", "channel": "security", "data": {"score": 91}}
 
 
 def test_rejects_missing_authorization_header(client: TestClient, monkeypatch):
@@ -126,7 +128,7 @@ def test_accepts_correct_service_token(client: TestClient, monkeypatch):
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["ok"] is True
-    assert body["event_type"] == "fenrir_finding"
+    assert body["event_type"] == "fenrir.finding"
 
 
 __all__: list[str] = []

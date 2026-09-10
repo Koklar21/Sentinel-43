@@ -50,11 +50,11 @@ def _env(monkeypatch):
     monkeypatch.setenv("S43_LOGIN_FAIL_WINDOW_SECONDS", "300")
     monkeypatch.setenv("S43_LOGIN_LOCKOUT_SECONDS", "300")
     # fresh throttle state each test
-    with auth_module._login_lock:
-        auth_module._login_failures.clear()
+    with auth_module._LOGIN_LOCK:
+        auth_module._LOGIN_FAILURES.clear()
     yield
-    with auth_module._login_lock:
-        auth_module._login_failures.clear()
+    with auth_module._LOGIN_LOCK:
+        auth_module._LOGIN_FAILURES.clear()
 
 
 @pytest.fixture
@@ -72,7 +72,9 @@ def test_wrong_password_eventually_locks_out(client):
         assert _login(client).status_code == 401, i
     r = _login(client)
     assert r.status_code == 429
-    assert r.headers.get("Retry-After") == "300"
+    # Retry-After counts down from the 300s lockout; allow for the ~1s the
+    # preceding requests took.
+    assert 295 <= int(r.headers["Retry-After"]) <= 300
 
 
 def test_lockout_is_per_username(client):

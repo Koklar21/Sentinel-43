@@ -102,8 +102,10 @@ _MIN_SYMBOLS = {
     # PR #254 defect list -- cross-checked against the import sweep's own record.
     "core.config": ["get_settings"],
     "core.audit.store": ["AuditStore", "AuditConfig"],
+    # core.security.fenrir_auth was rewritten to a principal-based contract.
     "core.security.fenrir_auth": [
-        "FenrirAuthConfig", "FenrirAuthError", "extract_bearer_token", "verify_fenrir_token",
+        "FenrirPrincipal", "FenrirAuthorizationError", "extract_bearer_token",
+        "principal_from_authenticated_claims", "require_fenrir_scope",
     ],
     "core.detection": [
         "ThreatAssessment", "ThreatKind", "ThreatSeverity", "ThreatSourceKind",
@@ -119,8 +121,15 @@ _MIN_SYMBOLS = {
         "BaseExpectation", "CoreStartupExpectation", "get_default_expectations",
         "ExpectationContract", "SentinelError",
     ],
-    "core.audit": ["AuditEvent", "AuditLogger"],
-    "core.governance.orchestrator": ["build_orchestrator_from_settings"],
+    # core.audit now surfaces the authoritative SQLite/HMAC store + JSONL
+    # mirror; the historical AuditEvent/AuditLogger logger API is gone.
+    "core.audit": ["AuditStore", "AuditConfig", "AuditJsonlMirror"],
+    # The governance composition builder moved to the package root
+    # (core.governance / core.governance.composition); orchestrator.py keeps
+    # the orchestrator + mode enum.
+    "core.governance": ["build_orchestrator_from_settings", "SystemOrchestrator"],
+    "core.governance.orchestrator": ["SystemOrchestrator", "GovernanceMode"],
+    "core.policy_gate": ["GovernanceMode", "GovernanceAction", "PolicyContext", "evaluate"],
 }
 
 
@@ -144,6 +153,9 @@ def test_audit_store_is_usable_not_just_importable(tmp_path):
     store = AuditStore(cfg)
     # append() is the operation core/governance/orchestrator.py relies on.
     assert hasattr(store, "append")
+    # Production lifecycle: core.api.main._start_audit_store() calls
+    # initialize() (schema + integrity verification) before any append().
+    store.initialize()
     rec = store.append({"event": "integrity_test", "n": 1})
     assert rec is not None
 
@@ -158,14 +170,16 @@ def test_core_monitoring_lazy_exports_resolve():
         assert getattr(cm, name) is not None, f"core.monitoring.{name} did not resolve"
 
 
-def test_fenrir_middleware_still_resolves_its_auth_import():
-    """PR #253 deleted core/s34_auth/; PR #254 restored fenrir_auth at the
-    path core/api/middleware/fenrir.py imports it from."""
-    import core.api.middleware.fenrir as fen
+def test_fenrir_auth_exposes_its_canonical_contract():
+    """PR #253 deleted core/s34_auth/; fenrir_auth was restored at
+    core/security/fenrir_auth.py with the principal-based contract that is the
+    canonical Fenrir service-identity surface."""
+    import core.security.fenrir_auth as fa
 
-    for name in ("FenrirAuthConfig", "FenrirAuthError", "verify_fenrir_token",
-                 "extract_bearer_token"):
-        assert hasattr(fen, name), f"fenrir middleware lost {name}"
+    for name in ("FenrirPrincipal", "FenrirAuthorizationError",
+                 "extract_bearer_token", "principal_from_authenticated_claims",
+                 "require_fenrir_scope", "require_fenrir_role"):
+        assert hasattr(fa, name), f"core.security.fenrir_auth lost {name}"
 
 
 def test_dashboard_state_singletons_present():

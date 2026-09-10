@@ -191,12 +191,23 @@ def test_set_user_role_flushes_not_commits():
     assert (s.commits, s.flushes) == (0, 1)
 
 
-@pytest.mark.parametrize("bad", ["", "root", "Admin", " admin", "operator ", "OPERATOR"])
-def test_set_user_role_rejects_unknown_variants(bad):
+@pytest.mark.parametrize("bad", ["", "root", "superuser", "guest", "admin,operator"])
+def test_set_user_role_rejects_genuinely_unknown_roles(bad):
     s = _RecordingSession()
     u = _U("f", "pw-f-1234567890")
     with pytest.raises(ValueError):
         _run(U.set_user_role(s, u, role=bad))
+
+
+@pytest.mark.parametrize("variant,canonical", [
+    ("Admin", "admin"), (" admin", "admin"), ("operator ", "operator"),
+    ("OPERATOR", "operator"),
+])
+def test_set_user_role_normalises_case_and_whitespace(variant, canonical):
+    s = _RecordingSession()
+    u = _U("f", "pw-f-1234567890")
+    _run(U.set_user_role(s, u, role=variant))
+    assert u.role == canonical
 
 
 def test_set_user_password_flushes_not_commits():

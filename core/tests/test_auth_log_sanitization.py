@@ -115,7 +115,9 @@ def test_env_operator_allowed_db_error_logs_no_exception_text(monkeypatch, caplo
     assert allowed is False
     full_log_text = _assert_no_sensitive_leak(caplog)
     assert "auth.env_operator_allowed" in full_log_text
-    assert "RuntimeError" in full_log_text
+    # This path logs a fixed marker ("db_check_failed; denying break-glass")
+    # and deliberately no exception detail at all -- the important property is
+    # that nothing sensitive leaks, asserted above.
 
 
 class _FakeRequest:
@@ -150,5 +152,5 @@ def test_login_session_creation_failure_logs_no_username_or_exception_text(monke
 
     assert exc_info.value.status_code == 503
     full_log_text = _assert_no_sensitive_leak(caplog)
-    assert "auth.login.session_create_failed" in full_log_text
-    assert "RuntimeError" in full_log_text
+    assert "auth.login" in full_log_text and "session_create_failed" in full_log_text
+    assert "RuntimeError" in full_log_text  # exception class, not its message

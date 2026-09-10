@@ -214,7 +214,9 @@ class User(Base):
 
 _engine: AsyncEngine | None = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
-_factory_lock = threading.Lock()
+# Reentrant: get_sessionmaker() holds this while calling get_engine(), which
+# re-acquires it. A plain Lock deadlocks on that first cold call.
+_factory_lock = threading.RLock()
 
 
 def _environment() -> str:
