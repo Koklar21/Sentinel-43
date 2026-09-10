@@ -1267,7 +1267,12 @@ class FenrirHunter:
                 self._post_json(
                     url=self.config.api_broadcast_url,
                     payload={
-                        "event_type": "fenrir_finding",
+                        # Must be "fenrir.*": /internal/events/broadcast
+                        # restricts the Fenrir service token to its own
+                        # namespace and 403s anything else. The former
+                        # "fenrir_finding" (underscore) was rejected on
+                        # every call and counted as broadcast_failures.
+                        "event_type": "fenrir.finding",
                         "channel": "security",
                         "data": finding,
                     },
