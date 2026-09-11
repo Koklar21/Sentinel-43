@@ -61,8 +61,14 @@ class SubsystemState(StrEnum):
     STARTING     initialization in progress
     ACTIVE       running and able to do its job
     DEGRADED     running, but not at full capability
-    UNAVAILABLE  should be running and is not (misconfigured or failed)
+    UNAVAILABLE  enabled but cannot run -- typically not configured
+    FAILED       was running or tried to run, and broke
+    STOPPING     orderly shutdown in progress
     STOPPED      shut down cleanly; not a fault
+
+    UNAVAILABLE and FAILED are both faults but answer different operator
+    questions: "you did not give it what it needs" versus "it broke". Mirrors
+    the STOPPED/FAILED split on WatchtowerState.
     """
 
     DISABLED = "DISABLED"
@@ -70,6 +76,8 @@ class SubsystemState(StrEnum):
     ACTIVE = "ACTIVE"
     DEGRADED = "DEGRADED"
     UNAVAILABLE = "UNAVAILABLE"
+    FAILED = "FAILED"
+    STOPPING = "STOPPING"
     STOPPED = "STOPPED"
 
 
@@ -337,11 +345,21 @@ class SubsystemRegistry:
         *,
         reason: Reason = Reason.START_FAILED,
     ) -> SubsystemStatus:
+        """It broke. Distinct from UNAVAILABLE, which means it was never
+        given what it needs to run."""
         return self.set(
             name,
-            SubsystemState.UNAVAILABLE,
+            SubsystemState.FAILED,
             reason=reason,
             detail=detail,
+        )
+
+    def mark_stopping(self, name: str) -> SubsystemStatus:
+        return self.set(
+            name,
+            SubsystemState.STOPPING,
+            reason=Reason.STOPPED,
+            detail="Shutting down.",
         )
 
     def mark_stopped(self, name: str) -> SubsystemStatus:
