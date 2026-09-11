@@ -34,12 +34,38 @@ SECRET SAFETY
     Dead-letter rows are built by ``sanitize_for_record``, which keeps an
     explicit allowlist of envelope fields and drops everything else --
     including the payload. Tokens, passwords, keys and authorization headers
-    have no path into storage. Fields are kept only if named; there is no
-    redaction pass to rely on.
+    have no path into that sanitized, dashboard-visible projection.
+
+    A SEPARATE, protected column (``replay_payload``, written by
+    ``sanitize_replay_payload`` and read only by
+    ``DeadLetterStore.get_replay_payload``) retains the minimum body needed
+    to faithfully redeliver an event on operator replay. It is never
+    returned by ``get()``/``list_records()``/``DeadLetterRecord.to_dict()``,
+    never logged, bounded in size, and refused (not truncated) rather than
+    persisted if it does not fit -- see the REPLAY FIDELITY note below.
+
+REPLAY FIDELITY
+    A replay must never claim success while redelivering a materially
+    different event than the one that failed. Two consequences follow:
+
+    - Dead-lettering an event without a persisted, faithful replay body
+      records that fact (``replay_payload`` stays NULL), and
+      ``EventReliabilityManager.replay()`` refuses to replay such a record
+      rather than redeliver a payload-less approximation of it. Legacy rows
+      written before this existed are exactly this case.
+    - ``ReplayStatus.REPLAY_IN_PROGRESS`` marks a record BEFORE the delivery
+      attempt, via ``DeadLetterStore.begin_replay_attempt``'s atomic
+      claim, and only ``mark_replay_result`` may move it out of that state.
+      If persisting the outcome fails after a delivery attempt was already
+      made, the row is deliberately left claimed rather than reverted --
+      this module cannot know whether the delivery landed, so it refuses to
+      let an uncertain outcome look safely replayable again. This is an
+      honest at-least-once boundary, not a distributed transaction.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import sqlite3
@@ -387,6 +413,7 @@ class IdempotencyLedger:
 _RECORD_FIELDS: Final[tuple[str, ...]] = (
     "event_id",
     "correlation_id",
+    "parent_event_id",
     "event_type",
     "kind",
     "schema_version",
@@ -401,7 +428,9 @@ def sanitize_for_record(envelope: Mapping[str, Any]) -> dict[str, Any]:
     """Project an event envelope down to the fields safe to persist.
 
     Allowlist only. Anything not named in ``_RECORD_FIELDS`` is dropped,
-    including the payload, which may carry arbitrary producer data.
+    including the payload, which may carry arbitrary producer data. The
+    payload has its own separate, protected persistence path -- see
+    ``sanitize_replay_payload``.
     """
     record: dict[str, Any] = {}
     for field_name in _RECORD_FIELDS:
@@ -423,10 +452,89 @@ def sanitize_reason(reason: Any) -> str:
     return text[:_MAX_REASON_CHARS]
 
 
+#: Bound on the persisted replay body. The dead-letter store already bounds
+#: row COUNT (``max_rows``); this bounds the SIZE of any single row, so one
+#: large producer payload cannot make the underlying SQLite file grow
+#: unpredictably. 64 KiB comfortably holds a Fenrir finding or a Sparta
+#: integrity report; anything larger is refused rather than truncated,
+#: because a truncated body cannot be faithfully redelivered.
+_MAX_REPLAY_PAYLOAD_BYTES: Final[int] = 65536
+
+
+def sanitize_replay_payload(payload: Any) -> str | None:
+    """Bound and serialize the body needed to faithfully replay an event.
+
+    Deliberately NOT the same allowlist as ``sanitize_for_record``: the
+    point of this value is to redeliver the ORIGINAL event, so it is not
+    projected down to a UI-safe subset. What keeps it safe instead:
+      - it is persisted in a column nothing but
+        ``DeadLetterStore.get_replay_payload`` ever reads,
+      - that accessor is called only from replay internals, never from a
+        dashboard/status route,
+      - it is never logged,
+      - it is bounded in size and refused -- not truncated -- when it does
+        not fit, because a truncated replay body is not a faithful one.
+
+    Returns None -- meaning "persist no replay body for this event" -- if
+    the payload is missing, is not JSON-serializable, or exceeds the size
+    bound. None is what makes ``EventReliabilityManager.replay()`` correctly
+    refuse an old or oversized record later instead of fabricating a
+    partial redelivery.
+    """
+    if payload is None:
+        return None
+
+    try:
+        # No `default=` fallback: coercing an unserializable value to its
+        # str() would silently change what gets redelivered, which is
+        # exactly the unfaithful replay this module exists to refuse.
+        encoded = json.dumps(payload, separators=(",", ":"))
+    except (TypeError, ValueError):
+        logger.warning(
+            "Replay payload is not JSON-serializable; this event will be "
+            "recorded as not replayable rather than reconstructed partially."
+        )
+        return None
+
+    if len(encoded.encode("utf-8")) > _MAX_REPLAY_PAYLOAD_BYTES:
+        logger.warning(
+            "Replay payload exceeds %d bytes; this event will be recorded "
+            "as not replayable rather than truncated.",
+            _MAX_REPLAY_PAYLOAD_BYTES,
+        )
+        return None
+
+    return encoded
+
+
 class ReplayStatus(StrEnum):
     PENDING = "pending"
+    #: Claimed by ``begin_replay_attempt`` before a delivery attempt is
+    #: made. Only ``mark_replay_result`` may move a row out of this state.
+    #: Seeing it OUTSIDE the brief window of an in-flight attempt means one
+    #: of two things happened -- a delivery was attempted and persisting its
+    #: result then failed, or the process died between the two -- and in
+    #: both cases this module genuinely does not know whether delivery
+    #: succeeded. It deliberately does not guess: the record stays here,
+    #: ineligible for ordinary replay, until a human reconciles it.
+    REPLAY_IN_PROGRESS = "replay_in_progress"
     REPLAYED_OK = "replayed_ok"
     REPLAY_FAILED = "replay_failed"
+
+
+#: Statuses an ordinary operator replay request may act on.
+_REPLAYABLE_STATUSES: Final[frozenset[str]] = frozenset(
+    {ReplayStatus.PENDING.value, ReplayStatus.REPLAY_FAILED.value}
+)
+
+
+class ReplayEligibility(StrEnum):
+    """Outcome of atomically attempting to claim one replay attempt."""
+
+    CLAIMED = "claimed"
+    NOT_FOUND = "not_found"
+    ALREADY_REPLAYED = "already_replayed"
+    IN_PROGRESS = "in_progress"
 
 
 @dataclass(frozen=True, slots=True)
@@ -434,6 +542,7 @@ class DeadLetterRecord:
     row_id: int
     event_id: str
     correlation_id: str
+    parent_event_id: str
     event_type: str
     schema_version: str
     source: str
@@ -448,12 +557,20 @@ class DeadLetterRecord:
     last_attempt_at: str
     replay_status: str
     replay_attempts: int
+    #: Whether a faithful replay body was persisted for this event -- NOT
+    #: the payload itself (see ``DeadLetterStore.get_replay_payload``, the
+    #: only reader of that protected column). False means an ordinary
+    #: replay request will be refused: either this row predates replay-body
+    #: persistence, or the payload was refused at record time for being
+    #: unserializable or too large (see ``sanitize_replay_payload``).
+    replay_available: bool
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "row_id": self.row_id,
             "event_id": self.event_id,
             "correlation_id": self.correlation_id,
+            "parent_event_id": self.parent_event_id,
             "event_type": self.event_type,
             "schema_version": self.schema_version,
             "source": self.source,
@@ -468,6 +585,7 @@ class DeadLetterRecord:
             "last_attempt_at": self.last_attempt_at,
             "replay_status": self.replay_status,
             "replay_attempts": self.replay_attempts,
+            "replay_available": self.replay_available,
         }
 
 
@@ -476,6 +594,7 @@ CREATE TABLE IF NOT EXISTS dead_letter_events (
     row_id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     event_id               TEXT NOT NULL UNIQUE,
     correlation_id         TEXT NOT NULL DEFAULT '',
+    parent_event_id        TEXT NOT NULL DEFAULT '',
     event_type             TEXT NOT NULL DEFAULT '',
     schema_version         TEXT NOT NULL DEFAULT '',
     source                 TEXT NOT NULL DEFAULT '',
@@ -489,7 +608,8 @@ CREATE TABLE IF NOT EXISTS dead_letter_events (
     first_failed_at        TEXT NOT NULL DEFAULT '',
     last_attempt_at        TEXT NOT NULL DEFAULT '',
     replay_status          TEXT NOT NULL DEFAULT 'pending',
-    replay_attempts        INTEGER NOT NULL DEFAULT 0
+    replay_attempts        INTEGER NOT NULL DEFAULT 0,
+    replay_payload         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_dl_replay_status
     ON dead_letter_events (replay_status);
@@ -544,9 +664,39 @@ class DeadLetterStore:
             connection = self._connect()
             try:
                 connection.executescript(_SCHEMA)
+                self._migrate_schema(connection)
             finally:
                 connection.close()
             self._initialized = True
+
+    def _migrate_schema(self, connection: sqlite3.Connection) -> None:
+        """Additive column migration for a store created before replay
+        fidelity (parent_event_id, replay_payload) existed.
+
+        ``CREATE TABLE IF NOT EXISTS`` does not add columns to a table that
+        already exists, so a dead-letter database from before this change
+        would otherwise be missing them, and every row read would fail.
+        There is no data to backfill: an old row correctly reports
+        ``parent_event_id=''`` and ``replay_available=False`` -- the causal
+        link and the replay body were never captured for it, and pretending
+        otherwise would be exactly the fabrication this module refuses to
+        do (see the REPLAY FIDELITY module note).
+        """
+        existing = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(dead_letter_events)"
+            )
+        }
+        if "parent_event_id" not in existing:
+            connection.execute(
+                "ALTER TABLE dead_letter_events "
+                "ADD COLUMN parent_event_id TEXT NOT NULL DEFAULT ''"
+            )
+        if "replay_payload" not in existing:
+            connection.execute(
+                "ALTER TABLE dead_letter_events ADD COLUMN replay_payload TEXT"
+            )
 
     def _require_ready(self) -> None:
         if not self._initialized:
@@ -566,7 +716,12 @@ class DeadLetterStore:
         """Persist (or update) the dead-letter row for one logical event.
 
         Keyed on ``event_id`` so a retried-then-failed event updates its own
-        row rather than accumulating one row per attempt.
+        row rather than accumulating one row per attempt. ``envelope`` may
+        carry a ``"payload"`` field (the original producer body) -- it is
+        NOT covered by ``sanitize_for_record``'s allowlist; it goes through
+        the separate, protected ``sanitize_replay_payload`` path so a
+        faithful replay stays possible without widening the sanitized,
+        dashboard-visible projection.
         """
         self._require_ready()
 
@@ -575,6 +730,8 @@ class DeadLetterStore:
         if not event_id:
             raise ValueError("cannot dead-letter an event with no event_id")
 
+        replay_payload = sanitize_replay_payload(envelope.get("payload"))
+
         now = _utc_now()
         with self._lock:
             connection = self._connect()
@@ -582,12 +739,13 @@ class DeadLetterStore:
                 connection.execute(
                     """
                     INSERT INTO dead_letter_events (
-                        event_id, correlation_id, event_type, schema_version,
-                        source, source_identity, created_at, ingested_at,
-                        failure_stage, failure_classification, failure_reason,
-                        attempts, first_failed_at, last_attempt_at,
-                        replay_status, replay_attempts
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
+                        event_id, correlation_id, parent_event_id,
+                        event_type, schema_version, source, source_identity,
+                        created_at, ingested_at, failure_stage,
+                        failure_classification, failure_reason, attempts,
+                        first_failed_at, last_attempt_at, replay_status,
+                        replay_attempts, replay_payload
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)
                     ON CONFLICT(event_id) DO UPDATE SET
                         failure_stage          = excluded.failure_stage,
                         failure_classification = excluded.failure_classification,
@@ -598,6 +756,7 @@ class DeadLetterStore:
                     (
                         event_id,
                         safe.get("correlation_id", ""),
+                        safe.get("parent_event_id", ""),
                         safe.get("event_type", "") or safe.get("kind", ""),
                         safe.get("schema_version", ""),
                         safe.get("source", ""),
@@ -611,6 +770,7 @@ class DeadLetterStore:
                         now,
                         now,
                         ReplayStatus.PENDING.value,
+                        replay_payload,
                     ),
                 )
                 self._enforce_bound(connection)
@@ -713,6 +873,113 @@ class DeadLetterStore:
             result[str(row["replay_status"])] = int(row["n"])
         return result
 
+    def begin_replay_attempt(
+        self, event_id: str
+    ) -> tuple[ReplayEligibility, DeadLetterRecord | None]:
+        """Atomically decide whether one replay attempt may proceed.
+
+        This is the ONLY place replay eligibility is decided, and it is a
+        single guarded UPDATE, not a read-then-write: two concurrent replay
+        requests for the same event_id cannot both be told CLAIMED. The
+        winner's row is durably marked ``REPLAY_IN_PROGRESS`` BEFORE the
+        caller may attempt external delivery, so a process crash -- or a
+        later failure to persist the eventual result -- leaves the row in a
+        state that is deliberately NOT eligible for another ordinary replay
+        (see ``ReplayStatus.REPLAY_IN_PROGRESS``): it requires human
+        reconciliation, not an automatic retry.
+
+        This does not build a distributed transaction or exactly-once
+        delivery -- it is what an honest at-least-once boundary looks like
+        with a single SQLite writer, which matches this application's
+        single-replica-safe deployment model.
+        """
+        self._require_ready()
+        now = _utc_now()
+
+        with self._lock:
+            connection = self._connect()
+            try:
+                cursor = connection.execute(
+                    """
+                    UPDATE dead_letter_events
+                    SET replay_status   = ?,
+                        last_attempt_at = ?
+                    WHERE event_id = ? AND replay_status IN (?, ?)
+                    """,
+                    (
+                        ReplayStatus.REPLAY_IN_PROGRESS.value,
+                        now,
+                        str(event_id),
+                        ReplayStatus.PENDING.value,
+                        ReplayStatus.REPLAY_FAILED.value,
+                    ),
+                )
+                claimed = cursor.rowcount == 1
+                row = connection.execute(
+                    "SELECT * FROM dead_letter_events WHERE event_id = ?",
+                    (str(event_id),),
+                ).fetchone()
+            finally:
+                connection.close()
+
+        if row is None:
+            return ReplayEligibility.NOT_FOUND, None
+
+        record = _row_to_record(row)
+        if claimed:
+            return ReplayEligibility.CLAIMED, record
+        if record.replay_status == ReplayStatus.REPLAYED_OK.value:
+            return ReplayEligibility.ALREADY_REPLAYED, record
+        # Anything else not claimed is REPLAY_IN_PROGRESS -- either a
+        # genuinely concurrent attempt or an earlier one whose outcome was
+        # never confirmed. Both refuse identically: only a human can tell
+        # them apart, and only a human may clear it.
+        return ReplayEligibility.IN_PROGRESS, record
+
+    def get_replay_payload(self, event_id: str) -> dict[str, Any] | None:
+        """The minimum body needed to faithfully redeliver one dead-lettered
+        event. INTERNAL REPLAY USE ONLY.
+
+        Never returned by ``get()``, ``list_records()``, or
+        ``DeadLetterRecord.to_dict()`` -- those stay sanitized metadata
+        only, so this is the one path that reads the protected
+        ``replay_payload`` column, and it exists solely for
+        ``EventReliabilityManager.replay()`` to reconstruct what to
+        redeliver. Do not call this from any dashboard/status route.
+
+        Returns None if no replay body was persisted: a legacy row from
+        before this existed, or one whose payload was refused at record
+        time (see ``sanitize_replay_payload``). The caller must treat None
+        as "this event cannot be faithfully replayed," never as an empty
+        payload.
+        """
+        self._require_ready()
+        with self._lock:
+            connection = self._connect()
+            try:
+                row = connection.execute(
+                    "SELECT replay_payload FROM dead_letter_events "
+                    "WHERE event_id = ?",
+                    (str(event_id),),
+                ).fetchone()
+            finally:
+                connection.close()
+
+        if row is None or row["replay_payload"] is None:
+            return None
+
+        try:
+            decoded = json.loads(row["replay_payload"])
+        except (TypeError, ValueError):
+            logger.error(
+                "Stored replay payload for event_id=%s is corrupt JSON; "
+                "treating as not replayable.",
+                event_id,
+            )
+            return None
+
+        return decoded if isinstance(decoded, dict) else None
+
     def mark_replay_result(
         self,
         event_id: str,
@@ -720,7 +987,17 @@ class DeadLetterStore:
         succeeded: bool,
         reason: Any = "",
     ) -> DeadLetterRecord | None:
-        """Record the outcome of one operator-initiated replay attempt."""
+        """Record the outcome of one operator-initiated replay attempt.
+
+        Only applies from ``REPLAY_IN_PROGRESS`` -- the state
+        ``begin_replay_attempt`` puts a row into before delivery is
+        attempted. If no row matches (already resolved by a concurrent
+        writer, or called outside the normal
+        begin-attempt/deliver/mark-result flow), this refuses to overwrite
+        whatever the row's actual state is rather than silently clobbering
+        it, and logs the anomaly -- that should not happen given this
+        module's own call pattern.
+        """
         self._require_ready()
         status = (
             ReplayStatus.REPLAYED_OK
@@ -732,7 +1009,7 @@ class DeadLetterStore:
         with self._lock:
             connection = self._connect()
             try:
-                connection.execute(
+                cursor = connection.execute(
                     """
                     UPDATE dead_letter_events
                     SET replay_status   = ?,
@@ -740,7 +1017,7 @@ class DeadLetterStore:
                         last_attempt_at = ?,
                         failure_reason  = CASE WHEN ? = ''
                                                THEN failure_reason ELSE ? END
-                    WHERE event_id = ?
+                    WHERE event_id = ? AND replay_status = ?
                     """,
                     (
                         status.value,
@@ -748,8 +1025,17 @@ class DeadLetterStore:
                         safe_reason,
                         safe_reason,
                         str(event_id),
+                        ReplayStatus.REPLAY_IN_PROGRESS.value,
                     ),
                 )
+                if cursor.rowcount != 1:
+                    logger.error(
+                        "mark_replay_result for event_id=%s found no row in "
+                        "REPLAY_IN_PROGRESS -- refusing to overwrite its "
+                        "current state. This should not happen outside "
+                        "begin_replay_attempt()->deliver->mark_replay_result.",
+                        event_id,
+                    )
             finally:
                 connection.close()
         return self.get(event_id)
@@ -760,6 +1046,7 @@ def _row_to_record(row: sqlite3.Row) -> DeadLetterRecord:
         row_id=int(row["row_id"]),
         event_id=str(row["event_id"]),
         correlation_id=str(row["correlation_id"]),
+        parent_event_id=str(row["parent_event_id"]),
         event_type=str(row["event_type"]),
         schema_version=str(row["schema_version"]),
         source=str(row["source"]),
@@ -774,6 +1061,7 @@ def _row_to_record(row: sqlite3.Row) -> DeadLetterRecord:
         last_attempt_at=str(row["last_attempt_at"]),
         replay_status=str(row["replay_status"]),
         replay_attempts=int(row["replay_attempts"]),
+        replay_available=row["replay_payload"] is not None,
     )
 
 
@@ -800,6 +1088,9 @@ class ReliabilityMetrics:
         "replay_requested",
         "replay_success",
         "replay_failed",
+        "replay_unavailable",
+        "replay_conflict",
+        "replay_reconciliation_required",
         "queue_overflow",
         "ws_slow_client_disconnect",
     )
@@ -1096,9 +1387,31 @@ class EventReliabilityManager:
         """Replay one dead-lettered event on explicit operator instruction.
 
         Never runs on a timer and never loops: one operator request produces
-        at most one delivery attempt. The replayed event keeps its original
-        event_id and provenance -- it is the same logical event being
-        delivered again, not a new origination.
+        at most one delivery attempt, and only when every eligibility check
+        below passes. The replayed event keeps its original event_id and
+        provenance, reconstructed from the protected replay body -- it is
+        the same logical event being delivered again, not a new
+        origination, and not an approximation of one.
+
+        Eligibility is checked in this order; the first failure wins and no
+        delivery attempt is made:
+          1. the record must exist                    -> else "unknown_event_id"
+          2. a faithful replay body must have been
+             persisted for it                          -> else "replay_unavailable"
+          3. it must not already be REPLAYED_OK         -> else "already_replayed"
+          4. it must not have another attempt
+             outstanding or unresolved                  -> else "replay_in_progress"
+        Steps 3 and 4 are enforced atomically by
+        ``DeadLetterStore.begin_replay_attempt``, not inferred from a
+        separate read.
+
+        If persisting the delivery outcome fails AFTER a delivery attempt
+        was made, this does not report a clean success or a clean failure
+        -- it returns "reconciliation_required" and leaves the record
+        claimed (see the REPLAY FIDELITY module note): this module would
+        rather require a human to resolve an uncertain outcome than let a
+        second automatic attempt risk redelivering an event that may
+        already have landed.
         """
         store = self.dead_letter_store
         if store is None:
@@ -1118,6 +1431,67 @@ class EventReliabilityManager:
                 reason="unknown_event_id",
             )
 
+        payload = store.get_replay_payload(event_id)
+        if payload is None:
+            self.metrics.increment("replay_unavailable")
+            self._audit(
+                event_id=record.event_id,
+                correlation_id=record.correlation_id,
+                delivery_state=DeliveryState.FAILED_TERMINAL.value,
+                replay=True,
+                operator=operator_id,
+                failure_reason="replay_unavailable",
+            )
+            return DeliveryOutcome(
+                state=DeliveryState.FAILED_TERMINAL,
+                event_id=record.event_id,
+                correlation_id=record.correlation_id,
+                attempts=0,
+                reason="replay_unavailable",
+            )
+
+        eligibility, claimed_record = store.begin_replay_attempt(event_id)
+
+        if eligibility is ReplayEligibility.NOT_FOUND:
+            # Deleted between the two reads above (eviction, concurrent
+            # admin action). Same outward reason as never having existed.
+            return DeliveryOutcome(
+                state=DeliveryState.FAILED_TERMINAL,
+                event_id=str(event_id),
+                correlation_id="",
+                attempts=0,
+                reason="unknown_event_id",
+            )
+
+        if eligibility in (
+            ReplayEligibility.ALREADY_REPLAYED,
+            ReplayEligibility.IN_PROGRESS,
+        ):
+            conflict_reason = (
+                "already_replayed"
+                if eligibility is ReplayEligibility.ALREADY_REPLAYED
+                else "replay_in_progress"
+            )
+            self.metrics.increment("replay_conflict")
+            self._audit(
+                event_id=record.event_id,
+                correlation_id=record.correlation_id,
+                delivery_state=DeliveryState.FAILED_TERMINAL.value,
+                replay=True,
+                operator=operator_id,
+                failure_reason=conflict_reason,
+            )
+            return DeliveryOutcome(
+                state=DeliveryState.FAILED_TERMINAL,
+                event_id=record.event_id,
+                correlation_id=record.correlation_id,
+                attempts=0,
+                reason=conflict_reason,
+            )
+
+        # eligibility is CLAIMED: exactly one delivery attempt follows, and
+        # the row is already durably REPLAY_IN_PROGRESS.
+        record = claimed_record or record
         self.metrics.increment("replay_requested")
         self._audit(
             event_id=record.event_id,
@@ -1127,16 +1501,17 @@ class EventReliabilityManager:
             operator=operator_id,
         )
 
-        # Original identity and provenance are what get replayed.
+        # Original identity, causal linkage, and the protected replay body
+        # are what get redelivered -- never audited or logged as a whole.
         envelope = {
+            **payload,
             "event_id": record.event_id,
             "correlation_id": record.correlation_id,
+            "parent_event_id": record.parent_event_id,
             "event_type": record.event_type,
             "schema_version": record.schema_version,
             "source": record.source,
             "source_identity": record.source_identity,
-            "created_at": record.created_at,
-            "ingested_at": record.ingested_at,
             "replay_of": record.event_id,
         }
 
@@ -1149,11 +1524,49 @@ class EventReliabilityManager:
                 reason=type(exc).__name__,
             )
 
-        store.mark_replay_result(
-            record.event_id,
-            succeeded=result.ok,
-            reason="" if result.ok else result.reason,
-        )
+        try:
+            store.mark_replay_result(
+                record.event_id,
+                succeeded=result.ok,
+                reason="" if result.ok else result.reason,
+            )
+        except Exception:
+            # The delivery attempt above may already have reached
+            # Watchtower -- this genuinely does not know. The row is left
+            # exactly where begin_replay_attempt put it
+            # (REPLAY_IN_PROGRESS), which ordinary replay cannot act on.
+            # Reported as its own outcome rather than as a clean failure
+            # (it might have succeeded) or a clean success (persisting that
+            # fact just failed).
+            logger.error(
+                "Failed to persist a replay result for event_id=%s after a "
+                "delivery attempt (delivery reported ok=%s) -- the record "
+                "is left REPLAY_IN_PROGRESS and requires manual "
+                "reconciliation; it will not be replayed again "
+                "automatically.",
+                record.event_id,
+                result.ok,
+                exc_info=True,
+            )
+            self.metrics.increment("replay_reconciliation_required")
+            self._audit(
+                event_id=record.event_id,
+                correlation_id=record.correlation_id,
+                delivery_state="RECONCILIATION_REQUIRED",
+                replay=True,
+                operator=operator_id,
+                attempts=1,
+                reconciliation_required=True,
+                delivery_may_have_succeeded=result.ok,
+            )
+            return DeliveryOutcome(
+                state=DeliveryState.FAILED_TERMINAL,
+                event_id=record.event_id,
+                correlation_id=record.correlation_id,
+                attempts=1,
+                reason="reconciliation_required",
+                status_code=result.status_code,
+            )
 
         if result.ok:
             self.metrics.increment("replay_success")
@@ -1219,10 +1632,12 @@ __all__ = [
     "IdempotencyDecision",
     "IdempotencyLedger",
     "ReliabilityMetrics",
+    "ReplayEligibility",
     "ReplayStatus",
     "RetryPolicy",
     "Retryability",
     "classify_delivery_result",
     "sanitize_for_record",
     "sanitize_reason",
+    "sanitize_replay_payload",
 ]

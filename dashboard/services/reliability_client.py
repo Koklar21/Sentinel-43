@@ -46,9 +46,11 @@ ENDPOINTS: dict[str, str] = {
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 500
 
-#: Replay statuses the API reports.
+#: Replay statuses the API reports. "replay_in_progress" marks a record
+#: claimed for a delivery attempt whose outcome has not yet been confirmed
+#: persisted -- see core/reliability.py's ReplayStatus docstring.
 REPLAY_STATUSES: frozenset[str] = frozenset(
-    {"pending", "replayed_ok", "replay_failed"}
+    {"pending", "replayed_ok", "replay_failed", "replay_in_progress"}
 )
 
 #: Event ids are echoed into a URL path, so they are constrained to a boring
@@ -61,6 +63,7 @@ _EVENT_ID_RE: re.Pattern[str] = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
 _DISPLAY_FIELDS: tuple[str, ...] = (
     "event_id",
     "correlation_id",
+    "parent_event_id",
     "event_type",
     "schema_version",
     "source",
@@ -73,6 +76,10 @@ _DISPLAY_FIELDS: tuple[str, ...] = (
     "last_attempt_at",
     "replay_status",
     "replay_attempts",
+    # Whether a faithfully replayable body was persisted -- NOT the body
+    # itself. The API never returns that; see core/reliability.py's
+    # DeadLetterStore.get_replay_payload docstring.
+    "replay_available",
 )
 
 
