@@ -21,6 +21,10 @@ SNAPSHOT_ENDPOINTS = {
     "health": "/health",
     "ready": "/ready",
     "status": "/status",
+    # The canonical subsystem lifecycle surface. "/status" is the coarse
+    # anonymous one and reports only "online" -- it cannot distinguish a
+    # disabled subsystem from a failed one.
+    "system_status": "/system/status",
     "metrics": "/metrics",
     "routes": "/system/routes",
     "routes_status": "/system/routes/status",
@@ -274,3 +278,123 @@ def get_health_snapshot(
         headers={},
         is_json=True,
     ).to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Canonical subsystem lifecycle
+#
+# The runtime reports each subsystem in one of eight states. Collapsing those
+# into online/offline destroys the distinction an operator actually needs:
+# "turned off on purpose" is not "broken", and "enabled but never configured"
+# is not "it crashed".
+# ---------------------------------------------------------------------------
+
+#: Mirrors core.lifecycle.SubsystemState.
+SUBSYSTEM_STATES: frozenset[str] = frozenset({
+    "DISABLED", "STARTING", "ACTIVE", "DEGRADED",
+    "UNAVAILABLE", "FAILED", "STOPPING", "STOPPED",
+})
+
+#: States that are not faults: behaving exactly as configured.
+NON_FAULT_STATES: frozenset[str] = frozenset({"DISABLED", "ACTIVE", "STOPPED"})
+
+
+def get_system_status(client: ApiClient | None = None) -> dict[str, Any]:
+    """Authoritative subsystem lifecycle snapshot (operator-authenticated)."""
+    return _get_with_retry(client, SNAPSHOT_ENDPOINTS["system_status"])
+
+
+def summarize_subsystems(system_status: dict[str, Any]) -> dict[str, Any]:
+    """Reduce a /system/status body to a display-ready subsystem summary.
+
+    Preserves each subsystem's real state and never infers health from an
+    object merely existing. An unrecognised state is reported as-is and
+    treated as a fault rather than being silently mapped to healthy.
+    """
+    data = system_status.get("data") if isinstance(system_status, dict) else None
+    if not isinstance(data, dict):
+        data = system_status if isinstance(system_status, dict) else {}
+
+    subsystems = data.get("subsystems")
+    if not isinstance(subsystems, dict):
+        return {
+            "available": False,
+            "subsystems": {},
+            "degraded": [],
+            "failed": [],
+            "disabled": [],
+        }
+
+    summary: dict[str, dict[str, Any]] = {}
+    degraded: list[str] = []
+    failed: list[str] = []
+    disabled: list[str] = []
+
+    for name, record in sorted(subsystems.items()):
+        if not isinstance(record, dict):
+            continue
+
+        state = str(record.get("state") or "").strip().upper()
+        known = state in SUBSYSTEM_STATES
+        summary[name] = {
+            "state": state or "UNKNOWN",
+            "known_state": known,
+            "required": bool(record.get("required")),
+            "configured": bool(record.get("configured")),
+            "reason": str(record.get("reason") or ""),
+            "detail": str(record.get("detail") or ""),
+            "missing": list(record.get("missing") or []),
+            # An unrecognised state is NOT evidence of health.
+            "faulted": (not known) or state not in NON_FAULT_STATES,
+        }
+
+        if state == "DISABLED":
+            disabled.append(name)
+        elif state in ("FAILED", "UNAVAILABLE"):
+            failed.append(name)
+        elif summary[name]["faulted"]:
+            degraded.append(name)
+
+    return {
+        "available": True,
+        "subsystems": summary,
+        "degraded": degraded,
+        "failed": failed,
+        "disabled": disabled,
+    }
+
+
+def classify_runtime(
+    health: dict[str, Any],
+    ready: dict[str, Any],
+) -> dict[str, Any]:
+    """Distinguish HEALTH from READINESS from DEGRADED.
+
+    They answer different questions and must not be merged:
+      health    -- is the process alive?
+      readiness -- can it actually do its job right now?
+      degraded  -- it is serving, but something optional is not well.
+    """
+    alive = bool(health.get("ok"))
+    ready_ok = bool(ready.get("ok"))
+
+    body = ready.get("data") if isinstance(ready.get("data"), dict) else {}
+    degraded = list(body.get("degraded") or [])
+    blocking = list(body.get("blocking") or [])
+
+    if not alive:
+        state = "UNAVAILABLE"
+    elif not ready_ok:
+        state = "NOT_READY"
+    elif degraded:
+        state = "DEGRADED"
+    else:
+        state = "READY"
+
+    return {
+        "state": state,
+        "alive": alive,
+        "ready": ready_ok,
+        "degraded": degraded,
+        "blocking": blocking,
+    }
