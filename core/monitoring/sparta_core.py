@@ -58,6 +58,10 @@ from typing import Any, Protocol, runtime_checkable
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from .event_types import (
+    INTEGRITY_STATUS_COMPROMISED,
+    INTEGRITY_STATUS_OK,
+)
 from ..security_context import (
     UNKNOWN_CLIENT,
     IdentityType,
@@ -114,6 +118,21 @@ def _env_float(name: str, default: float, *, lo: float, hi: float) -> float:
     except ValueError:
         return default
     return max(lo, min(hi, value))
+
+
+def _secret_equals(supplied: str, expected: str) -> bool:
+    """Constant-time credential comparison that cannot be forced to 500.
+
+    ``secrets.compare_digest`` raises TypeError when given a str containing
+    non-ASCII characters, so a client sending a non-ASCII credential could
+    turn an intended 401 into an unhandled 500. Comparing UTF-8 bytes keeps
+    the comparison constant-time while accepting any input a client can send.
+    Mirrors the hardened pattern in core.monitoring.watchtower.
+    """
+    return secrets.compare_digest(
+        str(supplied).encode("utf-8"),
+        str(expected).encode("utf-8"),
+    )
 
 
 def _json_size_bytes(obj: Any) -> int:
@@ -447,7 +466,11 @@ class SpartaCore:
         compromised = event.state_at_event is SpartaState.COMPROMISED
         monitoring_event = {
             "kind": "log",
-            "integrity_status": "compromised" if compromised else "ok",
+            "integrity_status": (
+                INTEGRITY_STATUS_COMPROMISED
+                if compromised
+                else INTEGRITY_STATUS_OK
+            ),
             "missing_required_fields": False,
             # Normalized envelope provenance.
             "source": event.source or "SpartaCore",
@@ -927,7 +950,7 @@ def _verify_token(token: str, secret: str) -> str | None:
             secret.encode(), payload.encode(), hashlib.sha256
         ).hexdigest()
 
-        if not secrets.compare_digest(provided_sig, expected_sig):
+        if not _secret_equals(provided_sig, expected_sig):
             return None
 
         return node_id
@@ -971,7 +994,7 @@ def _require_node_token(
             detail="Missing bearer token.",
         )
 
-    if not secrets.compare_digest(token, config.node_api_token):
+    if not _secret_equals(token, config.node_api_token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid node API token.",
@@ -1082,7 +1105,7 @@ def create_node_router(
         core = _guard(request, authorization)
         cfg = core._config
 
-        if not secrets.compare_digest(body.credential, cfg.node_api_token):
+        if not _secret_equals(body.credential, cfg.node_api_token):
             core._record_auth_failure(
                 core.get_client_id(request), "invalid_body_credential"
             )

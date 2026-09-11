@@ -103,6 +103,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from ..logging.health_check_filter import install_health_check_access_filter
+from .event_types import (
+    INTEGRITY_STATUS_COMPROMISED,
+    KNOWN_INTEGRITY_STATUSES,
+)
 
 # Watchtower's own /watchtower/health and /watchtower/ready are polled
 # routinely (Docker, external monitors, s43-api's own bridge routes) and,
@@ -554,9 +558,24 @@ class WatchtowerSegment:
                 severity = AlertSeverity.MEDIUM
 
         elif tower_type == TowerType.LOGGING_AUDIT and kind == "log":
-            if event.get("integrity_status") == "tampered":
-                reason = "Log integrity issue detected"
+            # Canonical vocabulary shared with the producer. This previously
+            # matched only "tampered", a value nothing in the codebase ever
+            # emits -- so a genuine SpartaCore integrity compromise
+            # ("compromised") traversed the scanner and raised no alert.
+            integrity_status = str(
+                event.get("integrity_status") or ""
+            ).strip().lower()
+
+            if integrity_status == INTEGRITY_STATUS_COMPROMISED:
+                reason = "Integrity compromise detected"
                 severity = AlertSeverity.CRITICAL
+            elif (
+                integrity_status
+                and integrity_status not in KNOWN_INTEGRITY_STATUSES
+            ):
+                # Fail safe: an unrecognised status is not evidence of health.
+                reason = "Unrecognised integrity status reported"
+                severity = AlertSeverity.HIGH
             elif event.get("audit_write_failed", False):
                 reason = "Audit write failure detected"
                 severity = AlertSeverity.CRITICAL
