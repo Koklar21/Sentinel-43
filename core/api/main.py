@@ -864,6 +864,42 @@ async def _ws_safe_close(
             pass
 
 
+async def _ws_send_error_then_close(
+    websocket: WebSocket,
+    *,
+    error: str,
+    code: int = 1008,
+    reason: str = "",
+) -> None:
+    """Deliver a terminal error frame, then close -- in that guaranteed order.
+
+    The regular outbound path (``_queue_ws_frame`` -> the client's writer
+    task) is fire-and-forget: it enqueues and returns immediately, with no
+    guarantee the frame was actually written before the caller's next
+    ``await``. That is fine for ordinary broadcast traffic, but wrong for a
+    frame telling the client WHY it is about to be disconnected -- queuing
+    that frame and then immediately closing races the writer task, and the
+    close can reach the client first, silently dropping the explanation.
+    (A real network usually hides this by adding enough latency for the
+    writer to run first; it reproduces reliably against an in-process
+    TestClient with no such delay.)
+
+    Sent directly, bypassing the queue, and awaited before the close call
+    returns -- so the reason is guaranteed delivered whenever the transport
+    accepts it at all. Best-effort: if the send itself fails, the socket is
+    already going away regardless, and the close's own `reason` string still
+    carries the same information at the protocol level.
+    """
+    try:
+        await asyncio.wait_for(
+            websocket.send_json({"type": "error", "payload": {"error": error}}),
+            timeout=float(WS_SEND_TIMEOUT_SECONDS),
+        )
+    except Exception:
+        pass
+    await _ws_safe_close(websocket, code=code, reason=reason)
+
+
 async def _ws_writer(client: WebSocketClient) -> None:
     try:
         while True:
@@ -1858,13 +1894,18 @@ async def _shutdown_runtime() -> None:
         clients = list(runtime.ws_clients.values())
 
     for client in clients:
-        await _queue_ws_frame(
-            client,
-            {
-                "type": "server_shutdown",
-                "payload": {"timestamp": utc_now()},
-            },
-        )
+        try:
+            await asyncio.wait_for(
+                client.websocket.send_json(
+                    {
+                        "type": "server_shutdown",
+                        "payload": {"timestamp": utc_now()},
+                    }
+                ),
+                timeout=float(WS_SEND_TIMEOUT_SECONDS),
+            )
+        except Exception:
+            pass
         await _ws_safe_close(
             client.websocket,
             code=1012,
@@ -2631,15 +2672,12 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
             except asyncio.TimeoutError:
                 ok, reason = await _session_still_valid(client)
                 if not ok:
-                    await _queue_ws_frame(
-                        client,
-                        {
-                            "type": "error",
-                            "payload": {"error": reason},
-                        },
-                    )
-                    await _ws_safe_close(
+                    # Sent directly and awaited, not queued -- see
+                    # _ws_send_error_then_close's docstring for why the
+                    # queue races the close it precedes.
+                    await _ws_send_error_then_close(
                         websocket,
+                        error=reason,
                         code=1011
                         if reason == "auth_service_unavailable"
                         else 1008,
@@ -2659,15 +2697,9 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
 
             ok, reason = await _session_still_valid(client)
             if not ok:
-                await _queue_ws_frame(
-                    client,
-                    {
-                        "type": "error",
-                        "payload": {"error": reason},
-                    },
-                )
-                await _ws_safe_close(
+                await _ws_send_error_then_close(
                     websocket,
+                    error=reason,
                     code=1011
                     if reason == "auth_service_unavailable"
                     else 1008,

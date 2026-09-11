@@ -40,6 +40,40 @@ pytestmark = pytest.mark.skipif(
     not _DSN, reason="set S43_TEST_PG_DSN to a disposable PostgreSQL to run"
 )
 
+# core/api/main.py reads SENTINEL_ENV (and S43_JWT_SECRET, S43_TRUSTED_HOSTS,
+# S43_TLS_TERMINATED_AT_TRUSTED_EDGE, ...) into frozen module-level constants
+# (IS_LOCAL_ENV, JWT_SECRET, _TRUSTED_HOSTS, ...) exactly ONCE, at the first
+# `import core.api.main` anywhere in the process -- never re-read per test,
+# regardless of a later monkeypatch.setenv.
+#
+# This file's `_clean` fixture below is autouse and monkeypatches
+# SENTINEL_ENV to "production"/"development" for its own coverage of
+# core.auth.schema_version's `_check_enabled()`, which DOES read the
+# environment live -- that part is fine. The problem is three tests here
+# build a bare `TestClient(main_module.app)` with NO lifespan, purely to
+# exercise /ready or /health, via a deferred `import core.api.main` inside
+# the test function -- so if that import happens to be the FIRST one in the
+# whole pytest run (it is, per this file's position in
+# .github/workflows/k8s.yml's PG-suite command), it freezes IS_LOCAL_ENV as
+# whatever _clean's autouse fixture happened to monkeypatch for THAT test
+# ("production"), not this file's own intent. Every OTHER PG test file in
+# the same run that DOES exercise the full lifespan (test_auth_session_pg.py,
+# test_ws_session_pg.py) then inherits that frozen "production" state and
+# fails core.api.main's non-local startup validation
+# (S43_TRUSTED_HOSTS / S43_TLS_TERMINATED_AT_TRUSTED_EDGE) -- their own
+# monkeypatch.setenv("SENTINEL_ENV", "test") is already too late to matter.
+#
+# Importing it here, eagerly, at collection time -- before any fixture in
+# this file has had a chance to run -- pins that freeze to a known-safe
+# local environment instead, deterministically, regardless of import order
+# in later files.
+os.environ.setdefault("SENTINEL_ENV", "test")
+os.environ.setdefault(
+    "S43_JWT_SECRET", "test-secret-for-schema-version-pg-collection"
+)
+os.environ.setdefault("S43_JWT_ALGORITHM", "HS256")
+import core.api.main as _pin_core_api_main_import  # noqa: F401,E402
+
 _SYNC_DSN = (_DSN or "").replace("+asyncpg", "+psycopg")
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _DROP_ALL = "DROP TABLE IF EXISTS sessions, users, alembic_version CASCADE"
