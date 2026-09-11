@@ -63,16 +63,22 @@ services:
 
     environment:
       S43_ENV: ${S43_ENV:-production}
+      SENTINEL_ENV: ${SENTINEL_ENV:-${S43_ENV:-production}}
       S43_LOG_LEVEL: ${S43_LOG_LEVEL:-INFO}
 
       S43_WATCHTOWER_HOST: 0.0.0.0
       S43_WATCHTOWER_PORT: "9100"
       S43_WATCHTOWER_SERVICE_TOKEN: ${S43_WATCHTOWER_SERVICE_TOKEN}
 
+      # Watchtower operator-admin identity, distinct from the internal service
+      # token above (X-S43-Admin-Token). Empty = unconfigured: the admin route
+      # answers 503 rather than accepting anonymously.
+      S43_ADMIN_TOKEN: ${S43_ADMIN_TOKEN:-}
+
       DATABASE_URL: ${DATABASE_URL}
 
-      S43_AUDIT_HMAC_KEY: ${S43_AUDIT_HMAC_KEY}
-      S43_SESSION_HASH_PEPPER: ${S43_SESSION_HASH_PEPPER}
+      S43_AUDIT_HMAC_KEY: ${S43_AUDIT_HMAC_KEY:?S43_AUDIT_HMAC_KEY is required}
+      S43_SESSION_HASH_PEPPER: ${S43_SESSION_HASH_PEPPER:?S43_SESSION_HASH_PEPPER is required}
 
     depends_on:
       s43-db:
@@ -102,6 +108,7 @@ services:
 
     environment:
       S43_ENV: ${S43_ENV:-production}
+      SENTINEL_ENV: ${SENTINEL_ENV:-${S43_ENV:-production}}
       S43_LOG_LEVEL: ${S43_LOG_LEVEL:-INFO}
       DATABASE_URL: ${DATABASE_URL}
 
@@ -139,6 +146,7 @@ services:
     environment:
       # Runtime
       S43_ENV: ${S43_ENV:-production}
+      SENTINEL_ENV: ${SENTINEL_ENV:-${S43_ENV:-production}}
       S43_LOG_LEVEL: ${S43_LOG_LEVEL:-INFO}
 
       # Transport / trusted proxy boundary
@@ -168,7 +176,7 @@ services:
 
       # Auth/session integrity
       S43_AUTH_PEPPER: ${S43_AUTH_PEPPER}
-      S43_SESSION_HASH_PEPPER: ${S43_SESSION_HASH_PEPPER}
+      S43_SESSION_HASH_PEPPER: ${S43_SESSION_HASH_PEPPER:?S43_SESSION_HASH_PEPPER is required}
       S43_SESSION_ACCESS_TTL_SECONDS: ${S43_SESSION_ACCESS_TTL_SECONDS:-900}
       S43_SESSION_REFRESH_TTL_SECONDS: ${S43_SESSION_REFRESH_TTL_SECONDS:-604800}
       S43_WS_SESSION_RECHECK_SECONDS: ${S43_WS_SESSION_RECHECK_SECONDS:-60}
@@ -191,15 +199,53 @@ services:
       S43_FENRIR_ANOMALY_DECAY: ${S43_FENRIR_ANOMALY_DECAY:-0.002}
       S43_FENRIR_MAX_HONEYPOT_EVENTS: ${S43_FENRIR_MAX_HONEYPOT_EVENTS:-500}
 
+      # FenrirHunter runs embedded in this container and reports back through
+      # the API bridge under its OWN service identity (never the Watchtower
+      # service token). Without these it reaches HUNTING but has no report
+      # target and no credential, so every finding is dropped.
+      # Empty token = unconfigured: /internal/events/broadcast and
+      # /watchtower/events answer 503 rather than accepting anonymously.
+      S43_FENRIR_API_TOKEN: ${S43_FENRIR_API_TOKEN:-}
+      S43_FENRIR_WATCHTOWER_URL: ${S43_FENRIR_WATCHTOWER_URL:-http://s43-api:8000/watchtower/events}
+      S43_FENRIR_BROADCAST_URL: ${S43_FENRIR_BROADCAST_URL:-http://s43-api:8000/internal/events/broadcast}
+      S43_FENRIR_REPORT_TIMEOUT: ${S43_FENRIR_REPORT_TIMEOUT:-2.0}
+
       # Optional observational subsystems
       S43_SPARTA_ENABLED: ${S43_SPARTA_ENABLED:-false}
       S43_JORM_ENABLED: ${S43_JORM_ENABLED:-false}
+
+      # SpartaCore integrity watchdog + /node router.
+      # Only consulted when S43_SPARTA_ENABLED=true; an empty node token keeps
+      # the /node routes fail-closed (503) instead of serving anonymously.
+      S43_SPARTA_NODE_TOKEN: ${S43_SPARTA_NODE_TOKEN:-}
+      S43_SPARTA_TOKEN_SECRET: ${S43_SPARTA_TOKEN_SECRET:-}
+      S43_SPARTA_NODE_SIGNATURE: ${S43_SPARTA_NODE_SIGNATURE:-sparta-core}
+      S43_SPARTA_PUBLIC_HEALTH_DETAIL: ${S43_SPARTA_PUBLIC_HEALTH_DETAIL:-false}
+      S43_SPARTA_CHECK_INTERVAL: ${S43_SPARTA_CHECK_INTERVAL:-30.0}
+
+      # Watched-file digests. main.py scans os.environ for the
+      # S43_SPARTA_HASH_ prefix, so these are declared value-less: Compose then
+      # passes each through ONLY when it is set on the host and omits it
+      # otherwise. Do not give these a "${VAR:-}" default -- an empty digest
+      # is not skipped, it fails IntegrityConfig validation at startup.
+      #
+      # Key -> path: the suffix is lowercased and EVERY "_" becomes "/", so
+      # write the file extension with a literal dot:
+      #     …_CORE_API_MAIN.PY  ->  core/api/main.py
+      # Because every underscore becomes a separator, a path whose directory
+      # or file name itself contains "_" cannot be expressed this way
+      # (…_SPARTA_CORE.PY resolves to core/monitoring/sparta/core.py, not
+      # sparta_core.py). The three slots below are underscore-free on purpose:
+      # the composition root, the Watchtower node, and the audit authority.
+      S43_SPARTA_HASH_CORE_API_MAIN.PY:
+      S43_SPARTA_HASH_CORE_MONITORING_WATCHTOWER.PY:
+      S43_SPARTA_HASH_CORE_AUDIT_STORE.PY:
 
       # Local-only test hook. Production bootstrap must reject true.
       S43_ENABLE_TEST_INJECTION: ${S43_ENABLE_TEST_INJECTION:-false}
 
       # Audit authority
-      S43_AUDIT_HMAC_KEY: ${S43_AUDIT_HMAC_KEY}
+      S43_AUDIT_HMAC_KEY: ${S43_AUDIT_HMAC_KEY:?S43_AUDIT_HMAC_KEY is required}
 
     volumes:
       - sentinel43_state:/app/sentinel43_state
@@ -263,7 +309,7 @@ services:
 
     entrypoint:
       - python
-      - scripts/generate_secrets.py
+      - core/scripts/generate_secrets.py
 
     command: []
 
