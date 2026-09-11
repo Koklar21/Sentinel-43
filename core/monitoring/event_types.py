@@ -41,6 +41,19 @@ EVENT_SCHEMA_VERSION: Final[str] = "1.0"
 SUPPORTED_SCHEMA_VERSIONS: Final[frozenset[str]] = frozenset({"1.0"})
 
 
+#: Canonical integrity-status vocabulary for LogEvent.integrity_status.
+#: Producer (SpartaCore) and scanner (WatchtowerNode) must agree on these
+#: exact values -- a second, undocumented vocabulary is how a real integrity
+#: compromise reaches the scanner and produces no alert.
+INTEGRITY_STATUS_OK: Final[str] = "ok"
+INTEGRITY_STATUS_COMPROMISED: Final[str] = "compromised"
+
+#: Anything outside this set is treated as suspect, never as healthy.
+KNOWN_INTEGRITY_STATUSES: Final[frozenset[str]] = frozenset(
+    {INTEGRITY_STATUS_OK, INTEGRITY_STATUS_COMPROMISED}
+)
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -480,18 +493,60 @@ def normalize_event(
         "kind"
     ] = kind
 
-    if not local_event.get(
-        "id"
-    ):
-        local_event[
-            "id"
-        ] = str(
-            uuid.uuid4()
+    # Event identity. "event_id" is the envelope's outward name for the same
+    # value as the internal "id" field, so a producer may supply either.
+    #
+    # Order matters: generating a fallback id BEFORE consulting "event_id"
+    # made the producer-supplied identifier unreachable and silently replaced
+    # it with a fresh UUID, breaking any cross-system correlation the
+    # producer had established. Resolve the supplied identity first, and
+    # generate exactly once only when neither was given.
+    #
+    # Event identity is NOT correlation identity: correlation_id is a separate
+    # envelope field and is never derived from, or used as, the event id.
+    raw_event_id = local_event.get("event_id")
+    raw_id = local_event.get("id")
+
+    supplied_event_id = str(
+        raw_event_id or ""
+    ).strip()
+
+    supplied_id = str(
+        raw_id or ""
+    ).strip()
+
+    # A key that is present but blank is malformed input, not an absent one.
+    # Generating a fresh identity for it would silently accept a producer bug;
+    # reject instead, matching BaseEvent's own "must not be empty" contract.
+    if raw_event_id is not None and not supplied_event_id:
+        raise ValueError(
+            "event_id must not be empty"
         )
 
-    # Accept "event_id" as an inbound alias for the envelope's id.
-    if not local_event.get("id") and local_event.get("event_id"):
-        local_event["id"] = local_event["event_id"]
+    if raw_id is not None and not supplied_id:
+        raise ValueError(
+            "event id must not be empty"
+        )
+
+    if (
+        supplied_event_id
+        and supplied_id
+        and supplied_event_id != supplied_id
+    ):
+        # Two different identities for one event is ambiguous. Reject rather
+        # than silently picking one and discarding the other.
+        raise ValueError(
+            "conflicting event identity: "
+            f"id={supplied_id!r} != event_id={supplied_event_id!r}"
+        )
+
+    resolved_id = (
+        supplied_event_id
+        or supplied_id
+        or str(uuid.uuid4())
+    )
+
+    local_event["id"] = resolved_id
     local_event.pop("event_id", None)
 
     # Reject an unsupported envelope version explicitly and BEFORE

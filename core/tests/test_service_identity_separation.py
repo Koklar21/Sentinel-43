@@ -299,11 +299,26 @@ class TestSpartaNodeBoundary:
     def test_sparta_verifier_uses_constant_time_compare_only(self, env):
         import inspect
         from core.monitoring import sparta_core as sc
+
         src = inspect.getsource(sc._require_node_token)
-        assert "compare_digest" in src
-        assert "verify_jwt_token" not in src
-        assert "_issue_token" not in src
-        assert "_validate_env_credentials" not in src
+
+        # The comparison now goes through _secret_equals, which compares UTF-8
+        # bytes -- secrets.compare_digest raises TypeError on a non-ASCII str,
+        # so comparing raw strings let a client force a 500 instead of a 401.
+        # Follow the indirection rather than dropping the assertion.
+        assert "_secret_equals" in src
+        helper_src = inspect.getsource(sc._secret_equals)
+        assert "compare_digest" in helper_src
+        assert 'encode("utf-8")' in helper_src
+
+        # Still a distinct machine identity: never the human credential path.
+        for forbidden in (
+            "verify_jwt_token",
+            "_issue_token",
+            "_validate_env_credentials",
+        ):
+            assert forbidden not in src
+            assert forbidden not in helper_src
 
 
 class TestSpartaTokenCannotSatisfyOtherIdentities:
