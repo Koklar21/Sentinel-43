@@ -210,6 +210,19 @@ services:
       S43_FENRIR_BROADCAST_URL: ${S43_FENRIR_BROADCAST_URL:-http://s43-api:8000/internal/events/broadcast}
       S43_FENRIR_REPORT_TIMEOUT: ${S43_FENRIR_REPORT_TIMEOUT:-2.0}
 
+      # Event delivery reliability (idempotency, bounded retry, dead-letter).
+      # Undeclared variables never reach the container, so the tunables the
+      # reliability layer reads are declared here or they are inert.
+      # Defaults are the in-code defaults; empty means "use the default".
+      S43_DEAD_LETTER_PATH: ${S43_DEAD_LETTER_PATH:-/app/sentinel43_state/dead_letter.sqlite3}
+      S43_DEAD_LETTER_MAX_ROWS: ${S43_DEAD_LETTER_MAX_ROWS:-10000}
+      S43_IDEMPOTENCY_MAX_ENTRIES: ${S43_IDEMPOTENCY_MAX_ENTRIES:-10000}
+      S43_IDEMPOTENCY_TTL_SECONDS: ${S43_IDEMPOTENCY_TTL_SECONDS:-900}
+      S43_DELIVERY_MAX_ATTEMPTS: ${S43_DELIVERY_MAX_ATTEMPTS:-3}
+      S43_DELIVERY_BASE_DELAY: ${S43_DELIVERY_BASE_DELAY:-0.2}
+      S43_DELIVERY_MAX_DELAY: ${S43_DELIVERY_MAX_DELAY:-5.0}
+      S43_DELIVERY_DEADLINE: ${S43_DELIVERY_DEADLINE:-10.0}
+
       # Optional observational subsystems
       S43_SPARTA_ENABLED: ${S43_SPARTA_ENABLED:-false}
       S43_JORM_ENABLED: ${S43_JORM_ENABLED:-false}
