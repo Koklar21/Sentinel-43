@@ -44,7 +44,7 @@ from typing import Any, Final, Protocol
 from uuid import uuid4
 
 from core.guards.velocity import VelocityGuard
-from core.policy_gate import PolicyContext, evaluate
+from core.policy_gate import STATUS_OBSERVE, PolicyContext, evaluate
 
 
 logger = logging.getLogger("sentinel43.governance")
@@ -78,6 +78,10 @@ class ReasonCode(str, Enum):
     VELOCITY_CAP_EXCEEDED = "VELOCITY_CAP_EXCEEDED"
     INVALID_INPUT = "INVALID_INPUT"
     POLICY_DENY = "POLICY_DENY"
+    # SHADOW-mode observation: the action was evaluated and recorded, not
+    # enforced. Distinct from CLEARED so the audit trail never conflates an
+    # observed action with a genuinely allowed one.
+    POLICY_OBSERVED = "POLICY_OBSERVED"
     POLICY_REQUIRES_HUMAN = "POLICY_REQUIRES_HUMAN"
     HUMAN_APPROVED = "HUMAN_APPROVED"
     HUMAN_VETOED = "HUMAN_VETOED"
@@ -863,6 +867,54 @@ class SystemOrchestrator:
                     score=score,
                     reason=ReasonCode.POLICY_REQUIRES_HUMAN,
                     decision_id=decision_id,
+                )
+
+            if (
+                policy_decision.status
+                == STATUS_OBSERVE
+            ):
+                # SHADOW is observational, not enforcing. PolicyDecision.allowed
+                # is `status == ALLOW`, so OBSERVE arrives here alongside real
+                # denials -- and used to fall through to POLICY_DENY, blocking
+                # every known action in SHADOW mode. Observation is recorded
+                # under its own reason code so the audit trail keeps OBSERVE
+                # distinguishable from a genuine ALLOW; the transaction then
+                # continues without any enforcement or external action.
+                record = self._audit_record(
+                    context=context,
+                    user_id=user_id,
+                    decision=DecisionStatus.APPROVED,
+                    reason_code=ReasonCode.POLICY_OBSERVED,
+                    score=score,
+                    caller_id=caller.caller_id,
+                    policy=policy_payload,
+                )
+
+                try:
+                    self._append_audit(
+                        record
+                    )
+                except Exception:
+                    # Observation that cannot be recorded is not observation.
+                    return Decision(
+                        status=DecisionStatus.BLOCKED,
+                        score=score,
+                        reason=ReasonCode.AUDIT_APPEND_FAILED,
+                    )
+
+                self._notify_monitoring(
+                    {
+                        "kind": "security",
+                        "event_category": "governance_shadow_observed",
+                        "caller_id": caller.caller_id,
+                        "user_id": user_id,
+                    }
+                )
+
+                return Decision(
+                    status=DecisionStatus.APPROVED,
+                    score=score,
+                    reason=ReasonCode.POLICY_OBSERVED,
                 )
 
             record = self._audit_record(
