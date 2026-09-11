@@ -63,6 +63,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..bootstrap import bootstrap_expectations
+from ..lifecycle import (
+    Reason as SubsystemReason,
+    SubsystemRegistry,
+    SubsystemState,
+    missing_settings,
+)
 from ..logging.health_check_filter import install_health_check_access_filter
 from ..monitoring.watchtower_client import (
     configure as _configure_watchtower_client,
@@ -404,6 +410,12 @@ class RuntimeState:
     sparta_instance: Any | None = None
     sparta_task: asyncio.Task[Any] | None = None
     fenrir_instance: Any | None = None
+
+    #: Lifecycle state of every optional/required subsystem. Populated during
+    #: lifespan startup and read by /health, /ready and /system/status.
+    subsystems: SubsystemRegistry = field(
+        default_factory=SubsystemRegistry
+    )
 
 
 runtime = RuntimeState()
@@ -1151,7 +1163,95 @@ async def _async_heartbeat_loop() -> None:
 # Subsystem lifecycle
 # =============================================================================
 
+# Subsystem names used in the lifecycle registry and on the status surface.
+SUBSYS_MONITORING = "monitoring_manager"
+SUBSYS_WATCHTOWER = "watchtower"
+SUBSYS_SPARTA = "sparta"
+SUBSYS_FENRIR = "fenrir"
+SUBSYS_AUDIT = "audit_store"
+SUBSYS_GOVERNANCE = "governance"
+
+
+def _declare_subsystems() -> None:
+    """Register every subsystem before startup so none is silently absent."""
+    runtime.subsystems.reset()
+    runtime.subsystems.declare(
+        SUBSYS_MONITORING, required=_env_bool("S43_MONITORING_REQUIRED", False)
+    )
+    runtime.subsystems.declare(
+        SUBSYS_WATCHTOWER, required=_env_bool("S43_WATCHTOWER_REQUIRED", False)
+    )
+    runtime.subsystems.declare(
+        SUBSYS_SPARTA, required=_env_bool("S43_SPARTA_REQUIRED", False)
+    )
+    runtime.subsystems.declare(
+        SUBSYS_FENRIR, required=_env_bool("S43_FENRIR_REQUIRED", False)
+    )
+    runtime.subsystems.declare(
+        SUBSYS_AUDIT, required=_env_bool("S43_GOVERNANCE_ENABLED", False)
+        or not IS_LOCAL_ENV
+    )
+    runtime.subsystems.declare(
+        SUBSYS_GOVERNANCE, required=_env_bool("S43_GOVERNANCE_REQUIRED", True)
+        and _env_bool("S43_GOVERNANCE_ENABLED", False)
+    )
+
+
+def _refuse_unconfigured(
+    name: str,
+    missing: tuple[str, ...],
+    *,
+    required_flag: str,
+    reason: SubsystemReason,
+) -> bool:
+    """Record an enabled-but-unconfigured subsystem and decide whether to fail.
+
+    Returns True when startup of that subsystem must be skipped. Raises when
+    the deployment marked it required. The names of the unset settings are
+    reported; their values are never read, logged, or returned.
+    """
+    runtime.subsystems.mark_unconfigured(name, missing, reason=reason)
+    logger.error(
+        "%s is enabled but not configured: configured=false reason=%s "
+        "missing=%s (values are never logged)",
+        name,
+        reason.value,
+        ",".join(missing),
+    )
+    if _env_bool(required_flag, False):
+        raise RuntimeError(
+            f"{name} is enabled and required but not configured; "
+            f"reason={reason.value} missing={','.join(missing)}"
+        )
+    return True
+
+
+def _validate_watchtower_config() -> None:
+    """Validate the Watchtower client settings the API depends on."""
+    missing = missing_settings(
+        {
+            "S43_WATCHTOWER_URL": WATCHTOWER_URL,
+            "S43_WATCHTOWER_SERVICE_TOKEN": _env_str(
+                "S43_WATCHTOWER_SERVICE_TOKEN"
+            ),
+        }
+    )
+    if missing:
+        _refuse_unconfigured(
+            SUBSYS_WATCHTOWER,
+            missing,
+            required_flag="S43_WATCHTOWER_REQUIRED",
+            reason=SubsystemReason.MISSING_TOKEN,
+        )
+        return
+
+    # Reachability is proven later by registration/heartbeat; configuration
+    # is correct, so the subsystem is at least startable.
+    runtime.subsystems.mark_starting(SUBSYS_WATCHTOWER)
+
+
 async def _start_monitoring_manager() -> None:
+    runtime.subsystems.mark_starting(SUBSYS_MONITORING)
     try:
         from core.monitoring import (
             MonitoringManager,
@@ -1171,8 +1271,14 @@ async def _start_monitoring_manager() -> None:
         await asyncio.to_thread(manager.start)
         set_monitoring_manager(manager)
         runtime.monitoring_manager = manager
+        runtime.subsystems.mark_active(
+            SUBSYS_MONITORING, "Scanning via the embedded Watchtower node."
+        )
         logger.info("MonitoringManager started and wired")
-    except Exception:
+    except Exception as exc:
+        runtime.subsystems.mark_failed(
+            SUBSYS_MONITORING, f"Failed to start: {type(exc).__name__}"
+        )
         if _env_bool("S43_MONITORING_REQUIRED", False):
             raise
         logger.error("MonitoringManager unavailable", exc_info=True)
@@ -1180,25 +1286,53 @@ async def _start_monitoring_manager() -> None:
 
 async def _start_sparta() -> None:
     if not _env_bool("S43_SPARTA_ENABLED", False):
+        runtime.subsystems.mark_disabled(SUBSYS_SPARTA)
         return
 
+    watched_files: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key.startswith("S43_SPARTA_HASH_"):
+            file_key = (
+                key[len("S43_SPARTA_HASH_") :]
+                .lower()
+                .replace("_", "/")
+            )
+            watched_files[file_key] = value
+
+    # Validate before constructing anything: an enabled Sparta with no node
+    # token serves 503 on every /node route, and one with no digests cannot
+    # watch anything. Both are refused here with an explicit reason instead
+    # of surfacing later as a half-started subsystem.
+    required: dict[str, str | None] = {
+        "S43_SPARTA_NODE_TOKEN": _env_str("S43_SPARTA_NODE_TOKEN"),
+    }
+    if not IS_LOCAL_ENV:
+        required["S43_SPARTA_TOKEN_SECRET"] = _env_str(
+            "S43_SPARTA_TOKEN_SECRET"
+        )
+
+    missing = missing_settings(required)
+    if missing:
+        _refuse_unconfigured(
+            SUBSYS_SPARTA,
+            missing,
+            required_flag="S43_SPARTA_REQUIRED",
+            reason=SubsystemReason.MISSING_TOKEN,
+        )
+        return
+
+    if not watched_files:
+        _refuse_unconfigured(
+            SUBSYS_SPARTA,
+            ("S43_SPARTA_HASH_*",),
+            required_flag="S43_SPARTA_REQUIRED",
+            reason=SubsystemReason.MISSING_CONFIG,
+        )
+        return
+
+    runtime.subsystems.mark_starting(SUBSYS_SPARTA)
     try:
         from core.monitoring import build_sparta_core
-
-        watched_files: dict[str, str] = {}
-        for key, value in os.environ.items():
-            if key.startswith("S43_SPARTA_HASH_"):
-                file_key = (
-                    key[len("S43_SPARTA_HASH_") :]
-                    .lower()
-                    .replace("_", "/")
-                )
-                watched_files[file_key] = value
-
-        if not watched_files:
-            raise RuntimeError(
-                "S43_SPARTA_ENABLED=true but no S43_SPARTA_HASH_* values exist"
-            )
 
         # build_sparta_core() is the canonical Sparta factory: it owns the
         # IntegrityConfig.from_env() read and the SpartaCore construction.
@@ -1212,11 +1346,19 @@ async def _start_sparta() -> None:
             runtime.sparta_instance.run(),
             name="sentinel43-sparta-watchdog",
         )
+        runtime.subsystems.mark_active(
+            SUBSYS_SPARTA,
+            f"Watching {len(watched_files)} file(s).",
+        )
         logger.info(
             "SpartaCore watchdog started for %d files",
             len(watched_files),
         )
-    except Exception:
+    except Exception as exc:
+        runtime.sparta_instance = None
+        runtime.subsystems.mark_failed(
+            SUBSYS_SPARTA, f"Failed to start: {type(exc).__name__}"
+        )
         if _env_bool("S43_SPARTA_REQUIRED", False):
             raise
         logger.error("SpartaCore failed to start", exc_info=True)
@@ -1232,16 +1374,52 @@ async def _start_fenrir() -> None:
         False,
     )
     if not enabled:
+        runtime.subsystems.mark_disabled(SUBSYS_FENRIR)
         return
 
+    # Validate before starting. A FenrirHunter with no service token, or with
+    # nowhere to report, still reaches HUNTING and then silently discards
+    # every finding -- exactly the half-alive startup this check exists to
+    # prevent. The token's value is never inspected beyond emptiness.
+    missing = missing_settings(
+        {"S43_FENRIR_API_TOKEN": _env_str("S43_FENRIR_API_TOKEN")}
+    )
+    if missing:
+        _refuse_unconfigured(
+            SUBSYS_FENRIR,
+            missing,
+            required_flag="S43_FENRIR_REQUIRED",
+            reason=SubsystemReason.MISSING_TOKEN,
+        )
+        return
+
+    if not (
+        _env_str("S43_FENRIR_WATCHTOWER_URL")
+        or _env_str("S43_FENRIR_BROADCAST_URL")
+    ):
+        _refuse_unconfigured(
+            SUBSYS_FENRIR,
+            ("S43_FENRIR_WATCHTOWER_URL", "S43_FENRIR_BROADCAST_URL"),
+            required_flag="S43_FENRIR_REQUIRED",
+            reason=SubsystemReason.MISSING_CONFIG,
+        )
+        return
+
+    runtime.subsystems.mark_starting(SUBSYS_FENRIR)
     try:
         from core.detection.feniri_hunter import FenrirHunter
 
         runtime.fenrir_instance = FenrirHunter()
         await runtime.fenrir_instance.start()
+        runtime.subsystems.mark_active(
+            SUBSYS_FENRIR, "Hunting and reporting through the API bridge."
+        )
         logger.info("FenrirHunter started")
-    except Exception:
+    except Exception as exc:
         runtime.fenrir_instance = None
+        runtime.subsystems.mark_failed(
+            SUBSYS_FENRIR, f"Failed to start: {type(exc).__name__}"
+        )
         if _env_bool("S43_FENRIR_REQUIRED", False):
             raise
         logger.error("FenrirHunter failed to start", exc_info=True)
@@ -1270,6 +1448,11 @@ async def _start_audit_store() -> None:
                 "store cannot be keyed. It is mandatory outside "
                 "development/local/test and whenever S43_GOVERNANCE_ENABLED=true."
             )
+        runtime.subsystems.mark_unconfigured(
+            SUBSYS_AUDIT,
+            ("S43_AUDIT_HMAC_KEY",),
+            reason=SubsystemReason.MISSING_TOKEN,
+        )
         logger.warning(
             "S43_AUDIT_HMAC_KEY is not set; authoritative audit store is "
             "disabled (development/local/test only)."
@@ -1298,6 +1481,9 @@ async def _start_audit_store() -> None:
         ) from exc
 
     runtime.audit_store = store
+    runtime.subsystems.mark_active(
+        SUBSYS_AUDIT, "HMAC-chained audit store initialized and verified."
+    )
     logger.info(
         "Authoritative audit store initialized (%s)",
         sqlite_path,
@@ -1306,6 +1492,7 @@ async def _start_audit_store() -> None:
 
 async def _start_governance() -> None:
     if not _env_bool("S43_GOVERNANCE_ENABLED", False):
+        runtime.subsystems.mark_disabled(SUBSYS_GOVERNANCE)
         return
 
     if runtime.audit_store is None:
@@ -1362,12 +1549,19 @@ async def _start_governance() -> None:
             audit_store=runtime.audit_store,
             monitoring_manager=runtime.monitoring_manager,
         )
+        runtime.subsystems.mark_active(
+            SUBSYS_GOVERNANCE,
+            f"Human-gated orchestrator active (mode={resolved_default_mode}).",
+        )
         logger.info(
             "SystemOrchestrator started (mode=%s)",
             resolved_default_mode,
         )
-    except Exception:
+    except Exception as exc:
         runtime.orchestrator = None
+        runtime.subsystems.mark_failed(
+            SUBSYS_GOVERNANCE, f"Failed to start: {type(exc).__name__}"
+        )
         if _env_bool("S43_GOVERNANCE_REQUIRED", True):
             raise
         logger.error("SystemOrchestrator failed to start", exc_info=True)
@@ -1493,6 +1687,7 @@ async def _shutdown_runtime() -> None:
             logger.warning("FenrirHunter shutdown error", exc_info=True)
         finally:
             runtime.fenrir_instance = None
+            runtime.subsystems.mark_stopped(SUBSYS_FENRIR)
 
     if runtime.sparta_instance is not None:
         try:
@@ -1518,6 +1713,7 @@ async def _shutdown_runtime() -> None:
             logger.warning("SpartaCore close error", exc_info=True)
         finally:
             runtime.sparta_instance = None
+            runtime.subsystems.mark_stopped(SUBSYS_SPARTA)
 
     if runtime.monitoring_manager is not None:
         try:
@@ -1529,6 +1725,7 @@ async def _shutdown_runtime() -> None:
             )
         finally:
             runtime.monitoring_manager = None
+            runtime.subsystems.mark_stopped(SUBSYS_MONITORING)
             # Deregister from the canonical registry too, so late callers
             # (remote gateway, firewall) see "no manager" rather than a
             # stopped one that would raise on analyze_event().
@@ -1576,6 +1773,12 @@ async def lifespan(api: FastAPI):
         timeout_seconds=WATCHTOWER_TIMEOUT,
     )
 
+    # Declare every subsystem, then validate configuration, before starting
+    # anything. An enabled-but-unconfigured subsystem is refused with an
+    # explicit reason rather than started half-alive.
+    _declare_subsystems()
+    _validate_watchtower_config()
+
     try:
         await _start_monitoring_manager()
         await _start_sparta()
@@ -1589,6 +1792,23 @@ async def lifespan(api: FastAPI):
         # make this fatal with S43_WATCHTOWER_REQUIRED=true.
         registration = await register_api_with_watchtower()
         heartbeat = await send_api_heartbeat()
+
+        # Configuration was validated before startup; this is the first
+        # evidence of actual reachability, so the Watchtower subsystem's
+        # state is settled here.
+        if runtime.subsystems.get(SUBSYS_WATCHTOWER) is not None:
+            if registration.get("registered") and heartbeat.get(
+                "heartbeat_sent"
+            ):
+                runtime.subsystems.mark_active(
+                    SUBSYS_WATCHTOWER, "Registered and sending heartbeats."
+                )
+            else:
+                runtime.subsystems.mark_failed(
+                    SUBSYS_WATCHTOWER,
+                    "Configured but unreachable at startup.",
+                    reason=SubsystemReason.DEPENDENCY_UNREACHABLE,
+                )
 
         if _env_bool("S43_WATCHTOWER_REQUIRED", False):
             if not registration.get("registered"):
@@ -1776,7 +1996,35 @@ async def ready() -> Any:
                 },
             )
 
-    return {"status": "ready", "service": APP_NAME}
+    # Readiness reflects whether this service can do its job. A REQUIRED
+    # subsystem that is not ACTIVE blocks readiness; an optional one that is
+    # disabled is entirely fine, and an optional one that is faulted leaves
+    # the API ready but degraded rather than killing it.
+    report = runtime.subsystems.readiness()
+
+    if not report.ready:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "service": APP_NAME,
+                "reason": "subsystem_unavailable",
+                "blocking": list(report.blocking),
+                "subsystems": {
+                    item.name: {
+                        "state": item.state.value,
+                        "configured": item.configured,
+                        "reason": item.reason.value,
+                    }
+                    for item in report.subsystems
+                },
+            },
+        )
+
+    body: dict[str, Any] = {"status": "ready", "service": APP_NAME}
+    if report.degraded:
+        body["degraded"] = list(report.degraded)
+    return body
 
 
 # =============================================================================
@@ -2914,29 +3162,18 @@ async def system_status(
             ),
             "rules": "loaded",
             "config": "loaded",
-            "monitoring_manager": (
-                "active"
-                if runtime.monitoring_manager
-                else "disabled"
-            ),
-            "sparta": (
-                "active"
-                if runtime.sparta_instance
-                else "disabled"
-            ),
-            "fenrir": (
-                "active"
-                if runtime.fenrir_instance
-                else "disabled"
-            ),
-            "governance": (
-                "active"
-                if runtime.orchestrator
-                else "disabled"
-            ),
+            # Real lifecycle state, not a present/absent guess: an enabled
+            # subsystem that was refused for missing configuration reports
+            # UNAVAILABLE here, where it previously read "disabled".
+            **{
+                item.name: item.state.value
+                for item in runtime.subsystems.snapshot()
+            },
             "redis": "unknown",
             "postgres": "unknown",
         },
+        "subsystems": runtime.subsystems.to_dict(),
+        "readiness": runtime.subsystems.readiness().to_dict(),
         "watchtower": wt,
         "timestamp": utc_now(),
     }
