@@ -413,8 +413,22 @@ jobs:
           set -euo pipefail
           kubectl -n sentinel43 port-forward svc/s43-api 18000:8000 &
           sleep 3
-          curl -fsS http://localhost:18000/health
-          curl -fsS http://localhost:18000/bootstrap/status
+          # A plain `curl http://localhost:18000/...` sends `Host:
+          # localhost:18000` -- port-forward tunnels the TCP connection but
+          # does not touch the Host header a client sends. TrustedHostGuard
+          # (core/api/middleware/security_headers.py) enforces
+          # S43_TRUSTED_HOSTS regardless of profile, and the dev overlay's
+          # ConfigMap trusts "s43-api" (the name Fenrir's own self-report
+          # traffic uses, deploy/kubernetes/base/configmap.yaml), not
+          # "localhost". Sending that same Host here is what a legitimate
+          # in-cluster caller's request actually looks like, and is the
+          # honest fix: it exercises the real trusted-host list instead of
+          # adding "localhost" to it, which would need to be maintained
+          # forever for a value nothing but this smoke test ever sends.
+          # /health is in the guard's exempt-path allowlist and would pass
+          # either way; sent identically for a representative smoke test.
+          curl -fsS -H "Host: s43-api" http://localhost:18000/health
+          curl -fsS -H "Host: s43-api" http://localhost:18000/bootstrap/status
 
       - name: Teardown
         if: always()
