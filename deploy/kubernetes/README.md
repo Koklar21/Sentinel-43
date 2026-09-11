@@ -11,7 +11,7 @@ development and is unaffected except for one shared, security-motivated fix
 | Requirement | Notes |
 |---|---|
 | Kubernetes | 1.28–1.32 tested (kind's `kindest/node:v1.32.2`; kubeconform validated against 1.30.0 schemas). Older/newer 1.2x versions are likely fine but untested here. |
-| A **NetworkPolicy-enforcing CNI** | Required — Postgres/Redis isolation and the whole default-deny posture depend on it. Calico, Cilium, and most managed-cloud CNIs (EKS with the AWS VPC CNI + Calico, GKE's native NetworkPolicy support, AKS with Azure CNI + Calico/Cilium) enforce it. **kind's default CNI (kindnet) and some minimal setups do not** — verify with a real negative test (see "Verifying NetworkPolicy enforcement" below), don't trust `kubectl get networkpolicy` returning objects as proof they're doing anything. |
+| A **NetworkPolicy-enforcing CNI** | Required — Postgres isolation and the whole default-deny posture depend on it. Calico, Cilium, and most managed-cloud CNIs (EKS with the AWS VPC CNI + Calico, GKE's native NetworkPolicy support, AKS with Azure CNI + Calico/Cilium) enforce it. **kind's default CNI (kindnet) and some minimal setups do not** — verify with a real negative test (see "Verifying NetworkPolicy enforcement" below), don't trust `kubectl get networkpolicy` returning objects as proof they're doing anything. |
 | Ingress controller (beta overlay only) | ingress-nginx, installed in a namespace literally named `ingress-nginx` (the default for standard install methods). Different namespace name → edit `overlays/beta/networkpolicy-ingress.yaml`'s `namespaceSelector`. |
 | cert-manager (beta overlay only) | For the `cert-manager.io/cluster-issuer: letsencrypt-prod` annotation in `overlays/beta/ingress.yaml` to do anything — install it and create that ClusterIssuer (or change the annotation) before applying. |
 | A container registry (beta overlay only) | Not provided by this repo. `overlays/beta/kustomization.yaml`'s image digest is a deliberately-invalid placeholder — CI (`.github/workflows/k8s.yml`) is set up to build the image, but pushing to a real registry and pinning the resulting digest is an operator decision (GHCR, ECR, GCR, etc.). |
@@ -23,7 +23,7 @@ development and is unaffected except for one shared, security-motivated fix
 deploy/kubernetes/
   base/                    # every security control lives here — shared by every overlay
   overlays/dev/            # local dev on kind/Docker Desktop: locally-built image, no ingress
-  overlays/beta/           # ingress+TLS, 2 API replicas + PodDisruptionBudget, registry image
+  overlays/beta/           # ingress+TLS, beta resource sizing, registry image
   kind-cluster-config.yaml # disposable test-cluster config (Calico, not kindnet — see below)
 ```
 
@@ -46,19 +46,49 @@ set -a; source .env; set +a
 kubectl create namespace sentinel43 --dry-run=client -o yaml | kubectl apply -f -
 kubectl create secret generic sentinel43-secrets -n sentinel43 \
   --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
-  --from-literal=REDIS_PASSWORD="$REDIS_PASSWORD" \
   --from-literal=DATABASE_URL="postgresql+asyncpg://s43:${POSTGRES_PASSWORD}@s43-db:5432/s43" \
-  --from-literal=REDIS_URL="redis://:${REDIS_PASSWORD}@s43-redis:6379/0" \
   --from-literal=S43_JWT_SECRET="$S43_JWT_SECRET" \
   --from-literal=S43_OPERATOR_PASSWORD_HASH="$S43_OPERATOR_PASSWORD_HASH" \
   --from-literal=S43_AUTH_PEPPER="$S43_AUTH_PEPPER" \
-  --from-literal=SENTINEL_LOG_SALT="$SENTINEL_LOG_SALT" \
-  --from-literal=SENTINEL_REMOTE_TOKEN_OWNER="$SENTINEL_REMOTE_TOKEN_OWNER" \
-  --from-literal=SENTINEL_REMOTE_TOKEN_ADMIN="$SENTINEL_REMOTE_TOKEN_ADMIN" \
-  --from-literal=SENTINEL_REMOTE_TOKEN_AUDITOR="$SENTINEL_REMOTE_TOKEN_AUDITOR" \
+  --from-literal=S43_SESSION_HASH_PEPPER="$S43_SESSION_HASH_PEPPER" \
+  --from-literal=S43_AUDIT_HMAC_KEY="$S43_AUDIT_HMAC_KEY" \
   --from-literal=S43_FENRIR_API_TOKEN="$S43_FENRIR_API_TOKEN" \
   --from-literal=S43_WATCHTOWER_SERVICE_TOKEN="$S43_WATCHTOWER_SERVICE_TOKEN"
 ```
+
+Those nine are the **required** keys — they are exactly the non-optional
+keys in `base/secret.example.yaml`, and the API or Watchtower fails closed
+without each of them. Two were missing from this command until the
+Kubernetes parity pass and are not optional:
+
+| Key | What breaks without it |
+| --- | --- |
+| `S43_AUDIT_HMAC_KEY` | the authoritative HMAC-chained audit ledger has no key |
+| `S43_SESSION_HASH_PEPPER` | the canonical session verifier has no pepper |
+
+Add these **only if you are using the feature they belong to**. Each one is
+absent-means-disabled, and each fails closed rather than degrading:
+
+```bash
+  # Watchtower administrative routes (s43-core). NOT the service token:
+  # that authenticates s43-api as a machine, this authorizes an admin
+  # action. Unset => those routes answer 503.
+  --from-literal=S43_ADMIN_TOKEN="$S43_ADMIN_TOKEN" \
+  # Remote operator gateway (core/api/routers/remote_gateway.py). Each role
+  # is independent; an unset role is simply not issued.
+  --from-literal=SENTINEL_REMOTE_TOKEN_OWNER="$SENTINEL_REMOTE_TOKEN_OWNER" \
+  --from-literal=SENTINEL_REMOTE_TOKEN_ADMIN="$SENTINEL_REMOTE_TOKEN_ADMIN" \
+  --from-literal=SENTINEL_REMOTE_TOKEN_AUDITOR="$SENTINEL_REMOTE_TOKEN_AUDITOR" \
+  # Only with S43_SPARTA_ENABLED="true" in the ConfigMap. Two distinct
+  # credentials; generate them independently.
+  --from-literal=S43_SPARTA_NODE_TOKEN="$S43_SPARTA_NODE_TOKEN" \
+  --from-literal=S43_SPARTA_TOKEN_SECRET="$S43_SPARTA_TOKEN_SECRET"
+```
+
+`REDIS_PASSWORD` / `REDIS_URL` are **no longer provisioned** — there is no
+Redis in this deployment (see "No Redis" below). `SENTINEL_LOG_SALT` is not
+provisioned either: `core/cli/generate_secrets.py` still generates both, but
+no module outside that generator reads either one.
 
 `S43_WATCHTOWER_SERVICE_TOKEN` is read by both `s43-api` and `s43-core` (both
 `envFrom` this Secret). The Watchtower core rejects every operational and
@@ -163,23 +193,48 @@ kubectl describe pod -n sentinel43 -l app=s43-api   # events, probe failures
 
 ## Scaling
 
-Only `s43-api` is designed to run >1 replica (stateless, behind its
-Service). `overlays/beta/resources-patch.yaml` sets `replicas: 2` with a
-`PodDisruptionBudget` (`minAvailable: 1`) and a soft pod-anti-affinity
-preference to spread replicas across nodes. Scale further with:
+**Every workload here runs exactly one replica, `s43-api` included.** Do not
+scale `s43-api` out. This is a property of the application, not a
+conservative default, and the manifests enforce it: `replicas: 1` plus
+`strategy: Recreate`, so a rollout never overlaps two API pods either.
 
-```bash
-kubectl scale deployment/s43-api -n sentinel43 --replicas=4
-```
+`s43-api` holds four pieces of state that exist per process and are not
+shared between pods:
 
-`s43-core`, `s43-db`, and `s43-redis` are single-replica everywhere in this
-repo — see "Known limitations" below for why scaling `s43-db`/`s43-redis`
-isn't as simple as changing a replica count.
+| State | Where | What a second replica does |
+| --- | --- | --- |
+| Idempotency ledger | `core/reliability.py` (in-process `OrderedDict`) | each replica has its own; the same `event_id` is processed twice |
+| `FenrirHunter` | started per API process | N replicas produce N copies of every finding |
+| Sparta watchdog task | started per API process | N concurrent integrity scanners |
+| Dashboard WebSocket clients | held per process | a dashboard sees only events that landed on its own replica |
+
+It also could not work mechanically: `s43-api` mounts the ReadWriteOnce PVC
+`s43-api-state`, which holds the audit ledger and the dead-letter store, so
+a second pod on another node would sit `Pending` on volume attach — and two
+processes writing the same SQLite files would risk corrupting them.
+
+An earlier revision of `overlays/beta` set `replicas: 2` with a
+`PodDisruptionBudget` and an anti-affinity rule spreading replicas across
+nodes. That combination was removed in the Kubernetes parity pass: it
+promised horizontal scale the application cannot honour, and the
+anti-affinity actively guaranteed the second pod could never attach the
+volume.
+
+Making `s43-api` genuinely horizontally scalable is application work, not a
+manifest change — a shared idempotency store, a shared broadcast bus, and
+leader election for the Fenrir/Sparta singletons. `scripts/k8s_policy_check.py`
+fails the build if a manifest sets `replicas != 1`, switches to
+`RollingUpdate`, or adds a PodDisruptionBudget selecting `s43-api`, so this
+cannot regress silently.
+
+`s43-core` and `s43-db` are single-replica for their own reasons — see
+"Known limitations" below for why scaling `s43-db` isn't as simple as
+changing a replica count.
 
 ## Backup / restore
 
-Postgres and Redis here are **single-instance StatefulSets with PVCs, not a
-managed or HA database** — see "Known limitations." There is no automated
+Postgres here is a **single-instance StatefulSet with a PVC, not a managed
+or HA database** — see "Known limitations." There is no automated
 backup CronJob in this repo (it would need an operator-specific object
 storage target — S3 bucket, GCS, etc. — that this repo has no way to know
 in advance). Manual procedure:
@@ -192,13 +247,24 @@ kubectl exec -n sentinel43 s43-db-0 -- pg_dump -U s43 s43 > s43-backup-$(date +%
 kubectl exec -i -n sentinel43 s43-db-0 -- psql -U s43 s43 < s43-backup-YYYYMMDD.sql
 ```
 
-For Redis (only relevant if you rely on cached state — see "Known
-limitations," nothing in `core/` currently uses Redis):
+`pg_dump` is **not** a complete backup of this system. Two SQLite databases
+live on the `s43-api-state` PVC and are not in Postgres:
 
 ```bash
-kubectl exec -n sentinel43 s43-redis-0 -- redis-cli -a "$REDIS_PASSWORD" --rdb /data/dump.rdb
-kubectl cp sentinel43/s43-redis-0:/data/dump.rdb ./s43-redis-backup-$(date +%Y%m%d).rdb
+kubectl cp sentinel43/$(kubectl get pod -n sentinel43 -l app=s43-api \
+  -o jsonpath='{.items[0].metadata.name}'):/app/sentinel43_state/audit.sqlite3 \
+  ./audit-$(date +%Y%m%d).sqlite3
+kubectl cp sentinel43/$(kubectl get pod -n sentinel43 -l app=s43-api \
+  -o jsonpath='{.items[0].metadata.name}'):/app/sentinel43_state/dead_letter.sqlite3 \
+  ./dead-letter-$(date +%Y%m%d).sqlite3
 ```
+
+`audit.sqlite3` is the authoritative HMAC-chained audit ledger; losing it
+loses the tamper-evident record, and restoring a partial copy breaks the
+chain. `dead_letter.sqlite3` holds the events that failed delivery and
+whether an operator replayed them. Copying a live SQLite file can capture a
+torn write — quiesce the pod (scale to 0, copy, scale back to 1) if the
+copy needs to be authoritative.
 
 For real production use, put a proper backup/restore process (pgBackRest,
 WAL-G, a managed database's native backups) in front of this — the above is
@@ -206,22 +272,46 @@ a manual break-glass procedure, not a backup strategy.
 
 ## Upgrade / rollback
 
-Standard Kubernetes rolling update — `s43-api` and `s43-core` use
-`maxUnavailable: 0, maxSurge: 1` so a bad rollout never takes down the
-currently-serving replica while the new one is starting. **Proven in
-integration testing**: deploying a nonexistent image tag left the new pod
-stuck in `ErrImageNeverPull`/`ImagePullBackOff` while the old pod kept
-serving `/health` successfully throughout; `kubectl rollout undo` recovered
+`s43-core` uses a rolling update (`maxUnavailable: 0, maxSurge: 1`), so a
+bad rollout never takes down the serving pod while the new one starts.
+**Proven in integration testing**: deploying a nonexistent image tag left
+the new pod stuck in `ErrImageNeverPull`/`ImagePullBackOff` while the old
+pod kept serving `/health` throughout; `kubectl rollout undo` recovered
 cleanly.
+
+`s43-api` uses **`strategy: Recreate`** instead, and therefore has a short
+outage on every rollout — the old pod terminates before the new one starts.
+That is deliberate: `maxSurge: 1` would briefly run two API pods, which is
+exactly the duplicated-singleton state described under "Scaling", and the
+second pod could not attach the ReadWriteOnce state PVC anyway. The tradeoff
+is a visible gap instead of silent duplicate event processing.
+
+Because of that, an `s43-api` rollback is not covered by a still-serving old
+pod — verify the new image elsewhere first, and keep `rollout undo` ready:
 
 ```bash
 kubectl rollout status deployment/s43-api -n sentinel43
 kubectl rollout undo deployment/s43-api -n sentinel43
 ```
 
-`s43-db`/`s43-redis` are StatefulSets — upgrading their image version
-follows standard Postgres/Redis major-version upgrade caveats (not
-Kubernetes-specific); this repo doesn't attempt to automate that.
+`s43-db` is a StatefulSet — upgrading its image version follows standard
+Postgres major-version upgrade caveats (not Kubernetes-specific); this repo
+doesn't attempt to automate that.
+
+### Changing configuration
+
+A `ConfigMap` or `Secret` consumed through `envFrom` is read **once, at
+container start**. Editing either one changes nothing in a running pod, and
+there is no reload signal — `kubectl apply -k ...` on a ConfigMap-only
+change looks successful while the old values stay live. Roll the workload
+explicitly:
+
+```bash
+kubectl rollout restart deployment/s43-api  -n sentinel43
+kubectl rollout restart deployment/s43-core -n sentinel43
+```
+
+(For `s43-api` this is a Recreate rollout — see the outage note above.)
 
 ## Complete removal
 
@@ -242,15 +332,16 @@ test, PSS-compliant so it isn't rejected outright by the namespace's
 kubectl run netpol-test -n sentinel43 --image=busybox:1.36 --restart=Never \
   --overrides='{"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"runAsGroup":65532,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"netpol-test","image":"busybox:1.36","command":["sleep","3600"],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"privileged":false,"capabilities":{"drop":["ALL"]},"seccompProfile":{"type":"RuntimeDefault"}}}]}}' \
   --command -- sleep 3600
-kubectl exec -n sentinel43 netpol-test -- timeout 5 nc -zv s43-db 5432    # must hang/fail
-kubectl exec -n sentinel43 netpol-test -- timeout 5 nc -zv s43-redis 6379 # must hang/fail
+kubectl exec -n sentinel43 netpol-test -- timeout 5 nc -zv s43-db 5432   # must hang/fail
+kubectl exec -n sentinel43 netpol-test -- timeout 5 nc -zv s43-core 9100 # must hang/fail
 kubectl delete pod netpol-test -n sentinel43
 ```
 
-This exact sequence was run against a kind cluster with Calico installed
-during development (see "Integration testing evidence" below) — all three
-connections hung until the 5s timeout killed them (exit 143), confirming
-real enforcement, not just object presence.
+This sequence was run against a kind cluster with Calico installed during
+development (see "Integration testing evidence" below) — the connections
+hung until the 5s timeout killed them (exit 143), confirming real
+enforcement, not just object presence. That run also probed `s43-redis:6379`,
+which no longer exists (see "No Redis").
 
 ## Relationship to Docker Compose
 
@@ -259,34 +350,49 @@ real enforcement, not just object presence.
   `restricted` profile requires it and there's no way to satisfy that only
   for k8s without maintaining two Dockerfiles. Verified not to break Compose
   (rebuilt, ran the full stack, confirmed `/app/logs`'s bind mount and
-  `/tmp` are writable as the new non-root user; nothing in the live app
-  writes to `/app/sentinel43_state` today — see "Known limitations").
+  `/tmp` are writable as the new non-root user). The claim that once
+  followed here — that nothing writes to `/app/sentinel43_state` — is no
+  longer true: the audit ledger and the dead-letter store both live there,
+  and the directory is `chown`ed to 65532 in the image for that reason.
 - `core/middleware/sentinel_firewall.py`'s trusted-proxy fix (see
   `docs/security/trusted_proxy_handling.md`) also applies to Compose —
   behavior is unchanged for anyone not setting `S43_TRUSTED_PROXIES`
   (nobody currently does, since it was silently broken before).
 - Everything else here is additive. `docker-compose.yml` is untouched and
   remains the documented default for local development.
+- **Environment parity is checked, not assumed.** Every variable
+  `docker-compose.yml` passes to `s43-api` is either in `base/configmap.yaml`
+  or `base/secret.example.yaml`. Two deliberate divergences:
+  `s43-core` gets no `sentinel43_state` mount here (Compose shares one named
+  volume between `s43-api` and `s43-core`, but `core/monitoring/watchtower.py`
+  opens no file — sharing it in Kubernetes would need ReadWriteMany for no
+  reason), and the Sparta integrity baselines
+  (`S43_SPARTA_HASH_<PATH>`) are not committed because they are per-image
+  hashes, not per-environment configuration.
 
 ## Known limitations
 
-- **The firewall's rate limiter is in-process, not Redis-backed.**
-  `sentinel_firewall_middleware.py`'s rate limiting is per-pod in-memory
-  state. `overlays/beta` runs 2 `s43-api` replicas — rate limits are
-  therefore enforced *per replica*, not globally (a client could get up to
-  2x the configured limit by landing on both pods). This is a real
-  application-level gap, not something this Kubernetes deployment
-  introduces or silently works around; fixing it means making the rate
-  limiter Redis-backed, which is an application change outside this task's
-  scope.
-- **`/health` (liveness) does not verify Postgres/Redis connectivity** — by
+- **`s43-api` is a singleton, and several subsystems are why.** The
+  in-process rate limiter, the in-process idempotency ledger, the
+  per-process Fenrir and Sparta producers, and the per-process WebSocket
+  client set all assume one API process. Every manifest here pins
+  `replicas: 1` with `strategy: Recreate` accordingly, and
+  `scripts/k8s_policy_check.py` enforces it. The consequence to accept:
+  `s43-api` has a brief outage during rollouts and during node maintenance,
+  and there is no PodDisruptionBudget that can change that (on a 1-replica
+  workload `minAvailable: 1` only blocks drains forever). Fixing it is
+  application work — shared limiter/ledger state and leader election for the
+  producers — see "Scaling".
+- **`/health` (liveness) does not verify database connectivity** — by
   design: a DB outage must not make Kubernetes kill every API pod.
   `/ready` (readiness) now **does** connect to Postgres to check the Alembic
   schema revision (`core/auth/schema_version.py`), so a pod that cannot reach
   the database, or is pointed at an un-migrated / wrong-revision one, reports
   `503` and is taken out of the Service's endpoint list until it recovers.
-  It still does not check Redis (nothing in `core/` uses Redis —
-  `dependencies_status()` reports it `"unknown"`).
+  `/ready` also reflects the subsystem dependency graph: it returns `503`
+  while a REQUIRED subsystem (`core/lifecycle.py`) is not `ACTIVE`, so a pod
+  whose Watchtower, audit or reliability wiring failed to start never
+  receives traffic.
 - **`/watchtower/ready` is intentionally NOT used for any probe on
   `s43-core`**, despite the name suggesting it's the obvious readiness
   check. It measures whether every *other* registered module/dependency
@@ -298,18 +404,33 @@ real enforcement, not just object presence.
   `base/s43-core-deployment.yaml`'s comment for the full explanation. All
   three probes on `s43-core` use `/watchtower/health` instead, which only
   reflects the node's own local state.
-- **Postgres and Redis are single-instance StatefulSets, not a managed or
-  HA database.** No replication, no automatic failover, no automated
-  backups. Real production/public-beta-at-scale use should sit behind a
-  managed database service (RDS, Cloud SQL, managed Redis, etc.) or a
-  proper HA operator (CloudNativePG, Zalando's postgres-operator, Redis
-  Sentinel/Cluster) — this repo's manifests are a functional starting
-  point, not a substitute for that.
-- **Nothing in `core/` currently connects to Redis.** `REDIS_URL` is wired
-  through as config (matching `docker-compose.yml`) but grep confirms no
-  live import of a Redis client anywhere in `core/`. It's provisioned for
-  parity and forward-compatibility, not because the app depends on it
-  today.
+- **Postgres is a single-instance StatefulSet, not a managed or HA
+  database.** No replication, no automatic failover, no automated backups.
+  Real production/public-beta-at-scale use should sit behind a managed
+  database service (RDS, Cloud SQL) or a proper HA operator (CloudNativePG,
+  Zalando's postgres-operator) — this repo's manifests are a functional
+  starting point, not a substitute for that.
+- **The audit ledger and dead-letter store are SQLite files on a single
+  ReadWriteOnce PVC.** They are backed up by `kubectl cp`, not by
+  `pg_dump` (see "Backup / restore"), and they are a second reason
+  `s43-api` cannot be scaled out.
+- **No Redis.** There is none in this deployment, and there never was one
+  that worked. A `s43-redis` StatefulSet, its NetworkPolicy and the
+  `network/s43-redis-client` labels were removed in the Kubernetes parity
+  pass, for three independent reasons: nothing in `core/` or `dashboard/`
+  opens a Redis connection; `docker-compose.yml` runs no Redis service, so
+  it was a Kubernetes-only component with no counterpart in the canonical
+  runtime; and the StatefulSet named a ServiceAccount (`s43-redis`) that no
+  manifest in this tree ever defined, so its pods could not be admitted.
+  `scripts/k8s_policy_check.py` now fails any workload that references an
+  object the render does not create, so that class of defect cannot ship
+  again. `core/cli/generate_secrets.py` still emits `REDIS_PASSWORD` and
+  `.env.example` still lists it — both are unused leftovers in application
+  tooling, left alone deliberately rather than changed from a deployment
+  pass. Redis becomes relevant again only if the rate limiter or the
+  idempotency ledger is made shared, and it should be reintroduced by that
+  work, with a client in `core/`.
+
 - **`/docs`, `/redoc`, `/openapi.json` are public and unauthenticated**
   (FastAPI defaults) on whatever this Ingress exposes — already flagged as
   an open decision in `docs/security/endpoint_access_matrix.md` (finding
@@ -336,7 +457,27 @@ real enforcement, not just object presence.
 
 Run manually against a disposable `kind` cluster (Calico CNI) during
 development of this deployment — not against Docker Desktop's persistent
-cluster, and torn down unconditionally afterward:
+cluster, and torn down unconditionally afterward.
+
+> **This log describes the manifests as they were at the time of that run,
+> and is kept unedited as a record.** The Kubernetes parity pass changed two
+> things it depends on, so read these items with that in mind rather than as
+> claims about the current manifests:
+>
+> - **Redis was removed.** Anything below mentioning `s43-redis` describes a
+>   workload that no longer exists — and, as it turns out, one whose pods
+>   could not have been admitted in the tree as committed, because its
+>   ServiceAccount was never defined. Whatever reached `Ready` in that run
+>   was not reproducible from these manifests.
+> - **`s43-api` is now a `Recreate` singleton.** The three "the old/good
+>   replica kept serving" observations below were properties of
+>   `replicas: 2` + `RollingUpdate`. They no longer hold: a bad image, a
+>   deleted Secret and an invalid `S43_JWT_SECRET` all still fail closed
+>   exactly as described — `ErrImageNeverPull`, `CreateContainerConfigError`
+>   and `CrashLoopBackOff` respectively — but with a brief API outage
+>   instead of zero downtime. The fail-closed behaviour is what that testing
+>   established; the zero-downtime part was a consequence of a replica count
+>   the application could not actually support.
 
 - Full stack (`s43-db`, `s43-redis`, `s43-core`, `s43-api`) reached `Ready`
   under the `restricted` Pod Security Standard.

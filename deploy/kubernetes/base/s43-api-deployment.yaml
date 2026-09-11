@@ -5,10 +5,26 @@ metadata:
   namespace: sentinel43
   labels: {app: s43-api}
 spec:
-  replicas: 1  # beta overlay patches this to 2 and adds a PodDisruptionBudget
+  # REPLICA SAFETY: the API is single-replica-safe ONLY. This is a property of
+  # the current application, not a scaling preference:
+  #   - core/reliability.py's IdempotencyLedger is an in-process dict, so a
+  #     second replica has its own ledger and would process the same event_id
+  #     a second time -- duplicate analysis and duplicate alerts.
+  #   - FenrirHunter and the SpartaCore watchdog are started per API process,
+  #     so N replicas means N copies of each producer generating findings.
+  #   - _broadcast_dashboard_event only reaches WebSocket clients attached to
+  #     the replica that handled the event, so a dashboard on replica A would
+  #     silently miss events distributed by replica B.
+  #   - the audit and dead-letter SQLite files live on a ReadWriteOnce PVC
+  #     mounted below; concurrent writers would risk corrupting them.
+  # Scaling out requires shared idempotency/broadcast state first. Until then
+  # this stays 1, and the strategy below keeps it 1 even mid-rollout.
+  replicas: 1
   strategy:
-    type: RollingUpdate
-    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+    # Recreate, NOT RollingUpdate: maxSurge would briefly run a second API
+    # pod, which is exactly the doubled-singleton state described above, and
+    # the new pod could not attach the ReadWriteOnce PVC anyway.
+    type: Recreate
   selector:
     matchLabels: {app: s43-api}
   template:
@@ -16,7 +32,6 @@ spec:
       labels:
         app: s43-api
         network/s43-db-client: "true"
-        network/s43-redis-client: "true"
         network/s43-core-client: "true"
     spec:
       serviceAccountName: s43-api
@@ -28,6 +43,72 @@ spec:
         runAsGroup: 65532
         fsGroup: 65532
         seccompProfile: {type: RuntimeDefault}
+      initContainers:
+        # Wait for s43-core to accept connections before starting the API.
+        #
+        # This mirrors docker-compose.yml's `depends_on: s43-core:
+        # {condition: service_started}`, which Kubernetes has no equivalent
+        # for -- and the absence was not harmless. Observed on a live
+        # cluster: with everything applied at once, the API came up first,
+        # its Watchtower registration hit ConnectionRefusedError three times
+        # (modules/register, modules/heartbeat, dependencies/report), and the
+        # `watchtower` subsystem was left FAILED. It stayed FAILED for the
+        # life of the pod even after s43-core was serving and events were
+        # being delivered to it successfully -- so /system/status told an
+        # operator a healthy subsystem was broken.
+        #
+        # NOTE the exit code: unlike the migration Job's wait-for-db, this
+        # exits 0 on timeout instead of failing. Watchtower is an OPTIONAL
+        # subsystem -- readiness reports it as degraded, not blocking -- so a
+        # genuinely absent s43-core must still leave the API able to start
+        # and say so. This container removes a startup race; it does not
+        # turn an optional dependency into a required one.
+        - name: wait-for-core
+          image: sentinel43-api:base-placeholder
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - -c
+            - |
+              import os, socket, sys, time
+              from urllib.parse import urlsplit
+
+              url = urlsplit(os.environ.get("S43_WATCHTOWER_URL", ""))
+              host, port = url.hostname or "s43-core", url.port or 9100
+              deadline = time.monotonic() + 120
+
+              while time.monotonic() < deadline:
+                  try:
+                      with socket.create_connection((host, port), timeout=5):
+                          print(f"{host}:{port} is accepting connections")
+                          sys.exit(0)
+                  except OSError as exc:
+                      print(f"waiting for {host}:{port}: {exc}", flush=True)
+                      time.sleep(2)
+
+              print(
+                  f"{host}:{port} did not answer; starting anyway -- "
+                  f"Watchtower is optional and will be reported degraded",
+                  flush=True,
+              )
+              sys.exit(0)
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          envFrom:
+            - configMapRef: {name: sentinel43-config}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities: {drop: ["ALL"]}
+            seccompProfile: {type: RuntimeDefault}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+          resources:
+            requests: {cpu: 10m, memory: 64Mi}
+            limits: {cpu: 200m, memory: 128Mi}
+
       containers:
         - name: s43-api
           image: sentinel43-api:base-placeholder  # overridden by every overlay
@@ -63,9 +144,14 @@ spec:
           # readiness = /ready, which connects to Postgres and returns 503
           # while alembic_version is behind/ahead/missing (schema_version.py)
           # -- so a pod pointed at an un-migrated database is kept out of the
-          # Service until the s43-migration Job completes. With
-          # maxUnavailable: 0 the previously-serving replica stays up
-          # throughout. readiness still does not check Redis (unused).
+          # Service until the s43-migration Job completes.
+          # readiness also reflects the subsystem dependency graph: /ready
+          # returns 503 while a REQUIRED subsystem (see core/lifecycle.py)
+          # is not ACTIVE, so a pod whose Watchtower/audit wiring failed to
+          # start never receives traffic.
+          # There is no "previously-serving replica stays up" here: the
+          # Deployment is a Recreate singleton, so a rollout is a short,
+          # deliberate gap rather than an overlap.
           startupProbe:
             httpGet: {path: /health, port: 8000}
             periodSeconds: 5
@@ -86,13 +172,21 @@ spec:
         - name: state
           persistentVolumeClaim: {claimName: s43-api-state}
 ---
-# Provisioned for parity with docker-compose.yml's sentinel43_state volume.
-# Note (README's "Known limitations"): nothing in core/api or
-# core/monitoring currently writes here — core/sentinel43_core_db.py is the
-# only reader of SENTINEL_DB_PATH-style config and isn't imported by the
-# live app (verified: no import of it anywhere else in core/). Kept for
-# forward-compatibility and Compose parity, not because it's load-bearing
-# today.
+# Durable runtime state, mirroring docker-compose.yml's sentinel43_state
+# volume. This IS load-bearing (it was not when this PVC was first written,
+# and the note that used to sit here saying nothing writes here is now
+# wrong). Two SQLite databases live on it:
+#   /app/sentinel43_state/audit.sqlite3        S43_AUDIT_SQLITE_PATH -- the
+#       authoritative HMAC-chained audit ledger
+#   /app/sentinel43_state/dead_letter.sqlite3  S43_DEAD_LETTER_PATH -- failed
+#       events awaiting operator replay
+# An emptyDir here would silently discard the audit chain and the record of
+# which events failed, on every pod restart. The container also runs with
+# readOnlyRootFilesystem: true, so this is the ONLY writable path the
+# application has for state.
+# ReadWriteOnce is correct precisely because s43-api is a singleton (see the
+# replica-safety note on the Deployment above); it is also why a second
+# replica could not schedule even if someone set one.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -101,7 +195,15 @@ metadata:
 spec:
   accessModes: ["ReadWriteOnce"]
   resources:
-    requests: {storage: 256Mi}
+    # 256Mi was sized when this volume was believed to hold nothing. The
+    # audit ledger has NO retention policy -- it is an append-only
+    # hash-chained record and grows without bound -- so this is a runway,
+    # not a limit that keeps it in check. The dead-letter store beside it IS
+    # bounded (S43_DEAD_LETTER_MAX_ROWS). Monitor free space on this volume:
+    # if it fills, audit writes fail, and an audit ledger that cannot be
+    # written is a security control that has stopped working. Expanding it
+    # later requires a StorageClass with allowVolumeExpansion: true.
+    requests: {storage: 2Gi}
 ---
 apiVersion: v1
 kind: Service

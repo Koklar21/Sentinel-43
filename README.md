@@ -76,7 +76,6 @@ The system currently has established Docker-based components for:
 - Sentinel-43 API
 - Sentinel-43 core
 - PostgreSQL
-- Redis
 - migration execution
 - reverse-proxy / TLS-edge integration
 
@@ -673,7 +672,6 @@ A deployment may contain services corresponding to:
     s43-api
     s43-core
     s43-db
-    s43-redis
     s43-migrate
     s43-proxy
 
@@ -687,9 +685,6 @@ s43-core
 
 s43-db
     PostgreSQL persistent storage.
-
-s43-redis
-    Shared transient/state infrastructure where required.
 
 s43-migrate
     One-shot database migration execution.
@@ -730,16 +725,23 @@ passes against a lightweight substitute database.
 
 # Redis
 
-Redis is available as part of the Sentinel-43 service architecture for
-shared transient/state requirements where appropriate.
+Redis is reserved for shared transient state, and no deployment target
+currently runs one. Nothing in `core/` or `dashboard/` opens a Redis
+connection, `docker-compose.yml` defines no Redis service, and the
+Kubernetes manifests no longer provision one.
 
-Redis must not be publicly exposed.
+This is a deliberate position, not an oversight. Sentinel-43 does not
+introduce Redis merely to replace simpler, well-defined persistence
+behavior, and an unused datastore in a deployment is attack surface plus a
+false signal that shared state exists.
 
-Redis usage remains intentionally limited to cases where shared state is
-actually required.
+Two components would genuinely need it before it comes back: the firewall's
+rate limiter and the event idempotency ledger are both in-process today,
+which is a large part of why `s43-api` runs as a singleton (see
+`deploy/kubernetes/README.md`). Whichever change makes one of those shared
+should reintroduce Redis along with a client in `core/` -- not ahead of it.
 
-Sentinel-43 does not introduce Redis merely to replace simpler,
-well-defined persistence behavior.
+If it is reintroduced, it must not be publicly exposed.
 
 ---
 

@@ -18,6 +18,24 @@
 #
 # DATABASE_URL is supplied by sentinel43-secrets. alembic.ini must not contain
 # credentials or a connection string.
+#
+# WAITING FOR THE DATABASE
+# docker-compose.yml orders this with `depends_on: {condition:
+# service_healthy}`. Kubernetes has no equivalent, and for a while nothing
+# replaced it here -- which is not theoretical: applying this Kustomization
+# in one shot against a cluster with no database yet, every attempt failed
+# within four minutes with `socket.gaierror: [Errno -3] Try again`, because
+# s43-db is a HEADLESS Service and headless Services publish no DNS record
+# at all until a pod behind them is Ready. backoffLimit was then exhausted
+# and the Job stayed Failed, which in a production profile means the API
+# never passes readiness (schema_report reports `fresh` and blocks serving)
+# and a human has to delete and re-create the Job by hand.
+#
+# The initContainer below closes that gap inside the Job, so the documented
+# apply-and-wait sequence works even when everything is created at once.
+# It waits for the database to accept TCP connections; it does not touch
+# the schema, hold credentials, or make any decision -- alembic still does
+# all of that, in the container after it.
 
 apiVersion: batch/v1
 kind: Job
@@ -29,8 +47,13 @@ metadata:
     app: s43-migration
 
 spec:
+  # Retries are for a database that is slow to come up or briefly
+  # unreachable, not for a migration that is actually wrong: a failing
+  # `alembic upgrade` fails the same way every time, so a higher limit only
+  # delays the error. The initContainer absorbs startup ordering, and
+  # activeDeadlineSeconds caps the whole Job regardless.
   backoffLimit: 3
-  activeDeadlineSeconds: 300
+  activeDeadlineSeconds: 900
   ttlSecondsAfterFinished: 3600
 
   template:
@@ -52,6 +75,64 @@ spec:
         fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
+
+      initContainers:
+        # Wait for Postgres to accept connections. Deliberately uses only
+        # the host and port -- no credentials, no query, no schema access.
+        # It re-resolves DNS on every attempt, which is the point: the
+        # headless Service's record does not exist until s43-db-0 is Ready.
+        - name: wait-for-db
+          image: sentinel43-api:base-placeholder
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - -c
+            - |
+              import os, socket, sys, time
+              from urllib.parse import urlsplit
+
+              url = urlsplit(os.environ.get("DATABASE_URL", ""))
+              host, port = url.hostname or "s43-db", url.port or 5432
+              deadline = time.monotonic() + 600
+
+              while time.monotonic() < deadline:
+                  try:
+                      with socket.create_connection((host, port), timeout=5):
+                          print(f"{host}:{port} is accepting connections")
+                          sys.exit(0)
+                  except OSError as exc:
+                      print(f"waiting for {host}:{port}: {exc}", flush=True)
+                      time.sleep(3)
+
+              print(f"timed out waiting for {host}:{port}", file=sys.stderr)
+              sys.exit(1)
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          envFrom:
+            - configMapRef:
+                name: sentinel43-config
+            - secretRef:
+                name: sentinel43-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
 
       containers:
         - name: migrate
