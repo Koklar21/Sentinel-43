@@ -72,10 +72,23 @@ def test_declaration_order_is_preserved():
 # lifecycle states
 # --------------------------------------------------------------------------- #
 
-def test_all_six_lifecycle_states_exist():
+def test_all_lifecycle_states_exist():
     assert {s.value for s in SubsystemState} == {
-        "DISABLED", "STARTING", "ACTIVE", "DEGRADED", "UNAVAILABLE", "STOPPED",
+        "DISABLED", "STARTING", "ACTIVE", "DEGRADED",
+        "UNAVAILABLE", "FAILED", "STOPPING", "STOPPED",
     }
+
+
+def test_unavailable_and_failed_are_distinct():
+    """"not configured" and "it broke" are different operator questions."""
+    reg = SubsystemRegistry()
+    reg.declare("a")
+    reg.mark_unconfigured("a", ("S43_X",))
+    assert reg.get("a").state is SubsystemState.UNAVAILABLE
+
+    reg.declare("b")
+    reg.mark_failed("b", "boom")
+    assert reg.get("b").state is SubsystemState.FAILED
 
 
 @pytest.mark.parametrize(
@@ -87,6 +100,8 @@ def test_all_six_lifecycle_states_exist():
         (SubsystemState.STARTING, True),
         (SubsystemState.DEGRADED, True),
         (SubsystemState.UNAVAILABLE, True),
+        (SubsystemState.FAILED, True),
+        (SubsystemState.STOPPING, True),
     ],
 )
 def test_disabled_and_stopped_are_not_faults(state, faulted):
@@ -146,6 +161,7 @@ def test_optional_faulted_subsystem_is_degraded_but_still_ready():
     report = reg.readiness()
     assert report.ready is True
     assert report.degraded == ("fenrir",)
+    assert reg.get("fenrir").state is SubsystemState.FAILED
 
 
 def test_stopped_subsystem_is_not_reported_as_degraded():
