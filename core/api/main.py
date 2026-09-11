@@ -46,6 +46,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from collections.abc import Mapping
 from typing import Any
 from uuid import uuid4
 
@@ -70,13 +71,23 @@ from ..lifecycle import (
     missing_settings,
 )
 from ..logging.health_check_filter import install_health_check_access_filter
+from ..reliability import (
+    DeadLetterStore,
+    EventReliabilityManager,
+    FailureStage,
+    IdempotencyLedger,
+    RetryPolicy,
+)
 from ..monitoring.watchtower_client import (
     configure as _configure_watchtower_client,
     watchtower_request as _canonical_watchtower_request,
 )
 from ..security.jwt_constants import APPROVED_JWT_ALGORITHMS
+from ..monitoring.event_types import EVENT_SCHEMA_VERSION
 from ..security_context import (
     IdentityType,
+    get_security_context,
+    new_id as new_event_id,
     set_identity as _set_identity,
 )
 from .routers.audit import router as audit_router
@@ -414,6 +425,9 @@ class RuntimeState:
     sparta_instance: Any | None = None
     sparta_task: asyncio.Task[Any] | None = None
     fenrir_instance: Any | None = None
+
+    #: Event delivery reliability (idempotency, bounded retry, dead-letter).
+    reliability: Any | None = None
 
     #: Lifecycle state of every optional/required subsystem. Populated during
     #: lifespan startup and read by /health, /ready and /system/status.
@@ -884,6 +898,12 @@ async def _queue_ws_frame(
         client.outbound.put_nowait(frame)
         return True
     except asyncio.QueueFull:
+        # Bounded per-client queue: a dashboard that stops reading is
+        # disconnected rather than allowed to stall event processing for
+        # everyone else. The eviction is counted so it is observable.
+        if runtime.reliability is not None:
+            runtime.reliability.metrics.increment("ws_slow_client_disconnect")
+            runtime.reliability.metrics.increment("queue_overflow")
         logger.warning("Dropping slow WebSocket client: outbound queue full")
         await _ws_safe_close(
             client.websocket,
@@ -1179,6 +1199,7 @@ SUBSYS_SPARTA = "sparta"
 SUBSYS_FENRIR = "fenrir"
 SUBSYS_AUDIT = "audit_store"
 SUBSYS_GOVERNANCE = "governance"
+SUBSYS_RELIABILITY = "reliability"
 
 
 def _declare_subsystems() -> None:
@@ -1204,6 +1225,7 @@ def _declare_subsystems() -> None:
         SUBSYS_GOVERNANCE, required=_env_bool("S43_GOVERNANCE_REQUIRED", True)
         and _env_bool("S43_GOVERNANCE_ENABLED", False)
     )
+    runtime.subsystems.declare(SUBSYS_RELIABILITY, required=False)
 
 
 def _refuse_unconfigured(
@@ -1576,6 +1598,86 @@ async def _start_governance() -> None:
         logger.error("SystemOrchestrator failed to start", exc_info=True)
 
 
+async def _start_reliability() -> None:
+    """Build the event delivery reliability layer.
+
+    Optional by design: if it cannot be built the API still serves and the
+    event path behaves exactly as it did before, just without idempotency,
+    bounded retry or dead-lettering. It is reported DEGRADED rather than
+    silently absent.
+
+    The audit sink is the authoritative store, so delivery-state transitions
+    land in the same ledger as everything else -- no second pseudo-audit log.
+    """
+    runtime.subsystems.mark_starting(SUBSYS_RELIABILITY)
+    try:
+        from pathlib import Path as _Path
+
+        store = DeadLetterStore(
+            sqlite_path=_Path(
+                _env_str(
+                    "S43_DEAD_LETTER_PATH",
+                    "sentinel43_state/dead_letter.sqlite3",
+                )
+            ),
+            max_rows=_env_int(
+                "S43_DEAD_LETTER_MAX_ROWS", 10_000,
+                minimum=1, maximum=1_000_000,
+            ),
+        )
+        await asyncio.to_thread(store.initialize)
+
+        audit_store = runtime.audit_store
+
+        def _audit_sink(payload: dict[str, Any]) -> None:
+            if audit_store is None:
+                return
+            audit_store.append(payload)
+
+        runtime.reliability = EventReliabilityManager(
+            dead_letter_store=store,
+            idempotency=IdempotencyLedger(
+                max_entries=_env_int(
+                    "S43_IDEMPOTENCY_MAX_ENTRIES", 10_000,
+                    minimum=1, maximum=1_000_000,
+                ),
+                ttl_seconds=_env_float(
+                    "S43_IDEMPOTENCY_TTL_SECONDS", 900.0,
+                    minimum=1.0, maximum=86_400.0,
+                ),
+            ),
+            retry_policy=RetryPolicy(
+                max_attempts=_env_int(
+                    "S43_DELIVERY_MAX_ATTEMPTS", 3, minimum=1, maximum=10
+                ),
+                base_delay_seconds=_env_float(
+                    "S43_DELIVERY_BASE_DELAY", 0.2,
+                    minimum=0.001, maximum=60.0,
+                ),
+                max_delay_seconds=_env_float(
+                    "S43_DELIVERY_MAX_DELAY", 5.0,
+                    minimum=0.001, maximum=300.0,
+                ),
+                total_deadline_seconds=_env_float(
+                    "S43_DELIVERY_DEADLINE", 10.0,
+                    minimum=0.01, maximum=300.0,
+                ),
+            ),
+            audit_sink=_audit_sink if audit_store is not None else None,
+        )
+        runtime.subsystems.mark_active(
+            SUBSYS_RELIABILITY,
+            "Idempotency, bounded retry and dead-lettering active.",
+        )
+        logger.info("Event reliability layer active")
+    except Exception as exc:
+        runtime.reliability = None
+        runtime.subsystems.mark_failed(
+            SUBSYS_RELIABILITY, f"Failed to start: {type(exc).__name__}"
+        )
+        logger.error("Event reliability layer unavailable", exc_info=True)
+
+
 async def _register_remote_dispatch_handlers() -> None:
     try:
         from .routers.remote_gateway import (
@@ -1724,6 +1826,10 @@ async def _shutdown_runtime() -> None:
             runtime.sparta_instance = None
             runtime.subsystems.mark_stopped(SUBSYS_SPARTA)
 
+    if runtime.reliability is not None:
+        runtime.reliability = None
+        runtime.subsystems.mark_stopped(SUBSYS_RELIABILITY)
+
     if runtime.monitoring_manager is not None:
         try:
             await asyncio.to_thread(runtime.monitoring_manager.stop)
@@ -1793,6 +1899,7 @@ async def lifespan(api: FastAPI):
         await _start_sparta()
         await _start_fenrir()
         await _start_audit_store()
+        await _start_reliability()
         await _start_governance()
         await _register_remote_dispatch_handlers()
 
@@ -2092,6 +2199,11 @@ async def metrics(request: Request) -> dict[str, Any]:
         "watchtower_heartbeat_seconds": WATCHTOWER_HEARTBEAT_SECONDS,
         "legacy_auth_request_total": legacy_auth,
         "in_memory_action_insert_count": await _action_insert_count(),
+        "event_reliability": (
+            runtime.reliability.status()
+            if runtime.reliability is not None
+            else {"state": "unavailable"}
+        ),
         "timestamp": utc_now(),
     }
 
@@ -2911,6 +3023,58 @@ async def watchtower_check(
     }
 
 
+def _delivery_envelope(
+    body: Mapping[str, Any],
+    request: Request,
+) -> dict[str, Any]:
+    """Build the reliability envelope for an inbound event.
+
+    Non-destructive on purpose: this ingress forwards arbitrary producer
+    bodies to Watchtower, which does its own scanning, so the envelope is
+    derived alongside the body rather than by rejecting anything that is not
+    a known typed event kind.
+
+    A producer-supplied event_id is preserved -- that is what makes a
+    transport retry recognisable as the same logical event. The
+    correlation_id comes from the request's SecurityContext so the event ties
+    back to everything else that happened on that request.
+    """
+    context = get_security_context(request)
+
+    event_id = str(
+        body.get("event_id") or body.get("id") or ""
+    ).strip() or new_event_id()
+
+    correlation_id = (
+        str(body.get("correlation_id") or "").strip()
+        or (context.correlation_id if context is not None else "")
+        # Never empty: an event with no wider correlation still traces as a
+        # singleton under its own id, which is far more useful downstream
+        # than a blank field.
+        or event_id
+    )
+
+    return {
+        "event_id": event_id,
+        "correlation_id": correlation_id,
+        "event_type": str(
+            body.get("event_type") or body.get("kind") or "event"
+        ),
+        "kind": str(body.get("kind") or ""),
+        "schema_version": str(
+            body.get("schema_version") or EVENT_SCHEMA_VERSION
+        ),
+        "source": str(body.get("source") or "fenrir"),
+        "source_identity": (
+            context.identity_type.value
+            if context is not None
+            else IdentityType.SERVICE_FENRIR.value
+        ),
+        "created_at": str(body.get("created_at") or utc_now()),
+        "ingested_at": utc_now(),
+    }
+
+
 @watchtower_router.post("/events")
 async def watchtower_ingest_event(
     body: dict[str, Any],
@@ -2918,26 +3082,188 @@ async def watchtower_ingest_event(
 ) -> dict[str, Any]:
     _require_fenrir_service_token(request)
 
-    result = await asyncio.to_thread(
-        _watchtower_request,
-        "POST",
-        "/watchtower/analyze",
-        {"event": body},
-    )
+    envelope = _delivery_envelope(body, request)
+    forwarded = {**body, **{
+        "event_id": envelope["event_id"],
+        "correlation_id": envelope["correlation_id"],
+    }}
 
+    def _deliver() -> Any:
+        return _watchtower_request(
+            "POST",
+            "/watchtower/analyze",
+            {"event": forwarded},
+        )
+
+    reliability = runtime.reliability
+
+    if reliability is None:
+        # Reliability layer unavailable: behave exactly as before, but still
+        # refuse to call a failed delivery a success.
+        result = await asyncio.to_thread(_deliver)
+        delivered = isinstance(result, dict) and "error" not in result
+        delivery = {
+            "state": "DELIVERED" if delivered else "FAILED_TERMINAL",
+            "event_id": envelope["event_id"],
+            "correlation_id": envelope["correlation_id"],
+            "attempts": 1,
+        }
+    else:
+        outcome = await asyncio.to_thread(
+            reliability.deliver,
+            envelope,
+            _deliver,
+            stage=FailureStage.WATCHTOWER_DELIVERY,
+        )
+        delivered = outcome.handled
+        result = outcome.response
+        delivery = outcome.to_dict()
+
+    # Distribution carries the same identity the event was accepted under.
     await _broadcast_dashboard_event(
         "watchtower_event",
         {
-            "event": body,
+            "event": forwarded,
+            "event_id": envelope["event_id"],
+            "correlation_id": envelope["correlation_id"],
             "watchtower_response": result,
+            "delivery": delivery,
             "timestamp": utc_now(),
         },
         channel="watchtower",
     )
 
+    if not delivered:
+        # A failed delivery is never reported as ok:true. This route used to
+        # return success unconditionally, so a Watchtower outage looked
+        # identical to a clean ingest.
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "delivery": delivery,
+                "forwarded": result,
+                "timestamp": utc_now(),
+            },
+        )
+
     return {
         "ok": True,
+        "delivery": delivery,
         "forwarded": result,
+        "timestamp": utc_now(),
+    }
+
+
+# =============================================================================
+# Event reliability operator router
+#
+# Authenticated HUMAN operator surface. Service tokens do not reach these
+# routes: _require_operator is the human/session verifier, and a Fenrir,
+# Sparta or Watchtower service credential cannot satisfy it. Replay is an
+# explicit operator act -- there is no automatic or scheduled replay anywhere
+# in this module.
+# =============================================================================
+
+reliability_router = APIRouter(
+    prefix="/reliability",
+    tags=["reliability"],
+)
+
+
+def _require_reliability() -> Any:
+    manager = runtime.reliability
+    if manager is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Event reliability layer is not available.",
+        )
+    return manager
+
+
+@reliability_router.get("/status")
+async def reliability_status(request: Request) -> dict[str, Any]:
+    await _require_operator(request)
+    return _require_reliability().status()
+
+
+@reliability_router.get("/failed-events")
+async def reliability_failed_events(
+    request: Request,
+    limit: int = 50,
+    replay_status: str | None = None,
+) -> dict[str, Any]:
+    """Sanitized metadata for dead-lettered events.
+
+    Records contain provenance and failure classification only -- never a
+    payload, token or credential (see reliability.sanitize_for_record).
+    """
+    await _require_operator(request)
+    manager = _require_reliability()
+
+    store = manager.dead_letter_store
+    if store is None:
+        raise HTTPException(
+            status_code=503,
+            detail="No dead-letter store is configured.",
+        )
+
+    records = await asyncio.to_thread(
+        store.list_records,
+        limit=max(1, min(int(limit), 500)),
+        replay_status=replay_status,
+    )
+    return {
+        "count": len(records),
+        "counts": await asyncio.to_thread(store.counts),
+        "events": [record.to_dict() for record in records],
+        "timestamp": utc_now(),
+    }
+
+
+@reliability_router.post("/replay/{event_id}")
+async def reliability_replay(
+    event_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    """Replay ONE dead-lettered event, on explicit operator instruction.
+
+    Bounded by construction: one request produces at most one delivery
+    attempt. There is no replay-all, and a failed replay returns to the
+    dead-letter state rather than being recycled. Replay re-delivers an
+    event; it never executes a remediation or approves an action.
+    """
+    operator = await _require_operator(request)
+    manager = _require_reliability()
+
+    safe_id = str(event_id).strip()
+    if not safe_id or len(safe_id) > 200:
+        raise HTTPException(status_code=422, detail="Invalid event_id.")
+
+    def _redeliver(envelope: Mapping[str, Any]) -> Any:
+        return _watchtower_request(
+            "POST",
+            "/watchtower/analyze",
+            {"event": dict(envelope)},
+        )
+
+    outcome = await asyncio.to_thread(
+        manager.replay,
+        safe_id,
+        _redeliver,
+        operator=operator,
+    )
+
+    if outcome.reason == "unknown_event_id":
+        raise HTTPException(
+            status_code=404,
+            detail="No dead-lettered event with that id.",
+        )
+
+    return {
+        "ok": outcome.delivered,
+        "replay": outcome.to_dict(),
+        "operator": operator,
         "timestamp": utc_now(),
     }
 
@@ -3395,6 +3721,7 @@ app.include_router(watchgate_router)
 app.include_router(internal_router)
 app.include_router(proxy_events_router)
 app.include_router(watchtower_router)
+app.include_router(reliability_router)
 app.include_router(core_router)
 app.include_router(rules_router)
 app.include_router(config_router)
