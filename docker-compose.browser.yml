@@ -17,7 +17,13 @@
 # =============================================================================
 services:
   s43-db:      { container_name: s43browser_postgres }
-  s43-redis:   { container_name: s43browser_redis }
+  # No s43-redis override: docker-compose.yml defines no such service (Redis
+  # is unused by the runtime -- see deploy/kubernetes/README.md's "No Redis").
+  # This override used to reference it anyway, which is a merge onto a
+  # service that doesn't exist -- Compose synthesizes an empty service
+  # definition with no image/build context and refuses the whole project
+  # ("service \"s43-redis\" has neither an image nor a build context
+  # specified"), which is what blocked this stack from starting at all.
   s43-core:    { container_name: s43browser_core }
   s43-migrate: { container_name: s43browser_migrate }
   s43-api:
