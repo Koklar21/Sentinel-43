@@ -34,6 +34,7 @@ build/
 
 venv/
 .venv/
+.venv-*/
 env/
 .env_virt/
 
@@ -119,3 +120,12 @@ Thumbs.db
 *.tgz
 *.7z
 *.rar
+
+# -----------------------------------------------------------------------------
+# Local developer tooling (gitignored, machine-local -- CI's fresh checkout
+# never has this directory, but a local build on a machine that does would
+# otherwise COPY these straight into the image). Found via a local Trivy
+# scan surfacing two Windows kind.exe/kubeconform.exe binaries bundled with
+# their own outdated Go toolchain, entirely unrelated to the application.
+# -----------------------------------------------------------------------------
+.tools/

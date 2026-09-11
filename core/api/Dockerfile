@@ -16,6 +16,19 @@
 # Debian-package findings seen in the former slim-based image.
 FROM python:3.13-alpine AS dependencies
 
+# Alpine OS packages, upgraded to their current fixed versions at build time.
+# python:3.13-alpine is a mutable tag; this repo has no digest-pinning
+# convention for it (or for any other base image) to be consistent with, so
+# picking up current package fixes on every build -- rather than freezing to
+# whatever the tag happened to resolve to on a given day -- is the more
+# defensible default here. Concretely, this closed 7 HIGH util-linux/libuuid
+# findings the Trivy gate caught (CVE-2026-53612/53613/53614/76642/78409,
+# fixed in libuuid 2.42.3-r0; CVE-2026-78408/78410, fixed in 2.42.3-r1) --
+# Alpine 3.24.1 shipped 2.42.1-r0. Scoped to `apk upgrade`, not a newer
+# Alpine major/minor: this patches existing packages within the same
+# release, it does not change what Alpine version the image reports.
+RUN apk update && apk upgrade --no-cache
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
