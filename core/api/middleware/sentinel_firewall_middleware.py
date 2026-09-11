@@ -55,6 +55,16 @@ from typing import (
 )
 from urllib.parse import unquote
 
+from ...security_context import (
+    STATE_KEY as SC_STATE_KEY,
+    UNKNOWN_CLIENT,
+    IdentityType,
+    SecurityContext,
+    attach_security_context,
+    new_id,
+    sanitize_correlation_id,
+)
+
 logger = logging.getLogger(__name__)
 
 ASGIApp = Callable[
@@ -141,6 +151,31 @@ def _env_csv(name: str) -> tuple[str, ...]:
     )
 
 
+class TrafficClass(str, Enum):
+    """Rate-budget class for a request.
+
+    The firewall runs before authentication, so it cannot key budgets on a
+    verified identity. Route prefix is the honest proxy available at this
+    layer, and it is sufficient for the property that matters: a malfunctioning
+    internal producer burns only its own budget and cannot starve operators.
+    """
+
+    PUBLIC = "public"
+    INTERNAL_FENRIR = "internal_fenrir"
+    SPARTA_NODE = "sparta_node"
+    REMOTE_GATEWAY = "remote_gateway"
+    WEBSOCKET = "websocket"
+
+
+#: Longest-prefix wins; order matters.
+_TRAFFIC_CLASS_PREFIXES: Final[tuple[tuple[str, TrafficClass], ...]] = (
+    ("/internal/", TrafficClass.INTERNAL_FENRIR),
+    ("/watchtower/events", TrafficClass.INTERNAL_FENRIR),
+    ("/node/", TrafficClass.SPARTA_NODE),
+    ("/remote-gateway/", TrafficClass.REMOTE_GATEWAY),
+)
+
+
 @dataclass(frozen=True, slots=True)
 class FirewallConfig:
     enabled: bool = True
@@ -186,6 +221,13 @@ class FirewallConfig:
     websocket_rate_limit_requests: int = 60
     websocket_rate_limit_window_seconds: int = 60
     rate_limit_max_keys: int = 10_000
+
+    # Independent per-class budgets. Each class gets its own limiter, keyed
+    # per client within that class, so exhausting one cannot deny another.
+    # An internal producer in a retry storm degrades itself, not the operator.
+    internal_rate_limit_requests: int = 600
+    sparta_rate_limit_requests: int = 600
+    remote_gateway_rate_limit_requests: int = 120
 
     # Response behavior
     block_status_code: int = 403
@@ -565,6 +607,28 @@ class SentinelFirewall:
             max_keys=self.config.rate_limit_max_keys,
         )
 
+        window = self.config.http_rate_limit_window_seconds
+        max_keys = self.config.rate_limit_max_keys
+        self._class_limiters: dict[TrafficClass, _RateLimiter] = {
+            TrafficClass.PUBLIC: self._http_limiter,
+            TrafficClass.WEBSOCKET: self._ws_limiter,
+            TrafficClass.INTERNAL_FENRIR: _RateLimiter(
+                self.config.internal_rate_limit_requests,
+                window,
+                max_keys=max_keys,
+            ),
+            TrafficClass.SPARTA_NODE: _RateLimiter(
+                self.config.sparta_rate_limit_requests,
+                window,
+                max_keys=max_keys,
+            ),
+            TrafficClass.REMOTE_GATEWAY: _RateLimiter(
+                self.config.remote_gateway_rate_limit_requests,
+                window,
+                max_keys=max_keys,
+            ),
+        }
+
     async def __call__(
         self,
         scope: dict[str, Any],
@@ -695,7 +759,8 @@ class SentinelFirewall:
             if not content_decision.allowed:
                 return content_decision
 
-        limiter = self._ws_limiter if websocket else self._http_limiter
+        traffic_class = self._classify(scope, websocket=websocket)
+        limiter = self._class_limiters[traffic_class]
         limiter_key = client_ip_text or "unknown"
 
         if not limiter.allow(limiter_key):
@@ -711,6 +776,24 @@ class SentinelFirewall:
             )
 
         return FirewallDecision(allowed=True)
+
+    @staticmethod
+    def _classify(
+        scope: Mapping[str, Any],
+        *,
+        websocket: bool,
+    ) -> TrafficClass:
+        if websocket:
+            return TrafficClass.WEBSOCKET
+
+        raw_path = scope.get("path")
+        path = raw_path if isinstance(raw_path, str) else ""
+
+        for prefix, traffic_class in _TRAFFIC_CLASS_PREFIXES:
+            if path.startswith(prefix):
+                return traffic_class
+
+        return TrafficClass.PUBLIC
 
     def _resolve_client_ip(
         self,
@@ -892,8 +975,12 @@ class SentinelFirewall:
         try:
             headers = _headers_to_mapping(scope.get("headers") or [])
             client_ip = self._resolve_client_ip(scope, headers)
+            via_trusted_proxy = self._came_via_trusted_proxy(scope)
+            inbound_correlation = _first_header(headers, "x-request-id")
         except Exception:
             client_ip = ""
+            via_trusted_proxy = False
+            inbound_correlation = None
 
         state = scope.setdefault("state", {})
 
@@ -907,7 +994,38 @@ class SentinelFirewall:
             if decision.reason
             else None
         )
-        state["s43_client_ip"] = client_ip or None
+
+        # The single canonical security context for this request. Downstream
+        # code reads this instead of re-deriving the client identity, so the
+        # trusted-proxy decision has exactly one implementation.
+        context = SecurityContext(
+            request_id=new_id(),
+            correlation_id=sanitize_correlation_id(inbound_correlation),
+            client_ip=client_ip or UNKNOWN_CLIENT,
+            via_trusted_proxy=via_trusted_proxy,
+            firewall_allowed=decision.allowed,
+            firewall_reason=(
+                decision.reason.value if decision.reason else ""
+            ),
+        )
+        attach_security_context(state, context)
+
+    def _came_via_trusted_proxy(
+        self,
+        scope: Mapping[str, Any],
+    ) -> bool:
+        """True only when the immediate peer is a configured trusted proxy.
+
+        This is the same predicate that gates whether X-Forwarded-For is
+        honoured, surfaced so downstream code can record how the client
+        identity was established without re-deriving it.
+        """
+        if not self._trusted_proxy_networks:
+            return False
+        direct_ip = _parse_ip(_client_host_from_scope(scope))
+        if direct_ip is None:
+            return False
+        return _ip_in_networks(direct_ip, self._trusted_proxy_networks)
 
     @staticmethod
     def _security_headers() -> tuple[tuple[bytes, bytes], ...]:
@@ -1022,9 +1140,25 @@ class SentinelFirewall:
         except Exception:
             client_ip = ""
 
+        # Provenance travels with the event: the firewall is the source, and
+        # the request's correlation id lets this block be tied to everything
+        # else that happened on the same request.
+        state = scope.get("state") or {}
+        context = (
+            state.get(SC_STATE_KEY) if isinstance(state, dict) else None
+        )
+
         event = {
             "kind": "security",
             "source": self.config.monitoring_source,
+            "source_identity": (
+                context.identity_type.value
+                if context is not None
+                else IdentityType.ANONYMOUS.value
+            ),
+            "correlation_id": (
+                context.correlation_id if context is not None else ""
+            ),
             "node": self.config.monitoring_node,
             "status": "blocked",
             "severity": "warning",
@@ -1070,6 +1204,7 @@ class SentinelFirewall:
 
 __all__ = [
     "BlockReason",
+    "TrafficClass",
     "FirewallConfig",
     "FirewallDecision",
     "SentinelFirewall",

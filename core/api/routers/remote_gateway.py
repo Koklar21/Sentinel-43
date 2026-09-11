@@ -53,6 +53,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ...monitoring.watchtower_client import watchtower_request
+from ...security_context import IdentityType, client_ip_of, set_identity
 
 logger = logging.getLogger(__name__)
 
@@ -888,24 +889,13 @@ def _reset_auth_failures() -> None:
 def _client_id(
     request: Request,
 ) -> str:
-    # Prefer the firewall's trusted-proxy-resolved client identity.
-    state = getattr(request, "state", None)
-    resolved = getattr(
-        state,
-        "s43_client_ip",
-        None,
-    )
+    """Client identity for rate limiting and security events.
 
-    if resolved:
-        return str(resolved)
-
-    if (
-        request.client is not None
-        and request.client.host
-    ):
-        return request.client.host
-
-    return "unknown"
+    Delegates to the canonical resolver so the trusted-proxy decision has a
+    single implementation; this used to be one of three near-identical
+    copies that disagreed on the unknown-peer fallback.
+    """
+    return client_ip_of(request)
 
 
 def _check_auth_rate_limit(
@@ -1085,9 +1075,18 @@ async def _authenticate(
         raise
 
     try:
-        return _resolve_principal(
+        principal = _resolve_principal(
             authorization
         )
+        # Distinct service identity; a gateway token is never an operator
+        # session and never another service's credential. The token itself
+        # is not recorded -- principal_id is already a truncated digest.
+        set_identity(
+            request,
+            IdentityType.SERVICE_REMOTE_GATEWAY,
+            principal.principal_id,
+        )
+        return principal
 
     except HTTPException as exc:
         if exc.status_code == status.HTTP_401_UNAUTHORIZED:

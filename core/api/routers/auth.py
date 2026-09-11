@@ -44,6 +44,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ...security.jwt_constants import APPROVED_JWT_ALGORITHMS
+from ...security_context import client_ip_of
 
 logger = logging.getLogger(__name__)
 
@@ -1339,14 +1340,8 @@ async def _create_login_session(
         generate_csrf_token()
     )
 
-    client_ip = getattr(
-        request.state,
-        "s43_client_ip",
-        None,
-    )
-
-    if not client_ip and request.client:
-        client_ip = request.client.host
+    # Canonical resolver: the firewall owns the trusted-proxy decision.
+    client_ip = client_ip_of(request)
 
     user_agent = request.headers.get(
         "user-agent"

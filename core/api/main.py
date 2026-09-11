@@ -75,6 +75,10 @@ from ..monitoring.watchtower_client import (
     watchtower_request as _canonical_watchtower_request,
 )
 from ..security.jwt_constants import APPROVED_JWT_ALGORITHMS
+from ..security_context import (
+    IdentityType,
+    set_identity as _set_identity,
+)
 from .routers.audit import router as audit_router
 from .routers.auth import router as auth_router
 from .routers.bootstrap import router as bootstrap_router
@@ -627,7 +631,9 @@ async def _get_operator(
 
 
 async def _require_operator(request: Request) -> str:
-    return await _get_operator(request, allow_local_fallback=False)
+    operator = await _get_operator(request, allow_local_fallback=False)
+    _set_identity(request, IdentityType.OPERATOR, operator)
+    return operator
 
 
 def _require_fenrir_service_token(request: Request) -> None:
@@ -645,6 +651,9 @@ def _require_fenrir_service_token(request: Request) -> None:
     token = auth[7:].strip()
     if not token or not secrets.compare_digest(token, expected):
         raise HTTPException(status_code=401, detail="Invalid service token")
+
+    # Record WHICH identity authenticated. Never records the token itself.
+    _set_identity(request, IdentityType.SERVICE_FENRIR, "fenrir-hunter")
 
 
 # =============================================================================

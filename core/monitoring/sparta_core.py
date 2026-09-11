@@ -58,6 +58,13 @@ from typing import Any, Protocol, runtime_checkable
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..security_context import (
+    UNKNOWN_CLIENT,
+    IdentityType,
+    client_ip_of,
+    set_identity,
+)
+
 import logging
 
 logger = logging.getLogger("SentinelSpartaCore")
@@ -442,7 +449,10 @@ class SpartaCore:
             "kind": "log",
             "integrity_status": "compromised" if compromised else "ok",
             "missing_required_fields": False,
+            # Normalized envelope provenance.
             "source": event.source or "SpartaCore",
+            "source_identity": IdentityType.SERVICE_SPARTA_NODE.value,
+            "created_at": event.timestamp,
             "node": self._config.node_signature or "sparta-core",
             "event_type": event.event_type,
             "details": payload,
@@ -779,18 +789,14 @@ class SpartaCore:
     # ------------------------------------------------------------------
 
     def get_client_id(self, request: Request | None) -> str:
-        """The SentinelFirewall-resolved client IP if present, else the peer."""
+        """The SentinelFirewall-resolved client IP if present, else the peer.
+
+        Delegates to the canonical resolver in ``core.security_context`` so
+        the trusted-proxy decision is made in exactly one place.
+        """
         if request is None:
-            return "unknown"
-
-        state_ip = getattr(request.state, "s43_client_ip", None)
-        if isinstance(state_ip, str) and state_ip.strip():
-            return state_ip.strip()
-
-        if request.client is None:
-            return "unknown"
-
-        return request.client.host or "unknown"
+            return UNKNOWN_CLIENT
+        return client_ip_of(request)
 
     def _is_client_blocked(self, client_id: str) -> bool:
         now = time.monotonic()
@@ -876,6 +882,13 @@ class SpartaCore:
             if exc.status_code != status.HTTP_503_SERVICE_UNAVAILABLE:
                 self._record_auth_failure(client_id, "missing_or_invalid_bearer")
             raise
+
+        # Distinct machine identity; never the operator or Fenrir identity.
+        set_identity(
+            request,
+            IdentityType.SERVICE_SPARTA_NODE,
+            self._config.node_signature or "sparta-node",
+        )
 
 
 # =============================================================================
