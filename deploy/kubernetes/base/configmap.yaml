@@ -11,13 +11,30 @@ metadata:
 
 data:
   # Environment / logging
+  # S43_ENV and SENTINEL_ENV are aliases read by different components
+  # (Fenrir/Sparta/Watchtower read S43_ENV). Compose keeps them in sync via
+  # SENTINEL_ENV=${SENTINEL_ENV:-${S43_ENV:-production}}; here they are two
+  # literal keys and must be changed together. The dev overlay sets both.
   S43_ENV: "production"
+  SENTINEL_ENV: "production"
   S43_LOG_LEVEL: "INFO"
 
   # Database
   POSTGRES_DB: "s43"
   POSTGRES_USER: "s43"
   S43_DB_PATH: "/app/sentinel43_state/sentinel43.sqlite3"
+
+  # Durable state. Every path below MUST stay under /app/sentinel43_state:
+  # that is the only writable mount (the container runs with
+  # readOnlyRootFilesystem: true) and the only one backed by a PVC. Pointing
+  # either database elsewhere means it is lost on restart -- for the audit
+  # ledger that is the loss of the authoritative record, and for the
+  # dead-letter store the loss of which events failed and were replayed.
+  # These match the application's defaults, spelled out rather than inferred
+  # from the container's working directory.
+  S43_AUDIT_SQLITE_PATH: "/app/sentinel43_state/audit.sqlite3"
+  S43_DEAD_LETTER_PATH: "/app/sentinel43_state/dead_letter.sqlite3"
+  S43_DEAD_LETTER_MAX_ROWS: "10000"
 
   # Watchtower / internal service routing
   S43_WATCHTOWER_HOST: "0.0.0.0"
@@ -43,6 +60,42 @@ data:
   # Production overlays must explicitly set the ingress-controller network.
   S43_TRUSTED_PROXIES: ""
 
+  # Host allow-list (TrustedHostGuard, core/api/middleware/security_headers.py)
+  #
+  # "s43-api" is REQUIRED here and is not cosmetic. Fenrir reports its own
+  # findings over HTTP to S43_FENRIR_WATCHTOWER_URL / _BROADCAST_URL, which
+  # resolve to http://s43-api:8000/... -- so those requests arrive carrying
+  # `Host: s43-api:8000`. The guard strips the port and matches the bare
+  # host against this list; neither /watchtower/events nor
+  # /internal/events/broadcast is in the guard's probe-exemption set, so
+  # omitting "s43-api" makes the API answer 400 to its own detection node
+  # and Fenrir findings are lost with no obvious symptom.
+  # (Kubelet probes hit /health and /ready with `Host: <podIP>:8000`; those
+  # paths ARE exempt, which is why probes do not need an entry here.)
+  #
+  # Outside a local/dev environment this must be non-empty or the API
+  # refuses to start (core/api/main.py::_validate_security_config). Overlays
+  # that serve real traffic append their public hostname; keep "s43-api".
+  S43_TRUSTED_HOSTS: "s43-api"
+
+  # Browser origins for CORS. Deliberately EMPTY in base: an origin list is
+  # a property of a specific deployment's dashboard, and base has no
+  # hostname. Empty is fail-closed (no browser origin is allowed) rather
+  # than a permissive default. Overlays set the real https:// origin.
+  S43_ALLOWED_ORIGINS: ""
+  # Never true outside local/dev: it disables the guard that rejects
+  # plaintext http:// browser origins in a non-local environment.
+  S43_ALLOW_INSECURE_ORIGINS: "false"
+
+  # Explicit operator assertion that HTTPS/WSS is terminated before traffic
+  # reaches this container. The application cannot verify this from inside,
+  # so it demands the claim: with S43_ENV=production and this false, startup
+  # fails by design. Base leaves it FALSE because base has no TLS edge --
+  # the beta overlay, which owns the TLS Ingress, sets it true. Do not flip
+  # this to "true" here to make a deploy proceed; that converts a checked
+  # deployment property into an unchecked assumption.
+  S43_TLS_TERMINATED_AT_TRUSTED_EDGE: "false"
+
   # Fenrir
   # Fenrir uses canonical Sentinel-43 authentication. It does not own a
   # separate JWT secret, issuer, audience, or auth-disable switch.
@@ -56,6 +109,18 @@ data:
   S43_FENRIR_BROADCAST_URL: "http://s43-api:8000/internal/events/broadcast"
   S43_FENRIR_REPORT_TIMEOUT: "2.0"
 
+  # Event delivery reliability (core/reliability.py)
+  # Bounded retry with a hard total deadline, then dead-letter. Raising
+  # attempts/delays past the deadline does not buy more retries; the
+  # deadline wins. None of this is autonomous enforcement -- a dead-lettered
+  # event waits for an operator.
+  S43_IDEMPOTENCY_MAX_ENTRIES: "10000"
+  S43_IDEMPOTENCY_TTL_SECONDS: "900"
+  S43_DELIVERY_MAX_ATTEMPTS: "3"
+  S43_DELIVERY_BASE_DELAY: "0.2"
+  S43_DELIVERY_MAX_DELAY: "5.0"
+  S43_DELIVERY_DEADLINE: "10.0"
+
   # Feature gates
   # Never true outside local/dev/test.
   S43_ENABLE_TEST_INJECTION: "false"
@@ -65,5 +130,24 @@ data:
   S43_DEFAULT_MODE: "HUMAN_GATED"
 
   # Optional subsystems
-  S43_SPARTA_ENABLED: "false"
   S43_JORM_ENABLED: "false"
+
+  # Sparta file-integrity watchdog. Disabled in base.
+  # Enabling it requires credentials in the Secret
+  # (S43_SPARTA_NODE_TOKEN, S43_SPARTA_TOKEN_SECRET) -- without them the
+  # /node API fails closed with 401/503 rather than running unauthenticated.
+  S43_SPARTA_ENABLED: "false"
+  S43_SPARTA_CHECK_INTERVAL: "30.0"
+  S43_SPARTA_NODE_SIGNATURE: "sparta-core"
+  # Public health detail leaks integrity state to unauthenticated callers.
+  S43_SPARTA_PUBLIC_HEALTH_DETAIL: "false"
+  #
+  # Sparta's integrity baselines are per-IMAGE, not per-environment: they are
+  # SHA-256 hashes of specific source files inside the built container. They
+  # are read by prefix scan as
+  #   S43_SPARTA_HASH_<PATH>   e.g. S43_SPARTA_HASH_CORE_API_MAIN.PY
+  # (path separators -> "_", case preserved from the filename). No baseline
+  # values are committed here on purpose: a stale or invented hash makes
+  # Sparta report a compromise on every check, and a placeholder that
+  # silently "passes" would be worse. Generate them against the image you
+  # are actually deploying and supply them with the image's own overlay.

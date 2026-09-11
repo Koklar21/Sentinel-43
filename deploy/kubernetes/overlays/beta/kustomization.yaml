@@ -6,7 +6,14 @@ resources:
   - ../../base
   - ingress.yaml
   - networkpolicy-ingress.yaml
-  - poddisruptionbudget.yaml
+
+# NO PodDisruptionBudget. s43-api is a required singleton (see the
+# replica-safety note on base/s43-api-deployment.yaml), and the only PDB
+# expressible for a 1-replica workload -- minAvailable: 1 -- blocks every
+# voluntary eviction, so `kubectl drain` on that node hangs forever with no
+# availability gained. Node maintenance takes the API down briefly; that is
+# the honest consequence of running a singleton, and a PDB cannot conjure
+# away an availability guarantee the architecture does not provide.
 
 patches:
   - path: configmap-patch.yaml

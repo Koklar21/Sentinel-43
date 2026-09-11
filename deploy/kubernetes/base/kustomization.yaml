@@ -13,10 +13,17 @@ resources:
   - networkpolicy-api.yaml
   - networkpolicy-core.yaml
   - networkpolicy-db.yaml
-  - networkpolicy-redis.yaml
 
+  # No Redis. It was provisioned here for "forward compatibility" and
+  # never used: nothing in core/ or dashboard/ opens a Redis connection,
+  # docker-compose.yml runs no Redis service, and the StatefulSet named a
+  # ServiceAccount (s43-redis) that this tree never defined, so its pods
+  # could not have been admitted. An unused datastore in the namespace is
+  # attack surface and a false capability signal, not readiness. The
+  # firewall rate limiter that would justify it is in-process today (see
+  # README "Known limitations"); making it shared is an application
+  # change, and Redis comes back with it.
   - postgres-statefulset.yaml
-  - redis-statefulset.yaml
 
   - s43-core-deployment.yaml
   - s43-api-deployment.yaml

@@ -1,28 +1,34 @@
-# Real beta sizing for s43-api: 2 replicas (paired with
-# poddisruptionbudget.yaml) and higher resource requests/limits than base's
+# Real beta sizing for s43-api: higher resource requests/limits than base's
 # conservative defaults. Treat these numbers as a starting point, not a
-# load-tested recommendation — tune against your actual traffic.
+# load-tested recommendation -- tune against your actual traffic.
+#
+# REPLICAS: this overlay previously set replicas: 2 with a podAntiAffinity
+# spreading them across nodes. That was removed because it was wrong in two
+# independent ways:
+#
+#   1. The application is single-replica-safe only. The idempotency ledger
+#      (core/reliability.py) is an in-process dict, FenrirHunter and the
+#      Sparta watchdog are started per API process, and dashboard WebSocket
+#      clients are held per process. Two replicas means the same event is
+#      processed twice, findings are produced twice, and a dashboard sees
+#      only the events that happen to land on its own replica.
+#   2. It could not have worked anyway: the base Deployment mounts the
+#      ReadWriteOnce PVC s43-api-state, so a second pod on another node --
+#      exactly what the anti-affinity asked for -- would sit Pending on
+#      volume attach forever.
+#
+# Beta therefore inherits replicas: 1 from base. Scaling out is a real piece
+# of work (shared idempotency store, shared broadcast bus, singleton election
+# for the producers), not a manifest change. See the replica-safety note on
+# base/s43-api-deployment.yaml.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: s43-api
   namespace: sentinel43
 spec:
-  replicas: 2
   template:
     spec:
-      # Soft preference only (not required) — on a single-node test cluster
-      # this has no effect and both replicas still schedule fine; on a
-      # real multi-node beta cluster it spreads the 2 replicas across nodes
-      # so a single node failure doesn't take the whole API down.
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                topologyKey: kubernetes.io/hostname
-                labelSelector:
-                  matchLabels: {app: s43-api}
       containers:
         - name: s43-api
           resources:

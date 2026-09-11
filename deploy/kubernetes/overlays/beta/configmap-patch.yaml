@@ -4,24 +4,46 @@
 # guessed generically here. Find yours with, e.g.:
 #   kubectl get pods -n ingress-nginx -o wide   # note the pod IPs' /16 or /24
 #   kubectl cluster-info dump | grep -m1 cluster-cidr
-# Leaving this as the placeholder below is safe (fails closed — XFF is
-# simply never trusted, every request appears to come from the ingress) but
-# means the firewall/rate-limiter/audit trail will attribute every request
-# to the ingress controller's IP instead of the real client. See
+# The value below is EMPTY, not a CHANGEME string, and that is deliberate:
+# S43_TRUSTED_PROXIES is parsed as CIDRs, and a non-CIDR placeholder raises
+# RuntimeError ("Invalid CIDR ...") rather than failing closed -- it would
+# break every request, not just forwarded-header trust. Empty genuinely
+# fails closed: no peer is a trusted proxy, X-Forwarded-For is never
+# honoured, and every request is attributed to the ingress controller's own
+# IP in the firewall, rate limiter and audit trail. That is safe but
+# lossy -- set the real CIDR to recover true client IPs. See
 # docs/security/trusted_proxy_handling.md.
 #
 # CHANGEME: S43_TRUSTED_HOSTS and S43_ALLOWED_ORIGINS must be your real
-# public hostname. In a non-local environment the API refuses to start if
-# S43_ALLOWED_ORIGINS holds a plaintext (http://) non-loopback origin
-# (beta-execution Phase 2, F-TLS-1) — the ingress forces HTTPS, so every
-# browser origin here must be https://. S43_TRUSTED_HOSTS unset => the app
-# answers on any Host header (logged as a warning); set it.
+# public hostname.
+#
+# S43_TRUSTED_HOSTS: a ConfigMap patch REPLACES the key, it does not append
+# to base's value -- so the in-cluster name "s43-api" must be repeated here.
+# Dropping it does not merely lose a hostname: Fenrir reports its findings to
+# http://s43-api:8000/..., those requests carry `Host: s43-api:8000`, and the
+# TrustedHostGuard would answer them 400. The public host is what browsers
+# and the Ingress send; both are needed.
+# Leaving this unset is not an option outside a local environment -- the API
+# refuses to start (this file previously claimed the app would answer on any
+# Host with a warning; that has not been true since startup validation
+# landed in core/api/main.py::_validate_security_config).
+#
+# S43_ALLOWED_ORIGINS: in a non-local environment the API refuses to start if
+# this holds a plaintext (http://) non-loopback origin -- the ingress forces
+# HTTPS, so every browser origin here must be https://.
+#
+# S43_TLS_TERMINATED_AT_TRUSTED_EDGE is "true" here, and only here, because
+# this overlay is the thing that makes it true: ingress.yaml terminates TLS
+# (cert-manager + ssl-redirect: "true") before traffic reaches the API. If
+# you fork this overlay into one that serves plaintext, set it back to
+# "false" and let startup fail rather than leaving the claim behind.
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: sentinel43-config
   namespace: sentinel43
 data:
-  S43_TRUSTED_PROXIES: "CHANGEME_SET_TO_YOUR_INGRESS_CONTROLLER_POD_CIDR"
-  S43_TRUSTED_HOSTS: "beta.example.invalid"             # CHANGEME -> your real host
+  S43_TRUSTED_PROXIES: ""   # CHANGEME -> your ingress pod CIDR, e.g. "10.244.0.0/16"
+  S43_TRUSTED_HOSTS: "beta.example.invalid,s43-api"     # CHANGEME -> <your real host>,s43-api
   S43_ALLOWED_ORIGINS: "https://beta.example.invalid"   # CHANGEME -> https://<your host>
+  S43_TLS_TERMINATED_AT_TRUSTED_EDGE: "true"

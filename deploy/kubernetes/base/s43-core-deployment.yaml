@@ -17,10 +17,9 @@ spec:
     metadata:
       labels:
         app: s43-core
-        # Lets it reach db/redis under networkpolicy-db.yaml /
-        # networkpolicy-redis.yaml's client-label-based ingress rules.
+        # Lets it reach the database under networkpolicy-db.yaml's
+        # client-label-based ingress rules.
         network/s43-db-client: "true"
-        network/s43-redis-client: "true"
     spec:
       serviceAccountName: s43-core
       automountServiceAccountToken: false

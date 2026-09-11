@@ -7,8 +7,9 @@
 #   1. manifest rendering + schema/deprecated-API validation (kubeconform)
 #   2. the Phase-12-equivalent security policy checklist
 #      (scripts/k8s_policy_check.py — no root, read-only rootfs, pinned
-#      images, resource limits, probes, NetworkPolicy coverage, no public
-#      db/redis, no wildcard RBAC, no embedded secrets, no hostPath,
+#      images, resource limits, probes, NetworkPolicy coverage, no
+#      publicly exposed datastore, no wildcard RBAC, no embedded secrets,
+#      no hostPath,
 #      automountServiceAccountToken false)
 #   3. image build + vulnerability scan (Trivy)
 #   4. the full pytest suite
@@ -319,25 +320,29 @@ jobs:
           # than adding a separate Python/pip setup step to this job.
           gen_operator_hash() {
             docker run --rm sentinel43-api:ci python -c "
-import secrets
-from core.auth.users import hash_password
-print(hash_password(secrets.token_urlsafe(32)))
-"
+          import secrets
+          from core.auth.users import hash_password
+          print(hash_password(secrets.token_urlsafe(32)))
+          "
           }
-          PG_PW=$(gen); REDIS_PW=$(gen); OPERATOR_HASH=$(gen_operator_hash)
+          # S43_AUDIT_HMAC_KEY must be HEX: core.audit.store decodes it with
+          # bytes.fromhex and requires >= 32 decoded bytes, so a token_urlsafe
+          # value is rejected.
+          gen_hex() { python3 -c "import secrets; print(secrets.token_hex(32))"; }
+          PG_PW=$(gen); OPERATOR_HASH=$(gen_operator_hash)
+          # These are exactly the required keys in
+          # deploy/kubernetes/base/secret.example.yaml. Keep the two lists in
+          # step: a key that is required but never provisioned here means CI
+          # smoke-deploys a configuration no operator can reproduce.
           kubectl create secret generic sentinel43-secrets -n sentinel43 \
             --from-literal=POSTGRES_PASSWORD="$PG_PW" \
-            --from-literal=REDIS_PASSWORD="$REDIS_PW" \
             --from-literal=DATABASE_URL="postgresql+asyncpg://s43:${PG_PW}@s43-db:5432/s43" \
-            --from-literal=REDIS_URL="redis://:${REDIS_PW}@s43-redis:6379/0" \
             --from-literal=S43_JWT_SECRET="$(gen)" \
             --from-literal=S43_OPERATOR_PASSWORD_HASH="$OPERATOR_HASH" \
             --from-literal=S43_AUTH_PEPPER="$(gen)" \
+            --from-literal=S43_SESSION_HASH_PEPPER="$(gen)" \
+            --from-literal=S43_AUDIT_HMAC_KEY="$(gen_hex)" \
             --from-literal=S43_WATCHTOWER_SERVICE_TOKEN="$(gen)" \
-            --from-literal=SENTINEL_LOG_SALT="$(gen)" \
-            --from-literal=SENTINEL_REMOTE_TOKEN_OWNER="$(gen)" \
-            --from-literal=SENTINEL_REMOTE_TOKEN_ADMIN="$(gen)" \
-            --from-literal=SENTINEL_REMOTE_TOKEN_AUDITOR="$(gen)" \
             --from-literal=S43_FENRIR_API_TOKEN="$(gen)"
           cd deploy/kubernetes/overlays/dev
           kustomize edit set image sentinel43-api=sentinel43-api:ci
@@ -351,14 +356,31 @@ print(hash_password(secrets.token_urlsafe(32)))
       - name: Wait for rollout
         run: |
           kubectl -n sentinel43 wait --for=condition=Ready pod -l app=s43-db --timeout=180s
-          kubectl -n sentinel43 wait --for=condition=Ready pod -l app=s43-redis --timeout=120s
-          kubectl -n sentinel43 wait --for=condition=Complete job/s43-migration --timeout=120s
+          # The migration Job now waits for the database itself (see
+          # base/migration-job.yaml's wait-for-db initContainer), so this no
+          # longer depends on apply ordering.
+          kubectl -n sentinel43 wait --for=condition=Complete job/s43-migration --timeout=300s
           kubectl -n sentinel43 rollout status deployment/s43-api --timeout=180s
           kubectl -n sentinel43 rollout status deployment/s43-core --timeout=180s
 
       - name: Security posture assertions
         run: |
           set -euo pipefail
+          # The API is a singleton by design (see base/s43-api-deployment.yaml).
+          # Assert it on the live cluster, not just in the rendered YAML.
+          test "$(kubectl get deploy s43-api -n sentinel43 \
+            -o jsonpath='{.spec.replicas}')" = "1"
+          test "$(kubectl get deploy s43-api -n sentinel43 \
+            -o jsonpath='{.spec.strategy.type}')" = "Recreate"
+          # Watchtower must not be left FAILED by a startup race with s43-core
+          # (the wait-for-core initContainer exists for this).
+          kubectl exec -n sentinel43 deployment/s43-api -c s43-api -- python -c "
+          import json, urllib.request
+          with urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=10) as r:
+              body = json.load(r)
+          assert 'watchtower' not in body.get('degraded', []), body
+          print('readiness:', body)
+          "
           uid=$(kubectl exec -n sentinel43 deployment/s43-api -- id -u)
           test "$uid" = "65532"
           if kubectl exec -n sentinel43 deployment/s43-api -- sh -c 'touch /app/should_fail'; then

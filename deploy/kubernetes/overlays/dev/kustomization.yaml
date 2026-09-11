@@ -17,6 +17,10 @@ patches:
       - op: replace
         path: /spec/template/spec/containers/0/imagePullPolicy
         value: Never
+      # The wait-for-core initContainer runs the same locally-built image.
+      - op: replace
+        path: /spec/template/spec/initContainers/0/imagePullPolicy
+        value: Never
   - target: {kind: Deployment, name: s43-core}
     patch: |-
       - op: replace
@@ -26,6 +30,12 @@ patches:
     patch: |-
       - op: replace
         path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Never
+      # The wait-for-db initContainer runs the same locally-built image and
+      # needs the same treatment; a JSON patch on containers/0 does not
+      # reach initContainers.
+      - op: replace
+        path: /spec/template/spec/initContainers/0/imagePullPolicy
         value: Never
 
 images:

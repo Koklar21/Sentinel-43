@@ -151,8 +151,21 @@ services:
 
       # Transport / trusted proxy boundary
       S43_TRUSTED_PROXIES: ${S43_TRUSTED_PROXIES:-172.28.0.250/32}
-      S43_TRUSTED_HOSTS: ${S43_TRUSTED_HOSTS:-localhost,127.0.0.1}
+      # s43-api is in this list because FenrirHunter reports its own findings
+      # to S43_FENRIR_WATCHTOWER_URL / _BROADCAST_URL below, which resolve to
+      # http://s43-api:8000 -- so those requests carry `Host: s43-api:8000`.
+      # TrustedHostGuard does not exempt the event-ingress paths, so without
+      # this entry the API answers its own detection node 400 and findings
+      # are lost silently.
+      S43_TRUSTED_HOSTS: ${S43_TRUSTED_HOSTS:-localhost,127.0.0.1,s43-api}
       S43_ALLOW_INSECURE_ORIGINS: ${S43_ALLOW_INSECURE_ORIGINS:-}
+      # Operator assertion that HTTPS/WSS is terminated before the API (by
+      # s43-proxy, in this stack). With S43_ENV=production the API refuses to
+      # start without it -- and because Compose only passes variables that are
+      # DECLARED here, setting it in .env alone would never reach the
+      # container, leaving an operator with a startup error they cannot fix
+      # from configuration.
+      S43_TLS_TERMINATED_AT_TRUSTED_EDGE: ${S43_TLS_TERMINATED_AT_TRUSTED_EDGE:-}
 
       # Internal services
       S43_WATCHTOWER_URL: http://s43-core:9100
@@ -162,6 +175,11 @@ services:
       # Database
       DATABASE_URL: ${DATABASE_URL}
       S43_DB_PATH: /app/sentinel43_state/sentinel43.sqlite3
+      # Stated explicitly rather than inherited from the container's working
+      # directory, and identical to the Kubernetes ConfigMap. The audit
+      # ledger must land on the sentinel43_state volume; anywhere else and
+      # the authoritative record is discarded when the container is replaced.
+      S43_AUDIT_SQLITE_PATH: ${S43_AUDIT_SQLITE_PATH:-/app/sentinel43_state/audit.sqlite3}
 
       # Canonical JWT authentication
       S43_JWT_SECRET: ${S43_JWT_SECRET}

@@ -1,5 +1,18 @@
-# API ingress is intentionally not granted by the base.
-# Environment overlays define their own ingress policy.
+# EXTERNAL API ingress is intentionally not granted by the base -- exposing
+# the API to the outside world is an environment decision, so environment
+# overlays define that (see overlays/beta/networkpolicy-ingress.yaml).
+#
+# The self-directed rules below are a different thing and belong here: they
+# are the API talking to itself, not an exposure decision. FenrirHunter runs
+# inside the s43-api process and reports its findings over HTTP to
+# S43_FENRIR_WATCHTOWER_URL / S43_FENRIR_BROADCAST_URL, both of which point
+# at http://s43-api:8000. Under the namespace's default-deny that is a pod
+# reaching a pod, and it needs BOTH halves: egress from s43-api to s43-api,
+# and ingress to s43-api from s43-api. Without them, under a CNI that
+# actually enforces NetworkPolicy, every Fenrir finding is dropped at the
+# network layer with no application-level error -- and the symptom looks
+# like "Fenrir isn't detecting anything", not like a policy problem.
+#
 # Egress rules are additive with the shared DNS policy.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -14,7 +27,20 @@ spec:
       app: s43-api
 
   policyTypes:
+    - Ingress
     - Egress
+
+  # Self-ingress only. This does NOT open the API to anything else: the
+  # namespace default-deny still drops every other source unless an overlay
+  # explicitly allows it.
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: s43-api
+      ports:
+        - protocol: TCP
+          port: 8000
 
   egress:
     - to:
@@ -28,15 +54,16 @@ spec:
     - to:
         - podSelector:
             matchLabels:
-              app: s43-redis
-      ports:
-        - protocol: TCP
-          port: 6379
-
-    - to:
-        - podSelector:
-            matchLabels:
               app: s43-core
       ports:
         - protocol: TCP
           port: 9100
+
+    # Fenrir's own report path (see the note at the top of this file).
+    - to:
+        - podSelector:
+            matchLabels:
+              app: s43-api
+      ports:
+        - protocol: TCP
+          port: 8000
