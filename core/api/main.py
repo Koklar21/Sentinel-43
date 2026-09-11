@@ -47,7 +47,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Final
 from uuid import uuid4
 
 from fastapi import (
@@ -3203,9 +3203,16 @@ async def watchtower_ingest_event(
             "attempts": 1,
         }
     else:
+        # "payload" carries the exact body Watchtower is sent (``forwarded``,
+        # already computed above for ``_deliver``) so that, if this event is
+        # ever dead-lettered, an operator replay can faithfully redeliver it
+        # rather than reconstruct a payload-less approximation from
+        # sanitized metadata alone. It is stored behind a separate,
+        # protected path -- see core/reliability.py's REPLAY FIDELITY note
+        # -- never through the sanitized dashboard-visible projection.
         outcome = await asyncio.to_thread(
             reliability.deliver,
-            envelope,
+            {**envelope, "payload": forwarded},
             _deliver,
             stage=FailureStage.WATCHTOWER_DELIVERY,
         )
@@ -3271,6 +3278,33 @@ reliability_router = APIRouter(
     prefix="/reliability",
     tags=["reliability"],
 )
+
+#: Replay outcomes that were refused before, or without confirmation after,
+#: a delivery attempt. Each is a state conflict, not a not-found or a
+#: validation error, so each maps to 409 -- matching the convention already
+#: used for a refused analysis loop (see ``_reject_analysis_loop``).
+_REPLAY_CONFLICT_DETAIL: Final[dict[str, str]] = {
+    "already_replayed": (
+        "This event was already successfully replayed; it will not be "
+        "redelivered again through this route."
+    ),
+    "replay_in_progress": (
+        "A replay attempt for this event is already in progress, or an "
+        "earlier attempt's outcome could not be confirmed. It requires "
+        "operator reconciliation before another attempt can be made."
+    ),
+    "replay_unavailable": (
+        "This event has no faithfully replayable body persisted -- a "
+        "legacy record, or one whose payload exceeded the size bound at "
+        "record time. Replay is refused rather than redelivering a "
+        "payload-less approximation of the original event."
+    ),
+    "reconciliation_required": (
+        "A delivery attempt was made but its result could not be "
+        "persisted, so whether it succeeded is unknown. It requires "
+        "manual reconciliation before another replay attempt can be made."
+    ),
+}
 
 
 def _require_reliability() -> Any:
@@ -3361,6 +3395,10 @@ async def reliability_replay(
             status_code=404,
             detail="No dead-lettered event with that id.",
         )
+
+    conflict_detail = _REPLAY_CONFLICT_DETAIL.get(outcome.reason)
+    if conflict_detail is not None:
+        raise HTTPException(status_code=409, detail=conflict_detail)
 
     return {
         "ok": outcome.delivered,

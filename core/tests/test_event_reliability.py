@@ -33,24 +33,32 @@ from core.reliability import (
     FailureStage,
     IdempotencyLedger,
     ReliabilityMetrics,
+    ReplayEligibility,
     Retryability,
     RetryPolicy,
     classify_delivery_result,
     sanitize_for_record,
     sanitize_reason,
+    sanitize_replay_payload,
 )
 
 SECRET = "SECRET-token-must-never-persist"
 
+# A real event includes a producer payload and, often, a causal parent.
+# Both are exercised throughout this file so the default fixture matches
+# what actually reaches core/api/main.py's ingress rather than the
+# provenance-only shape it happened to have before replay fidelity existed.
 _ENVELOPE = {
     "event_id": "ev-1",
     "correlation_id": "corr-1",
+    "parent_event_id": "ev-0",
     "event_type": "fenrir.finding",
     "schema_version": "1.0",
     "source": "FenrirHunter",
     "source_identity": "service:fenrir",
     "created_at": "2026-01-01T00:00:00+00:00",
     "ingested_at": "2026-01-01T00:00:01+00:00",
+    "payload": {"kind": "security", "score": 9, "detail": "port scan"},
 }
 
 
@@ -390,7 +398,12 @@ def test_replay_preserves_identity_and_provenance():
     assert outcome.state is DeliveryState.DELIVERED
     assert seen["event_id"] == "ev-1"
     assert seen["correlation_id"] == "corr-1"
+    assert seen["parent_event_id"] == "ev-0"
     assert seen["source_identity"] == "service:fenrir"
+    # The whole point of replay fidelity: the original producer payload
+    # travels with the redelivery, not just provenance metadata.
+    assert seen["score"] == 9
+    assert seen["detail"] == "port scan"
 
 
 def test_replayed_event_is_not_a_new_origination():
@@ -453,6 +466,243 @@ def test_replay_is_recorded_for_audit():
     assert replay_records
     assert all(a["operator"] == "alice" for a in replay_records)
     assert all(a["event_id"] == "ev-1" for a in replay_records)
+
+
+def test_raw_payload_never_reaches_audit_output():
+    store = _store()
+    manager, audits = _manager(store)
+    manager.deliver(
+        {**_ENVELOPE, "payload": {"api_key": SECRET, "score": 9}},
+        lambda: {"error": "watchtower_unreachable"},
+    )
+    manager.replay("ev-1", lambda env: {"status_code": 200}, operator="alice")
+
+    assert SECRET not in str(audits)
+
+
+def test_raw_payload_never_reaches_logs(caplog):
+    import logging
+
+    store = _store()
+    manager, _ = _manager(store)
+    manager.deliver(
+        {**_ENVELOPE, "payload": {"api_key": SECRET, "score": 9}},
+        lambda: {"error": "watchtower_unreachable"},
+    )
+    with caplog.at_level(logging.DEBUG, logger="sentinel43.reliability"):
+        manager.replay("ev-1", lambda env: {"status_code": 200}, operator="alice")
+
+    assert SECRET not in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# defect #1 -- payload-loss on replay
+# --------------------------------------------------------------------------- #
+
+def test_dead_letter_record_never_exposes_the_replay_body():
+    """DeadLetterRecord -- the shape returned by /reliability/failed-events
+    -- carries a boolean, never the payload it describes."""
+    store = _store()
+    manager, _ = _manager(store)
+    manager.deliver(
+        {**_ENVELOPE, "payload": {"api_key": SECRET}},
+        lambda: {"error": "watchtower_unreachable"},
+    )
+
+    record = store.get("ev-1")
+    assert record.replay_available is True
+    blob = str(record.to_dict())
+    assert SECRET not in blob
+    assert "api_key" not in blob
+
+
+def test_legacy_row_with_no_replay_body_refuses_replay():
+    """A row written before replay-body persistence existed (or one whose
+    payload was refused at record time) must never be redelivered as a
+    payload-less approximation of the original event."""
+    store = _store()
+    manager, _ = _manager(store)
+    store.record_failure(
+        envelope={**_ENVELOPE, "payload": None},
+        failure_stage=FailureStage.WATCHTOWER_DELIVERY,
+        classification=Retryability.TERMINAL,
+        reason="down",
+        attempts=1,
+    )
+    assert store.get("ev-1").replay_available is False
+
+    calls = {"n": 0}
+
+    def redeliver(_envelope):
+        calls["n"] += 1
+        return {"status_code": 200}
+
+    outcome = manager.replay("ev-1", redeliver, operator="alice")
+
+    assert outcome.reason == "replay_unavailable"
+    assert calls["n"] == 0, "a non-replayable record must cause zero deliveries"
+    # Refusing to replay must not itself mutate the record's replay state.
+    assert store.get("ev-1").replay_status == "pending"
+
+
+def test_oversized_payload_is_refused_not_truncated():
+    assert sanitize_replay_payload("x" * 100_000) is None
+
+
+def test_unserializable_payload_is_refused_not_dropped_silently():
+    assert sanitize_replay_payload(object()) is None
+
+
+# --------------------------------------------------------------------------- #
+# defect #2 -- REPLAYED_OK must not be replayable again
+# --------------------------------------------------------------------------- #
+
+def test_pending_record_may_be_replayed():
+    store = _store()
+    manager, _ = _manager(store)
+    manager.deliver(_ENVELOPE, lambda: {"error": "watchtower_unreachable"})
+    assert store.get("ev-1").replay_status == "pending"
+
+    outcome = manager.replay("ev-1", lambda env: {"status_code": 200}, operator="alice")
+    assert outcome.state is DeliveryState.DELIVERED
+
+
+def test_replay_failed_record_may_be_replayed_again():
+    store = _store()
+    manager, _ = _manager(store)
+    manager.deliver(_ENVELOPE, lambda: {"error": "watchtower_unreachable"})
+
+    manager.replay("ev-1", lambda env: {"error": "watchtower_unreachable"}, operator="alice")
+    assert store.get("ev-1").replay_status == "replay_failed"
+
+    outcome = manager.replay("ev-1", lambda env: {"status_code": 200}, operator="alice")
+    assert outcome.state is DeliveryState.DELIVERED
+    assert store.get("ev-1").replay_status == "replayed_ok"
+
+
+def test_successful_replay_records_replayed_ok():
+    store = _store()
+    manager, _ = _manager(store)
+    manager.deliver(_ENVELOPE, lambda: {"error": "watchtower_unreachable"})
+    manager.replay("ev-1", lambda env: {"status_code": 200}, operator="alice")
+    assert store.get("ev-1").replay_status == "replayed_ok"
+
+
+def test_replayed_ok_cannot_be_replayed_again():
+    store = _store()
+    manager, _ = _manager(store)
+    manager.deliver(_ENVELOPE, lambda: {"error": "watchtower_unreachable"})
+    manager.replay("ev-1", lambda env: {"status_code": 200}, operator="alice")
+
+    outcome = manager.replay("ev-1", lambda env: {"status_code": 200}, operator="alice")
+    assert outcome.reason == "already_replayed"
+    assert outcome.state is not DeliveryState.DELIVERED
+
+
+def test_second_replay_of_an_already_replayed_event_causes_zero_delivery():
+    store = _store()
+    manager, _ = _manager(store)
+    manager.deliver(_ENVELOPE, lambda: {"error": "watchtower_unreachable"})
+
+    calls = {"n": 0}
+
+    def redeliver(_envelope):
+        calls["n"] += 1
+        return {"status_code": 200}
+
+    manager.replay("ev-1", redeliver, operator="alice")
+    assert calls["n"] == 1
+
+    manager.replay("ev-1", redeliver, operator="alice")
+    assert calls["n"] == 1, "an already-replayed event must not be redelivered"
+
+
+def test_concurrent_replay_claims_only_one_winner():
+    """begin_replay_attempt is the single source of eligibility truth: two
+    callers racing the same event_id cannot both be told CLAIMED."""
+    store = _store()
+    store.record_failure(
+        envelope={**_ENVELOPE, "payload": {"x": 1}},
+        failure_stage=FailureStage.WATCHTOWER_DELIVERY,
+        classification=Retryability.TERMINAL,
+        reason="down",
+        attempts=1,
+    )
+
+    first, _ = store.begin_replay_attempt("ev-1")
+    second, _ = store.begin_replay_attempt("ev-1")
+
+    assert {first, second} == {ReplayEligibility.CLAIMED, ReplayEligibility.IN_PROGRESS}
+
+
+# --------------------------------------------------------------------------- #
+# defect #3 -- post-delivery persistence failure must not look replayable
+# --------------------------------------------------------------------------- #
+
+def test_persistence_failure_after_delivery_yields_reconciliation_required():
+    store = _store()
+    manager, audits = _manager(store)
+    manager.deliver(_ENVELOPE, lambda: {"error": "watchtower_unreachable"})
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("disk full")
+
+    store.mark_replay_result = _boom  # type: ignore[method-assign]
+
+    outcome = manager.replay("ev-1", lambda env: {"status_code": 200}, operator="alice")
+
+    assert outcome.reason == "reconciliation_required"
+    # Never falsely reported as a clean failure -- a real delivery happened.
+    assert outcome.state is not DeliveryState.DEAD_LETTERED
+    assert outcome.state is not DeliveryState.DELIVERED
+
+    reconciliation_audits = [a for a in audits if a.get("reconciliation_required")]
+    assert reconciliation_audits
+    assert reconciliation_audits[0]["delivery_may_have_succeeded"] is True
+
+
+def test_uncertain_record_is_left_claimed_and_cannot_replay_ordinarily():
+    store = _store()
+    manager, _ = _manager(store)
+    manager.deliver(_ENVELOPE, lambda: {"error": "watchtower_unreachable"})
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("disk full")
+
+    store.mark_replay_result = _boom  # type: ignore[method-assign]
+    manager.replay("ev-1", lambda env: {"status_code": 200}, operator="alice")
+
+    assert store.get("ev-1").replay_status == "replay_in_progress"
+
+    # restore normal persistence and prove the record is still refused
+    del store.mark_replay_result
+    calls = {"n": 0}
+
+    def redeliver(_envelope):
+        calls["n"] += 1
+        return {"status_code": 200}
+
+    outcome = manager.replay("ev-1", redeliver, operator="alice")
+    assert outcome.reason == "replay_in_progress"
+    assert calls["n"] == 0, "an uncertain record must not be replayed automatically"
+
+
+def test_persistence_exception_does_not_report_a_clean_delivery_failure():
+    """A raised exception while persisting a SUCCESSFUL delivery's outcome
+    must never be reported as though the delivery itself failed -- that
+    would tell an operator it is safe to just try again."""
+    store = _store()
+    manager, _ = _manager(store)
+    manager.deliver(_ENVELOPE, lambda: {"error": "watchtower_unreachable"})
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("disk full")
+
+    store.mark_replay_result = _boom  # type: ignore[method-assign]
+    outcome = manager.replay("ev-1", lambda env: {"status_code": 200}, operator="alice")
+
+    assert outcome.reason != "replay_failed"
+    assert outcome.reason == "reconciliation_required"
 
 
 # --------------------------------------------------------------------------- #
