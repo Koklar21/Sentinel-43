@@ -27,7 +27,22 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import asdict, dataclass, field, fields
+from datetime import datetime, timezone
 from typing import Any, Final
+
+
+#: Version of the normalized event envelope. Bump only for a breaking change
+#: to the envelope itself, never for a new event kind.
+EVENT_SCHEMA_VERSION: Final[str] = "1.0"
+
+#: Envelope versions this build understands. An event declaring anything else
+#: is REJECTED rather than half-interpreted -- a future producer must not be
+#: silently parsed against older assumptions.
+SUPPORTED_SCHEMA_VERSIONS: Final[frozenset[str]] = frozenset({"1.0"})
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 # Subclasses below chain to BaseEvent.__post_init__ by explicit class
@@ -49,6 +64,16 @@ class BaseEvent:
     )
     kind: str = "base"
 
+    # --- normalized envelope -------------------------------------------------
+    # Provenance travels with the event. ``ingested_at`` is stamped by
+    # normalize_event() at the trust boundary and is ours, not the producer's.
+    schema_version: str = EVENT_SCHEMA_VERSION
+    source: str = ""
+    source_identity: str = ""
+    correlation_id: str = ""
+    created_at: str = ""
+    ingested_at: str = ""
+
     def __post_init__(self) -> None:
         self.id = str(
             self.id
@@ -68,12 +93,36 @@ class BaseEvent:
                 "event kind must not be empty"
             )
 
+        self.schema_version = str(
+            self.schema_version
+        ).strip() or EVENT_SCHEMA_VERSION
+
+        if self.schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+            raise ValueError(
+                f"unsupported event schema_version "
+                f"{self.schema_version!r}; supported: "
+                f"{sorted(SUPPORTED_SCHEMA_VERSIONS)}"
+            )
+
+        self.source = str(self.source).strip()
+        self.source_identity = str(self.source_identity).strip()
+        self.correlation_id = str(self.correlation_id).strip()
+        self.created_at = str(self.created_at).strip()
+        self.ingested_at = str(self.ingested_at).strip()
+
+    @property
+    def event_id(self) -> str:
+        """Envelope name for the event's unique id."""
+        return self.id
+
     def to_dict(
         self,
     ) -> dict[str, Any]:
-        return asdict(
+        payload = asdict(
             self
         )
+        payload["event_id"] = self.id
+        return payload
 
 
 @dataclass(slots=True)
@@ -439,6 +488,31 @@ def normalize_event(
         ] = str(
             uuid.uuid4()
         )
+
+    # Accept "event_id" as an inbound alias for the envelope's id.
+    if not local_event.get("id") and local_event.get("event_id"):
+        local_event["id"] = local_event["event_id"]
+    local_event.pop("event_id", None)
+
+    # Reject an unsupported envelope version explicitly and BEFORE
+    # construction, so the caller learns the actual reason instead of a
+    # generic "invalid <kind> event".
+    declared_version = str(
+        local_event.get("schema_version") or EVENT_SCHEMA_VERSION
+    ).strip()
+    if declared_version not in SUPPORTED_SCHEMA_VERSIONS:
+        raise ValueError(
+            f"unsupported event schema_version {declared_version!r}; "
+            f"supported: {sorted(SUPPORTED_SCHEMA_VERSIONS)}"
+        )
+    local_event["schema_version"] = declared_version
+
+    # Ingestion time is stamped HERE, at the trust boundary. A producer may
+    # assert when it created an event; it may not assert when we accepted it.
+    local_event["ingested_at"] = _utc_now_iso()
+
+    if not local_event.get("created_at"):
+        local_event["created_at"] = local_event["ingested_at"]
 
     valid_fields = _EVENT_TYPE_FIELDS[
         event_cls
