@@ -92,6 +92,11 @@ _SECRET_SPECS: Final[tuple[SecretSpec, ...]] = (
         "Authentication hardening",
     ),
     SecretSpec(
+        "S43_SESSION_HASH_PEPPER",
+        _hex,
+        None,
+    ),
+    SecretSpec(
         "SENTINEL_LOG_SALT",
         _hex,
         "Log pseudonymization",

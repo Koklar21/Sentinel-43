@@ -46,7 +46,6 @@ from core.api.models import (
     ActionStatus,
     ApiStatus,
     ErrorDetail,
-    HealthResponse,
     ThreatAssessmentIn,
     ThreatAssessmentOut,
     utc_now_iso,
@@ -403,22 +402,9 @@ def _read_authoritative_action_status(
 # =============================================================================
 # Health
 # =============================================================================
-
-@router.get(
-    "/health",
-    response_model=HealthResponse,
-    tags=["system"],
-)
-def health(
-    request_id: str = Depends(dep_request_id),
-) -> HealthResponse:
-    return HealthResponse(
-        status=ApiStatus.OK,
-        request_id=request_id,
-        service=S43_API_NAME,
-        version=S43_API_VERSION,
-        principle=S43_CORE_PRINCIPLE,
-    )
+#
+# The canonical GET /health lives in core/api/main.py. This router must not
+# register its own — main.py fails at import time on a duplicate /health.
 
 
 # =============================================================================

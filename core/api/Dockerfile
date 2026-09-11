@@ -84,15 +84,4 @@ VOLUME ["/app/logs", "/app/sentinel43_state"]
 # Uvicorn allow-list to the immediate proxy addresses as well.
 #
 # Do not use "*" here.
-CMD [
-    "python",
-    "-m",
-    "uvicorn",
-    "core.api.main:app",
-    "--host",
-    "0.0.0.0",
-    "--port",
-    "8000",
-    "--forwarded-allow-ips",
-    "127.0.0.1"
-]
+CMD ["python", "-m", "uvicorn", "core.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--forwarded-allow-ips", "127.0.0.1"]
