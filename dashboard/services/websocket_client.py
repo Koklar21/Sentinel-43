@@ -9,6 +9,7 @@ subscription, and heartbeat helpers.
 from __future__ import annotations
 
 import copy
+from collections import OrderedDict
 import html
 import json
 import os
@@ -205,7 +206,103 @@ def decode_ws_message(message: str) -> dict[str, Any]:
     return {
         "type": normalized_event_type,
         "payload": payload,
+        # The canonical envelope, extracted HERE and only here. Widgets read
+        # these fields; they do not re-parse frames themselves.
+        "envelope": extract_envelope(payload),
     }
+
+
+# ---------------------------------------------------------------------------
+# Canonical event envelope
+#
+# The core stamps every event with identity and provenance. The dashboard used
+# to read only {type, payload}, so it could not tell two deliveries of one
+# logical event apart, could not follow a causal chain, and could not notice an
+# event from a future schema. This is the ONE boundary where a frame becomes an
+# envelope -- conversion logic must not spread into individual widgets.
+# ---------------------------------------------------------------------------
+
+#: Envelope versions this dashboard build understands. An event declaring
+#: anything else is surfaced as unsupported rather than half-rendered against
+#: today's assumptions.
+SUPPORTED_EVENT_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1.0"})
+
+_ENVELOPE_FIELDS: tuple[str, ...] = (
+    "event_id",
+    "correlation_id",
+    "parent_event_id",
+    "schema_version",
+    "source",
+    "source_identity",
+    "event_type",
+    "created_at",
+    "ingested_at",
+)
+
+
+def extract_envelope(payload: dict[str, Any]) -> dict[str, Any]:
+    """Pull the canonical envelope out of an event payload.
+
+    Tolerant by design: a payload that predates the envelope simply yields
+    empty fields rather than being rejected, because the dashboard observes
+    the system and must not go blind on an older producer.
+    """
+    envelope: dict[str, Any] = {}
+    for field in _ENVELOPE_FIELDS:
+        value = payload.get(field)
+        envelope[field] = str(value).strip() if value is not None else ""
+
+    declared = envelope["schema_version"]
+    envelope["schema_supported"] = (
+        True if not declared else declared in SUPPORTED_EVENT_SCHEMA_VERSIONS
+    )
+    # A derived finding names the signal it came from.
+    envelope["is_derived"] = bool(envelope["parent_event_id"])
+    return envelope
+
+
+class EventDeduplicator:
+    """Bounded, event_id-keyed guard against rendering one event twice.
+
+    The core reliability layer already prevents duplicate *processing*. This
+    prevents duplicate *display*: a reconnect or an operator-approved replay
+    re-delivers the same logical event, and it must not appear as a second,
+    unrelated incident.
+
+    Keyed on event_id only. Deduplicating by payload text would collapse
+    genuinely distinct findings that happen to look identical.
+    """
+
+    def __init__(self, max_entries: int = 2048) -> None:
+        if max_entries < 1:
+            raise ValueError("max_entries must be >= 1")
+        self._max_entries = max_entries
+        self._seen: OrderedDict[str, None] = OrderedDict()
+
+    def is_duplicate(self, envelope: dict[str, Any]) -> bool:
+        """True when this event_id has already been displayed.
+
+        An event with no id cannot be deduplicated, so it is always shown --
+        dropping it would lose a finding.
+        """
+        event_id = str(envelope.get("event_id") or "").strip()
+        if not event_id:
+            return False
+
+        if event_id in self._seen:
+            self._seen.move_to_end(event_id)
+            return True
+
+        self._seen[event_id] = None
+        while len(self._seen) > self._max_entries:
+            self._seen.popitem(last=False)
+        return False
+
+    def reset(self) -> None:
+        self._seen.clear()
+
+    def __len__(self) -> int:
+        return len(self._seen)
 
 
 def build_subscribe_message(channel: str) -> str:
