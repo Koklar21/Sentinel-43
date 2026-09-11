@@ -207,7 +207,14 @@ def test_events_route_accepts_fenrir_token_and_forwards_to_analyze(fenrir_events
     assert fenrir_events_env, "handler never forwarded to the Watchtower"
     method, path, payload = fenrir_events_env[0]
     assert (method, path) == ("POST", "/watchtower/analyze")
-    assert payload == {"event": {"kind": "security", "score": 91}}
+    # The original producer fields must survive forwarding...
+    event = payload["event"]
+    assert event["kind"] == "security"
+    assert event["score"] == 91
+    # ...and the delivery identity must travel with it, so Watchtower and the
+    # audit trail can correlate this event across the whole path.
+    assert event["event_id"]
+    assert event["correlation_id"]
 
 
 __all__: list[str] = []
