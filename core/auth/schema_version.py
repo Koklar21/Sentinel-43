@@ -245,14 +245,18 @@ def _classify(
                 SchemaState.UNSTAMPED,
                 (
                     "database contains application tables but has no "
-                    "alembic_version row"
+                    "alembic_version row -- adopt it with "
+                    "`alembic stamp 0001_baseline` (after confirming the "
+                    "existing schema actually matches that revision), then "
+                    "`alembic upgrade head`"
                 ),
             )
 
         return (
             SchemaState.FRESH,
             (
-                "database has not been initialized by Alembic"
+                "database has not been initialized by Alembic -- run "
+                "`alembic upgrade head` before serving traffic"
             ),
         )
 
@@ -269,7 +273,7 @@ def _classify(
             SchemaState.BEHIND,
             (
                 f"database revision {current} is behind expected "
-                f"revision {graph.head}"
+                f"revision {graph.head} -- run `alembic upgrade head`"
             ),
         )
 

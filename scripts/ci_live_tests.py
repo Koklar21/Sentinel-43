@@ -54,6 +54,9 @@ def main() -> int:
     jwt_secret = secrets.token_urlsafe(32)
     pepper = secrets.token_urlsafe(32)
     service_token = secrets.token_urlsafe(32)
+    # core.audit.store decodes this via bytes.fromhex and requires >= 32
+    # decoded bytes -- hex, not urlsafe, and token_hex(32) is exactly that.
+    audit_hmac_key = secrets.token_hex(32)
     # P0-1: the break-glass operator hash must be Argon2id, produced by the
     # project's own canonical generator, exactly like a real deployment's
     # S43_OPERATOR_PASSWORD_HASH — not the retired unsalted SHA-256 digest
@@ -61,7 +64,10 @@ def main() -> int:
     # correctly refuses to start on in SENTINEL_ENV=production (as set
     # below), which is exactly why this fixture was failing CI.
     operator_hash = hash_password(password)
-    sensitive = [database_url, password, jwt_secret, pepper, service_token, operator_hash]
+    sensitive = [
+        database_url, password, jwt_secret, pepper, service_token,
+        operator_hash, audit_hmac_key,
+    ]
     for value in sensitive:
         print(f"::add-mask::{value}", flush=True)
 
@@ -89,6 +95,39 @@ def main() -> int:
         "S43_BREAK_GLASS_ARMED": "true",
         "S43_WATCHTOWER_URL": "http://127.0.0.1:19100",
         "S43_WATCHTOWER_SERVICE_TOKEN": service_token,
+        # Mandatory outside development/local/test (core/api/main.py's
+        # _start_audit_store()) -- the authoritative audit store cannot be
+        # keyed without it.
+        "S43_AUDIT_HMAC_KEY": audit_hmac_key,
+        # core/api/main.py's _validate_security_config() added two more
+        # non-local startup requirements after this script was last updated
+        # for them: a Host allow-list, and an explicit assertion that TLS is
+        # terminated before traffic reaches the API. Both are genuine,
+        # correct requirements for a real deployment (this is not a
+        # weakened check) -- this script just never supplied them, so the
+        # API failed closed at startup rather than serving anything.
+        #
+        # S43_TRUSTED_HOSTS=127.0.0.1 is simply true: every request below
+        # goes to S43_TEST_API_URL=http://127.0.0.1:18000, so 127.0.0.1 is
+        # the only Host header this deployment will ever see.
+        "S43_TRUSTED_HOSTS": "127.0.0.1",
+        # S43_TLS_TERMINATED_AT_TRUSTED_EDGE is a claim this harness can
+        # honestly make for its own narrow purpose: both uvicorn processes
+        # are bound to 127.0.0.1 inside a single ephemeral, single-tenant
+        # GitHub Actions runner with no external network exposure at all --
+        # there is no public edge for TLS to protect, unlike the production
+        # deployments (see deploy/kubernetes/, docker-compose.yml's
+        # s43-proxy) this check exists for. This is not the same as
+        # disabling the check: it still runs, and it would still fail this
+        # script closed if the deployment shape ever changed to something
+        # actually internet-facing.
+        "S43_TLS_TERMINATED_AT_TRUSTED_EDGE": "true",
+        # /auth/login enforces Origin/Referer validation outside a local
+        # environment (core/api/routers/auth.py's
+        # _check_state_change_origin), and test_bootstrap.py /
+        # test_system_smoke.py now send an Origin header identifying
+        # themselves as this exact address -- allow-list it.
+        "S43_ALLOWED_ORIGINS": "http://127.0.0.1:18000",
     })
     # SENTINEL_ENV=production above, so core.auth.users.init_models() is a
     # deliberate no-op (Alembic owns the schema in a non-local environment).

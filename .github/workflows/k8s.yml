@@ -169,6 +169,26 @@ jobs:
           S43_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
           S43_WATCHTOWER_URL: http://127.0.0.1:19100
           S43_WATCHTOWER_TIMEOUT: "0.1"
+          # core/api/main.py reads SENTINEL_ENV into module-level constants
+          # (IS_LOCAL_ENV, _TRUSTED_HOSTS, JWT_SECRET, ...) exactly ONCE, at
+          # the first `import core.api.main` in the process -- not per test,
+          # regardless of a later monkeypatch.setenv. Several files here do
+          # a deferred `import core.api.main` inside a test function without
+          # ever setting SENTINEL_ENV themselves (test_schema_version_pg.py's
+          # /ready and /health checks explicitly build a TestClient with NO
+          # lifespan, so _validate_security_config() never runs for them --
+          # they don't need this and were never the problem). Whichever file
+          # happens to import it FIRST decides SENTINEL_ENV for the entire
+          # job; with nothing set at this level that import saw "production"
+          # (SENTINEL_ENV's own unset-fallback), and Pass A's non-local
+          # startup checks (S43_TRUSTED_HOSTS, S43_TLS_TERMINATED_AT_TRUSTED_EDGE)
+          # then failed every later test whose fixture DOES boot the full
+          # lifespan (test_auth_session_pg.py, test_ws_session_pg.py) --
+          # their own `monkeypatch.setenv("SENTINEL_ENV", "test")` was
+          # already too late. Setting it once here, before pytest starts,
+          # makes the outcome independent of import order.
+          SENTINEL_ENV: test
+          S43_ENV: test
         run: >-
           python -m pytest -q -rs --junit-xml=/tmp/pg-junit.xml
           core/tests/test_schema_version_pg.py

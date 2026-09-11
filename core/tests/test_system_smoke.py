@@ -42,6 +42,18 @@ import requests
 
 API_URL = os.getenv("S43_TEST_API_URL", "http://localhost:8000").rstrip("/")
 
+# /auth/login is a state-changing route and enforces Origin/Referer
+# validation outside a local environment (core/api/routers/auth.py's
+# _check_state_change_origin) so a browser's ambient, cookie-carrying
+# cross-origin request can't silently log in as someone else. A plain
+# `requests` client sends neither header by default, which the check
+# correctly treats as unproven origin, not as "no browser, so exempt" --
+# there is no separate bearer-only login path, since logging in is
+# precisely the step before a bearer token exists. This self-identifies the
+# harness by the address it is actually calling from; the deployment must
+# list it in S43_ALLOWED_ORIGINS (scripts/ci_live_tests.py does).
+_LOGIN_HEADERS = {"Origin": API_URL}
+
 
 def _live_target_reachable() -> bool:
     try:
@@ -149,6 +161,7 @@ def test_live_login_and_protected_route_round_trip() -> None:
     login_response = requests.post(
         f"{API_URL}/auth/login",
         json={"username": _LIVE_USERNAME, "password": _LIVE_PASSWORD},
+        headers=_LOGIN_HEADERS,
         timeout=5,
     )
     assert login_response.status_code == 200, (
@@ -215,6 +228,7 @@ def test_live_system_status_and_routes_require_auth() -> None:
     login_response = requests.post(
         f"{API_URL}/auth/login",
         json={"username": _LIVE_USERNAME, "password": _LIVE_PASSWORD},
+        headers=_LOGIN_HEADERS,
         timeout=5,
     )
     assert login_response.status_code == 200, (
