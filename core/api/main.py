@@ -83,7 +83,7 @@ from ..monitoring.watchtower_client import (
     watchtower_request as _canonical_watchtower_request,
 )
 from ..security.jwt_constants import APPROVED_JWT_ALGORITHMS
-from ..monitoring.event_types import EVENT_SCHEMA_VERSION
+from ..monitoring.event_types import EVENT_SCHEMA_VERSION, would_loop
 from ..security_context import (
     IdentityType,
     get_security_context,
@@ -2814,9 +2814,29 @@ async def internal_broadcast_event(
             detail="Fenrir service token may only emit fenrir.* events",
         )
 
+    # This route used to be pure distribution: a Fenrir finding was fanned
+    # out to dashboards and then forgotten -- never analyzed, never
+    # correlated. Give it the canonical envelope and publish it into
+    # monitoring like every other producer.
+    envelope = _delivery_envelope(
+        {
+            "event_type": body.event_type,
+            "source": "FenrirHunter",
+            **(body.data if isinstance(body.data, dict) else {}),
+        },
+        request,
+    )
+    _reject_analysis_loop(envelope)
+
+    await _notify_monitoring(envelope, kind="security")
+
     await _broadcast_dashboard_event(
         body.event_type,
-        body.data,
+        {
+            **body.data,
+            "event_id": envelope["event_id"],
+            "correlation_id": envelope["correlation_id"],
+        },
         channel=body.channel,
     )
 
@@ -2825,6 +2845,8 @@ async def internal_broadcast_event(
 
     return {
         "ok": True,
+        "event_id": envelope["event_id"],
+        "correlation_id": envelope["correlation_id"],
         "event_type": body.event_type,
         "channel": body.channel,
         "clients": client_count,
@@ -3023,6 +3045,75 @@ async def watchtower_check(
     }
 
 
+async def _notify_monitoring(
+    envelope: Mapping[str, Any],
+    *,
+    kind: str,
+    extra: Mapping[str, Any] | None = None,
+) -> bool:
+    """Publish one accepted event into the canonical monitoring path.
+
+    Every other producer (firewall, Sparta, remote gateway, governance)
+    already reaches MonitoringManager. Fenrir -- the primary detection nerve
+    -- did not: its findings went to Watchtower and the dashboard and were
+    never analyzed by the manager.
+
+    The producer's own ``event_type`` (e.g. "fenrir.finding") is carried as a
+    field while ``kind`` stays a canonical typed kind, because normalize_event
+    rejects an unknown kind outright. Best-effort by design -- monitoring is
+    observational and must not fail an accepted ingest -- but counted rather
+    than silently swallowed, so a broken monitoring path is visible.
+    """
+    manager = runtime.monitoring_manager
+    if manager is None:
+        return False
+
+    event: dict[str, Any] = {
+        "kind": kind,
+        "event_id": envelope.get("event_id", ""),
+        "correlation_id": envelope.get("correlation_id", ""),
+        "parent_event_id": envelope.get("parent_event_id", ""),
+        "event_type": envelope.get("event_type", ""),
+        "source": envelope.get("source", ""),
+        "source_identity": envelope.get("source_identity", ""),
+        "created_at": envelope.get("created_at", ""),
+        "schema_version": envelope.get("schema_version", ""),
+    }
+    if extra:
+        event.update(dict(extra))
+
+    try:
+        await asyncio.to_thread(manager.analyze_event, event)
+        return True
+    except Exception:
+        if runtime.reliability is not None:
+            runtime.reliability.metrics.increment("events_rejected")
+        logger.warning(
+            "Monitoring analysis failed for event_id=%s",
+            envelope.get("event_id"),
+            exc_info=True,
+        )
+        return False
+
+
+def _reject_analysis_loop(envelope: Mapping[str, Any]) -> None:
+    """Refuse to re-submit an analyzer's own derived output to itself.
+
+    Watchtower finding -> monitoring -> Watchtower -> ... is unbounded. An
+    event carrying parent_event_id AND naming Watchtower as its own source is
+    a derived assessment, not a new signal, so forwarding it for analysis
+    again would close the cycle.
+    """
+    if would_loop(envelope, analyzer_source="Watchtower"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Refusing to re-analyze a Watchtower-derived finding; "
+                "this would create a circular event path."
+            ),
+        )
+
+
 def _delivery_envelope(
     body: Mapping[str, Any],
     request: Request,
@@ -3057,6 +3148,8 @@ def _delivery_envelope(
     return {
         "event_id": event_id,
         "correlation_id": correlation_id,
+        # Causal linkage, if the producer declared one.
+        "parent_event_id": str(body.get("parent_event_id") or "").strip(),
         "event_type": str(
             body.get("event_type") or body.get("kind") or "event"
         ),
@@ -3083,6 +3176,7 @@ async def watchtower_ingest_event(
     _require_fenrir_service_token(request)
 
     envelope = _delivery_envelope(body, request)
+    _reject_analysis_loop(envelope)
     forwarded = {**body, **{
         "event_id": envelope["event_id"],
         "correlation_id": envelope["correlation_id"],
@@ -3118,6 +3212,14 @@ async def watchtower_ingest_event(
         delivered = outcome.handled
         result = outcome.response
         delivery = outcome.to_dict()
+
+    # The canonical monitoring path. Fenrir findings previously reached
+    # Watchtower and the dashboard but never MonitoringManager.
+    await _notify_monitoring(
+        envelope,
+        kind="security",
+        extra={"delivery_state": delivery.get("state", "")},
+    )
 
     # Distribution carries the same identity the event was accepted under.
     await _broadcast_dashboard_event(
