@@ -9,3 +9,12 @@
 playwright==1.49.1
 pytest==8.3.4
 pytest-playwright==0.6.2
+
+# Deliberately NOT argon2-cffi: browser_tests/run.sh needs one Argon2id
+# hash for the stack's operator account, but core.auth.users (which owns
+# hash_password) also imports sqlalchemy and pulls in the rest of the
+# runtime's dependency graph -- "the minimal dependency" turns out not to be
+# minimal at all. run.sh instead builds the real s43-api image and runs the
+# hash helper inside a throwaway container from it (the same pattern
+# scripts/ci_live_tests.py already uses), so this venv never needs the
+# runtime's dependencies duplicated into it.

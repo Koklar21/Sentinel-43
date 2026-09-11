@@ -48,6 +48,18 @@ trap cleanup EXIT
 # --- test CA + leaf (gitignored) ---
 [ -f browser_tests/certs/s43.fullchain.crt ] || bash browser_tests/certs/generate-test-ca.sh
 
+# --- runtime image, built once and reused for hash generation below ---
+# core.auth.users.hash_password (needed to mint the stack's operator
+# credential) pulls in sqlalchemy and the rest of the runtime's dependency
+# graph, not just argon2 -- "install the one missing package" turns out not
+# to be minimal at all. Building the real image and running the helper
+# inside a throwaway container from it needs nothing extra in
+# .venv-browser, and computes the hash with the exact same code/environment
+# that will later verify it -- the same pattern
+# scripts/ci_live_tests.py already uses for its own break-glass hash.
+HASH_HELPER_IMAGE=s43browser-hash-helper
+docker build -q -t "$HASH_HELPER_IMAGE" -f core/api/Dockerfile . >/dev/null
+
 # --- fresh disposable secrets for this stack only ---
 rm -f "$ENV_FILE"
 PYTHONPATH=. "$PY" core/scripts/generate_secrets.py --write "$ENV_FILE" >/dev/null
@@ -65,13 +77,30 @@ S43_OPERATOR_USERNAME=browser-envop-unused
 # literal \$ in the Argon2id hash must be doubled to \$\$ -- otherwise
 # "\$argon2id\$v=19\$m=..." is parsed as a run of undefined variable
 # references and the container starts with a mangled, non-Argon2id value
-# (confirmed via `docker compose config` while fixing this).
-S43_OPERATOR_PASSWORD_HASH=$(PYTHONPATH=. python -c "
+# confirmed via "docker compose config" while fixing this -- and backticks
+# in THIS comment must never come back: they are live command substitution
+# inside an unquoted heredoc (bash does not treat "#" as a comment marker
+# there), so a backtick-quoted command here previously executed for real
+# and spliced its stdout into the generated secrets file. That is what
+# actually produced the original hosted failure's "S43_SESSION_HASH_PEPPER
+# is missing" / "POSTGRES_PASSWORD ... defaulting to a blank string" --
+# both were real warnings from a "docker compose config" invoked here,
+# against the .env.browser file as it existed mid-construction, not from
+# the real "docker compose up" that ran afterward.
+S43_OPERATOR_PASSWORD_HASH=$(docker run --rm "$HASH_HELPER_IMAGE" python -c "
 import secrets
 from core.auth.users import hash_password
 print(hash_password(secrets.token_urlsafe(32)).replace('\$', '\$\$'))
 ")
 S43_WS_REQUIRE_AUTH=true
+# Genuinely true here, not a CI-only assertion of convenience: s43-proxy
+# (nginx, docker-compose.browser.yml) really does terminate HTTPS/WSS with
+# the throwaway test CA's cert before forwarding to s43-api -- the whole
+# point of this stack is testing that real edge. core/api/main.py's
+# _validate_security_config() added this requirement within the same PR
+# that added the browser stack's own S43_TRUSTED_PROXIES pin to the proxy's
+# address, without this stack ever picking it up.
+S43_TLS_TERMINATED_AT_TRUSTED_EDGE=true
 S43_ALLOWED_ORIGINS=https://s43.beta.test:8443
 S43_TRUSTED_HOSTS=s43.beta.test
 S43_ENABLE_TEST_INJECTION=false
