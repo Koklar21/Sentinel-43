@@ -127,6 +127,19 @@ _SECRET_SPECS: Final[tuple[SecretSpec, ...]] = (
         "Watchtower",
     ),
     SecretSpec(
+        # Keys the authoritative HMAC-chained audit ledger. docker-compose
+        # hard-requires this on s43-api and s43-core, so it must come out of
+        # the documented secret-generation path or a correct setup still
+        # fails Compose's required-variable check.
+        #
+        # Hex on purpose: core.audit.store decodes an all-hex, even-length
+        # value via bytes.fromhex and then enforces >= 32 decoded bytes.
+        # token_hex(32) yields 64 hex characters = exactly 32 bytes.
+        "S43_AUDIT_HMAC_KEY",
+        _hex,
+        "Audit integrity",
+    ),
+    SecretSpec(
         "POSTGRES_PASSWORD",
         _hex,
         "Infrastructure",
