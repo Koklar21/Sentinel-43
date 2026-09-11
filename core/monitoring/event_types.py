@@ -28,7 +28,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
-from typing import Any, Final
+from typing import Any, Final, Mapping
 
 
 #: Version of the normalized event envelope. Bump only for a breaking change
@@ -86,6 +86,11 @@ class BaseEvent:
     correlation_id: str = ""
     created_at: str = ""
     ingested_at: str = ""
+    #: The event this one was derived FROM, if any. A derived finding gets its
+    #: own event_id (it is genuinely a new event) but keeps causal linkage to
+    #: the signal that produced it, so one originating signal stays traceable
+    #: end to end. Empty for an originating event.
+    parent_event_id: str = ""
 
     def __post_init__(self) -> None:
         self.id = str(
@@ -122,6 +127,7 @@ class BaseEvent:
         self.correlation_id = str(self.correlation_id).strip()
         self.created_at = str(self.created_at).strip()
         self.ingested_at = str(self.ingested_at).strip()
+        self.parent_event_id = str(self.parent_event_id).strip()
 
     @property
     def event_id(self) -> str:
@@ -727,7 +733,69 @@ def to_event_context(
     )
 
 
+
+# =============================================================================
+# Causation and loop prevention
+# =============================================================================
+
+def derive_envelope(
+    parent: Mapping[str, Any],
+    *,
+    source: str,
+    source_identity: str = "",
+    event_type: str = "",
+) -> dict[str, Any]:
+    """Build a causally-linked child envelope for a DERIVED finding.
+
+    A derived finding (e.g. a Watchtower assessment of an inbound event) is
+    genuinely a new event and gets its own ``event_id``. It keeps the
+    parent's ``correlation_id`` so both sit on the same trace, and records
+    ``parent_event_id`` so the causal chain is explicit rather than inferred.
+    """
+    parent_id = str(
+        parent.get("event_id") or parent.get("id") or ""
+    ).strip()
+
+    return {
+        "event_id": str(uuid.uuid4()),
+        "parent_event_id": parent_id,
+        "correlation_id": str(parent.get("correlation_id") or "").strip()
+        or parent_id,
+        "event_type": event_type or str(parent.get("event_type") or ""),
+        "schema_version": str(
+            parent.get("schema_version") or EVENT_SCHEMA_VERSION
+        ),
+        "source": source,
+        "source_identity": source_identity,
+        "created_at": _utc_now_iso(),
+    }
+
+
+def is_derived(event: Mapping[str, Any]) -> bool:
+    """True when this event was produced BY analysis of another event."""
+    return bool(str(event.get("parent_event_id") or "").strip())
+
+
+def would_loop(event: Mapping[str, Any], *, analyzer_source: str) -> bool:
+    """Would re-submitting ``event`` to ``analyzer_source`` create a cycle?
+
+    An analyzer's own derived output must not be fed back into that same
+    analyzer: Watchtower finding -> monitoring -> Watchtower -> ... is
+    unbounded. The check is an explicit origin contract (is this analyzer's
+    own derived output?) rather than a global depth counter, so the rule
+    stays readable and cannot be defeated by resetting a hop count.
+    """
+    if not is_derived(event):
+        return False
+
+    origin = str(event.get("source") or "").strip().lower()
+    return origin == str(analyzer_source or "").strip().lower()
+
+
 __all__ = [
+    "would_loop",
+    "is_derived",
+    "derive_envelope",
     "BaseEvent",
     "ConfigEvent",
     "DependencyEvent",
