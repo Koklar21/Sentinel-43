@@ -61,9 +61,11 @@ Changes from v1.3.5 (carried forward from v1.3.6):
     no longer triggers node construction or FastAPI app creation at import
     time. uvicorn compatibility preserved: `uvicorn module:app` triggers
     __getattr__("app") which initialises on first access.
-  - Fix #2: WatchtowerNode.stop() added. Transitions node to FAILED,
+  - Fix #2: WatchtowerNode.stop() added. Transitions node to STOPPED,
     dropping all subsequent events. MonitoringManager.stop() no longer
-    raises AttributeError.
+    raises AttributeError. (STOPPED is distinct from FAILED: a clean
+    shutdown is not a fault. stop() will not overwrite an existing
+    FAILED state.)
   - Fix #3: ThresholdProfile renamed to TowerThresholdProfile and
     thresholds_for renamed to tower_thresholds_for to eliminate the name
     collision with the rules_engine ThresholdProfile enum.
@@ -235,6 +237,11 @@ class WatchtowerState(enum.Enum):
     INITIALIZING = "INITIALIZING"
     ACTIVE = "ACTIVE"
     DEGRADED = "DEGRADED"
+    # Terminal, and deliberately distinct: STOPPED is an orderly shutdown,
+    # FAILED is a fault. Both stop accepting events, but only FAILED means
+    # something went wrong -- operators and probes must be able to tell them
+    # apart.
+    STOPPED = "STOPPED"
     FAILED = "FAILED"
 
 
@@ -651,21 +658,33 @@ class WatchtowerNode:
         WatchtowerState.INITIALIZING: {
             WatchtowerState.ACTIVE,
             WatchtowerState.DEGRADED,
+            WatchtowerState.STOPPED,
             WatchtowerState.FAILED,
         },
         WatchtowerState.ACTIVE: {
             WatchtowerState.DEGRADED,
+            WatchtowerState.STOPPED,
             WatchtowerState.FAILED,
         },
         WatchtowerState.DEGRADED: {
             WatchtowerState.ACTIVE,
+            WatchtowerState.STOPPED,
             WatchtowerState.FAILED,
         },
+        # Both terminal. A stopped node is not restarted in place; the
+        # composition root builds a new one.
+        WatchtowerState.STOPPED: set(),
         WatchtowerState.FAILED: set(),
+    }
+
+    _TERMINAL_STATES: set[WatchtowerState] = {
+        WatchtowerState.STOPPED,
+        WatchtowerState.FAILED,
     }
 
     _DROP_EVENT_STATES: set[WatchtowerState] = {
         WatchtowerState.INITIALIZING,
+        WatchtowerState.STOPPED,
         WatchtowerState.FAILED,
     }
 
@@ -723,9 +742,10 @@ class WatchtowerNode:
 
     def start(self) -> None:
         with self._lock:
-            if self._state == WatchtowerState.FAILED:
+            if self._state in self._TERMINAL_STATES:
                 raise RuntimeError(
-                    f"[{self.config.node_id}] Cannot start a FAILED WatchtowerNode."
+                    f"[{self.config.node_id}] Cannot start a "
+                    f"{self._state.value} WatchtowerNode."
                 )
             applied = self._set_state_locked(WatchtowerState.ACTIVE)
             if not applied:
@@ -735,13 +755,23 @@ class WatchtowerNode:
                 )
 
     def stop(self) -> None:
+        """Shut the node down cleanly.
+
+        Moves to STOPPED, not FAILED: an orderly shutdown is a normal
+        lifecycle event, and reporting it as a fault made every clean
+        shutdown look like an incident in the logs and in any consumer
+        reading node state. Idempotent, and it will not overwrite a real
+        FAILED state -- a node that failed and was then stopped stays FAILED
+        so the fault is not lost.
+        """
         with self._lock:
-            if self._state == WatchtowerState.FAILED:
+            if self._state in self._TERMINAL_STATES:
                 return
-            self._set_state_locked(WatchtowerState.FAILED)
+            self._set_state_locked(WatchtowerState.STOPPED)
 
         logger.info(
-            "[%s] WatchtowerNode stopped (transitioned to FAILED -- all subsequent events will be dropped).",
+            "[%s] WatchtowerNode stopped cleanly (STOPPED -- no further "
+            "events accepted).",
             self.config.node_id,
         )
 
@@ -1307,6 +1337,10 @@ def create_watchtower_router(node: WatchtowerNode) -> APIRouter:
             http_code, svc_status = status.HTTP_200_OK, "ok"
         elif state == WatchtowerState.DEGRADED:
             http_code, svc_status = status.HTTP_503_SERVICE_UNAVAILABLE, "degraded"
+        elif state == WatchtowerState.STOPPED:
+            # Shut down on purpose, not broken. Still 503 -- a stopped node
+            # cannot serve -- but reported honestly.
+            http_code, svc_status = status.HTTP_503_SERVICE_UNAVAILABLE, "stopped"
         elif state == WatchtowerState.FAILED:
             http_code, svc_status = status.HTTP_503_SERVICE_UNAVAILABLE, "failed"
         else:
