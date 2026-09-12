@@ -11,15 +11,43 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
 # =============================================================================
 
-"""Sentinel-43 Watchgate API routes.
+"""Sentinel-43 "/v1" Watchgate compatibility routes.
 
-The router is intentionally thin:
-    - request validation is owned by Pydantic models
-    - authentication is owned by dependency wiring
-    - business behavior is delegated to engine/store interfaces
-    - authoritative action state comes from the store
-    - route code never fabricates a successful ledger state when the store is
-      unavailable or returns malformed data
+DISPOSITION (post-merge baseline remediation, Section D): this router used
+to delegate to a generic Engine/Store dependency-injection abstraction
+(core.api.deps.get_engine / get_store) that was never wired to a real
+backend anywhere in the deployed stack -- SENTINEL_ENGINE_FACTORY and
+SENTINEL_STORE_FACTORY are declared nowhere in docker-compose.yml or
+.env.example, and no second implementation of EngineProtocol/StoreProtocol
+exists anywhere in the tree besides the dev-only in-memory ones, which
+refuse to run outside S43_ENABLE_DEV_ENGINE/S43_ENABLE_DEV_STORE=true. Live
+baseline verification confirmed every route in this router 500s
+unconditionally in a standard deployment.
+
+Rather than inventing a new production Store/Engine (explicitly out of
+scope -- see S43_BASELINE_VERIFICATION_REPORT.md Section I, Defect 4), each
+route below is honestly dispositioned against the modern, working,
+canonical backend that superseded it:
+
+    /v1/actions               REPLACE -> wired directly to the same
+                               in-memory action ledger + _list_actions()
+                               core.api.main's own GET /actions already uses
+    /v1/actions/{id}/approve  REPLACE -> wired to
+                               _resolve_governance_and_commit_action(), the
+                               same human-gated commit path
+                               POST /actions/{id}/approve uses
+    /v1/actions/{id}/veto     REPLACE -> same, approved=False
+    /v1/assess                DEPRECATE -> explicit 501 Not Implemented;
+                               no modern equivalent exists (assessment now
+                               happens automatically through the canonical
+                               event pipeline, not via a posted payload),
+                               and no real caller depends on this route
+                               succeeding
+
+No route here fabricates a successful ledger state, autonomously executes
+anything, or bypasses operator/governance gating: every mutation still goes
+through the same human-gated core.api.main commit path the modern
+non-legacy routes use, with the same audit trail.
 """
 
 from __future__ import annotations
@@ -31,13 +59,7 @@ from typing import Any, Final
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 
-from core.api.deps import (
-    EngineProtocol,
-    StoreProtocol,
-    get_engine,
-    get_store,
-    require_operator,
-)
+from core.api.deps import require_operator
 from core.api.models import (
     ActionDecision,
     ActionListResponse,
@@ -45,9 +67,7 @@ from core.api.models import (
     ActionResponse,
     ActionStatus,
     ApiStatus,
-    ErrorDetail,
     ThreatAssessmentIn,
-    ThreatAssessmentOut,
     utc_now_iso,
 )
 
@@ -61,9 +81,6 @@ S43_CORE_PRINCIPLE: Final[str] = (
     "No autonomous enforcement in core."
 )
 
-S43_ERR_ASSESSMENT_PIPELINE_FAILURE: Final[str] = (
-    "S43_ASSESSMENT_PIPELINE_FAILURE"
-)
 S43_ERR_APPROVAL_PIPELINE_FAILURE: Final[str] = (
     "S43_APPROVAL_PIPELINE_FAILURE"
 )
@@ -76,15 +93,7 @@ S43_ERR_ACTION_LEDGER_QUERY_FAILURE: Final[str] = (
 S43_ERR_ACTION_ID_MISMATCH: Final[str] = (
     "S43_ACTION_ID_MISMATCH"
 )
-S43_ERR_ACTION_LEDGER_UNAVAILABLE: Final[str] = (
-    "S43_ACTION_LEDGER_UNAVAILABLE"
-)
-S43_ERR_ACTION_STATUS_INVALID: Final[str] = (
-    "S43_ACTION_STATUS_INVALID"
-)
-S43_ERR_ASSESSMENT_RESULT_INVALID: Final[str] = (
-    "S43_ASSESSMENT_RESULT_INVALID"
-)
+S43_ERR_V1_ASSESS_DEPRECATED: Final[str] = "S43_V1_ASSESS_DEPRECATED"
 
 _REQUEST_ID_RE: Final[re.Pattern[str]] = re.compile(
     r"^[A-Za-z0-9_.:-]{1,64}$"
@@ -95,22 +104,6 @@ v1 = APIRouter(
     prefix="/v1",
     dependencies=[Depends(require_operator)],
 )
-
-
-# =============================================================================
-# Dependency adapters
-# =============================================================================
-
-def dep_engine(
-    engine: EngineProtocol = Depends(get_engine),
-) -> EngineProtocol:
-    return engine
-
-
-def dep_store(
-    store: StoreProtocol = Depends(get_store),
-) -> StoreProtocol:
-    return store
 
 
 def dep_request_id(
@@ -175,228 +168,44 @@ def _http_500(
 # =============================================================================
 # Normalization helpers
 # =============================================================================
+#
+# core.api.main's canonical action dicts use their own status vocabulary
+# (STAGED/PENDING/APPROVED/VETOED, uppercase) rather than v1's ActionDecision
+# enum (approved/vetoed/pending/unknown, lowercase) -- STAGED in particular
+# has no literal match. This maps the real, current ledger onto the v1
+# response contract rather than pretending the two vocabularies are the
+# same thing.
 
-def _model_to_dict(model: Any) -> dict[str, Any]:
-    if hasattr(model, "model_dump"):
-        return dict(model.model_dump())
+_MODERN_STATUS_TO_DECISION: Final[dict[str, ActionDecision]] = {
+    "staged": ActionDecision.PENDING,
+    "pending": ActionDecision.PENDING,
+    "approved": ActionDecision.APPROVED,
+    "vetoed": ActionDecision.VETOED,
+}
 
-    if isinstance(model, dict):
-        return dict(model)
 
-    raise TypeError(
-        f"Unsupported model payload type: {type(model).__name__}"
+def _blank_to_none(value: Any) -> Any:
+    """A not-yet-decided action carries "" for operator/reason/timestamp,
+    not None (see core.api.main._create_synthetic_action /
+    _commit_action_status). ActionStatus's fields reject an empty-but-set
+    string, so "" must become None here rather than passing it through."""
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
+def _modern_action_to_status(action: dict[str, Any]) -> ActionStatus:
+    decision = _MODERN_STATUS_TO_DECISION.get(
+        str(action.get("status") or "").strip().lower(),
+        ActionDecision.UNKNOWN,
     )
-
-
-def _normalize_decision(value: Any) -> ActionDecision:
-    if isinstance(value, ActionDecision):
-        return value
-
-    normalized = str(value or "").strip().lower()
-
-    try:
-        return ActionDecision(normalized)
-    except ValueError as exc:
-        raise ValueError(
-            f"Unrecognized action decision {value!r}"
-        ) from exc
-
-
-def _as_action_status(raw: Any) -> ActionStatus:
-    if isinstance(raw, ActionStatus):
-        return raw
-
-    if not isinstance(raw, dict):
-        raise ValueError(
-            f"Unsupported action status payload type: "
-            f"{type(raw).__name__}"
-        )
-
-    action_id = str(
-        raw.get("action_id")
-        or raw.get("id")
-        or ""
-    ).strip()
-
-    if not action_id:
-        raise ValueError(
-            "Action status payload is missing action_id"
-        )
-
-    decision = _normalize_decision(
-        raw.get("decision")
-        or raw.get("status")
-        or ActionDecision.UNKNOWN.value
-    )
-
     return ActionStatus(
-        action_id=action_id,
+        action_id=str(action.get("id") or ""),
         decision=decision,
-        decided_by=raw.get("decided_by"),
-        decided_ts=(
-            raw.get("decided_ts")
-            or raw.get("ts")
-        ),
-        reason=raw.get("reason"),
+        decided_by=_blank_to_none(action.get("operator")),
+        decided_ts=_blank_to_none(action.get("decision_at")),
+        reason=_blank_to_none(action.get("decision_reason")),
     )
-
-
-def _safe_score(
-    value: Any,
-    *,
-    field_name: str,
-) -> int:
-    if isinstance(value, bool):
-        raise ValueError(
-            f"{field_name} must be numeric"
-        )
-
-    try:
-        score = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"{field_name} must be numeric"
-        ) from exc
-
-    if not 0 <= score <= 100:
-        raise ValueError(
-            f"{field_name} must be between 0 and 100"
-        )
-
-    return score
-
-
-def _as_assessment_out(
-    result: Any,
-    *,
-    request_id: str,
-) -> ThreatAssessmentOut:
-    if isinstance(result, ThreatAssessmentOut):
-        return result.model_copy(
-            update={"request_id": request_id}
-        )
-
-    if not isinstance(result, dict):
-        raise ValueError(
-            "Assessment engine returned unsupported payload type"
-        )
-
-    assessment_id = str(
-        result.get("assessment_id")
-        or result.get("id")
-        or ""
-    ).strip()
-
-    summary = str(
-        result.get("summary")
-        or result.get("message")
-        or ""
-    ).strip()
-
-    if not assessment_id:
-        raise ValueError(
-            "Assessment result missing assessment_id"
-        )
-
-    if not summary:
-        raise ValueError(
-            "Assessment result missing summary"
-        )
-
-    tags_raw = result.get("tags") or []
-
-    if not isinstance(tags_raw, list):
-        raise ValueError(
-            "Assessment result tags must be a list"
-        )
-
-    metadata: dict[str, Any] = {}
-
-    for key, value in result.items():
-        if key not in {
-            "assessment_id",
-            "id",
-            "severity",
-            "confidence",
-            "summary",
-            "message",
-            "tags",
-        }:
-            metadata[key] = value
-
-    return ThreatAssessmentOut(
-        status=ApiStatus.OK,
-        request_id=request_id,
-        assessment_id=assessment_id,
-        severity=_safe_score(
-            result.get("severity"),
-            field_name="severity",
-        ),
-        confidence=_safe_score(
-            result.get("confidence"),
-            field_name="confidence",
-        ),
-        summary=summary,
-        tags=tags_raw,
-        metadata=metadata or None,
-    )
-
-
-def _read_authoritative_action_status(
-    *,
-    store: StoreProtocol,
-    action_id: str,
-    request_id: str,
-) -> ActionStatus:
-    try:
-        raw = store.get_status(action_id)
-    except Exception as exc:
-        logger.exception(
-            "Sentinel-43 action ledger read failed. "
-            "action_id=%s request_id=%s",
-            action_id,
-            request_id,
-        )
-        raise _http_error(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            S43_ERR_ACTION_LEDGER_UNAVAILABLE,
-            "Authoritative action state is unavailable.",
-            request_id=request_id,
-        ) from exc
-
-    if raw is None:
-        raise _http_error(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            S43_ERR_ACTION_LEDGER_UNAVAILABLE,
-            "Authoritative action state is unavailable.",
-            request_id=request_id,
-        )
-
-    try:
-        action = _as_action_status(raw)
-    except Exception as exc:
-        logger.exception(
-            "Sentinel-43 action ledger returned invalid state. "
-            "action_id=%s request_id=%s",
-            action_id,
-            request_id,
-        )
-        raise _http_error(
-            status.HTTP_500_INTERNAL_SERVER_ERROR,
-            S43_ERR_ACTION_STATUS_INVALID,
-            "Authoritative action state is invalid.",
-            request_id=request_id,
-        ) from exc
-
-    if action.action_id != action_id:
-        raise _http_error(
-            status.HTTP_500_INTERNAL_SERVER_ERROR,
-            S43_ERR_ACTION_STATUS_INVALID,
-            "Authoritative action state does not match requested action.",
-            request_id=request_id,
-        )
-
-    return action
 
 
 # =============================================================================
@@ -408,58 +217,37 @@ def _read_authoritative_action_status(
 
 
 # =============================================================================
-# Assessment
+# Assessment -- DEPRECATED (see module docstring, disposition D)
 # =============================================================================
 
 @v1.post(
     "/assess",
-    response_model=ThreatAssessmentOut,
     tags=["assessment"],
 )
 def assess(
     payload: ThreatAssessmentIn,
     request_id: str = Depends(dep_request_id),
-    engine: EngineProtocol = Depends(dep_engine),
-) -> ThreatAssessmentOut:
-    try:
-        payload_dict = _model_to_dict(payload)
+) -> None:
+    """Deprecated: no supported backend, and none will be built here.
 
-        result = engine.handle_assessment(
-            payload.mode.value,
-            payload_dict,
-        )
-
-        return _as_assessment_out(
-            result,
-            request_id=request_id,
-        )
-
-    except HTTPException:
-        raise
-
-    except ValueError as exc:
-        logger.warning(
-            "Assessment engine returned invalid result. "
-            "request_id=%s error=%s",
-            request_id,
-            type(exc).__name__,
-        )
-        raise _http_error(
-            status.HTTP_502_BAD_GATEWAY,
-            S43_ERR_ASSESSMENT_RESULT_INVALID,
-            "Assessment engine returned an invalid result.",
-            request_id=request_id,
-        ) from exc
-
-    except Exception as exc:
-        logger.exception(
-            "Assessment failed. request_id=%s",
-            request_id,
-        )
-        raise _http_500(
-            S43_ERR_ASSESSMENT_PIPELINE_FAILURE,
-            request_id=request_id,
-        ) from exc
+    Threat assessment happens automatically through the canonical event
+    pipeline (Fenrir/SpartaCore -> MonitoringManager -> GET
+    /operator/findings); there was never a real backend behind "POST an
+    arbitrary payload for assessment" in the deployed stack, and inventing
+    one now would be a new production Store/Engine built solely to silence
+    this route -- exactly what this disposition pass was told not to do.
+    Payload shape is still validated (ThreatAssessmentIn) so a malformed
+    caller gets 422 before this deprecation notice, unchanged from before.
+    """
+    raise _http_error(
+        status.HTTP_501_NOT_IMPLEMENTED,
+        S43_ERR_V1_ASSESS_DEPRECATED,
+        "This legacy Watchgate assessment endpoint is deprecated and has "
+        "no supported backend. There is no direct replacement for posting "
+        "an arbitrary assessment payload -- assessment now happens "
+        "automatically through the canonical event pipeline.",
+        request_id=request_id,
+    )
 
 
 # =============================================================================
@@ -489,60 +277,39 @@ def _validate_action_id_match(
     response_model=ActionResponse,
     tags=["actions"],
 )
-def approve_action(
+async def approve_action(
     action_id: str,
     body: ActionRequest,
     request_id: str = Depends(dep_request_id),
-    engine: EngineProtocol = Depends(dep_engine),
-    store: StoreProtocol = Depends(dep_store),
 ) -> ActionResponse:
+    """REPLACE disposition: wired to the same human-gated commit path
+    POST /actions/{action_id}/approve uses (core.api.main
+    _resolve_governance_and_commit_action), not the dead Engine/Store
+    abstraction. v1's ActionRequest has no decision_id field; passing None
+    falls back to the decision_id already recorded on the staged action's
+    own payload -- exactly what the modern route does when its caller omits
+    one too.
+    """
     _validate_action_id_match(
         path_action_id=action_id,
         body_action_id=body.action_id,
         request_id=request_id,
     )
 
+    from core.api import main as _core_main
+
     try:
-        ok = bool(
-            engine.approve_action(
-                action_id,
-                body.operator_id,
-                reason=body.reason,
-            )
-        )
-
-        if not ok:
-            raise _http_error(
-                status.HTTP_409_CONFLICT,
-                S43_ERR_APPROVAL_PIPELINE_FAILURE,
-                "Approval was not accepted.",
-                request_id=request_id,
-            )
-
-        action = _read_authoritative_action_status(
-            store=store,
+        action = await _core_main._resolve_governance_and_commit_action(
             action_id=action_id,
-            request_id=request_id,
+            decision_id=None,
+            approved=True,
+            allowed_statuses={"STAGED"},
+            new_status="APPROVED",
+            reason=body.reason,
+            operator=body.operator_id,
         )
-
-        if action.decision is not ActionDecision.APPROVED:
-            raise _http_error(
-                status.HTTP_409_CONFLICT,
-                S43_ERR_ACTION_STATUS_INVALID,
-                "Approval did not produce an approved ledger state.",
-                request_id=request_id,
-            )
-
-        return ActionResponse(
-            status=ApiStatus.OK,
-            request_id=request_id,
-            result=True,
-            action=action,
-        )
-
     except HTTPException:
         raise
-
     except Exception as exc:
         logger.exception(
             "Approval failed. action_id=%s request_id=%s",
@@ -554,66 +321,45 @@ def approve_action(
             request_id=request_id,
         ) from exc
 
+    return ActionResponse(
+        status=ApiStatus.OK,
+        request_id=request_id,
+        result=True,
+        action=_modern_action_to_status(action),
+    )
+
 
 @v1.post(
     "/actions/{action_id}/veto",
     response_model=ActionResponse,
     tags=["actions"],
 )
-def veto_action(
+async def veto_action(
     action_id: str,
     body: ActionRequest,
     request_id: str = Depends(dep_request_id),
-    engine: EngineProtocol = Depends(dep_engine),
-    store: StoreProtocol = Depends(dep_store),
 ) -> ActionResponse:
+    """REPLACE disposition: same as approve_action, approved=False."""
     _validate_action_id_match(
         path_action_id=action_id,
         body_action_id=body.action_id,
         request_id=request_id,
     )
 
+    from core.api import main as _core_main
+
     try:
-        ok = bool(
-            engine.veto_action(
-                action_id,
-                body.operator_id,
-                reason=body.reason,
-            )
-        )
-
-        if not ok:
-            raise _http_error(
-                status.HTTP_409_CONFLICT,
-                S43_ERR_VETO_PIPELINE_FAILURE,
-                "Veto was not accepted.",
-                request_id=request_id,
-            )
-
-        action = _read_authoritative_action_status(
-            store=store,
+        action = await _core_main._resolve_governance_and_commit_action(
             action_id=action_id,
-            request_id=request_id,
+            decision_id=None,
+            approved=False,
+            allowed_statuses={"PENDING", "STAGED"},
+            new_status="VETOED",
+            reason=body.reason,
+            operator=body.operator_id,
         )
-
-        if action.decision is not ActionDecision.VETOED:
-            raise _http_error(
-                status.HTTP_409_CONFLICT,
-                S43_ERR_ACTION_STATUS_INVALID,
-                "Veto did not produce a vetoed ledger state.",
-                request_id=request_id,
-            )
-
-        return ActionResponse(
-            status=ApiStatus.OK,
-            request_id=request_id,
-            result=True,
-            action=action,
-        )
-
     except HTTPException:
         raise
-
     except Exception as exc:
         logger.exception(
             "Veto failed. action_id=%s request_id=%s",
@@ -625,13 +371,20 @@ def veto_action(
             request_id=request_id,
         ) from exc
 
+    return ActionResponse(
+        status=ApiStatus.OK,
+        request_id=request_id,
+        result=True,
+        action=_modern_action_to_status(action),
+    )
+
 
 @v1.get(
     "/actions",
     response_model=ActionListResponse,
     tags=["actions"],
 )
-def list_actions(
+async def list_actions(
     decision: ActionDecision | None = Query(
         default=None,
         alias="status",
@@ -647,59 +400,20 @@ def list_actions(
         max_length=512,
     ),
     request_id: str = Depends(dep_request_id),
-    store: StoreProtocol = Depends(dep_store),
 ) -> ActionListResponse:
+    """REPLACE disposition: wired to the same in-memory action ledger
+    GET /actions already reads via core.api.main._list_actions(), not the
+    dead Store abstraction. The ledger has no cursor-based pagination (a
+    flat, bounded, most-recent-first list); cursor is accepted for contract
+    compatibility and echoed back as None, unchanged from how this route
+    already behaved when the old Store returned a bare list.
+    """
+    from core.api import main as _core_main
+
     try:
-        items_raw = store.list_actions(
-            status=(
-                decision.value
-                if decision is not None
-                else None
-            ),
-            limit=limit,
-            cursor=cursor,
-        )
-
-        if isinstance(items_raw, dict):
-            raw_items = items_raw.get("items") or []
-            next_cursor = items_raw.get("next_cursor")
-        else:
-            raw_items = items_raw or []
-            next_cursor = None
-
-        if not isinstance(raw_items, list):
-            raise ValueError(
-                "Action ledger items must be a list"
-            )
-
-        items = [
-            _as_action_status(item)
-            for item in raw_items
-        ]
-
-        return ActionListResponse(
-            status=ApiStatus.OK,
-            request_id=request_id,
-            items=items,
-            next_cursor=next_cursor,
-        )
-
+        raw_actions = await _core_main._list_actions(limit)
     except HTTPException:
         raise
-
-    except ValueError as exc:
-        logger.exception(
-            "Action ledger returned invalid data. "
-            "request_id=%s",
-            request_id,
-        )
-        raise _http_error(
-            status.HTTP_500_INTERNAL_SERVER_ERROR,
-            S43_ERR_ACTION_STATUS_INVALID,
-            "Action ledger returned invalid data.",
-            request_id=request_id,
-        ) from exc
-
     except Exception as exc:
         logger.exception(
             "Action ledger query failed. request_id=%s",
@@ -711,6 +425,17 @@ def list_actions(
             "Action ledger is unavailable.",
             request_id=request_id,
         ) from exc
+
+    items = [_modern_action_to_status(action) for action in raw_actions]
+    if decision is not None:
+        items = [item for item in items if item.decision == decision]
+
+    return ActionListResponse(
+        status=ApiStatus.OK,
+        request_id=request_id,
+        items=items,
+        next_cursor=None,
+    )
 
 
 router.include_router(v1)
