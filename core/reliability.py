@@ -314,6 +314,21 @@ class IdempotencyDecision:
     original_recorded_at: str = ""
 
 
+#: Ledger states from which a NEW producer request for the same event_id
+#: may claim a fresh delivery attempt -- terminal failures only.
+#: DELIVERED is excluded: that event was genuinely handled, so a repeat is
+#: a real duplicate, not a retry. PROCESSING/RECEIVED are excluded too:
+#: another delivery for this exact id is in flight right now, and a second
+#: concurrent attempt would race it, not recover from it.
+_LEDGER_RETRYABLE_STATES: Final[frozenset[str]] = frozenset(
+    {
+        DeliveryState.FAILED_TERMINAL.value,
+        DeliveryState.FAILED_RETRYABLE.value,
+        DeliveryState.DEAD_LETTERED.value,
+    }
+)
+
+
 class IdempotencyLedger:
     """Bounded, TTL'd record of recently handled ``event_id`` values.
 
@@ -393,6 +408,33 @@ class IdempotencyLedger:
                 return
             seen_at, _, recorded_at = existing
             self._entries[key] = (seen_at, str(state), recorded_at)
+
+    def claim_retry(self, event_id: str) -> bool:
+        """Atomically reclaim a failed entry for one fresh delivery attempt.
+
+        Succeeds only when the CURRENTLY recorded state is a terminal
+        failure (``_LEDGER_RETRYABLE_STATES``) -- a single guarded
+        check-and-set, not a read then a separate write, so two callers
+        racing a retry for the same failed event_id cannot both be told
+        they may proceed. The same shape as
+        ``DeadLetterStore.begin_replay_attempt`` uses for operator replay,
+        applied here to the in-process ledger for an ordinary producer
+        retry. On success the entry is immediately marked PROCESSING.
+        """
+        key = str(event_id).strip()
+        with self._lock:
+            existing = self._entries.get(key)
+            if existing is None:
+                return False
+            seen_at, state, recorded_at = existing
+            if state not in _LEDGER_RETRYABLE_STATES:
+                return False
+            self._entries[key] = (
+                seen_at,
+                str(DeliveryState.PROCESSING),
+                recorded_at,
+            )
+            return True
 
     def __len__(self) -> int:
         with self._lock:
@@ -1081,6 +1123,8 @@ class ReliabilityMetrics:
         "events_accepted",
         "events_duplicate",
         "events_rejected",
+        "events_retried_after_failure",
+        "events_delivery_in_progress",
         "delivery_success",
         "delivery_retry",
         "delivery_failed_terminal",
@@ -1093,6 +1137,7 @@ class ReliabilityMetrics:
         "replay_reconciliation_required",
         "queue_overflow",
         "ws_slow_client_disconnect",
+        "audit_write_failed",
     )
 
     def __init__(self) -> None:
@@ -1185,14 +1230,44 @@ class EventReliabilityManager:
         Reliability telemetry must never break delivery, so a failure here is
         logged and swallowed. The authoritative security records are written
         on the governance and ingress paths, not from this helper.
+
+        The AUDIT RECORD's own identity is never the caller-supplied
+        ``event_id``: the authoritative audit store's ``event_id`` column is
+        UNIQUE, and it is the audit ledger's own row identity, auto-assigned
+        by ``AuditStore.append`` whenever the caller omits it -- not the
+        identity of the logical event a row is ABOUT. Passing the logical
+        event_id straight through as ``event_id`` collided with that unique
+        constraint on every second audit entry for the same event (a
+        replay's PROCESSING row and its outcome row both reusing the
+        original delivery's audit id, for instance), and the try/except
+        below silently swallowed every one of those failures -- so replay
+        activity was vanishing from the authoritative audit history. The
+        logical identity is preserved under ``subject_event_id`` instead,
+        letting ``append`` assign a fresh, genuinely unique row id each time.
         """
         sink = self._audit_sink
         if sink is None:
             return
+
+        record = dict(fields)
+        subject_event_id = record.pop("event_id", None)
+        if subject_event_id is not None:
+            record["subject_event_id"] = subject_event_id
+
         try:
-            sink({"event_category": "event_delivery", **fields})
+            sink({"event_category": "event_delivery", **record})
         except Exception:
-            logger.debug("Delivery audit append failed", exc_info=True)
+            # Best-effort by design (see the docstring), but "swallowed"
+            # must not mean "invisible": a uniqueness or storage failure
+            # here is a real defect (or a real full/unavailable audit
+            # volume), and an operator needs a way to notice it even though
+            # it will never break the delivery this audit entry describes.
+            self.metrics.increment("audit_write_failed")
+            logger.warning(
+                "Delivery audit append failed for subject_event_id=%s",
+                subject_event_id,
+                exc_info=True,
+            )
 
     def deliver(
         self,
@@ -1207,6 +1282,23 @@ class EventReliabilityManager:
         not report success unless ``delivered`` (or ``handled``) is True --
         converting FAILED into DELIVERED is exactly the failure this layer
         exists to prevent.
+
+        A producer retrying the SAME event_id is classified by what
+        actually happened to the prior attempt, not treated as one
+        unconditional "duplicate" bucket:
+          - DELIVERED: genuinely handled already -- report DUPLICATE, make
+            no second delivery attempt. Redelivering it would turn one
+            logical finding into two alerts.
+          - PROCESSING / RECEIVED: another delivery for this exact id is
+            in flight right now -- refuse the concurrent attempt rather
+            than racing it, but never call that "handled".
+          - FAILED_TERMINAL / FAILED_RETRYABLE / DEAD_LETTERED: nothing
+            succeeded yet. This is a new producer request, not an operator
+            replay, so it may re-enter the normal bounded delivery path
+            below -- a recovered dependency should not require a human to
+            notice and replay it by hand. This is still exactly ONE bounded
+            attempt sequence per call, on an explicit new request; nothing
+            here loops, schedules, or retries on its own.
         """
         event_id = str(envelope.get("event_id") or "").strip()
         correlation_id = str(envelope.get("correlation_id") or "").strip()
@@ -1225,26 +1317,61 @@ class EventReliabilityManager:
 
         decision = self.idempotency.check_and_register(event_id)
         if not decision.first_seen:
-            # A transport retry of an event already handled. Report it as a
-            # duplicate rather than analyzing again, so one logical finding
-            # cannot become two alerts.
-            self.metrics.increment("events_duplicate")
-            self._audit(
-                event_id=event_id,
-                correlation_id=correlation_id,
-                delivery_state=DeliveryState.DUPLICATE.value,
-                original_state=decision.original_state,
-            )
-            return DeliveryOutcome(
-                state=DeliveryState.DUPLICATE,
-                event_id=event_id,
-                correlation_id=correlation_id,
-                attempts=0,
-                reason="duplicate_event_id",
-            )
+            if decision.original_state == DeliveryState.DELIVERED.value:
+                self.metrics.increment("events_duplicate")
+                self._audit(
+                    event_id=event_id,
+                    correlation_id=correlation_id,
+                    delivery_state=DeliveryState.DUPLICATE.value,
+                    original_state=decision.original_state,
+                )
+                return DeliveryOutcome(
+                    state=DeliveryState.DUPLICATE,
+                    event_id=event_id,
+                    correlation_id=correlation_id,
+                    attempts=0,
+                    reason="duplicate_event_id",
+                )
 
-        self.metrics.increment("events_accepted")
-        self.idempotency.update_state(event_id, DeliveryState.PROCESSING)
+            if (
+                decision.original_state in _LEDGER_RETRYABLE_STATES
+                and self.idempotency.claim_retry(event_id)
+            ):
+                # Claimed: the prior attempt genuinely failed, so this
+                # request may proceed through the ordinary bounded delivery
+                # path below exactly as a first-seen event would.
+                self.metrics.increment("events_retried_after_failure")
+                self._audit(
+                    event_id=event_id,
+                    correlation_id=correlation_id,
+                    delivery_state=DeliveryState.PROCESSING.value,
+                    retry_of_failed_event=True,
+                    original_state=decision.original_state,
+                )
+            else:
+                # Either genuinely in flight (PROCESSING/RECEIVED), or
+                # another caller won the retry claim above at the same
+                # moment. Either way: refuse the concurrent duplicate
+                # rather than racing it. This is NOT a successfully
+                # handled event, so it must never be reported as DUPLICATE.
+                self.metrics.increment("events_delivery_in_progress")
+                self._audit(
+                    event_id=event_id,
+                    correlation_id=correlation_id,
+                    delivery_state=DeliveryState.PROCESSING.value,
+                    reason="delivery_in_progress",
+                    original_state=decision.original_state,
+                )
+                return DeliveryOutcome(
+                    state=DeliveryState.PROCESSING,
+                    event_id=event_id,
+                    correlation_id=correlation_id,
+                    attempts=0,
+                    reason="delivery_in_progress",
+                )
+        else:
+            self.metrics.increment("events_accepted")
+            self.idempotency.update_state(event_id, DeliveryState.PROCESSING)
 
         deadline = time.monotonic() + self.retry_policy.total_deadline_seconds
         attempts = 0
