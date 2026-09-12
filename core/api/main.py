@@ -3534,6 +3534,188 @@ async def reliability_replay(
 
 
 # =============================================================================
+# Operator findings router
+# =============================================================================
+#
+# Baseline verification found that Fenrir/Sparta findings successfully reach
+# MonitoringManager (which correctly scores and, for SpartaCore, actually
+# changes the embedded WatchtowerNode's own state) but had no authenticated
+# operator-facing retrieval surface -- only raw container logs. This router
+# is a VIEW into the canonical state MonitoringManager/WatchtowerNode already
+# maintain (WatchtowerNode.recent_events, a bounded deque sized by existing
+# config), not a new findings database, event bus, or monitoring subsystem.
+
+operator_router = APIRouter(
+    prefix="/operator",
+    tags=["operator"],
+)
+
+#: Named fields a finding entry may surface to an operator. Allowlist only,
+#: matching the same principle as _sanitize_finding_fields: a field reaches
+#: the operator only if it is named here, so an unexamined producer field
+#: (or a raw internal object) can never ride through. Never a service token,
+#: credential, Authorization header, or unrestricted producer blob.
+_FINDING_ALLOWED_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        # Identity / provenance (BaseEvent)
+        "id",
+        "event_id",
+        "kind",
+        "event_type",
+        "schema_version",
+        "source",
+        "source_identity",
+        "correlation_id",
+        "parent_event_id",
+        "created_at",
+        "ingested_at",
+        "received_ts",
+        "created_ts",
+        # Security/finding content (SecurityEvent)
+        "severity",
+        "threat_kind",
+        "source_ip",
+        "indicators",
+        "confidence",
+        "secrets_exposed",
+        "privilege_escalation",
+        "unsigned_artifact",
+        "debug_mode_enabled",
+        # Integrity content (LogEvent / SpartaCore)
+        "integrity_status",
+        # Alert-wrapper content (WatchtowerNode.scan_event's own findings)
+        "source_event_id",
+        "alerts",
+        "coordinator_decision",
+        # Dropped-event-wrapper content
+        "accepted",
+        "dropped_reason",
+        "node_state",
+    }
+)
+
+
+def _finding_subsystem(entry: Mapping[str, Any]) -> str:
+    """Best-effort human-facing subsystem label for one finding entry."""
+    identity = str(entry.get("source_identity") or "").strip()
+    if identity.startswith("service:"):
+        return identity[len("service:") :]
+    if identity:
+        return identity
+    return str(entry.get("source") or "unknown").strip() or "unknown"
+
+
+def _sanitize_finding_entry(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Project one raw recent_events entry down to the operator-safe view."""
+    entry = {
+        key: raw[key]
+        for key in _FINDING_ALLOWED_FIELDS
+        if key in raw
+    }
+    entry["subsystem"] = _finding_subsystem(raw)
+    return entry
+
+
+def _finding_timestamp(entry: Mapping[str, Any]) -> float:
+    """Best-effort epoch timestamp for filtering/ordering, never raises."""
+    created_at = entry.get("created_at")
+    if isinstance(created_at, str) and created_at:
+        try:
+            return datetime.fromisoformat(
+                created_at.replace("Z", "+00:00")
+            ).timestamp()
+        except ValueError:
+            pass
+
+    for key in ("created_ts", "received_ts"):
+        value = entry.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+
+    return 0.0
+
+
+def _parse_since(since: str) -> float:
+    since = since.strip()
+    try:
+        return float(since)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(since.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="since must be an epoch-seconds number or an ISO-8601 timestamp",
+        ) from None
+
+
+@operator_router.get("/findings")
+async def operator_findings(
+    request: Request,
+    limit: int = 50,
+    source: str | None = None,
+    severity: str | None = None,
+    event_type: str | None = None,
+    subsystem: str | None = None,
+    since: str | None = None,
+) -> dict[str, Any]:
+    """Bounded, authenticated, sanitized view of recent MonitoringManager
+    findings -- Fenrir detections, SpartaCore integrity events/alerts, and
+    anything else routed through analyze_event(). Human operators only.
+
+    This is read access to existing canonical state; it does not stage,
+    approve, or execute anything, so it carries no governance/audit action
+    of its own -- the same convention already used by the other read-only
+    status/listing routes (/reliability/status, /reliability/failed-events).
+    """
+    await _require_operator(request)
+
+    manager = runtime.monitoring_manager
+    if manager is None:
+        raise HTTPException(
+            status_code=503,
+            detail="MonitoringManager is not available.",
+        )
+
+    bounded_limit = max(1, min(int(limit), 500))
+
+    try:
+        snapshot = manager.recent_events(bounded_limit)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+
+    since_ts = _parse_since(since) if since else None
+
+    findings: list[dict[str, Any]] = []
+    for raw in snapshot.get("events", []):
+        if not isinstance(raw, Mapping):
+            continue
+
+        sanitized = _sanitize_finding_entry(raw)
+
+        if source is not None and sanitized.get("source") != source:
+            continue
+        if severity is not None and sanitized.get("severity") != severity:
+            continue
+        if event_type is not None and sanitized.get("event_type") != event_type:
+            continue
+        if subsystem is not None and sanitized.get("subsystem") != subsystem:
+            continue
+        if since_ts is not None and _finding_timestamp(sanitized) < since_ts:
+            continue
+
+        findings.append(sanitized)
+
+    return {
+        "count": len(findings),
+        "limit": bounded_limit,
+        "findings": findings,
+        "timestamp": utc_now(),
+    }
+
+
+# =============================================================================
 # Core router
 # =============================================================================
 
@@ -3987,6 +4169,7 @@ app.include_router(internal_router)
 app.include_router(proxy_events_router)
 app.include_router(watchtower_router)
 app.include_router(reliability_router)
+app.include_router(operator_router)
 app.include_router(core_router)
 app.include_router(rules_router)
 app.include_router(config_router)
