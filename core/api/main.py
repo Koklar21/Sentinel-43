@@ -1221,6 +1221,23 @@ async def _async_heartbeat_loop() -> None:
                     },
                     channel="dependencies",
                 )
+
+                # Startup reports this dependency once (see lifespan). Without
+                # a periodic refresh here, Watchtower's own dependency_stale_
+                # seconds (60s default) elapses during perfectly ordinary
+                # operation and /watchtower/ready reports not_ready forever
+                # after, even though /watchtower/health, the module heartbeat
+                # above, and everything else stays healthy. Re-report on the
+                # same cadence as the module heartbeat so the two stay
+                # consistent.
+                await report_dependency_to_watchtower(
+                    "sentinel-43-api",
+                    "online",
+                    {
+                        "version": APP_VERSION,
+                        "environment": SENTINEL_ENV,
+                    },
+                )
         except Exception:
             logger.warning("Heartbeat loop error", exc_info=True)
 
