@@ -71,7 +71,7 @@ def get_remote_gateway_health(client: ApiClient | None = None) -> dict[str, Any]
     if client is None:
         client = api_client
 
-    return client.get("/remote/health").to_dict()
+    return client.get("/remote-gateway/health").to_dict()
 
 
 def get_remote_targets(
@@ -96,7 +96,7 @@ def get_remote_targets(
         "offset": safe_offset,
     })
 
-    return client.get(f"/remote/targets?{query}").to_dict()
+    return client.get(f"/remote-gateway/targets?{query}").to_dict()
 
 
 def activate_remote_event(
@@ -135,7 +135,7 @@ def activate_remote_event(
         return _error("; ".join(str(error) for error in errors))
 
     return client.post(
-        "/remote/events/activate",
+        "/remote-gateway/events/activate",
         payload=validated["payload"],
     ).to_dict()
 
@@ -154,24 +154,7 @@ def get_remote_audit_records(
             "correlation_id must be 8-64 alphanumeric, dash, or underscore characters"
         )
 
-    return client.get(f"/remote/audit/{cleaned}").to_dict()
-
-
-def get_remote_event_status(
-    correlation_id: Any,
-    client: ApiClient | None = None,
-) -> dict[str, Any]:
-    if client is None:
-        client = api_client
-
-    cleaned = _validate_correlation_id(correlation_id)
-
-    if cleaned is None:
-        return _error(
-            "correlation_id must be 8-64 alphanumeric, dash, or underscore characters"
-        )
-
-    return client.get(f"/remote/events/{cleaned}/status").to_dict()
+    return client.get(f"/remote-gateway/audit/{cleaned}").to_dict()
 
 
 def get_remote_gateway_snapshot(
