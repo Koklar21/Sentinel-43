@@ -81,6 +81,17 @@ class WatchtowerNodeScanner:
     def scan_event(self, event: dict[str, Any]) -> list[dict[str, Any]]:
         return list(self._node.scan_event(event).alerts)
 
+    def recent_event_snapshot(self, limit: int) -> dict[str, Any]:
+        """Canonical bounded recent-event view, unchanged from the node.
+
+        WatchtowerNode already maintains this (a bounded deque, sized by
+        its own config) for every event it scans -- Fenrir findings, Sparta
+        integrity events, and everything else routed through
+        MonitoringManager.analyze_event(). This is a passthrough, not a
+        second store.
+        """
+        return self._node.recent_event_snapshot(limit)
+
 
 @runtime_checkable
 class WindowStore(Protocol):
@@ -410,6 +421,27 @@ class MonitoringManager:
             "manager": manager_status,
             "scanner": self._scanner.get_status(),
         }
+
+    def recent_events(self, limit: int) -> dict[str, Any]:
+        """Bounded, canonical, already-recorded recent events.
+
+        Delegates to the scanner's own recent-event view when it has one
+        (WatchtowerNodeScanner does). Raises if the wired scanner does not
+        support this rather than inventing a second, parallel history.
+        """
+        provider = getattr(self._scanner, "recent_event_snapshot", None)
+        if not callable(provider):
+            raise RuntimeError(
+                "The wired event scanner does not expose recent events"
+            )
+
+        with self._lock:
+            started = self._started
+
+        if not started:
+            raise RuntimeError("MonitoringManager is not started")
+
+        return provider(limit)
 
     def stop(
         self,
