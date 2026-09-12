@@ -158,19 +158,39 @@ def test_ingress_rejects_a_circular_event_path():
     assert "409" in source
 
 
-def test_both_fenrir_ingress_routes_publish_to_monitoring():
-    """Neither Fenrir route may be distribution-only."""
+def test_exactly_one_fenrir_route_publishes_to_monitoring():
+    """A Fenrir finding must be analyzed exactly once.
+
+    FenrirHunter.process_finding posts every finding to BOTH
+    /watchtower/events and /internal/events/broadcast concurrently, and a
+    raw finding carries no event_id of its own -- so if both routes called
+    _notify_monitoring, each would mint a different event_id and
+    MonitoringManager would analyze the same finding twice under two
+    identities, doubling alert counts and corrupting frequency/temporal
+    scoring. Exactly one route -- the one that also owns the
+    reliability/idempotency pipeline and the real Watchtower delivery --
+    may call it; the other must stay distribution-only.
+
+    Both routes still guard against a circular Watchtower-derived event
+    (_reject_analysis_loop) regardless of which one analyzes.
+    """
     import inspect
 
     import core.api.main as main
 
-    for handler in (
-        main.watchtower_ingest_event,
-        main.internal_broadcast_event,
-    ):
-        source = inspect.getsource(handler)
-        assert "_notify_monitoring" in source, handler.__name__
-        assert "_reject_analysis_loop" in source, handler.__name__
+    sources = {
+        handler.__name__: inspect.getsource(handler)
+        for handler in (main.watchtower_ingest_event, main.internal_broadcast_event)
+    }
+
+    notifying = [name for name, src in sources.items() if "_notify_monitoring" in src]
+    assert notifying == ["watchtower_ingest_event"], (
+        "exactly one Fenrir ingress route may call _notify_monitoring; "
+        f"got {notifying}"
+    )
+
+    for name, src in sources.items():
+        assert "_reject_analysis_loop" in src, name
 
 
 def test_monitoring_event_carries_full_provenance():

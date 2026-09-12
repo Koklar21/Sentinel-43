@@ -312,12 +312,59 @@ class ResourceEvent(BaseEvent):
             )
 
 
+#: Bounds for SecurityEvent's finding-content fields -- producer data, so
+#: never trusted to be well-formed or bounded on its own.
+_MAX_SEVERITY_LEN: Final[int] = 64
+_MAX_THREAT_KIND_LEN: Final[int] = 128
+_MAX_SOURCE_IP_LEN: Final[int] = 64
+_MAX_INDICATORS: Final[int] = 50
+_MAX_INDICATOR_LEN: Final[int] = 256
+
+
 @dataclass(slots=True)
 class SecurityEvent(BaseEvent):
     kind: str = "security"
     unsigned_artifact: bool = False
     secrets_exposed: bool = False
     debug_mode_enabled: bool = False
+
+    # Finding content -- what a detection producer (Fenrir, Sparta) actually
+    # found, not just that it reported something. Optional: producers that
+    # only need the base security signal (firewall, governance) leave these
+    # at their defaults, and normalize_event()'s allow_unknown_fields path
+    # already drops anything a caller doesn't set. Bounded and typed in
+    # __post_init__ below -- this is producer-supplied data reaching the
+    # canonical monitoring path, held to the same "never trust producer
+    # shape" standard as every other envelope field.
+    severity: str = ""
+    threat_kind: str = ""
+    source_ip: str = ""
+    indicators: tuple[str, ...] = field(default_factory=tuple)
+    confidence: float = 0.0
+
+    def __post_init__(self) -> None:
+        BaseEvent.__post_init__(self)
+
+        self.severity = str(self.severity).strip()[:_MAX_SEVERITY_LEN]
+        self.threat_kind = str(self.threat_kind).strip()[:_MAX_THREAT_KIND_LEN]
+        self.source_ip = str(self.source_ip).strip()[:_MAX_SOURCE_IP_LEN]
+
+        raw_indicators = self.indicators or ()
+        if isinstance(raw_indicators, str):
+            # A single string is not "many indicators split some other way"
+            # -- treat it as exactly one, rather than iterating characters.
+            raw_indicators = (raw_indicators,)
+        self.indicators = tuple(
+            str(item).strip()[:_MAX_INDICATOR_LEN]
+            for item in list(raw_indicators)[:_MAX_INDICATORS]
+            if str(item).strip()
+        )
+
+        try:
+            confidence = float(self.confidence or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        self.confidence = max(0.0, min(1.0, confidence))
 
 
 @dataclass(slots=True)

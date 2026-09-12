@@ -2847,10 +2847,18 @@ async def internal_broadcast_event(
             detail="Fenrir service token may only emit fenrir.* events",
         )
 
-    # This route used to be pure distribution: a Fenrir finding was fanned
-    # out to dashboards and then forgotten -- never analyzed, never
-    # correlated. Give it the canonical envelope and publish it into
-    # monitoring like every other producer.
+    # Distribution only -- deliberately NOT a second monitoring ingestion
+    # path. Fenrir's real producer (FenrirHunter.process_finding) posts
+    # every finding to BOTH this route and /watchtower/events concurrently,
+    # and a raw finding carries no event_id of its own, so each route used
+    # to assign it a DIFFERENT one and MonitoringManager analyzed the same
+    # finding twice under two identities -- doubling alert counts and
+    # corrupting temporal/frequency scoring. /watchtower/events is the
+    # canonical analysis path (it also owns the reliability/idempotency
+    # pipeline and the real Watchtower delivery); this route still builds
+    # the canonical envelope for identity/correlation and still guards
+    # against a circular Watchtower-derived event, but must not
+    # independently trigger a second analysis of the same finding.
     envelope = _delivery_envelope(
         {
             "event_type": body.event_type,
@@ -2860,8 +2868,6 @@ async def internal_broadcast_event(
         request,
     )
     _reject_analysis_loop(envelope)
-
-    await _notify_monitoring(envelope, kind="security")
 
     await _broadcast_dashboard_event(
         body.event_type,
@@ -3078,6 +3084,52 @@ async def watchtower_check(
     }
 
 
+#: Finding-content fields MonitoringManager needs to actually analyze and
+#: score a detection, not just know one happened. Allowlist only, matching
+#: core/reliability.py's sanitize_for_record principle: a producer field
+#: reaches monitoring only if it is named here, so a new or hostile field
+#: cannot ride along unexamined. Never secrets, credentials, or raw auth
+#: material -- none of that is ever part of a request JSON body to begin
+#: with (the service token lives in the Authorization header, which this
+#: never touches).
+_MAX_FINDING_INDICATORS: Final[int] = 50
+_MAX_FINDING_INDICATOR_LEN: Final[int] = 256
+
+
+def _sanitize_finding_fields(body: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a producer body down to the finding content that may reach
+    MonitoringManager, bounded and type-checked field by field."""
+    extra: dict[str, Any] = {}
+
+    severity = body.get("severity")
+    if isinstance(severity, str) and severity.strip():
+        extra["severity"] = severity.strip()[:64]
+
+    threat_kind = body.get("threat_kind")
+    if isinstance(threat_kind, str) and threat_kind.strip():
+        extra["threat_kind"] = threat_kind.strip()[:128]
+
+    source_ip = body.get("source_ip")
+    if isinstance(source_ip, str) and source_ip.strip():
+        extra["source_ip"] = source_ip.strip()[:64]
+
+    indicators = body.get("indicators")
+    if isinstance(indicators, (list, tuple)):
+        cleaned = tuple(
+            str(item).strip()[:_MAX_FINDING_INDICATOR_LEN]
+            for item in list(indicators)[:_MAX_FINDING_INDICATORS]
+            if str(item).strip()
+        )
+        if cleaned:
+            extra["indicators"] = cleaned
+
+    confidence = body.get("confidence")
+    if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+        extra["confidence"] = max(0.0, min(1.0, float(confidence)))
+
+    return extra
+
+
 async def _notify_monitoring(
     envelope: Mapping[str, Any],
     *,
@@ -3253,12 +3305,20 @@ async def watchtower_ingest_event(
         result = outcome.response
         delivery = outcome.to_dict()
 
-    # The canonical monitoring path. Fenrir findings previously reached
-    # Watchtower and the dashboard but never MonitoringManager.
+    # The canonical monitoring path -- the ONLY one for a Fenrir finding
+    # (see internal_broadcast_event's comment on why the other route must
+    # not also call this). Findings previously reached Watchtower and the
+    # dashboard but never MonitoringManager at all; carrying only the
+    # envelope reached MonitoringManager but not the finding CONTENT
+    # (severity, threat_kind, source_ip, indicators, confidence), which is
+    # what analysis/scoring actually needs to do anything with the event.
     await _notify_monitoring(
         envelope,
         kind="security",
-        extra={"delivery_state": delivery.get("state", "")},
+        extra={
+            "delivery_state": delivery.get("state", ""),
+            **_sanitize_finding_fields(body),
+        },
     )
 
     # Distribution carries the same identity the event was accepted under.
