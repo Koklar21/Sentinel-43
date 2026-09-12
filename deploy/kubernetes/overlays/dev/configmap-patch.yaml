@@ -2,6 +2,26 @@
 # (core/api/main.py's _get_operator()) the same way .env.example's
 # SENTINEL_ENV=development default does for docker-compose. Never applied
 # in the beta overlay.
+#
+# S43_TRUSTED_HOSTS / S43_ALLOWED_ORIGINS: a ConfigMap patch REPLACES the
+# key, it does not append to base's value (see the beta overlay's own
+# comment) -- so the in-cluster name "s43-api" and the loopback origins
+# must be repeated here alongside the addition below, or Fenrir's own
+# callback to http://s43-api:8000/... (Host: s43-api:8000) and ordinary
+# localhost dev access would stop matching.
+#
+# CHANGEME: 192.168.1.233 is this host's current private LAN IPv4 address
+# (Wi-Fi, /24), added so the s43-api-lb LoadBalancer Service -- already
+# reachable on this address via Docker Desktop's own port mapping, no
+# Service/NodePort change needed -- is actually usable from another device
+# on the same LAN: without it, GET requests already succeed (TrustedHostGuard
+# has nothing to check against an empty allow-list) but POST /auth/login
+# from a browser that loaded the dashboard at http://192.168.1.233:8000
+# fails closed with "Origin not allowed" before credentials are ever
+# checked. A DHCP lease change on this host will require updating this
+# value; kubelet's own /health and /ready probes are exempt from the host
+# check regardless (core/api/middleware/security_headers.py's
+# _HOST_CHECK_EXEMPT_PATHS), so this does not affect liveness/readiness.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -10,3 +30,5 @@ metadata:
 data:
   SENTINEL_ENV: "development"
   S43_ENV: "development"
+  S43_TRUSTED_HOSTS: "s43-api,192.168.1.233"
+  S43_ALLOWED_ORIGINS: "http://localhost:8000,http://127.0.0.1:8000,http://192.168.1.233:8000"
