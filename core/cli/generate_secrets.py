@@ -670,8 +670,23 @@ def password_hash_flow() -> int:
         )
         return 1
 
+    # Compose's .env-file interpolation treats a bare "$" as the start of a
+    # variable reference, and an Argon2id digest always contains several of
+    # them ($argon2id$v=19$m=...$salt$hash) -- pasted verbatim into .env,
+    # every one of those is silently swallowed before the container ever
+    # sees it, and the API then fails every login with "Break-glass
+    # credentials are not configured correctly." Doubling each "$" is
+    # exactly what Compose's own docs prescribe for a literal "$" in a .env
+    # value, and Compose undoes it before the value reaches the container.
+    env_file_safe = digest.replace("$", "$$")
     print(
-        f"S43_OPERATOR_PASSWORD_HASH={digest}"
+        f"S43_OPERATOR_PASSWORD_HASH={env_file_safe}"
+    )
+    print(
+        "# Safe to paste directly into .env for Docker Compose "
+        "(the $ characters above are doubled for Compose's .env "
+        "interpolation; the API will see the real Argon2id hash).",
+        file=sys.stderr,
     )
     return 0
 
