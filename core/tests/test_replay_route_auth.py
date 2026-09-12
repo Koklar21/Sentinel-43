@@ -283,4 +283,84 @@ def test_reconciliation_required_is_409_and_not_a_silent_500(
     assert store.get("ev-1").replay_status == "replay_in_progress"
 
 
+# --------------------------------------------------------------------------- #
+# defect: a failed replay delivery must not return HTTP 200
+#
+# outcome.delivered is false when Watchtower rejects or cannot receive a
+# replay, but the route used to return that outcome as a plain dict, so
+# FastAPI answered 200 regardless. The dashboard's ApiClient derives its
+# own "ok" purely from HTTP status (200 <= status < 300), so a 200 here
+# reported success to the UI for a replay that did not happen.
+# --------------------------------------------------------------------------- #
+
+def test_watchtower_rejecting_the_replay_is_non_2xx_not_200(
+    reliability_manager, allow_operator, monkeypatch
+):
+    _, store = reliability_manager
+    _dead_letter(store, payload={"score": 9})
+    monkeypatch.setattr(
+        main_module,
+        "_watchtower_request",
+        lambda *a, **k: {"status_code": 400, "error": "bad_request"},
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        _run(main_module.reliability_replay("ev-1", _request()))
+
+    assert exc.value.status_code == 503
+    assert exc.value.status_code not in (200, 201, 204)
+    # The record returns to the dead-letter state, never claims success.
+    assert store.get("ev-1").replay_status == "replay_failed"
+
+
+def test_watchtower_unavailable_during_replay_is_non_2xx_not_200(
+    reliability_manager, allow_operator, monkeypatch
+):
+    _, store = reliability_manager
+    _dead_letter(store, payload={"score": 9})
+
+    def _unreachable(*a, **k):  # noqa: ANN001, ANN002
+        raise ConnectionError("watchtower unreachable")
+
+    monkeypatch.setattr(main_module, "_watchtower_request", _unreachable)
+
+    with pytest.raises(HTTPException) as exc:
+        _run(main_module.reliability_replay("ev-1", _request()))
+
+    assert exc.value.status_code == 503
+    assert store.get("ev-1").replay_status == "replay_failed"
+
+
+def test_successful_replay_is_200(reliability_manager, allow_operator, monkeypatch):
+    _, store = reliability_manager
+    _dead_letter(store, payload={"score": 9})
+    monkeypatch.setattr(
+        main_module, "_watchtower_request", lambda *a, **k: {"status_code": 200}
+    )
+
+    # No HTTPException raised == the route returns a plain dict == FastAPI
+    # answers 200 -- the direct-call equivalent of asserting the status.
+    result = _run(main_module.reliability_replay("ev-1", _request()))
+    assert result["ok"] is True
+
+
+def test_dashboard_client_reports_failure_for_a_non_2xx_replay_response():
+    """The server-side status fix is what dashboard/services/reliability_client
+    already needed -- no client-side reinterpretation of a 200 body."""
+    from dashboard.services.reliability_client import describe_failure
+
+    # Shape of ApiResponse.to_dict() for the 503 case above: ApiClient's own
+    # "ok" is derived purely from HTTP status (200 <= status < 300).
+    response = {
+        "ok": False,
+        "status_code": 503,
+        "data": None,
+        "error": "Watchtower did not accept the replay; the event remains "
+        "dead-lettered (bad_request).",
+    }
+    message = describe_failure(response)
+    assert message
+    assert "unavailable" in message.lower()
+
+
 __all__: list[str] = []

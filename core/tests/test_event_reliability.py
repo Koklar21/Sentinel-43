@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import json
 import pathlib
 import tempfile
 
@@ -251,6 +252,143 @@ def test_retry_exhaustion_dead_letters():
     assert record.replay_status == "pending"
 
 
+# --------------------------------------------------------------------------- #
+# defect: a failed prior delivery must not be reported as a duplicate
+#
+# check_and_register() reports ANY existing ledger entry as "not first
+# seen", regardless of whether the prior attempt actually succeeded. A
+# blanket "not first seen -> DUPLICATE" would silently drop a producer's
+# legitimate retry of an event that never actually got delivered.
+# --------------------------------------------------------------------------- #
+
+def test_previously_delivered_id_is_a_true_duplicate_with_zero_new_delivery():
+    manager, _ = _manager()
+    calls = {"n": 0}
+
+    def deliver_fn():
+        calls["n"] += 1
+        return {"status_code": 200}
+
+    first = manager.deliver(_ENVELOPE, deliver_fn)
+    second = manager.deliver(_ENVELOPE, deliver_fn)
+
+    assert first.state is DeliveryState.DELIVERED
+    assert second.state is DeliveryState.DUPLICATE
+    assert second.reason == "duplicate_event_id"
+    assert calls["n"] == 1, "a genuine duplicate must cause zero redeliveries"
+
+
+def test_dead_lettered_id_gets_a_new_bounded_delivery_attempt_on_retry():
+    store = _store()
+    manager, _ = _manager(store)
+
+    first = manager.deliver(_ENVELOPE, lambda: {"error": "watchtower_unreachable"})
+    assert first.state is DeliveryState.DEAD_LETTERED
+
+    calls = {"n": 0}
+
+    def recovered():
+        calls["n"] += 1
+        return {"status_code": 200}
+
+    second = manager.deliver(_ENVELOPE, recovered)
+
+    assert calls["n"] == 1, "a producer retry of a dead-lettered event must reach Watchtower"
+    assert second.state is DeliveryState.DELIVERED
+    assert second.reason != "duplicate_event_id"
+
+
+def test_failed_terminal_id_gets_a_new_bounded_delivery_attempt_on_retry():
+    """A 401/403-classified terminal failure is retried identically to a
+    dead-lettered one -- the retry decision is about the LEDGER's recorded
+    outcome (any terminal failure), not about which failure classification
+    produced it."""
+    manager, _ = _manager()
+    manager.idempotency.check_and_register("ev-2")
+    manager.idempotency.update_state("ev-2", DeliveryState.FAILED_TERMINAL)
+
+    calls = {"n": 0}
+
+    def recovered():
+        calls["n"] += 1
+        return {"status_code": 200}
+
+    outcome = manager.deliver({**_ENVELOPE, "event_id": "ev-2"}, recovered)
+    assert calls["n"] == 1
+    assert outcome.state is DeliveryState.DELIVERED
+
+
+def test_in_progress_id_refuses_a_concurrent_delivery():
+    manager, _ = _manager()
+    # Simulate another in-flight delivery for this exact id: registered,
+    # but not yet resolved to any terminal state.
+    manager.idempotency.check_and_register("ev-3")
+
+    calls = {"n": 0}
+
+    def deliver_fn():
+        calls["n"] += 1
+        return {"status_code": 200}
+
+    outcome = manager.deliver({**_ENVELOPE, "event_id": "ev-3"}, deliver_fn)
+
+    assert calls["n"] == 0, "a concurrent in-flight id must not be redelivered"
+    assert outcome.state is DeliveryState.PROCESSING
+    assert outcome.reason == "delivery_in_progress"
+    assert outcome.delivered is False
+    assert outcome.handled is False
+
+
+def test_producer_retry_after_dependency_recovery_reaches_watchtower():
+    store = _store()
+    manager, _ = _manager(store)
+    manager.deliver(_ENVELOPE, lambda: {"error": "watchtower_unreachable"})
+
+    calls = {"n": 0}
+
+    def recovered():
+        calls["n"] += 1
+        return {"status_code": 200}
+
+    outcome = manager.deliver(_ENVELOPE, recovered)
+    assert calls["n"] == 1
+    assert outcome.state is DeliveryState.DELIVERED
+
+
+def test_successful_retry_updates_ledger_and_dead_letter_state():
+    store = _store()
+    manager, _ = _manager(store)
+    manager.deliver(_ENVELOPE, lambda: {"error": "watchtower_unreachable"})
+    assert store.get("ev-1").replay_status == "pending"
+
+    manager.deliver(_ENVELOPE, lambda: {"status_code": 200})
+
+    # A third delivery is now a TRUE duplicate of the successful retry.
+    calls = {"n": 0}
+    third = manager.deliver(_ENVELOPE, lambda: (calls.__setitem__("n", calls["n"] + 1), {"status_code": 200})[1])
+    assert third.state is DeliveryState.DUPLICATE
+    assert calls["n"] == 0
+
+
+def test_failed_retry_remains_dead_lettered_not_falsely_successful():
+    store = _store()
+    manager, _ = _manager(store)
+    manager.deliver(_ENVELOPE, lambda: {"error": "watchtower_unreachable"})
+
+    calls = {"n": 0}
+
+    def still_down():
+        calls["n"] += 1
+        return {"error": "watchtower_unreachable"}
+
+    outcome = manager.deliver(_ENVELOPE, still_down)
+    assert calls["n"] == 3, "the retry gets its own full bounded attempt budget"
+    assert outcome.state is DeliveryState.DEAD_LETTERED
+    record = store.get("ev-1")
+    assert record.replay_status == "pending"
+    assert record.attempts == 3
+
+
 def test_authentication_failure_is_never_retried():
     """401 cannot succeed by waiting; retrying burns budget and can trip
     lockouts."""
@@ -465,7 +603,132 @@ def test_replay_is_recorded_for_audit():
     replay_records = [a for a in audits if a.get("replay")]
     assert replay_records
     assert all(a["operator"] == "alice" for a in replay_records)
-    assert all(a["event_id"] == "ev-1" for a in replay_records)
+    # Not "event_id": that key names the AUDIT RECORD's own unique row id
+    # (core.audit.store.AuditStore.append), never the logical event a row
+    # is about -- see EventReliabilityManager._audit's docstring. The
+    # logical identity survives under "subject_event_id".
+    assert all(a["subject_event_id"] == "ev-1" for a in replay_records)
+    assert all("event_id" not in a for a in replay_records)
+
+
+# --------------------------------------------------------------------------- #
+# defect: replay audit rows must not collide on the audit store's own
+# unique event_id column
+#
+# core.audit.store.AuditStore.append() auto-assigns a fresh UUID to its own
+# "event_id" column whenever the caller does not supply one. Passing the
+# LOGICAL event_id straight through as that column's value meant a
+# record's initial dead-letter audit row, its replay-requested row, and its
+# replay-result row all tried to reuse the exact same value -- a UNIQUE
+# constraint the schema enforces -- and the append() calls after the first
+# one raised, which _audit()'s own best-effort try/except silently
+# swallowed. These tests exercise the real, disk-backed AuditStore (not a
+# stub sink) so a real uniqueness violation would actually surface.
+# --------------------------------------------------------------------------- #
+
+def _real_audit_store():
+    from core.audit.store import AuditConfig, AuditStore
+
+    root = pathlib.Path(tempfile.mkdtemp())
+    store = AuditStore(
+        AuditConfig(
+            sqlite_path=root / "audit.sqlite3",
+            signing_key="zq" * 32,
+            jsonl_path=None,
+        )
+    )
+    store.initialize()
+    return store
+
+
+def _audit_rows(audit_store) -> list[dict]:
+    import sqlite3
+
+    connection = sqlite3.connect(audit_store.cfg.sqlite_path)
+    try:
+        rows = connection.execute(
+            "SELECT event_id, payload_json FROM audit_log ORDER BY id"
+        ).fetchall()
+    finally:
+        connection.close()
+    return [
+        {"row_event_id": row_event_id, **json.loads(payload_json)}
+        for row_event_id, payload_json in rows
+    ]
+
+
+def _manager_with_real_audit(audit_store):
+    manager = EventReliabilityManager(
+        dead_letter_store=_store(),
+        retry_policy=RetryPolicy(
+            max_attempts=3,
+            base_delay_seconds=0.001,
+            max_delay_seconds=0.004,
+            total_deadline_seconds=5.0,
+        ),
+        audit_sink=audit_store.append,
+        sleep=lambda _delay: None,
+    )
+    return manager
+
+
+def test_replay_audit_rows_have_unique_ids_and_share_one_logical_event():
+    audit_store = _real_audit_store()
+    manager = _manager_with_real_audit(audit_store)
+
+    manager.deliver(_ENVELOPE, lambda: {"error": "watchtower_unreachable"})
+    manager.replay("ev-1", lambda env: {"status_code": 200}, operator="alice")
+
+    rows = _audit_rows(audit_store)
+    subject_ids = [r["subject_event_id"] for r in rows if r.get("subject_event_id")]
+    row_ids = [r["row_event_id"] for r in rows]
+
+    # 1: original delivery audit exists (dead-lettered), 2: replay
+    # requested, 3: replay succeeded -- three distinct transitions, none
+    # silently lost to a uniqueness collision.
+    assert len(rows) == 3, rows
+    assert len(set(row_ids)) == len(row_ids), "audit row ids collided"
+    assert all(sid == "ev-1" for sid in subject_ids), (
+        "every row must reference the same logical event"
+    )
+    # The raw replay payload is never part of an audited transition.
+    blob = json.dumps(rows)
+    assert "score" not in blob and "detail" not in blob
+
+
+def test_replay_unavailable_and_conflict_audits_also_get_unique_ids():
+    """The refusal paths (no replay body, already-replayed, in-progress)
+    audit too, and must not collide with the original delivery's row
+    either."""
+    audit_store = _real_audit_store()
+    manager = _manager_with_real_audit(audit_store)
+
+    manager.deliver(_ENVELOPE, lambda: {"error": "watchtower_unreachable"})
+    manager.replay("ev-1", lambda env: {"status_code": 200}, operator="alice")
+    # Already REPLAYED_OK now -- a second replay attempt hits the conflict
+    # path, which must also audit without colliding.
+    manager.replay("ev-1", lambda env: {"status_code": 200}, operator="alice")
+
+    rows = _audit_rows(audit_store)
+    row_ids = [r["row_event_id"] for r in rows]
+    assert len(set(row_ids)) == len(row_ids), "audit row ids collided"
+    assert len(rows) == 4, rows  # dead-letter, requested, succeeded, conflict
+
+
+def test_audit_write_failure_is_observable_not_swallowed_invisibly():
+    """A genuine persistence failure (not the uniqueness bug, which is
+    fixed -- a real I/O error) must still not break delivery, but it must
+    increment a counter an operator can see."""
+    manager, _ = _manager()
+
+    def _boom(_payload):
+        raise RuntimeError("disk full")
+
+    manager._audit_sink = _boom
+    outcome = manager.deliver(_ENVELOPE, lambda: {"status_code": 200})
+
+    assert outcome.state is DeliveryState.DELIVERED, "audit failure must not break delivery"
+    assert manager.metrics.snapshot()["audit_write_failed"] >= 1
 
 
 def test_raw_payload_never_reaches_audit_output():

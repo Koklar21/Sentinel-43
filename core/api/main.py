@@ -77,6 +77,7 @@ from ..reliability import (
     FailureStage,
     IdempotencyLedger,
     RetryPolicy,
+    sanitize_reason,
 )
 from ..monitoring.watchtower_client import (
     configure as _configure_watchtower_client,
@@ -3432,8 +3433,23 @@ async def reliability_replay(
     if conflict_detail is not None:
         raise HTTPException(status_code=409, detail=conflict_detail)
 
+    if not outcome.delivered:
+        # A real delivery attempt was made and Watchtower rejected it or
+        # could not be reached (state DEAD_LETTERED, outcome.reason is
+        # classify_delivery_result's bounded reason token). This must never
+        # be a 200: the dashboard's ApiClient derives "ok" purely from HTTP
+        # status, so a 200 body with "ok": false here would report success
+        # to the UI for a replay that did not happen.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Watchtower did not accept the replay; the event remains "
+                f"dead-lettered ({sanitize_reason(outcome.reason)})."
+            ),
+        )
+
     return {
-        "ok": outcome.delivered,
+        "ok": True,
         "replay": outcome.to_dict(),
         "operator": operator,
         "timestamp": utc_now(),
