@@ -225,6 +225,14 @@ def test_ready_endpoint_200_when_schema_at_head(_clean, monkeypatch):
     from fastapi.testclient import TestClient
     import core.api.main as main_module
 
+    # No lifespan: we are only exercising the route, not startup (same as
+    # test_ready_endpoint_503_when_schema_behind above). runtime.subsystems
+    # is a process-wide singleton _declare_subsystems() normally resets at
+    # lifespan start; without lifespan here, an earlier test's real app
+    # boot (elsewhere in the same pytest session) can leave it holding
+    # declared-but-unconfigured entries, which would surface as an
+    # unrelated "degraded" key this test never intended to exercise.
+    main_module.runtime.subsystems.reset()
     client = TestClient(main_module.app)
     resp = client.get("/ready")
     assert resp.status_code == 200, resp.text

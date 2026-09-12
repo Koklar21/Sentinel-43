@@ -35,7 +35,16 @@ from migrations.baseline import assert_users_baseline
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers defaults to True, which silently disables
+    # every logger already in the process that alembic.ini's own [loggers]
+    # section (root, sqlalchemy, alembic) doesn't name -- including every
+    # Sentinel-43 application logger. In production this runs inside the
+    # short-lived, single-purpose s43-migrate container, so the blast
+    # radius there is contained; in-process callers (tests, or any future
+    # code path that runs a migration inline rather than via that separate
+    # container) would otherwise have their own logging silently go dark
+    # for the rest of the process.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 
 # --- combined autogenerate metadata (§7 / §AH) ------------------------------
