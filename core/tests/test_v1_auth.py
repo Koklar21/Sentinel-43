@@ -106,7 +106,6 @@ def v1_auth_env(monkeypatch) -> None:
     monkeypatch.setenv("S43_JWT_ALGORITHM", JWT_ALGORITHM)
     monkeypatch.setenv("S43_JWT_ISSUER", JWT_ISSUER)
     monkeypatch.setenv("S43_JWT_AUDIENCE", JWT_AUDIENCE)
-    monkeypatch.setenv("S43_ENABLE_DEV_ENGINE", "true")
     monkeypatch.setattr(auth_module, "reverify_password", _fake_reverify_password)
 
 
@@ -186,13 +185,20 @@ def test_v1_rejects_unapproved_role(client: TestClient):
 
 
 def test_v1_accepts_valid_token_and_password(client: TestClient):
+    """A properly authenticated caller reaches the route handler itself --
+    proven by getting the route's own deliberate 501 (POST /v1/assess is
+    disposed as DEPRECATED, see core/api/routers/routers.py's module
+    docstring and S43_BASELINE_VERIFICATION_REPORT.md Section I Defect 4),
+    not an auth rejection. This file only owns the auth boundary; it does
+    not assert anything about /v1/assess's own (deprecated) behavior."""
     response = client.post(
         ASSESS_URL,
         json={},
         headers=_bearer(_build_token(), TEST_PASSWORD),
     )
 
-    assert response.status_code == 200, response.text
+    assert response.status_code == 501, response.text
+    assert response.json()["detail"]["error"]["code"] == "S43_V1_ASSESS_DEPRECATED"
 
 
 __all__: list[str] = []
