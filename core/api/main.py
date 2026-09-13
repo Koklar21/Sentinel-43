@@ -1521,7 +1521,7 @@ async def _start_audit_store() -> None:
     """
     from pathlib import Path
 
-    from core.audit import AuditConfig, AuditStore
+    from core.audit import AuditConfig, AuditStore, set_audit_store
 
     signing_key = _env_str("S43_AUDIT_HMAC_KEY")
     required = _env_bool("S43_GOVERNANCE_ENABLED", False) or not IS_LOCAL_ENV
@@ -1566,6 +1566,10 @@ async def _start_audit_store() -> None:
         ) from exc
 
     runtime.audit_store = store
+    # Also register in the canonical cross-package registry, mirroring
+    # set_monitoring_manager(), so late callers (e.g. the Remote Gateway)
+    # can reach the authoritative store without importing core.api back.
+    set_audit_store(store)
     runtime.subsystems.mark_active(
         SUBSYS_AUDIT, "HMAC-chained audit store initialized and verified."
     )

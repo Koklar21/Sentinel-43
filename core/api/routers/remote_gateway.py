@@ -26,8 +26,12 @@ Security properties:
     - correlation IDs are replay-protected within a bounded retention window
     - authentication-failure state is bounded
     - monitoring/Watchtower reporting is best-effort and off the critical path
-    - the in-memory event buffer is operational telemetry, not a durable audit
-      ledger and must not be treated as authoritative security evidence
+    - the in-memory event buffer is operational telemetry, not the authoritative
+      audit trail, and the /audit/{id} read path only reflects it -- when an
+      authoritative AuditStore is configured (core.audit.get_audit_store()),
+      every event record is also durably persisted there, best-effort, so
+      history survives a process restart even though this router does not
+      yet read it back
 """
 
 from __future__ import annotations
@@ -685,7 +689,11 @@ class RemoteEventRecord(StrictModel):
 class _EventBuffer:
     """Bounded process-local operational record buffer.
 
-    This is not a durable audit ledger.
+    This buffer itself is not durable and backs only the /audit/{id} read
+    path. Each record appended here is also, separately, best-effort
+    persisted to the authoritative AuditStore when one is configured -- see
+    _persist_event_record() -- so the record is not lost on restart even
+    though this buffer is.
     """
 
     def __init__(self) -> None:
@@ -784,6 +792,83 @@ def _resolve_monitoring_manager() -> Any | None:
             exc_info=True,
         )
         return None
+
+
+# =============================================================================
+# Durable audit persistence
+# =============================================================================
+
+_audit_store: Any | None = None
+
+
+def set_audit_store(
+    store: Any | None,
+) -> None:
+    """Override the AuditStore this router persists event records through.
+
+    Optional. When unset, ``_resolve_audit_store()`` falls back to the
+    canonical registry in ``core.audit``, which the API composition root
+    populates at startup.
+    """
+    global _audit_store
+    _audit_store = store
+
+
+def _resolve_audit_store() -> Any | None:
+    """The active authoritative AuditStore, local override first.
+
+    Mirrors ``_resolve_monitoring_manager()``: reads the registry the
+    composition root populates via ``core.audit.set_audit_store()`` rather
+    than keeping a second, unwired handoff. May legitimately be None (no
+    S43_AUDIT_HMAC_KEY configured, e.g. local/dev) -- callers must treat a
+    missing store as "durable persistence unavailable", not an error.
+    Imported lazily so core.api.routers does not import core.audit at
+    module scope.
+    """
+    if _audit_store is not None:
+        return _audit_store
+
+    try:
+        from core.audit import get_audit_store
+
+        return get_audit_store()
+    except Exception:  # pragma: no cover - registry must never break dispatch
+        logger.debug(
+            "AuditStore registry lookup failed",
+            exc_info=True,
+        )
+        return None
+
+
+def _persist_event_record(
+    record: dict[str, Any],
+) -> None:
+    """Best-effort durable persistence of one event record.
+
+    The in-memory EVENT_BUFFER remains the source for the /audit/{id} read
+    path and is unaffected by this. This only adds a write into the
+    authoritative HMAC-chained audit ledger so gateway activity survives a
+    restart. A durable-write failure does not fail the request: the record
+    is already visible via the buffer, and remote-gateway activity has
+    always been best-effort telemetry on this path (see module docstring).
+    """
+    store = _resolve_audit_store()
+
+    if store is None:
+        return
+
+    try:
+        store.append(
+            {
+                "component": "remote_gateway",
+                **record,
+            }
+        )
+    except Exception:
+        logger.warning(
+            "Remote Gateway durable audit write failed",
+            exc_info=True,
+        )
 
 
 async def _notify_monitoring_pipeline(
@@ -1427,6 +1512,9 @@ def _write_event_record(
     EVENT_BUFFER.append(
         record
     )
+    _persist_event_record(
+        record
+    )
 
     return event_record_id
 
@@ -1465,7 +1553,7 @@ async def remote_gateway_health(
             for event in RemoteEventType
         ],
         event_buffer_max=config.max_event_records,
-        event_buffer_durable=False,
+        event_buffer_durable=_resolve_audit_store() is not None,
     )
 
 
@@ -1711,5 +1799,6 @@ __all__ = [
     "reload_config",
     "reset_audit_log",
     "router",
+    "set_audit_store",
     "set_monitoring_manager",
 ]
