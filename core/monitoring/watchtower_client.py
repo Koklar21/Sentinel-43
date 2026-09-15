@@ -162,22 +162,61 @@ _ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
 
 
 def _validate_base_url(url: str) -> None:
-    """Validate the configured Watchtower base URL's scheme and host.
+    """Validate the configured Watchtower base URL's scheme, host, and shape.
 
     Raises ValueError for anything that would make urllib.request.Request(...)
     raise ValueError at construction time (an unknown/missing scheme) or that
     is simply not a URL this client is permitted to call (a scheme other than
-    http/https, or a URL with no host). Never substitutes a default -- an
+    http/https, a URL with no host, embedded credentials, a malformed port,
+    control characters, or a query string / fragment). The last two matter
+    because watchtower_request() builds the final request URL by
+    concatenating this base URL with a route path (see
+    _join_base_and_path()): a base URL ending in a query string or fragment
+    has no unambiguous place to append a path, so the concatenated result
+    would silently resolve to the wrong endpoint (or the wrong query) while
+    this validation reported success. Never substitutes a default -- an
     explicitly configured, malformed URL must be reported, not papered over.
     """
+    if url != url.strip() or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url):
+        raise ValueError(
+            "URL must not contain control characters or surrounding whitespace"
+        )
+
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in _ALLOWED_URL_SCHEMES:
         raise ValueError(
             f"unsupported or missing URL scheme {parsed.scheme!r}; "
             f"only {sorted(_ALLOWED_URL_SCHEMES)} are permitted"
         )
-    if not parsed.hostname:
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("URL must not contain embedded credentials")
+    try:
+        # .hostname / .port parse the authority component lazily and raise
+        # ValueError for a malformed port (non-numeric or out of range) --
+        # surface that now rather than only when a socket is opened.
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"URL has a malformed host or port: {exc}") from exc
+    if not hostname:
         raise ValueError("URL has no host")
+    if parsed.query:
+        raise ValueError("URL must not contain a query string")
+    if parsed.fragment:
+        raise ValueError("URL must not contain a fragment")
+
+
+def _join_base_and_path(base_url: str, path: str) -> str:
+    """Deterministically join a validated Watchtower base URL and route path.
+
+    ``base_url`` has already passed ``_validate_base_url``: it carries no
+    query string, fragment, or credentials, so its authority/path component
+    is fully bounded and plain concatenation cannot silently resolve to a
+    different endpoint or query than the one requested. ``path`` is always a
+    literal, caller-supplied route (e.g. ``/watchtower/analyze``), never
+    caller-supplied free text.
+    """
+    return f"{base_url}{path}"
 
 
 def _validate_timeout(value: float) -> float:
@@ -287,7 +326,7 @@ def watchtower_request(
             )
         return {"error": "watchtower_invalid_configuration", "detail": str(exc)}
 
-    url = f"{WATCHTOWER_URL}{path}"
+    url = _join_base_and_path(WATCHTOWER_URL, path)
     data = None
     headers = {"Content-Type": "application/json"}
 
