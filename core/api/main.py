@@ -1921,10 +1921,20 @@ async def _shutdown_runtime() -> None:
                     exc_info=True,
                 )
 
-    # Deregister the audit store the same way, so late callers (e.g. the
-    # Remote Gateway) see "no store" rather than a closed/stale one, and so
-    # a subsequent lifespan in the same process (tests booting the app
-    # repeatedly) never inherits a previous run's registration.
+    # Close, then deregister, the audit store the same way, so late callers
+    # (e.g. the Remote Gateway) see "no store" rather than a closed/stale
+    # one, and so a subsequent lifespan in the same process (tests booting
+    # the app repeatedly) never inherits a previous run's registration. A
+    # lingering reference elsewhere sees an honest CLOSED health state
+    # rather than a stale HEALTHY one.
+    if runtime.audit_store is not None:
+        try:
+            runtime.audit_store.close()
+        except Exception:
+            logger.debug(
+                "AuditStore close failed",
+                exc_info=True,
+            )
     runtime.audit_store = None
     try:
         from core.audit import set_audit_store

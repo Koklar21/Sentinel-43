@@ -30,6 +30,7 @@ not equivalent to an external immutable/WORM audit service.
 
 from __future__ import annotations
 
+import enum
 import hashlib
 import hmac
 import json
@@ -67,6 +68,23 @@ class AuditPersistenceError(AuditStoreError):
 
 class AuditConfigurationError(AuditStoreError):
     """Raised when the audit store is configured unsafely."""
+
+
+class AuditStoreHealth(str, enum.Enum):
+    """This store's own last-known health, from its own real operations.
+
+    Deliberately not "is writable now" -- there is no way to prove that
+    without performing a write, and a health check must not mutate the
+    ledger to answer its own question. This is honestly a *last known*
+    state, established by the store's genuine append()/verify_integrity()/
+    initialize() calls, not a live guarantee about the next filesystem
+    operation.
+    """
+
+    UNVERIFIED = "unverified"  # constructed, never yet successfully verified
+    HEALTHY = "healthy"        # last append or integrity verification succeeded
+    UNHEALTHY = "unhealthy"    # last append, verification, or init failed
+    CLOSED = "closed"          # explicitly closed; not currently available
 
 
 class AuditEncoder(json.JSONEncoder):
@@ -248,6 +266,34 @@ class AuditStore:
         self._key = _secret_from_str(
             cfg.signing_key
         )
+        self._health: AuditStoreHealth = AuditStoreHealth.UNVERIFIED
+
+    @property
+    def last_known_health(self) -> AuditStoreHealth:
+        """This store's own last-known health -- see AuditStoreHealth."""
+        with self._lock:
+            return self._health
+
+    def _set_health(
+        self,
+        health: AuditStoreHealth,
+    ) -> None:
+        with self._lock:
+            self._health = health
+
+    def close(self) -> None:
+        """Mark this store CLOSED: no longer available for use.
+
+        Each operation already opens and closes its own SQLite connection
+        (there is no persistent connection to release here) -- this exists
+        so a caller with a lingering reference, or a status check against
+        the canonical registry, sees an honest "closed", rather than a
+        stale "healthy" from before shutdown. A later successful
+        verify_integrity() or append() (e.g. against a freshly reopened
+        store object) can still restore HEALTHY -- CLOSED is not sticky
+        against genuine subsequent operations.
+        """
+        self._set_health(AuditStoreHealth.CLOSED)
 
     # ------------------------------------------------------------------
     # Startup / connection
@@ -255,6 +301,13 @@ class AuditStore:
 
     def initialize(self) -> None:
         """Create the audit directory and schema explicitly at startup."""
+        try:
+            self._initialize_unguarded()
+        except Exception:
+            self._set_health(AuditStoreHealth.UNHEALTHY)
+            raise
+
+    def _initialize_unguarded(self) -> None:
         self.cfg.sqlite_path.parent.mkdir(
             parents=True,
             exist_ok=True,
@@ -275,6 +328,8 @@ class AuditStore:
                 )
                 """
             )
+
+            self._ensure_lookup_columns(connection)
 
             connection.execute(
                 """
@@ -314,6 +369,72 @@ class AuditStore:
 
         finally:
             connection.close()
+
+    def _ensure_lookup_columns(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Add and backfill the denormalized component/correlation_id
+        columns get_records() filters on, if this table predates them.
+
+        These are plain copies extracted from payload_json at write time --
+        not part of the HMAC chain (compute_payload_hmac only ever sees the
+        canonical payload dict) -- purely so a bounded lookup can filter and
+        order in SQL instead of materializing every row in Python. The
+        smallest schema change that gets there: two nullable TEXT columns
+        plus one covering index, added only if a pre-existing database
+        doesn't already have them, with a one-time backfill for any rows
+        already present so an old ledger's records remain findable.
+        """
+        existing = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(audit_log)"
+            ).fetchall()
+        }
+
+        added = False
+        if "component" not in existing:
+            connection.execute(
+                "ALTER TABLE audit_log ADD COLUMN component TEXT"
+            )
+            added = True
+        if "correlation_id" not in existing:
+            connection.execute(
+                "ALTER TABLE audit_log ADD COLUMN correlation_id TEXT"
+            )
+            added = True
+
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_lookup "
+            "ON audit_log (component, correlation_id, id)"
+        )
+
+        if not added:
+            return
+
+        # One-time backfill: only rows written before this migration have
+        # NULL in the new columns (append() populates them from here on).
+        rows = connection.execute(
+            "SELECT id, payload_json FROM audit_log WHERE component IS NULL"
+        ).fetchall()
+
+        for record_id, payload_json in rows:
+            try:
+                payload = json.loads(str(payload_json))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            connection.execute(
+                "UPDATE audit_log SET component = ?, correlation_id = ? "
+                "WHERE id = ?",
+                (
+                    payload.get("component"),
+                    payload.get("correlation_id"),
+                    record_id,
+                ),
+            )
 
     def _connect(
         self,
@@ -457,6 +578,29 @@ class AuditStore:
         *,
         connection: sqlite3.Connection | None = None,
     ) -> AuditVerificationResult:
+        """Full-chain integrity verification, updating last_known_health.
+
+        Read-only against the ledger itself (no row is written) -- only
+        this in-process Python attribute is updated, which is not "mutating
+        the audit ledger". A passing result sets HEALTHY (this can restore
+        HEALTHY even from CLOSED -- see AuditStore.close()); a failing
+        result sets UNHEALTHY.
+        """
+        result = self._verify_integrity_unguarded(
+            connection=connection
+        )
+        self._set_health(
+            AuditStoreHealth.HEALTHY
+            if result.valid
+            else AuditStoreHealth.UNHEALTHY
+        )
+        return result
+
+    def _verify_integrity_unguarded(
+        self,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> AuditVerificationResult:
         owns_connection = (
             connection is None
         )
@@ -588,6 +732,8 @@ class AuditStore:
     # Read
     # ------------------------------------------------------------------
 
+    _MAX_RECORDS_LIMIT: Final[int] = 1000
+
     def get_records(
         self,
         *,
@@ -595,37 +741,64 @@ class AuditStore:
         correlation_id: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        """Bounded, integrity-verified read of this store's own payloads.
+        """Bounded read of this store's own payloads, filtered in SQL.
 
-        Reuses verify_integrity() as-is (no new database, no new ledger) --
-        a caller must never see rows from a chain that fails verification.
+        ``component`` and ``correlation_id`` (when given) are pushed into
+        the WHERE clause against the denormalized columns append() writes
+        (see _ensure_lookup_columns) -- always as bound parameters, never
+        string-interpolated, so a caller-supplied value can never become
+        raw SQL. ``ORDER BY id ASC LIMIT ?`` is likewise pushed into SQLite:
+        this never fetches more than ``limit`` rows, regardless of ledger
+        size, and ``id`` (an autoincrement primary key) gives a total,
+        deterministic order even for records sharing a timestamp.
+
         ``component`` is mandatory and filters server-side before any row
         reaches the caller, so a consumer scoped to one producer (e.g. the
         Remote Gateway, passing component="remote_gateway") can never see
         another producer's records (governance decisions, etc.) whose field
-        shape it hasn't examined. Returns payload dicts, oldest first,
-        capped at ``limit``.
+        shape it hasn't examined.
+
+        Fails closed on this store's own last-known health rather than
+        re-running a full O(total ledger) chain verification on every
+        ordinary read: that state is already established and kept current
+        by initialize()/append()/verify_integrity() (see AuditStoreHealth).
+        If the store is not currently HEALTHY -- unverified, unhealthy, or
+        closed -- this raises rather than returning rows a caller could
+        wrongly trust. Does not take self._lock: this is a read-only query
+        against a WAL-mode database, which is safe to run concurrently with
+        an in-progress append() and must not delay it.
         """
-        if limit <= 0:
-            raise ValueError("limit must be positive")
+        if not 0 < limit <= self._MAX_RECORDS_LIMIT:
+            raise ValueError(
+                f"limit must be in (0, {self._MAX_RECORDS_LIMIT}]"
+            )
 
-        with self._lock:
-            connection = self._connect()
-            try:
-                result = self.verify_integrity(
-                    connection=connection
-                )
-                if not result.valid:
-                    raise AuditIntegrityError(
-                        f"Audit ledger failed integrity verification: {result.error}"
-                    )
+        if self.last_known_health != AuditStoreHealth.HEALTHY:
+            raise AuditIntegrityError(
+                "Audit store is not currently healthy "
+                f"(last_known_health={self.last_known_health.value}); "
+                "refusing to serve reads until verify_integrity() succeeds"
+            )
 
+        connection = self._connect()
+        try:
+            if correlation_id is None:
                 cursor = connection.execute(
-                    "SELECT payload_json FROM audit_log ORDER BY id ASC"
+                    "SELECT payload_json FROM audit_log "
+                    "WHERE component = ? "
+                    "ORDER BY id ASC LIMIT ?",
+                    (component, limit),
                 )
-                rows = cursor.fetchall()
-            finally:
-                connection.close()
+            else:
+                cursor = connection.execute(
+                    "SELECT payload_json FROM audit_log "
+                    "WHERE component = ? AND correlation_id = ? "
+                    "ORDER BY id ASC LIMIT ?",
+                    (component, correlation_id, limit),
+                )
+            rows = cursor.fetchall()
+        finally:
+            connection.close()
 
         records: list[dict[str, Any]] = []
         for (payload_json,) in rows:
@@ -635,16 +808,7 @@ class AuditStore:
                 continue
             if not isinstance(payload, dict):
                 continue
-            if payload.get("component") != component:
-                continue
-            if (
-                correlation_id is not None
-                and payload.get("correlation_id") != correlation_id
-            ):
-                continue
             records.append(payload)
-            if len(records) >= limit:
-                break
 
         return records
 
@@ -656,7 +820,24 @@ class AuditStore:
         self,
         payload: dict[str, Any],
     ) -> str:
-        """Atomically append one authoritative audit record."""
+        """Atomically append one authoritative audit record.
+
+        Updates last_known_health: HEALTHY on success (this can restore
+        HEALTHY even from CLOSED), UNHEALTHY on any failure (validation,
+        SQLite, locking, or integrity) before the exception propagates.
+        """
+        try:
+            result = self._append_unguarded(payload)
+        except Exception:
+            self._set_health(AuditStoreHealth.UNHEALTHY)
+            raise
+        self._set_health(AuditStoreHealth.HEALTHY)
+        return result
+
+    def _append_unguarded(
+        self,
+        payload: dict[str, Any],
+    ) -> str:
         payload_copy = _validate_payload(
             payload
         )
@@ -709,9 +890,11 @@ class AuditStore:
                         decision_time,
                         payload_json,
                         payload_hmac,
-                        prev_hash
+                        prev_hash,
+                        component,
+                        correlation_id
                     )
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(
@@ -727,6 +910,11 @@ class AuditStore:
                         payload_json,
                         payload_hmac,
                         current_head,
+                        # Denormalized copies for get_records()'s bounded
+                        # SQL filter -- not part of the HMAC chain, which
+                        # is computed over payload_copy alone, above.
+                        payload_copy.get("component"),
+                        payload_copy.get("correlation_id"),
                     ),
                 )
 
