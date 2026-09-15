@@ -6,6 +6,12 @@ adds Kubernetes as an *additional* deployment path alongside
 development and is unaffected except for one shared, security-motivated fix
 (see "Relationship to Docker Compose" below).
 
+**For the full controlled-beta procedure** (secrets, session-only auth,
+image/digest pinning, migrations, backup/restore, TLS, NetworkPolicy
+verification, evidence to retain, and what beta evidence does and does not
+establish) **see [`docs/BETA_RUNBOOK.md`](../../docs/BETA_RUNBOOK.md)** —
+this file covers the Kubernetes-specific manifests and prerequisites only.
+
 ## Prerequisites
 
 | Requirement | Notes |
