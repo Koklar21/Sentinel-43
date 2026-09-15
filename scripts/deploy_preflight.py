@@ -607,9 +607,11 @@ def check_compose_config(rep: Report, env_file: str, hostname: str,
                "S43_ALLOW_INSECURE_ORIGINS is not set", insecure or "unset")
 
     legacy = env.get("S43_REJECT_LEGACY_AUTH", "").lower()
-    rep.record(NA if legacy in {"", "false", "0", "no", "off"} else PASS,
-               "S43_REJECT_LEGACY_AUTH left off for the initial beta",
-               "Phase-E cutover is a later, separate step", mandatory=False)
+    rep.record(FAIL if legacy in {"", "false", "0", "no", "off"} else PASS,
+               "S43_REJECT_LEGACY_AUTH is true for this non-local target",
+               "the per-request X-S43-Password fallback (break-glass/"
+               "env-operator only; real dashboard/API consumers never need "
+               "it) must be rejected outside local/dev")
 
 
 def check_kube_prereqs(rep: Report, context: str, namespace: str) -> None:
@@ -647,6 +649,22 @@ def check_kube_prereqs(rep: Report, context: str, namespace: str) -> None:
         rep.record(PASS if not hits else FAIL,
                    "no CHANGEME placeholders in ConfigMaps",
                    ", ".join(hits) or "clean")
+
+    rc, out = _run(kc + ["get", "cm", "sentinel43-config", "-o", "json"])
+    if rc != 0:
+        rep.record(INCOMPLETE, "S43_REJECT_LEGACY_AUTH is true for this "
+                   "non-local target", out.strip()[:160])
+    else:
+        try:
+            data = json.loads(out).get("data", {})
+        except ValueError:
+            data = {}
+        legacy = str(data.get("S43_REJECT_LEGACY_AUTH", "")).lower()
+        rep.record(FAIL if legacy in {"", "false", "0", "no", "off"} else PASS,
+                   "S43_REJECT_LEGACY_AUTH is true for this non-local target",
+                   "the per-request X-S43-Password fallback (break-glass/"
+                   "env-operator only; real dashboard/API consumers never "
+                   "need it) must be rejected outside local/dev")
 
 
 # =============================================================================

@@ -37,6 +37,17 @@
 # (cert-manager + ssl-redirect: "true") before traffic reaches the API. If
 # you fork this overlay into one that serves plaintext, set it back to
 # "false" and let startup fail rather than leaving the claim behind.
+#
+# S43_REJECT_LEGACY_AUTH: "true" here, and only here. The per-request
+# X-S43-Password fallback (for accounts with no DB-backed server session --
+# break-glass/env-operator) is a local/dev convenience the real shipped
+# consumers (browser dashboard's normal account path, dashboard Python
+# clients, browser_tests/) never depend on for a real operator/admin
+# account; only the break-glass path does. The code-level default stays
+# false (core/api/routers/auth.py) so local dev and the existing test suite
+# are unaffected -- this overlay is what actually turns it off for beta.
+# scripts/deploy_preflight.py's "verify" mode now fails a beta/non-local
+# target that still permits legacy auth, matching this.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -47,3 +58,4 @@ data:
   S43_TRUSTED_HOSTS: "beta.example.invalid,s43-api"     # CHANGEME -> <your real host>,s43-api
   S43_ALLOWED_ORIGINS: "https://beta.example.invalid"   # CHANGEME -> https://<your host>
   S43_TLS_TERMINATED_AT_TRUSTED_EDGE: "true"
+  S43_REJECT_LEGACY_AUTH: "true"
