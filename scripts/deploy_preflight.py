@@ -995,7 +995,7 @@ def check_kube_legacy_auth_runtime(rep: Report, context: str, namespace: str) ->
     check_kube_prereqs only reads the ConfigMap the operator intends to
     deploy -- a running pod started before a `kubectl apply` (no rollout
     triggered, e.g. an unrelated field changed) can still be running with
-    an older ConfigMap's values. This execs into the actual running
+    an older ConfigMap's values. This execs into every actual running
     s43-api pod and reads what that process was started with instead.
     """
     print("\n== kubernetes runtime: effective S43_REJECT_LEGACY_AUTH ==")
@@ -1005,26 +1005,53 @@ def check_kube_legacy_auth_runtime(rep: Report, context: str, namespace: str) ->
         return
     kc = ["kubectl", "--context", context, "-n", namespace]
 
-    rc, out = _run(kc + [
-        "get", "pods", "-l", "app=s43-api",
-        "--field-selector=status.phase=Running",
-        "-o", "jsonpath={.items[0].metadata.name}",
-    ])
-    pod = out.strip()
-    if rc != 0 or not pod:
-        rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
-                   f"no Running s43-api pod found: {out.strip()[:160]}")
-        return
-
-    rc, out = _run(kc + [
-        "exec", pod, "-c", "s43-api", "--", "sh", "-c", _PRINTENV_LEGACY_AUTH,
-    ])
+    rc, out = _run(kc + ["get", "pods", "-l", "app=s43-api", "-o", "json"])
     if rc != 0:
         rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
-                   f"could not exec into pod {pod}: {out.strip()[:120]}")
+                   f"could not list s43-api pods: {out.strip()[:160]}")
         return
-    rep.record(PASS if _is_explicitly_true(out.strip()) else FAIL,
-               _LEGACY_AUTH_CHECK_NAME, _LEGACY_AUTH_CHECK_DETAIL)
+    try:
+        items = json.loads(out).get("items", [])
+    except ValueError as exc:
+        rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+                   f"unparseable pod list: {exc}")
+        return
+
+    # status.phase stays "Running" for a pod that is mid-shutdown -- there is
+    # no separate API-level "Terminating" phase; kubectl only *displays* that
+    # label by checking metadata.deletionTimestamp itself, so a
+    # --field-selector=status.phase=Running alone would still match it.
+    # Exclude those explicitly, and check every genuinely-Running pod, not
+    # just the first one the API happens to return, so a drifted pod isn't
+    # silently skipped mid-rollout when more than one pod matches the
+    # selector (e.g. an old and a new ReplicaSet briefly overlapping).
+    pods = [
+        item["metadata"]["name"]
+        for item in items
+        if item.get("status", {}).get("phase") == "Running"
+        and not item.get("metadata", {}).get("deletionTimestamp")
+    ]
+    if not pods:
+        rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+                   "no non-terminating Running s43-api pod found")
+        return
+
+    failing: list[str] = []
+    for pod in pods:
+        rc, out = _run(kc + [
+            "exec", pod, "-c", "s43-api", "--", "sh", "-c", _PRINTENV_LEGACY_AUTH,
+        ])
+        if rc != 0:
+            rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+                       f"could not exec into pod {pod}: {out.strip()[:120]}")
+            return
+        if not _is_explicitly_true(out.strip()):
+            failing.append(pod)
+
+    rep.record(PASS if not failing else FAIL,
+               _LEGACY_AUTH_CHECK_NAME,
+               _LEGACY_AUTH_CHECK_DETAIL if not failing else
+               f"{_LEGACY_AUTH_CHECK_DETAIL} (failing pod(s): {', '.join(failing)})")
 
 
 # =============================================================================
