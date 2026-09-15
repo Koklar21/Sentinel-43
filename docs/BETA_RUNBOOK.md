@@ -183,20 +183,40 @@ newName: REGISTRY_PLACEHOLDER/sentinel43-api
 digest: sha256:0000000000000000000000000000000000000000000000000000000000000
 ```
 You must push the built image to a real registry you control and pin the
-resulting digest yourself:
+resulting digest yourself. `docker tag`'s destination must be a `repository:tag`
+reference — not a digest — so the sequence is tag-then-push-then-pin-the-digest-
+you-get-back, not the other way around:
 ```bash
-docker tag sentinel43-api:<tag> <registry>/sentinel43-api@<local-build>
+# 1. Build the local image with a normal tag (already done above; repeated
+#    here for the full sequence's own context).
+docker build -t sentinel43-api:<tag> -f core/api/Dockerfile .
+
+# 2. Tag it for the selected registry -- a normal repository:tag reference.
+docker tag sentinel43-api:<tag> <registry>/sentinel43-api:<tag>
+
+# 3. Push that tag.
 docker push <registry>/sentinel43-api:<tag>
-# capture the digest docker push reports, then:
+
+# 4. Obtain the immutable digest the registry/push returned (the line
+#    starting "<tag>: digest: sha256:..." in docker push's own output;
+#    docker inspect also works if you need it again later):
+docker inspect --format='{{index .RepoDigests 0}}' <registry>/sentinel43-api:<tag>
+
+# 5. Verify the digest resolves to the image you just pushed, from the
+#    registry itself (not just your local Docker cache):
+docker pull <registry>/sentinel43-api@sha256:<64-hex-digest-from-step-4>
+
+# 6. Pin that verified digest in the Kubernetes overlay.
 cd deploy/kubernetes/overlays/beta
-kustomize edit set image sentinel43-api=<registry>/sentinel43-api@sha256:<digest>
+kustomize edit set image sentinel43-api=<registry>/sentinel43-api@sha256:<64-hex-digest>
+
+# 7. Record the source revision alongside the digest (both together, not
+#    separately) -- this is part of the evidence retained per §21.
+echo "$(git rev-parse HEAD) <registry>/sentinel43-api@sha256:<64-hex-digest>" >> deployed-images.log
 ```
-Record which git commit SHA the pushed image was built from (e.g. tag the
-image with it, or note it alongside the digest) — this is part of the
-evidence retained per §21. A CI job that automates this push+pin step for
-beta does not currently exist in `.github/workflows/k8s.yml` (it exists only
-for the disposable `dev` overlay/kind-smoke path); until one is added, this
-is a manual operator step.
+A CI job that automates this push+pin step for beta does not currently exist
+in `.github/workflows/k8s.yml` (it exists only for the disposable `dev`
+overlay/kind-smoke path); until one is added, this is a manual operator step.
 
 ## 9. Database migration procedure
 
