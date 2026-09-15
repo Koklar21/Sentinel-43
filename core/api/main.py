@@ -2045,10 +2045,21 @@ async def lifespan(api: FastAPI):
 # Application
 # =============================================================================
 
+# Interactive API documentation (/docs, /redoc) and the raw schema
+# (/openapi.json) are a local/dev convenience only. FastAPI enables all
+# three unconditionally unless told otherwise; passing None for each
+# disables the route entirely (a real 404, not merely hidden UI with the
+# JSON schema still served) rather than relying solely on an ingress
+# annotation the application itself has no way to verify is in effect.
+_DOCS_ENABLED = IS_LOCAL_ENV
+
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
     lifespan=lifespan,
+    docs_url="/docs" if _DOCS_ENABLED else None,
+    redoc_url="/redoc" if _DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if _DOCS_ENABLED else None,
 )
 
 app.add_middleware(

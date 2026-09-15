@@ -431,11 +431,15 @@ which no longer exists (see "No Redis").
   idempotency ledger is made shared, and it should be reintroduced by that
   work, with a client in `core/`.
 
-- **`/docs`, `/redoc`, `/openapi.json` are public and unauthenticated**
-  (FastAPI defaults) on whatever this Ingress exposes — already flagged as
-  an open decision in `docs/security/endpoint_access_matrix.md` (finding
-  #5) pending the app owner's call; this deployment doesn't resolve it
-  either way (see `overlays/beta/ingress.yaml`'s comment).
+- **`/docs`, `/redoc`, `/openapi.json` are disabled outside local/dev.** The
+  application itself now decides this (`core/api/main.py` passes
+  `docs_url`/`redoc_url`/`openapi_url` as `None` whenever `SENTINEL_ENV` is
+  not one of the local/test values), not the Ingress — so it holds
+  regardless of which edge fronts this deployment. Local/dev environments
+  keep interactive docs; every other target gets a real 404 for all three
+  paths (not merely hidden UI with the JSON schema still served). Verified
+  by `scripts/deploy_preflight.py`'s existing `check_docs_exposure()` in
+  `verify` mode, which already expected exactly this (401/403/404 = PASS).
 - **`S43_TRUSTED_PROXIES` ships as an unfillable placeholder in the beta
   overlay** (pod CIDRs vary per cluster/CNI and can't be guessed
   generically) — see `overlays/beta/configmap-patch.yaml`. Left unset, XFF
