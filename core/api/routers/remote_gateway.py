@@ -26,8 +26,15 @@ Security properties:
     - correlation IDs are replay-protected within a bounded retention window
     - authentication-failure state is bounded
     - monitoring/Watchtower reporting is best-effort and off the critical path
-    - the in-memory event buffer is operational telemetry, not a durable audit
-      ledger and must not be treated as authoritative security evidence
+    - the in-memory event buffer is operational telemetry, not the
+      authoritative audit trail, and is not itself durable
+    - a live (non-dry-run) activation requires a durably-accepted pre-action
+      audit record before dispatch in any non-local environment; if no
+      AuditStore is configured, or the write fails, the activation is
+      refused (503) rather than proceeding unaudited -- see
+      _require_durable_pre_action_audit()
+    - durably-persisted records are retrievable via GET /audit/{id} after a
+      restart, through AuditStore.get_records(), merged with the buffer
 """
 
 from __future__ import annotations
@@ -522,7 +529,20 @@ class RemoteHealthResponse(StrictModel):
     registered_targets: int
     available_events: list[str]
     event_buffer_max: int
+    # The in-memory buffer itself is never durable, full stop -- it is lost
+    # on every restart regardless of whether an authoritative AuditStore is
+    # also configured. Do not compute this from audit-store availability.
     event_buffer_durable: bool = False
+    # Whether a live activation's mandatory pre-action audit write can
+    # currently be accepted (an authoritative AuditStore is registered).
+    # False here means live (non-dry-run) activation is refused outside a
+    # local/dev environment -- see _require_durable_pre_action_audit().
+    audit_write_available: bool = False
+    # Whether durably-persisted Remote Gateway records can currently be read
+    # back (the same AuditStore, via AuditStore.get_records()). This can be
+    # False even when audit_write_available is True immediately after a
+    # write, if the store's integrity check itself fails on read.
+    audit_read_available: bool = False
 
 
 class RemoteTargetResponse(StrictModel):
@@ -784,6 +804,167 @@ def _resolve_monitoring_manager() -> Any | None:
             exc_info=True,
         )
         return None
+
+
+# =============================================================================
+# Durable audit persistence
+# =============================================================================
+
+_audit_store: Any | None = None
+
+
+def set_audit_store(
+    store: Any | None,
+) -> None:
+    """Override the AuditStore this router persists event records through.
+
+    Optional. When unset, ``_resolve_audit_store()`` falls back to the
+    canonical registry in ``core.audit``, which the API composition root
+    populates at startup.
+    """
+    global _audit_store
+    _audit_store = store
+
+
+def _resolve_audit_store() -> Any | None:
+    """The active authoritative AuditStore, local override first.
+
+    Mirrors ``_resolve_monitoring_manager()``: reads the registry the
+    composition root populates via ``core.audit.set_audit_store()`` rather
+    than keeping a second, unwired handoff. May legitimately be None (no
+    S43_AUDIT_HMAC_KEY configured, e.g. local/dev) -- callers must treat a
+    missing store as "durable persistence unavailable", not an error.
+    Imported lazily so core.api.routers does not import core.audit at
+    module scope.
+    """
+    if _audit_store is not None:
+        return _audit_store
+
+    try:
+        from core.audit import get_audit_store
+
+        return get_audit_store()
+    except Exception:  # pragma: no cover - registry must never break dispatch
+        logger.debug(
+            "AuditStore registry lookup failed",
+            exc_info=True,
+        )
+        return None
+
+
+async def _require_durable_pre_action_audit(
+    *,
+    principal: AuthPrincipal,
+    body: "RemoteEventActivationRequest",
+) -> None:
+    """Durably record intent to activate a live event BEFORE dispatch.
+
+    This is the mandatory gate: in any non-local environment, a live
+    (non-dry-run) activation must not reach _dispatch_remote_event() at all
+    unless this pre-action record is durably accepted first. If no
+    AuditStore is registered, or the write itself raises, the action is
+    refused (503) and nothing is dispatched, mutated, or committed against
+    the replay ledger -- the caller's own except-and-release-correlation-id
+    handling around this call site returns the reservation exactly as it
+    would for any other pre-dispatch validation failure.
+
+    In a local/dev environment this is attempted best-effort and never
+    blocks: mirrors this module's existing strict-outside-local pattern
+    (RemoteGatewayConfig's own `strict = not _is_local()`), so a developer
+    without S43_AUDIT_HMAC_KEY configured can still exercise the gateway.
+
+    The synchronous AuditStore.append() (SQLite BEGIN IMMEDIATE + fsync) is
+    run via asyncio.to_thread -- it must never block the event loop that
+    every other concurrent request depends on.
+    """
+    store = _resolve_audit_store()
+    record = {
+        "component": "remote_gateway",
+        "phase": "pre_dispatch",
+        "event_record_id": str(uuid4()),
+        "timestamp_unix": time.time(),
+        "principal_id": principal.principal_id,
+        "operator_id": body.operator_id,
+        "operator_role": principal.role.value,
+        "target_id": body.target_id,
+        "event_type": body.event_type.value,
+        "reason": body.reason,
+        "correlation_id": body.correlation_id,
+    }
+
+    if store is None:
+        if _is_local():
+            logger.warning(
+                "Remote Gateway live activation proceeding without a "
+                "durable pre-action audit record (local/dev only, no "
+                "AuditStore configured): correlation_id=%s",
+                body.correlation_id,
+            )
+            return
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Remote Gateway activation requires the authoritative "
+                "audit store; none is configured."
+            ),
+        )
+
+    try:
+        await asyncio.to_thread(store.append, record)
+    except Exception as exc:
+        if _is_local():
+            logger.warning(
+                "Remote Gateway pre-action durable audit write failed "
+                "(local/dev, non-blocking): %s",
+                type(exc).__name__,
+            )
+            return
+        logger.error(
+            "Remote Gateway pre-action durable audit write failed; "
+            "refusing activation: %s",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Remote Gateway activation could not be durably audited.",
+        ) from None
+
+
+async def _persist_event_record(
+    record: dict[str, Any],
+) -> None:
+    """Best-effort durable persistence of the post-action event record.
+
+    By the time this runs, the mandatory pre-action gate (in non-local
+    environments) has already durably recorded intent -- this second,
+    post-action write adds the outcome (accepted/message) to the same
+    ledger. The in-memory EVENT_BUFFER remains the source for the
+    /audit/{id} read path when the durable store is unavailable, and is
+    unaffected by this. A durable-write failure here does not fail the
+    request: the irreversible effect (if any) already happened, and the
+    pre-action record already proves the activation was authorized before
+    it did. Run via asyncio.to_thread for the same reason as the pre-action
+    write -- synchronous SQLite I/O must never run on the event loop.
+    """
+    store = _resolve_audit_store()
+
+    if store is None:
+        return
+
+    try:
+        await asyncio.to_thread(
+            store.append,
+            {
+                "component": "remote_gateway",
+                "phase": "post_dispatch",
+                **record,
+            },
+        )
+    except Exception:
+        logger.warning(
+            "Remote Gateway post-action durable audit write failed",
+            exc_info=True,
+        )
 
 
 async def _notify_monitoring_pipeline(
@@ -1398,7 +1579,7 @@ def _validate_target_event_permission(
 # Event record
 # =============================================================================
 
-def _write_event_record(
+async def _write_event_record(
     *,
     principal: AuthPrincipal,
     body: RemoteEventActivationRequest,
@@ -1427,6 +1608,9 @@ def _write_event_record(
     EVENT_BUFFER.append(
         record
     )
+    await _persist_event_record(
+        record
+    )
 
     return event_record_id
 
@@ -1452,6 +1636,20 @@ async def remote_gateway_health(
     )
 
     config = get_config()
+    store = _resolve_audit_store()
+    audit_write_available = store is not None
+    audit_read_available = False
+
+    if store is not None:
+        try:
+            result = await asyncio.to_thread(store.verify_integrity)
+            audit_read_available = result.valid
+        except Exception:
+            logger.debug(
+                "Remote Gateway health: audit read-availability check failed",
+                exc_info=True,
+            )
+            audit_read_available = False
 
     return RemoteHealthResponse(
         gateway=config.gateway_name,
@@ -1466,6 +1664,8 @@ async def remote_gateway_health(
         ],
         event_buffer_max=config.max_event_records,
         event_buffer_durable=False,
+        audit_write_available=audit_write_available,
+        audit_read_available=audit_read_available,
     )
 
 
@@ -1582,6 +1782,17 @@ async def activate_remote_event(
                     detail="Live remote dispatch is disabled.",
                 )
 
+            # Mandatory pre-action gate: in any non-local environment, a
+            # live activation must not reach dispatch at all unless this
+            # durably succeeds. Raises 503 and performs no dispatch, state
+            # change, or replay-ledger commitment on failure -- the
+            # except-block below releases the correlation-id reservation
+            # exactly as it would for any other pre-dispatch failure.
+            await _require_durable_pre_action_audit(
+                principal=principal,
+                body=body,
+            )
+
             try:
                 message = await _dispatch_remote_event(
                     body
@@ -1596,7 +1807,7 @@ async def activate_remote_event(
                     ),
                 ) from exc
 
-        event_record_id = _write_event_record(
+        event_record_id = await _write_event_record(
             principal=principal,
             body=body,
             accepted=True,
@@ -1684,13 +1895,61 @@ async def get_remote_event_records(
         frozenset(),
     )
 
+    # Merge the process-local buffer (fast, but lost on restart) with the
+    # durable store (survives restart, when configured) so a record written
+    # before the current process started is still retrievable. Keyed by
+    # event_record_id so a record present in both is not duplicated.
+    by_id: dict[str, dict[str, Any]] = {}
+
+    store = _resolve_audit_store()
+    if store is not None:
+        try:
+            durable_records = await asyncio.to_thread(
+                store.get_records,
+                component="remote_gateway",
+                correlation_id=cleaned,
+            )
+        except Exception:
+            logger.warning(
+                "Remote Gateway durable audit read failed for %s",
+                cleaned,
+                exc_info=True,
+            )
+            durable_records = []
+
+        for record in durable_records:
+            # Only "post_dispatch" records carry the full RemoteEventRecord
+            # shape (dry_run/accepted/message); "pre_dispatch" intent
+            # records exist to satisfy the mandatory pre-action gate and
+            # are not surfaced through this read shape.
+            if record.get("phase") != "post_dispatch":
+                continue
+            event_record_id = record.get("event_record_id")
+            if not isinstance(event_record_id, str):
+                continue
+            cleaned_record = {
+                key: value
+                for key, value in record.items()
+                if key not in ("component", "phase")
+            }
+            by_id[event_record_id] = cleaned_record
+
+    for record in EVENT_BUFFER.snapshot():
+        if record.get("correlation_id") != cleaned:
+            continue
+        event_record_id = record.get("event_record_id")
+        if isinstance(event_record_id, str):
+            by_id[event_record_id] = record
+
     return [
         RemoteEventRecord(
             **record
         )
-        for record in EVENT_BUFFER.snapshot()
-        if record.get("correlation_id") == cleaned
-        and record.get("operator_role") in visible_roles
+        for record in sorted(
+            by_id.values(),
+            key=lambda r: r.get("timestamp_unix", 0.0),
+        )
+        if record.get("operator_role") in visible_roles
     ]
 
 
@@ -1711,5 +1970,6 @@ __all__ = [
     "reload_config",
     "reset_audit_log",
     "router",
+    "set_audit_store",
     "set_monitoring_manager",
 ]
