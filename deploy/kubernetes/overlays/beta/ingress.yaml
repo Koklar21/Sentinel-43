@@ -9,15 +9,12 @@
 #
 # Only routes "/" (the whole s43-api Service, port 8000) — the same single
 # FastAPI app docker-compose.yml exposes on host port 8000. Most
-# admin/internal routes on it already require an operator JWT (see
-# docs/security/endpoint_access_matrix.md), but /docs, /redoc, and
-# /openapi.json are PUBLIC AND UNAUTHENTICATED (FastAPI defaults) — that
-# doc already flags this as an open decision pending the app owner's call
-# before a public beta, and this Ingress does not resolve it either way.
-# If you decide to close it, the standard options are disabling those
-# routes at the FastAPI level (docs_url=None etc.) or adding an
-# nginx.ingress.kubernetes.io/server-snippet location block here — neither
-# is done by default.
+# admin/internal routes on it already require an operator JWT. /docs,
+# /redoc, and /openapi.json are disabled by the application itself outside
+# local/dev (core/api/main.py sets docs_url/redoc_url/openapi_url to None
+# whenever SENTINEL_ENV is not a local/test value) -- this holds regardless
+# of what this Ingress does, so no server-snippet/location-block workaround
+# is needed here.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
