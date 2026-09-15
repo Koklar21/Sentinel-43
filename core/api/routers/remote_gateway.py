@@ -704,6 +704,27 @@ class RemoteEventRecord(StrictModel):
     message: str
 
 
+class RemoteEventRecordsResponse(StrictModel):
+    """Records visible to the caller's role, plus their provenance.
+
+    ``authoritative`` is True only when the durable AuditStore was
+    consulted and its read succeeded (records may still be merged with the
+    process-local buffer in that case -- see get_remote_event_records()).
+    False means the durable store was NOT consulted at all: only the
+    non-durable, in-process EVENT_BUFFER backs this response, which is
+    permitted only in a local/dev environment with no AuditStore
+    configured. Callers must not treat authoritative=False as a complete
+    history -- a record written before this process started, or by another
+    process, would be missing. A durable store that IS configured but whose
+    read fails never reaches this model: that fails the request closed
+    (503) instead of returning a response that could be mistaken for a
+    complete (if empty) authoritative history.
+    """
+
+    records: list[RemoteEventRecord]
+    authoritative: bool
+
+
 # =============================================================================
 # Operational event buffer
 # =============================================================================
@@ -1866,9 +1887,15 @@ async def activate_remote_event(
     )
 
 
+_DURABLE_AUDIT_REQUIRED_DETAIL = (
+    "Remote Gateway audit history requires the authoritative audit store; "
+    "durable retrieval is currently unavailable."
+)
+
+
 @router.get(
     "/audit/{correlation_id}",
-    response_model=list[RemoteEventRecord],
+    response_model=RemoteEventRecordsResponse,
 )
 async def get_remote_event_records(
     request: Request,
@@ -1876,7 +1903,7 @@ async def get_remote_event_records(
     authorization: str | None = Header(
         default=None,
     ),
-) -> list[RemoteEventRecord]:
+) -> RemoteEventRecordsResponse:
     _require_gateway_enabled()
 
     principal = await _authenticate(
@@ -1904,6 +1931,7 @@ async def get_remote_event_records(
     # before the current process started is still retrievable. Keyed by
     # event_record_id so a record present in both is not duplicated.
     by_id: dict[str, dict[str, Any]] = {}
+    authoritative = False
 
     store = _resolve_audit_store()
     if store is not None:
@@ -1914,13 +1942,24 @@ async def get_remote_event_records(
                 correlation_id=cleaned,
             )
         except Exception:
+            # A configured durable store whose read failed must never fall
+            # back to the process-local buffer: that would return a normal
+            # (possibly empty) 200 that looks like a complete authoritative
+            # history when it is actually missing whatever the durable
+            # store held. Fail the request closed instead. Never include
+            # the raw exception (SQLite path, HMAC/signing details) in the
+            # response -- it is logged server-side only.
             logger.warning(
                 "Remote Gateway durable audit read failed for %s",
                 cleaned,
                 exc_info=True,
             )
-            durable_records = []
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=_DURABLE_AUDIT_REQUIRED_DETAIL,
+            ) from None
 
+        authoritative = True
         for record in durable_records:
             # Only "post_dispatch" records carry the full RemoteEventRecord
             # shape (dry_run/accepted/message); "pre_dispatch" intent
@@ -1937,6 +1976,16 @@ async def get_remote_event_records(
                 if key not in ("component", "phase")
             }
             by_id[event_record_id] = cleaned_record
+    elif not _is_local():
+        # No durable store configured at all, outside local/dev: the same
+        # "authoritative audit storage is required outside local"
+        # requirement _require_durable_pre_action_audit() already enforces
+        # at write time applies to reads too -- a buffer-only answer here
+        # could not be a complete history either.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_DURABLE_AUDIT_REQUIRED_DETAIL,
+        )
 
     for record in EVENT_BUFFER.snapshot():
         if record.get("correlation_id") != cleaned:
@@ -1945,16 +1994,19 @@ async def get_remote_event_records(
         if isinstance(event_record_id, str):
             by_id[event_record_id] = record
 
-    return [
-        RemoteEventRecord(
-            **record
-        )
-        for record in sorted(
-            by_id.values(),
-            key=lambda r: r.get("timestamp_unix", 0.0),
-        )
-        if record.get("operator_role") in visible_roles
-    ]
+    return RemoteEventRecordsResponse(
+        records=[
+            RemoteEventRecord(
+                **record
+            )
+            for record in sorted(
+                by_id.values(),
+                key=lambda r: r.get("timestamp_unix", 0.0),
+            )
+            if record.get("operator_role") in visible_roles
+        ],
+        authoritative=authoritative,
+    )
 
 
 __all__ = [
@@ -1965,6 +2017,7 @@ __all__ = [
     "RemoteEventActivationRequest",
     "RemoteEventActivationResponse",
     "RemoteEventRecord",
+    "RemoteEventRecordsResponse",
     "RemoteEventType",
     "RemoteGatewayConfig",
     "RemoteGatewayState",
