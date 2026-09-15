@@ -654,20 +654,31 @@ class AuditStore:
         must set UNHEALTHY too -- otherwise health would silently stay at
         its stale prior value instead of reflecting this failed check -- so
         it is caught here, health is set, and it is then re-raised unchanged.
+
+        The whole check-then-set runs under self._lock (an RLock, so this
+        nests safely with any caller that already holds it, e.g. the
+        startup path) rather than just the final flag write: append() now
+        holds the same lock for its own whole write-then-set critical
+        section, and only serializing this method's detection against that
+        makes "the last critical section to finish wins" the correct
+        tie-break -- a plain single-line flag write here could still let a
+        concurrently-finishing append's success land in between this
+        method's detection and its own health write.
         """
-        try:
-            result = self._verify_integrity_unguarded(
-                connection=connection
+        with self._lock:
+            try:
+                result = self._verify_integrity_unguarded(
+                    connection=connection
+                )
+            except Exception:
+                self._set_health(AuditStoreHealth.UNHEALTHY)
+                raise
+            self._set_health(
+                AuditStoreHealth.HEALTHY
+                if result.valid
+                else AuditStoreHealth.UNHEALTHY
             )
-        except Exception:
-            self._set_health(AuditStoreHealth.UNHEALTHY)
-            raise
-        self._set_health(
-            AuditStoreHealth.HEALTHY
-            if result.valid
-            else AuditStoreHealth.UNHEALTHY
-        )
-        return result
+            return result
 
     def _verify_integrity_unguarded(
         self,
@@ -953,41 +964,50 @@ class AuditStore:
     ) -> str:
         """Atomically append one authoritative audit record.
 
-        Updates last_known_health: HEALTHY on success (this can restore
-        HEALTHY even from CLOSED), UNHEALTHY on any failure (validation,
-        SQLite, locking, or integrity) before the exception propagates.
+        The resulting last_known_health transition -- HEALTHY on success
+        (this can restore HEALTHY even from CLOSED), UNHEALTHY on any
+        failure (validation, SQLite, locking, or integrity) -- is decided
+        and recorded inside _append_unguarded() itself, atomically with
+        the attempt it describes (inside the same critical section for the
+        SQLite portion). It must not be a separate step taken here, after
+        that section's lock has already released: a concurrent
+        get_records()/verify_integrity() that detects real corruption and
+        sets UNHEALTHY could otherwise land in that gap and be silently
+        overwritten by this now-stale success.
         """
-        try:
-            result = self._append_unguarded(payload)
-        except Exception:
-            self._set_health(AuditStoreHealth.UNHEALTHY)
-            raise
-        self._set_health(AuditStoreHealth.HEALTHY)
-        return result
+        return self._append_unguarded(payload)
 
     def _append_unguarded(
         self,
         payload: dict[str, Any],
     ) -> str:
-        payload_copy = _validate_payload(
-            payload
-        )
+        try:
+            payload_copy = _validate_payload(
+                payload
+            )
 
-        payload_copy.setdefault(
-            "event_id",
-            str(
-                uuid.uuid4()
-            ),
-        )
-        payload_copy.setdefault(
-            "decision_time",
-            utc_now_iso(),
-        )
+            payload_copy.setdefault(
+                "event_id",
+                str(
+                    uuid.uuid4()
+                ),
+            )
+            payload_copy.setdefault(
+                "decision_time",
+                utc_now_iso(),
+            )
 
-        # Revalidate after generated fields are added.
-        payload_copy = _validate_payload(
-            payload_copy
-        )
+            # Revalidate after generated fields are added.
+            payload_copy = _validate_payload(
+                payload_copy
+            )
+        except Exception:
+            # No write has been attempted yet -- nothing "succeeded
+            # earlier" for this to misrepresent -- so setting UNHEALTHY
+            # here, before the lock below is ever touched, carries none of
+            # the staleness risk the lock-held section guards against.
+            self._set_health(AuditStoreHealth.UNHEALTHY)
+            raise
 
         with self._lock:
             # Checked here, inside the same critical section that performs
@@ -995,11 +1015,12 @@ class AuditStore:
             # earlier would leave a window where a concurrent thread could
             # detect and set UNHEALTHY (e.g. get_records()'s lookup-metadata
             # check) between that check and lock acquisition, letting this
-            # append proceed anyway and then have append()'s outer wrapper
-            # unconditionally restore HEALTHY on success -- erasing the
-            # just-detected UNHEALTHY state with no actual repair having
-            # happened. last_known_health takes self._lock itself, which is
-            # safe here because self._lock is an RLock (re-entrant).
+            # append proceed anyway and then have its own success -- see
+            # the except/else below -- unconditionally restore HEALTHY,
+            # erasing the just-detected UNHEALTHY state with no actual
+            # repair having happened. last_known_health takes self._lock
+            # itself, which is safe here because self._lock is an RLock
+            # (re-entrant).
             #
             # A confirmed integrity failure (lookup-metadata tampering or a
             # broken HMAC chain, discovered by verify_integrity() or a prior
@@ -1017,101 +1038,115 @@ class AuditStore:
                     "repair"
                 )
 
-            connection = self._connect()
-
             try:
-                connection.execute(
-                    "BEGIN IMMEDIATE"
-                )
+                connection = self._connect()
 
-                current_head = (
-                    self._verify_anchor_matches_tail(
-                        connection
+                try:
+                    connection.execute(
+                        "BEGIN IMMEDIATE"
                     )
-                )
 
-                payload_json = _canonical_json(
-                    payload_copy
-                )
-
-                payload_hmac = (
-                    self.compute_payload_hmac(
-                        payload_copy,
-                        current_head,
+                    current_head = (
+                        self._verify_anchor_matches_tail(
+                            connection
+                        )
                     )
-                )
 
-                connection.execute(
-                    """
-                    INSERT INTO audit_log (
-                        event_id,
-                        decision_time,
-                        payload_json,
-                        payload_hmac,
-                        prev_hash,
-                        component,
-                        correlation_id
+                    payload_json = _canonical_json(
+                        payload_copy
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        str(
-                            payload_copy[
-                                "event_id"
-                            ]
+
+                    payload_hmac = (
+                        self.compute_payload_hmac(
+                            payload_copy,
+                            current_head,
+                        )
+                    )
+
+                    connection.execute(
+                        """
+                        INSERT INTO audit_log (
+                            event_id,
+                            decision_time,
+                            payload_json,
+                            payload_hmac,
+                            prev_hash,
+                            component,
+                            correlation_id
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            str(
+                                payload_copy[
+                                    "event_id"
+                                ]
+                            ),
+                            str(
+                                payload_copy[
+                                    "decision_time"
+                                ]
+                            ),
+                            payload_json,
+                            payload_hmac,
+                            current_head,
+                            # Denormalized copies for get_records()'s bounded
+                            # SQL filter -- not part of the HMAC chain, which
+                            # is computed over payload_copy alone, above.
+                            payload_copy.get("component"),
+                            payload_copy.get("correlation_id"),
                         ),
-                        str(
-                            payload_copy[
-                                "decision_time"
-                            ]
-                        ),
-                        payload_json,
-                        payload_hmac,
-                        current_head,
-                        # Denormalized copies for get_records()'s bounded
-                        # SQL filter -- not part of the HMAC chain, which
-                        # is computed over payload_copy alone, above.
-                        payload_copy.get("component"),
-                        payload_copy.get("correlation_id"),
-                    ),
-                )
-
-                updated = connection.execute(
-                    """
-                    UPDATE audit_anchor
-                    SET head_hash = ?
-                    WHERE id = 1
-                      AND head_hash = ?
-                    """,
-                    (
-                        payload_hmac,
-                        current_head,
-                    ),
-                )
-
-                if updated.rowcount != 1:
-                    raise AuditIntegrityError(
-                        "Audit anchor changed during append"
                     )
 
-                connection.commit()
+                    updated = connection.execute(
+                        """
+                        UPDATE audit_anchor
+                        SET head_hash = ?
+                        WHERE id = 1
+                          AND head_hash = ?
+                        """,
+                        (
+                            payload_hmac,
+                            current_head,
+                        ),
+                    )
 
-            except AuditIntegrityError:
-                connection.rollback()
-                raise
+                    if updated.rowcount != 1:
+                        raise AuditIntegrityError(
+                            "Audit anchor changed during append"
+                        )
 
-            except sqlite3.Error as exc:
-                connection.rollback()
-                raise AuditPersistenceError(
-                    "Authoritative audit append failed"
-                ) from exc
+                    connection.commit()
+
+                except AuditIntegrityError:
+                    connection.rollback()
+                    raise
+
+                except sqlite3.Error as exc:
+                    connection.rollback()
+                    raise AuditPersistenceError(
+                        "Authoritative audit append failed"
+                    ) from exc
+
+                except Exception:
+                    connection.rollback()
+                    raise
+
+                finally:
+                    connection.close()
 
             except Exception:
-                connection.rollback()
+                # Recorded before this critical section's lock releases --
+                # see append()'s docstring for why a later, separate step
+                # after that point would be too late: a concurrent
+                # get_records()/verify_integrity() could otherwise land in
+                # the gap and have its own, newer transition overwritten by
+                # a stale one from this already-finished attempt.
+                self._set_health(AuditStoreHealth.UNHEALTHY)
                 raise
 
-            finally:
-                connection.close()
+            else:
+                self._set_health(AuditStoreHealth.HEALTHY)
 
         self._write_jsonl_mirror(
             payload=payload_copy,
