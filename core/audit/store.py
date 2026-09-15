@@ -106,6 +106,20 @@ class AuditEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
+def _normalize_lookup_value(value: Any) -> str | None:
+    """Normalize a component/correlation_id value for equality comparison.
+
+    Both sides of a mismatch check can legitimately differ in Python type
+    even when they represent "the same" value: SQLite's TEXT column
+    affinity coerces a non-string value to its text form on insert, while
+    the JSON payload preserves the original type exactly. Comparing
+    str(x)-normalized forms (None stays None) avoids flagging that benign
+    round-trip difference as a tamper mismatch while still catching a
+    genuinely different value.
+    """
+    return None if value is None else str(value)
+
+
 def constant_time_compare(
     left: str,
     right: str,
@@ -329,8 +343,6 @@ class AuditStore:
                 """
             )
 
-            self._ensure_lookup_columns(connection)
-
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS audit_anchor (
@@ -355,6 +367,12 @@ class AuditStore:
                     ),
                 )
 
+            connection.commit()
+
+            # Must run after audit_anchor exists: a one-time backfill here
+            # may need to verify the existing HMAC chain first (see
+            # _ensure_lookup_columns), which reads the anchor row.
+            self._ensure_lookup_columns(connection)
             connection.commit()
 
             result = self.verify_integrity(
@@ -411,6 +429,32 @@ class AuditStore:
         )
 
         if not added:
+            return
+
+        # Only backfill from a chain that has already proven itself
+        # authentic. Backfilling from an unverified/tampered chain would
+        # let forged payload_json dictate the very columns full integrity
+        # verification later trusts (see _verify_integrity_unguarded's
+        # lookup-metadata check). This check is HMAC-chain-only
+        # (check_lookup_metadata=False): the columns being backfilled here
+        # are exactly what that check would otherwise compare against, and
+        # they are legitimately NULL pre-backfill, not a mismatch. It also
+        # bypasses the public verify_integrity() wrapper deliberately, so
+        # this one-time pre-check does not prematurely flip last_known_health
+        # -- the real _initialize_unguarded() caller runs the authoritative
+        # full check (with metadata) right after this method returns.
+        chain_check = self._verify_integrity_unguarded(
+            connection=connection,
+            check_lookup_metadata=False,
+        )
+        if not chain_check.valid:
+            logger.warning(
+                "Audit ledger HMAC chain failed verification before the "
+                "component/correlation_id backfill; leaving legacy rows "
+                "unbackfilled (error=%s, error_record_id=%s)",
+                chain_check.error,
+                chain_check.error_record_id,
+            )
             return
 
         # One-time backfill: only rows written before this migration have
@@ -600,7 +644,22 @@ class AuditStore:
         self,
         *,
         connection: sqlite3.Connection | None = None,
+        check_lookup_metadata: bool = True,
     ) -> AuditVerificationResult:
+        """Full-chain verification, optionally including lookup metadata.
+
+        ``check_lookup_metadata`` additionally verifies that each row's
+        denormalized ``component``/``correlation_id`` columns (see
+        _ensure_lookup_columns / get_records) exactly match the same fields
+        inside that row's own HMAC-authenticated payload. Those columns are
+        plain copies outside the HMAC chain -- editing them directly (UPDATE
+        audit_log SET component = ...) would otherwise make a record appear
+        under another producer, or vanish from every component-filtered
+        lookup, without breaking the hash chain at all. False only for the
+        one-time pre-backfill chain check in _ensure_lookup_columns, where
+        the columns are legitimately still NULL and have not been backfilled
+        yet -- never for a caller-facing verification.
+        """
         owns_connection = (
             connection is None
         )
@@ -618,7 +677,9 @@ class AuditStore:
                     id,
                     payload_json,
                     payload_hmac,
-                    prev_hash
+                    prev_hash,
+                    component,
+                    correlation_id
                 FROM audit_log
                 ORDER BY id ASC
                 """
@@ -629,6 +690,8 @@ class AuditStore:
                 payload_json,
                 payload_hmac,
                 prev_hash,
+                component_col,
+                correlation_id_col,
             ) in cursor:
                 if not constant_time_compare(
                     str(
@@ -693,6 +756,22 @@ class AuditStore:
                         records_checked=records_checked,
                         head_hash=expected_previous,
                         error="payload_hmac_mismatch",
+                        error_record_id=int(
+                            record_id
+                        ),
+                    )
+
+                if check_lookup_metadata and (
+                    _normalize_lookup_value(component_col)
+                    != _normalize_lookup_value(payload.get("component"))
+                    or _normalize_lookup_value(correlation_id_col)
+                    != _normalize_lookup_value(payload.get("correlation_id"))
+                ):
+                    return AuditVerificationResult(
+                        valid=False,
+                        records_checked=records_checked,
+                        head_hash=expected_previous,
+                        error="lookup_metadata_mismatch",
                         error_record_id=int(
                             record_id
                         ),
@@ -784,14 +863,14 @@ class AuditStore:
         try:
             if correlation_id is None:
                 cursor = connection.execute(
-                    "SELECT payload_json FROM audit_log "
+                    "SELECT payload_json, component, correlation_id FROM audit_log "
                     "WHERE component = ? "
                     "ORDER BY id ASC LIMIT ?",
                     (component, limit),
                 )
             else:
                 cursor = connection.execute(
-                    "SELECT payload_json FROM audit_log "
+                    "SELECT payload_json, component, correlation_id FROM audit_log "
                     "WHERE component = ? AND correlation_id = ? "
                     "ORDER BY id ASC LIMIT ?",
                     (component, correlation_id, limit),
@@ -801,13 +880,36 @@ class AuditStore:
             connection.close()
 
         records: list[dict[str, Any]] = []
-        for (payload_json,) in rows:
+        for payload_json, component_col, correlation_id_col in rows:
             try:
                 payload = json.loads(str(payload_json))
             except json.JSONDecodeError:
                 continue
             if not isinstance(payload, dict):
                 continue
+
+            # The WHERE clause above already filtered on the denormalized
+            # component/correlation_id columns for SQL-side bounding. Before
+            # trusting that a returned row genuinely belongs to the
+            # requested component/correlation_id, independently confirm
+            # those columns match the same fields inside this row's own
+            # HMAC-authenticated payload. A mismatch means the denormalized
+            # columns were edited directly (outside the HMAC chain) --
+            # trusting them here could return a record under the wrong
+            # producer's history, or hide one from it. Fail closed rather
+            # than silently return or omit a possibly misattributed record.
+            if (
+                _normalize_lookup_value(component_col)
+                != _normalize_lookup_value(payload.get("component"))
+                or _normalize_lookup_value(correlation_id_col)
+                != _normalize_lookup_value(payload.get("correlation_id"))
+            ):
+                self._set_health(AuditStoreHealth.UNHEALTHY)
+                raise AuditIntegrityError(
+                    "Audit record's denormalized lookup metadata does not "
+                    "match its authenticated payload"
+                )
+
             records.append(payload)
 
         return records
@@ -838,6 +940,21 @@ class AuditStore:
         self,
         payload: dict[str, Any],
     ) -> str:
+        # A confirmed integrity failure (lookup-metadata tampering or a
+        # broken HMAC chain, discovered by verify_integrity() or a prior
+        # get_records() mismatch) must keep blocking new writes -- and
+        # therefore the mandatory Remote Gateway pre-action gate, which
+        # calls append() -- until an operator repairs the ledger and an
+        # explicit verify_integrity() call restores HEALTHY. This does not
+        # apply to CLOSED/UNVERIFIED: append() succeeding from either of
+        # those is the documented, intentional way health recovers (see
+        # AuditStore.close()).
+        if self.last_known_health == AuditStoreHealth.UNHEALTHY:
+            raise AuditIntegrityError(
+                "Audit store failed its last integrity check; refusing to "
+                "append until verify_integrity() succeeds after repair"
+            )
+
         payload_copy = _validate_payload(
             payload
         )
