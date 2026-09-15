@@ -372,8 +372,21 @@ class AuditStore:
             # Must run after audit_anchor exists: a one-time backfill here
             # may need to verify the existing HMAC chain first (see
             # _ensure_lookup_columns), which reads the anchor row.
-            self._ensure_lookup_columns(connection)
+            premigration_check = self._ensure_lookup_columns(connection)
             connection.commit()
+
+            # If the pre-backfill chain-only check already found a real
+            # HMAC break, raise on THAT result now rather than falling
+            # through to the full check below: with the backfill skipped,
+            # legacy rows are left with NULL lookup columns that no longer
+            # match their (still HMAC-valid) payloads, so the full check
+            # would report a misleading lookup_metadata_mismatch on an
+            # early row instead of the true root cause identified here.
+            if premigration_check is not None and not premigration_check.valid:
+                raise AuditIntegrityError(
+                    f"Audit ledger failed startup integrity verification: "
+                    f"{premigration_check.error}"
+                )
 
             result = self.verify_integrity(
                 connection=connection
@@ -391,7 +404,7 @@ class AuditStore:
     def _ensure_lookup_columns(
         self,
         connection: sqlite3.Connection,
-    ) -> None:
+    ) -> AuditVerificationResult | None:
         """Add and backfill the denormalized component/correlation_id
         columns get_records() filters on, if this table predates them.
 
@@ -403,6 +416,12 @@ class AuditStore:
         plus one covering index, added only if a pre-existing database
         doesn't already have them, with a one-time backfill for any rows
         already present so an old ledger's records remain findable.
+
+        Returns the pre-backfill chain-only check's AuditVerificationResult
+        when that check ran and failed (so the caller can raise on the true
+        root cause instead of a later, misleading symptom -- see the call
+        site in _initialize_unguarded); returns None when no migration was
+        needed or the chain check passed.
         """
         existing = {
             row[1]
@@ -455,7 +474,7 @@ class AuditStore:
                 chain_check.error,
                 chain_check.error_record_id,
             )
-            return
+            return chain_check
 
         # One-time backfill: only rows written before this migration have
         # NULL in the new columns (append() populates them from here on).
@@ -479,6 +498,8 @@ class AuditStore:
                     record_id,
                 ),
             )
+
+        return None
 
     def _connect(
         self,
@@ -628,11 +649,19 @@ class AuditStore:
         this in-process Python attribute is updated, which is not "mutating
         the audit ledger". A passing result sets HEALTHY (this can restore
         HEALTHY even from CLOSED -- see AuditStore.close()); a failing
-        result sets UNHEALTHY.
+        result sets UNHEALTHY. An exception from the inner check (e.g. a
+        corrupted SQLite file raising before it can even return a result)
+        must set UNHEALTHY too -- otherwise health would silently stay at
+        its stale prior value instead of reflecting this failed check -- so
+        it is caught here, health is set, and it is then re-raised unchanged.
         """
-        result = self._verify_integrity_unguarded(
-            connection=connection
-        )
+        try:
+            result = self._verify_integrity_unguarded(
+                connection=connection
+            )
+        except Exception:
+            self._set_health(AuditStoreHealth.UNHEALTHY)
+            raise
         self._set_health(
             AuditStoreHealth.HEALTHY
             if result.valid
@@ -940,21 +969,6 @@ class AuditStore:
         self,
         payload: dict[str, Any],
     ) -> str:
-        # A confirmed integrity failure (lookup-metadata tampering or a
-        # broken HMAC chain, discovered by verify_integrity() or a prior
-        # get_records() mismatch) must keep blocking new writes -- and
-        # therefore the mandatory Remote Gateway pre-action gate, which
-        # calls append() -- until an operator repairs the ledger and an
-        # explicit verify_integrity() call restores HEALTHY. This does not
-        # apply to CLOSED/UNVERIFIED: append() succeeding from either of
-        # those is the documented, intentional way health recovers (see
-        # AuditStore.close()).
-        if self.last_known_health == AuditStoreHealth.UNHEALTHY:
-            raise AuditIntegrityError(
-                "Audit store failed its last integrity check; refusing to "
-                "append until verify_integrity() succeeds after repair"
-            )
-
         payload_copy = _validate_payload(
             payload
         )
@@ -976,6 +990,33 @@ class AuditStore:
         )
 
         with self._lock:
+            # Checked here, inside the same critical section that performs
+            # the write, rather than before the lock is acquired: checking
+            # earlier would leave a window where a concurrent thread could
+            # detect and set UNHEALTHY (e.g. get_records()'s lookup-metadata
+            # check) between that check and lock acquisition, letting this
+            # append proceed anyway and then have append()'s outer wrapper
+            # unconditionally restore HEALTHY on success -- erasing the
+            # just-detected UNHEALTHY state with no actual repair having
+            # happened. last_known_health takes self._lock itself, which is
+            # safe here because self._lock is an RLock (re-entrant).
+            #
+            # A confirmed integrity failure (lookup-metadata tampering or a
+            # broken HMAC chain, discovered by verify_integrity() or a prior
+            # get_records() mismatch) must keep blocking new writes -- and
+            # therefore the mandatory Remote Gateway pre-action gate, which
+            # calls append() -- until an operator repairs the ledger and an
+            # explicit verify_integrity() call restores HEALTHY. This does
+            # not apply to CLOSED/UNVERIFIED: append() succeeding from
+            # either of those is the documented, intentional way health
+            # recovers (see AuditStore.close()).
+            if self.last_known_health == AuditStoreHealth.UNHEALTHY:
+                raise AuditIntegrityError(
+                    "Audit store failed its last integrity check; refusing "
+                    "to append until verify_integrity() succeeds after "
+                    "repair"
+                )
+
             connection = self._connect()
 
             try:
