@@ -273,15 +273,217 @@ operator-facing scheduled backup.
 
 ## 12. SQLite audit/state volume backup and restore
 
-Also manual only, via `kubectl cp` off the `s43-api-state` PVC:
+**Manual break-glass procedure only, like §11 — there is no automated
+backup CronJob for this volume either.** This covers the two SQLite
+databases on the `s43-api-state` PVC (`audit.sqlite3` — the authoritative
+HMAC-chained audit ledger, `S43_AUDIT_SQLITE_PATH` — and
+`dead_letter.sqlite3` — failed events awaiting replay,
+`S43_DEAD_LETTER_PATH`; see the PVC's own comment in
+`deploy/kubernetes/base/s43-api-deployment.yaml`). **This is separate from,
+and does not replace, the PostgreSQL backup in §11** — Postgres holds
+sessions, targets, and everything else the application does not put on
+this volume; both must be backed up.
+
+Do not copy either file directly while `s43-api` is running: SQLite is in
+WAL mode here, and a plain file copy of `audit.sqlite3` alongside a
+missing or stale `audit.sqlite3-wal` can capture a torn, inconsistent
+snapshot. Do not scale `s43-api` to 0 first either — that removes the only
+pod that can reach the volume's contents to copy from, and there would be
+no pod left for `kubectl cp` to target. Instead, use SQLite's own online
+backup API (`sqlite3.Connection.backup()`, part of the Python stdlib
+already inside the `s43-api` image — no extra tooling to install) from
+*inside* the still-running pod: it produces a consistent snapshot of a
+live, WAL-mode database without stopping the writer.
+
+### 12a. Backup (the API keeps running; no downtime)
+
 ```bash
-POD=$(kubectl get pod -n sentinel43 -l app=s43-api -o jsonpath='{.items[0].metadata.name}')
-kubectl cp sentinel43/$POD:/app/sentinel43_state/audit.sqlite3 ./audit-$(date +%Y%m%d).sqlite3
-kubectl cp sentinel43/$POD:/app/sentinel43_state/dead_letter.sqlite3 ./dead-letter-$(date +%Y%m%d).sqlite3
+NAMESPACE=sentinel43
+POD=$(kubectl get pod -n "$NAMESPACE" -l app=s43-api -o jsonpath='{.items[0].metadata.name}')
+
+# Snapshot both databases with the online backup API, into the pod's own
+# /tmp (the "tmp" emptyDir volume -- the one writable path outside
+# sentinel43_state under readOnlyRootFilesystem: true). Paths are read from
+# the pod's own environment (S43_AUDIT_SQLITE_PATH / S43_DEAD_LETTER_PATH),
+# never hardcoded, so this stays correct even if an overlay changes them.
+# Snapshot files are created 0600 and never contain S43_AUDIT_HMAC_KEY or
+# any other secret -- only the ledger rows themselves.
+kubectl exec -i -n "$NAMESPACE" "$POD" -c s43-api -- python - <<'PYEOF'
+import os, sqlite3, sys
+
+outdir = "/tmp/s43-backup"
+os.makedirs(outdir, mode=0o700, exist_ok=True)
+
+sources = {
+    "audit": os.environ["S43_AUDIT_SQLITE_PATH"],
+    "dead_letter": os.environ["S43_DEAD_LETTER_PATH"],
+}
+
+for name, src_path in sources.items():
+    dst_path = f"{outdir}/{name}.sqlite3"
+    src = sqlite3.connect(src_path)
+    dst = sqlite3.connect(dst_path)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    os.chmod(dst_path, 0o600)
+
+    check = sqlite3.connect(dst_path)
+    try:
+        result = check.execute("PRAGMA integrity_check").fetchone()[0]
+    finally:
+        check.close()
+    if result != "ok":
+        print(f"INTEGRITY_FAIL {name}: {result}")
+        sys.exit(1)
+    print(f"OK {name} snapshot at {dst_path}")
+PYEOF
+
+# Copy the completed, already-integrity-checked snapshots out -- only after
+# the backup above exited 0. Never the live files themselves.
+DATE=$(date +%Y%m%d)
+kubectl cp "$NAMESPACE/$POD:/tmp/s43-backup/audit.sqlite3" -c s43-api "./audit-$DATE.sqlite3"
+kubectl cp "$NAMESPACE/$POD:/tmp/s43-backup/dead_letter.sqlite3" -c s43-api "./dead-letter-$DATE.sqlite3"
+
+# Re-verify the copies that actually landed on the operator's machine --
+# confirms the kubectl cp transfer itself didn't corrupt anything.
+for f in "./audit-$DATE.sqlite3" "./dead-letter-$DATE.sqlite3"; do
+  python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); r=c.execute('PRAGMA integrity_check').fetchone()[0]; c.close(); print(sys.argv[1], r); sys.exit(0 if r=='ok' else 1)" "$f"
+done
+
+# Remove the in-pod temporary copies now that the transfer is verified.
+kubectl exec -n "$NAMESPACE" "$POD" -c s43-api -- rm -rf /tmp/s43-backup
 ```
-**Copying a live SQLite file can capture a torn write.** If the copy needs
-to be authoritative (e.g. before a destructive change), quiesce the pod
-first: scale `s43-api` to 0, copy, scale back to 1.
+
+### 12b. Restore (requires downtime — replaces authoritative state)
+
+Restoring means the single `s43-api` pod must stop touching these files
+while they are replaced. Scaling the Deployment to 0 removes the only pod
+Sentinel-43 runs — by design (§16) — so there is no running `s43-api`
+container left to `kubectl exec`/`kubectl cp` into for the restore itself.
+Do the file replacement from a separate, temporary, tightly-scoped
+maintenance pod that mounts the same PVC instead — the same
+`kubectl run --overrides=...` pattern already used for the NetworkPolicy
+probe in §20, adapted to mount `s43-api-state` and pinned to the same
+image already running (or another explicitly pinned, trusted image; never
+`:latest` or a mutable tag).
+
+```bash
+NAMESPACE=sentinel43
+
+# 1. Stop the API so nothing else touches sentinel43_state during restore.
+kubectl scale deployment/s43-api -n "$NAMESPACE" --replicas=0
+kubectl wait --for=delete pod -l app=s43-api -n "$NAMESPACE" --timeout=60s
+
+# 2. Note the currently-deployed, digest-pinned image (per §8) to reuse for
+#    the maintenance pod -- do not substitute an unpinned tag.
+IMAGE=$(kubectl get deployment/s43-api -n "$NAMESPACE" \
+  -o jsonpath='{.spec.template.spec.containers[0].image}')
+# IMAGE now looks like <registry>/sentinel43-api@sha256:<64-hex-digest>
+
+# 3. Launch the maintenance pod: same restrictive posture as s43-api itself
+#    (runAsUser/Group 65532, no privilege escalation, all capabilities
+#    dropped, readOnlyRootFilesystem), the state PVC mounted read-write,
+#    no port/Service -- it exposes nothing on the network -- and it just
+#    sleeps until this operator deletes it.
+kubectl run s43-restore -n "$NAMESPACE" --image="$IMAGE" --restart=Never \
+  --overrides='{
+    "spec": {
+      "automountServiceAccountToken": false,
+      "securityContext": {"runAsNonRoot": true, "runAsUser": 65532,
+                           "runAsGroup": 65532, "fsGroup": 65532,
+                           "seccompProfile": {"type": "RuntimeDefault"}},
+      "containers": [{
+        "name": "s43-restore",
+        "image": "'"$IMAGE"'",
+        "envFrom": [{"configMapRef": {"name": "sentinel43-config"}}],
+        "securityContext": {"allowPrivilegeEscalation": false,
+                             "readOnlyRootFilesystem": true,
+                             "privileged": false,
+                             "capabilities": {"drop": ["ALL"]},
+                             "seccompProfile": {"type": "RuntimeDefault"}},
+        "volumeMounts": [{"name": "state", "mountPath": "/app/sentinel43_state"},
+                          {"name": "tmp", "mountPath": "/tmp"}]
+      }],
+      "volumes": [{"name": "state",
+                    "persistentVolumeClaim": {"claimName": "s43-api-state"}},
+                   {"name": "tmp", "emptyDir": {}}]
+    }
+  }' --command -- sleep 3600
+kubectl wait --for=condition=Ready pod/s43-restore -n "$NAMESPACE" --timeout=60s
+
+# 4. Copy the verified snapshots (from §12a) into the maintenance pod, then
+#    integrity-check them again on this volume before touching the active
+#    files -- copy failures or a bad backup file must be caught here, not
+#    after the active database is already overwritten.
+kubectl cp "./audit-$DATE.sqlite3" "$NAMESPACE/s43-restore:/tmp/audit.sqlite3"
+kubectl cp "./dead-letter-$DATE.sqlite3" "$NAMESPACE/s43-restore:/tmp/dead_letter.sqlite3"
+
+kubectl exec -i -n "$NAMESPACE" s43-restore -- python - <<'PYEOF'
+import os, shutil, sqlite3, sys
+
+# Same envFrom (sentinel43-config) as the real s43-api container, so these
+# resolve to the actual configured paths -- never hardcoded here either.
+pairs = [
+    ("/tmp/audit.sqlite3", os.environ["S43_AUDIT_SQLITE_PATH"]),
+    ("/tmp/dead_letter.sqlite3", os.environ["S43_DEAD_LETTER_PATH"]),
+]
+
+for snapshot_path, active_path in pairs:
+    check = sqlite3.connect(snapshot_path)
+    try:
+        result = check.execute("PRAGMA integrity_check").fetchone()[0]
+    finally:
+        check.close()
+    if result != "ok":
+        print(f"INTEGRITY_FAIL {snapshot_path}: {result}")
+        sys.exit(1)
+
+    # Replace the active file with the verified snapshot, preserving the
+    # UID/GID 65532 ownership and 0600 permissions the running s43-api
+    # process (also UID/GID 65532) expects. os.replace() is an atomic
+    # rename on the same filesystem -- no partially-written active file.
+    tmp_active = active_path + ".restoring"
+    shutil.copyfile(snapshot_path, tmp_active)
+    os.chown(tmp_active, 65532, 65532)
+    os.chmod(tmp_active, 0o600)
+    os.replace(tmp_active, active_path)
+    for suffix in ("-wal", "-shm"):
+        stale = active_path + suffix
+        if os.path.exists(stale):
+            os.remove(stale)
+    print(f"restored {active_path} from {snapshot_path}")
+PYEOF
+
+# 5. Remove the maintenance pod -- its job is done, and it must not
+#    linger holding the ReadWriteOnce PVC (s43-api could not reschedule
+#    while it does).
+kubectl delete pod s43-restore -n "$NAMESPACE"
+
+# 6. Restart the API and confirm it comes back healthy against the
+#    restored state.
+kubectl scale deployment/s43-api -n "$NAMESPACE" --replicas=1
+kubectl rollout status deployment/s43-api -n "$NAMESPACE" --timeout=120s
+```
+
+After the rollout completes, verify the restore actually worked, not just
+that the pod is Running:
+- **Audit integrity**: `initialize()` runs a full `verify_integrity()` at
+  every `s43-api` startup (`core/audit/store.py`) and refuses to serve if
+  the restored ledger's HMAC chain or lookup metadata (§18) doesn't check
+  out -- a pod that reaches `Ready` already proves this, but a
+  crash-looping pod after this procedure means the restored `audit.sqlite3`
+  itself is the problem, not a transient startup race.
+- **Readiness**: `curl -fsS https://<hostname>/ready` returns 200 (§10).
+- **Authentication**: log in through the dashboard/API as a real operator
+  -- confirms the restored state didn't leave auth in a broken
+  configuration.
+- **Retained records**: `GET /remote-gateway/audit/{correlation_id}` (§18)
+  for a `correlation_id` you know was recorded before the incident that
+  made this restore necessary, and confirm the expected record is present
+  and `authoritative: true` in the response.
 
 ## 13. TLS certificate and hostname validation
 
