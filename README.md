@@ -15,6 +15,10 @@ This release is intended for controlled development and validation.
 It is NOT currently certified or recommended for unrestricted production
 deployment.
 
+**Deploying a controlled beta?** See [`docs/BETA_RUNBOOK.md`](docs/BETA_RUNBOOK.md)
+— the one authoritative runbook for both the Compose and Kubernetes paths.
+It explicitly is not a production or public-sector readiness statement.
+
 ---
 
 # Mission
