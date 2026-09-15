@@ -245,6 +245,25 @@ def _run(cmd: list[str], timeout: int = 25) -> tuple[int, str]:
         return 124, f"{' '.join(cmd[:3])}...: timed out after {timeout}s"
 
 
+def _run_split(cmd: list[str], timeout: int = 25) -> tuple[int, str, str]:
+    """Like _run(), but keeps stdout and stderr separate.
+
+    _run()'s single combined stream is fine for callers that only ever
+    display the result, but a caller that parses stdout as structured JSON
+    cannot use it safely: a successful (rc=0) command that also writes a
+    warning to stderr would have that warning appended onto otherwise-valid
+    JSON, corrupting the parse. Only used by call sites that parse stdout
+    structurally -- every existing _run() caller keeps using it unchanged.
+    """
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout or "", p.stderr or ""
+    except FileNotFoundError as exc:
+        return 127, "", f"{cmd[0]}: not found ({exc})"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"{' '.join(cmd[:3])}...: timed out after {timeout}s"
+
+
 # =============================================================================
 # Pure helpers -- unit-tested in core/tests/test_deploy_preflight.py
 # =============================================================================
@@ -1005,16 +1024,37 @@ def check_kube_legacy_auth_runtime(rep: Report, context: str, namespace: str) ->
         return
     kc = ["kubectl", "--context", context, "-n", namespace]
 
-    rc, out = _run(kc + ["get", "pods", "-l", "app=s43-api", "-o", "json"])
+    # Separate stdout/stderr: a successful `kubectl get` (rc=0) that also
+    # writes a warning to stderr must not corrupt the JSON this parses from
+    # stdout -- see _run_split()'s own docstring.
+    rc, out, err = _run_split(kc + ["get", "pods", "-l", "app=s43-api", "-o", "json"])
     if rc != 0:
         rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
-                   f"could not list s43-api pods: {out.strip()[:160]}")
+                   f"could not list s43-api pods: {(err or out).strip()[:160]}")
         return
+
     try:
-        items = json.loads(out).get("items", [])
+        root = json.loads(out)
     except ValueError as exc:
         rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
                    f"unparseable pod list: {exc}")
+        return
+
+    # `kubectl get ... -o json` is expected to return a single List object
+    # ({"items": [...]}), but this validates the actual shape rather than
+    # assuming it -- a valid-but-unexpected JSON value (null, a bare list,
+    # {"items": null}, a non-object item, ...) must report INCOMPLETE, not
+    # raise AttributeError/TypeError out of this preflight check.
+    if not isinstance(root, dict):
+        rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+                   f"unexpected pod list shape: expected a JSON object, "
+                   f"got {type(root).__name__}")
+        return
+    items = root.get("items")
+    if not isinstance(items, list):
+        rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+                   f"unexpected pod list shape: 'items' is "
+                   f"{type(items).__name__}, expected a list")
         return
 
     # status.phase stays "Running" for a pod that is mid-shutdown -- there is
@@ -1025,33 +1065,58 @@ def check_kube_legacy_auth_runtime(rep: Report, context: str, namespace: str) ->
     # just the first one the API happens to return, so a drifted pod isn't
     # silently skipped mid-rollout when more than one pod matches the
     # selector (e.g. an old and a new ReplicaSet briefly overlapping).
-    pods = [
-        item["metadata"]["name"]
-        for item in items
-        if item.get("status", {}).get("phase") == "Running"
-        and not item.get("metadata", {}).get("deletionTimestamp")
-    ]
+    pods: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+                       "unexpected pod list shape: a pod entry is not a "
+                       "JSON object")
+            return
+        metadata, status = item.get("metadata"), item.get("status")
+        if not isinstance(metadata, dict) or not isinstance(status, dict):
+            rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+                       "unexpected pod list shape: metadata/status is not "
+                       "a JSON object")
+            return
+        name = metadata.get("name")
+        if not isinstance(name, str) or not name:
+            rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+                       "unexpected pod list shape: a pod has no valid name")
+            return
+        if status.get("phase") == "Running" and not metadata.get("deletionTimestamp"):
+            pods.append(name)
+
     if not pods:
         rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
                    "no non-terminating Running s43-api pod found")
         return
 
+    # Every eligible pod is checked regardless of an earlier or later pod's
+    # own result: a confirmed FAIL on one pod must never be discarded just
+    # because a *different* pod's exec happened to fail afterward -- that
+    # would silently downgrade an already-confirmed unsafe setting to a
+    # merely-INCOMPLETE result. FAIL takes precedence over INCOMPLETE below.
     failing: list[str] = []
+    inspection_failed: list[str] = []
     for pod in pods:
         rc, out = _run(kc + [
             "exec", pod, "-c", "s43-api", "--", "sh", "-c", _PRINTENV_LEGACY_AUTH,
         ])
         if rc != 0:
-            rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
-                       f"could not exec into pod {pod}: {out.strip()[:120]}")
-            return
+            inspection_failed.append(pod)
+            continue
         if not _is_explicitly_true(out.strip()):
             failing.append(pod)
 
-    rep.record(PASS if not failing else FAIL,
-               _LEGACY_AUTH_CHECK_NAME,
-               _LEGACY_AUTH_CHECK_DETAIL if not failing else
-               f"{_LEGACY_AUTH_CHECK_DETAIL} (failing pod(s): {', '.join(failing)})")
+    if failing:
+        rep.record(FAIL, _LEGACY_AUTH_CHECK_NAME,
+                   f"{_LEGACY_AUTH_CHECK_DETAIL} (failing pod(s): {', '.join(failing)})")
+        return
+    if inspection_failed:
+        rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+                   f"could not exec into pod(s): {', '.join(inspection_failed)}")
+        return
+    rep.record(PASS, _LEGACY_AUTH_CHECK_NAME, _LEGACY_AUTH_CHECK_DETAIL)
 
 
 # =============================================================================
