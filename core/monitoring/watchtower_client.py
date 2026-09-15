@@ -44,6 +44,7 @@ import os
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
@@ -152,6 +153,33 @@ _MAX_ALLOWED_RESPONSE_BYTES = 64 * 1024 * 1024
 _MAX_ALLOWED_TIMEOUT_SECONDS = 300.0
 
 
+# The only schemes an internal Watchtower base URL may use. Sentinel-43's
+# own deployment topologies (Compose, Kubernetes) only ever speak plain
+# HTTP or TLS-terminated HTTPS to s43-core; anything else (file://, a typo
+# missing the scheme entirely, etc.) is a configuration defect to surface,
+# not a request to attempt.
+_ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
+
+
+def _validate_base_url(url: str) -> None:
+    """Validate the configured Watchtower base URL's scheme and host.
+
+    Raises ValueError for anything that would make urllib.request.Request(...)
+    raise ValueError at construction time (an unknown/missing scheme) or that
+    is simply not a URL this client is permitted to call (a scheme other than
+    http/https, or a URL with no host). Never substitutes a default -- an
+    explicitly configured, malformed URL must be reported, not papered over.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in _ALLOWED_URL_SCHEMES:
+        raise ValueError(
+            f"unsupported or missing URL scheme {parsed.scheme!r}; "
+            f"only {sorted(_ALLOWED_URL_SCHEMES)} are permitted"
+        )
+    if not parsed.hostname:
+        raise ValueError("URL has no host")
+
+
 def _validate_timeout(value: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"timeout must be a real number, got {type(value).__name__}")
@@ -220,7 +248,8 @@ def watchtower_request(
     Send a request to a Watchtower route with the internal service token
     attached. Never raises — every failure mode (bad payload, HTTP error,
     timeout, unreachable host, oversized or malformed response, invalid
-    arguments) is returned as `{"error": ..., "detail": ...}` and also
+    arguments, or an invalid/malformed configured base URL) is returned as
+    `{"error": ..., "detail": ...}` and also
     logged at WARNING (rate-limited per path+kind, except invalid-argument
     misuse which is a caller bug, not a Watchtower outage, and is not
     rate-limited into invisibility). Callers must check for the "error"
@@ -243,6 +272,21 @@ def watchtower_request(
         logger.warning("Watchtower request %s %s rejected: %s", method.upper(), path, exc)
         return {"error": "watchtower_invalid_max_response_bytes", "detail": str(exc)}
 
+    try:
+        _validate_base_url(WATCHTOWER_URL)
+    except ValueError as exc:
+        # This is a static, persistent misconfiguration (WATCHTOWER_URL does
+        # not change between calls), not a one-off caller mistake -- it would
+        # otherwise fire on every single call while misconfigured. Rate-limit
+        # it the same way outage conditions are rate-limited below.
+        if _should_log((path, "invalid_configuration")):
+            logger.warning(
+                "Watchtower request %s %s rejected: invalid base URL "
+                "configuration (%s)",
+                method.upper(), path, exc,
+            )
+        return {"error": "watchtower_invalid_configuration", "detail": str(exc)}
+
     url = f"{WATCHTOWER_URL}{path}"
     data = None
     headers = {"Content-Type": "application/json"}
@@ -263,9 +307,15 @@ def watchtower_request(
                 )
             return {"error": "watchtower_payload_serialization_error", "detail": str(exc)}
 
-    request = urllib.request.Request(url=url, data=data, headers=headers, method=method.upper())
-
     try:
+        # Constructed inside the protected boundary: Request.__init__ parses
+        # the URL itself (via the full_url setter) and raises ValueError for
+        # a scheme/host combination _validate_base_url didn't anticipate --
+        # e.g. a caller-supplied path containing characters that change how
+        # the concatenated URL parses. That must never escape this function.
+        request = urllib.request.Request(
+            url=url, data=data, headers=headers, method=method.upper()
+        )
         with urllib.request.urlopen(request, timeout=effective_timeout) as response:
             body_bytes, oversized = _bounded_read(
                 response.read, response.getheader, max_response_bytes,
@@ -354,6 +404,19 @@ def watchtower_request(
                 method.upper(), path, type(exc.reason).__name__,
             )
         return {"error": "watchtower_unreachable", "detail": str(exc.reason)}
+
+    except ValueError as exc:
+        # Request(...) construction raised despite _validate_base_url passing
+        # -- e.g. a caller-supplied path made the concatenated URL invalid.
+        # This is a configuration/argument defect, not a connectivity
+        # failure; classify it distinctly rather than folding it into
+        # "unreachable", which would mislead anyone debugging the outage.
+        if _should_log((path, "invalid_configuration")):
+            logger.warning(
+                "Watchtower request %s %s rejected: %s",
+                method.upper(), path, exc,
+            )
+        return {"error": "watchtower_invalid_configuration", "detail": str(exc)}
 
     except Exception as exc:
         if _should_log((path, "unreachable")):
