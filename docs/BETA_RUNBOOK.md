@@ -601,7 +601,12 @@ the three `SENTINEL_REMOTE_TOKEN_*` role tokens):
   describes the in-memory operational buffer, not the authoritative ledger.
 - Durably-persisted Remote Gateway records remain retrievable via
   `GET /remote-gateway/audit/{correlation_id}` after a restart (merged from
-  the authoritative store), not just from the in-memory buffer.
+  the authoritative store), not just from the in-memory buffer. The
+  response is `{"records": [...], "authoritative": bool}` — `authoritative`
+  is `true` only when the durable store was actually consulted. If a
+  configured store's read fails, or none is configured outside local/dev,
+  the endpoint returns 503 rather than a normal response that could be
+  mistaken for a complete (if empty) history.
 
 ## 19. Shutdown, restart, rollback, and incident recovery
 
