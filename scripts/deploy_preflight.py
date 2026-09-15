@@ -956,6 +956,77 @@ def check_kube_runtime(rep: Report, context: str, namespace: str) -> None:
                    "no CHANGEME placeholders in ConfigMaps", ", ".join(hits) or "clean")
 
 
+_LEGACY_AUTH_CHECK_NAME = (
+    "S43_REJECT_LEGACY_AUTH is true for the running target's actual process"
+)
+_LEGACY_AUTH_CHECK_DETAIL = (
+    "the per-request X-S43-Password fallback (break-glass/env-operator "
+    "only; real dashboard/API consumers never need it) must be rejected "
+    "outside local/dev"
+)
+_PRINTENV_LEGACY_AUTH = "printenv S43_REJECT_LEGACY_AUTH 2>/dev/null || true"
+
+
+def check_compose_legacy_auth_runtime(rep: Report, project: str, env_file: str,
+                                      files: list[str]) -> None:
+    """Verify-phase companion to check_compose_config's prepare-phase check.
+
+    A target can drift after deploy (an operator edits .env and restarts
+    the proxy but not s43-api, a stale container image, a rollback) so a
+    prepare-phase pass against the repo's own .env is not evidence about
+    what the currently-running s43-api process actually has. This inspects
+    the live container's own environment instead of any file on disk.
+    """
+    print("\n== compose runtime: effective S43_REJECT_LEGACY_AUTH ==")
+    base = compose_base_cmd(project, env_file, files)
+    rc, out = _run(base + ["exec", "-T", "s43-api", "sh", "-c", _PRINTENV_LEGACY_AUTH])
+    if rc != 0:
+        rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+                   f"could not inspect the running s43-api container: "
+                   f"{out.strip()[:120]}")
+        return
+    rep.record(PASS if _is_explicitly_true(out.strip()) else FAIL,
+               _LEGACY_AUTH_CHECK_NAME, _LEGACY_AUTH_CHECK_DETAIL)
+
+
+def check_kube_legacy_auth_runtime(rep: Report, context: str, namespace: str) -> None:
+    """Verify-phase companion to check_kube_prereqs's prepare-phase check.
+
+    check_kube_prereqs only reads the ConfigMap the operator intends to
+    deploy -- a running pod started before a `kubectl apply` (no rollout
+    triggered, e.g. an unrelated field changed) can still be running with
+    an older ConfigMap's values. This execs into the actual running
+    s43-api pod and reads what that process was started with instead.
+    """
+    print("\n== kubernetes runtime: effective S43_REJECT_LEGACY_AUTH ==")
+    if not context or not namespace:
+        rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+                   "pass --context and --namespace")
+        return
+    kc = ["kubectl", "--context", context, "-n", namespace]
+
+    rc, out = _run(kc + [
+        "get", "pods", "-l", "app=s43-api",
+        "--field-selector=status.phase=Running",
+        "-o", "jsonpath={.items[0].metadata.name}",
+    ])
+    pod = out.strip()
+    if rc != 0 or not pod:
+        rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+                   f"no Running s43-api pod found: {out.strip()[:160]}")
+        return
+
+    rc, out = _run(kc + [
+        "exec", pod, "-c", "s43-api", "--", "sh", "-c", _PRINTENV_LEGACY_AUTH,
+    ])
+    if rc != 0:
+        rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+                   f"could not exec into pod {pod}: {out.strip()[:120]}")
+        return
+    rep.record(PASS if _is_explicitly_true(out.strip()) else FAIL,
+               _LEGACY_AUTH_CHECK_NAME, _LEGACY_AUTH_CHECK_DETAIL)
+
+
 # =============================================================================
 # CLI
 # =============================================================================
@@ -1014,6 +1085,8 @@ def run(args: argparse.Namespace) -> int:
                                args.from_external_host)
             check_compose_runtime(rep, args.project, args.env_file,
                                   args.compose_files)
+            check_compose_legacy_auth_runtime(rep, args.project, args.env_file,
+                                              args.compose_files)
     else:
         if args.phase == "prepare":
             check_tools(rep, ["kubectl", "openssl"])
@@ -1026,6 +1099,7 @@ def run(args: argparse.Namespace) -> int:
                                args.http_port, args.ca_bundle or None,
                                args.from_external_host)
             check_kube_runtime(rep, args.context, args.namespace)
+            check_kube_legacy_auth_runtime(rep, args.context, args.namespace)
 
     code = rep.exit_code()
     s = rep.summary()
