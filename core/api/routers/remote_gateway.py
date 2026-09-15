@@ -533,15 +533,21 @@ class RemoteHealthResponse(StrictModel):
     # on every restart regardless of whether an authoritative AuditStore is
     # also configured. Do not compute this from audit-store availability.
     event_buffer_durable: bool = False
-    # Whether a live activation's mandatory pre-action audit write can
-    # currently be accepted (an authoritative AuditStore is registered).
-    # False here means live (non-dry-run) activation is refused outside a
-    # local/dev environment -- see _require_durable_pre_action_audit().
+    # Whether the registered AuditStore's LAST KNOWN append()/
+    # verify_integrity() outcome was healthy -- not merely whether an
+    # AuditStore object is registered, and not a live guarantee that the
+    # *next* write will succeed. False here means a live (non-dry-run)
+    # activation would currently be refused outside a local/dev environment
+    # -- see _require_durable_pre_action_audit(). Derived from
+    # AuditStore.last_known_health, never by performing a write during this
+    # health check.
     audit_write_available: bool = False
     # Whether durably-persisted Remote Gateway records can currently be read
-    # back (the same AuditStore, via AuditStore.get_records()). This can be
-    # False even when audit_write_available is True immediately after a
-    # write, if the store's integrity check itself fails on read.
+    # back (AuditStore.get_records()), derived from the same last-known
+    # health as audit_write_available -- both depend on the same integrity
+    # chain, so they share one signal here rather than two independently
+    # meaningful ones. Distinct from event_buffer_durable, which describes
+    # the separate, always-non-durable, process-local buffer.
     audit_read_available: bool = False
 
 
@@ -1637,19 +1643,17 @@ async def remote_gateway_health(
 
     config = get_config()
     store = _resolve_audit_store()
-    audit_write_available = store is not None
-    audit_read_available = False
-
-    if store is not None:
-        try:
-            result = await asyncio.to_thread(store.verify_integrity)
-            audit_read_available = result.valid
-        except Exception:
-            logger.debug(
-                "Remote Gateway health: audit read-availability check failed",
-                exc_info=True,
-            )
-            audit_read_available = False
+    # Derived from the store's own last-known health (its real append()/
+    # verify_integrity() outcomes), never from object existence alone, and
+    # never by performing a write here -- a health check must not mutate
+    # the audit ledger. This is honestly a *last known* state: it does not
+    # guarantee the next write will succeed, only that the last real
+    # operation did.
+    audit_write_available = (
+        store is not None
+        and store.last_known_health.value == "healthy"
+    )
+    audit_read_available = audit_write_available
 
     return RemoteHealthResponse(
         gateway=config.gateway_name,
