@@ -63,6 +63,24 @@ NA = "n/a"
 
 EXIT_OK, EXIT_FAIL, EXIT_INCOMPLETE = 0, 1, 2
 
+# Mirrors core/api/routers/auth.py's _TRUE_VALUES exactly -- the only strings
+# the application itself will treat as boolean-true for S43_REJECT_LEGACY_AUTH
+# (via _env_bool). Not imported from core.api directly: this script is
+# deliberately stdlib-only so it runs without installing the application's
+# dependencies. Anything not in this set -- missing, blank, a recognized
+# false value ("disabled" included), or a malformed/unknown string -- must
+# NOT be approved as "legacy auth is rejected": the application either still
+# treats it as false (legacy auth stays accepted) or, in a real non-local
+# target where S43_REJECT_LEGACY_AUTH is read with strict=True, raises at
+# startup instead of serving at all. One canonical set, one canonical
+# predicate, used by both the Compose and Kubernetes paths below -- not two
+# independently drifting ones.
+_APP_TRUE_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
+
+
+def _is_explicitly_true(value: str) -> bool:
+    return value.strip().lower() in _APP_TRUE_VALUES
+
 # A value that looks like a stand-in rather than a real hostname / secret.
 PLACEHOLDER_RE = re.compile(
     r"CHANGEME|<[^>]+>|\byour[-_.]|example\.(?:invalid|com|org|net)\b|"
@@ -606,8 +624,8 @@ def check_compose_config(rep: Report, env_file: str, hostname: str,
     rep.record(PASS if not insecure else FAIL,
                "S43_ALLOW_INSECURE_ORIGINS is not set", insecure or "unset")
 
-    legacy = env.get("S43_REJECT_LEGACY_AUTH", "").lower()
-    rep.record(FAIL if legacy in {"", "false", "0", "no", "off"} else PASS,
+    legacy = env.get("S43_REJECT_LEGACY_AUTH", "")
+    rep.record(PASS if _is_explicitly_true(legacy) else FAIL,
                "S43_REJECT_LEGACY_AUTH is true for this non-local target",
                "the per-request X-S43-Password fallback (break-glass/"
                "env-operator only; real dashboard/API consumers never need "
@@ -659,8 +677,8 @@ def check_kube_prereqs(rep: Report, context: str, namespace: str) -> None:
             data = json.loads(out).get("data", {})
         except ValueError:
             data = {}
-        legacy = str(data.get("S43_REJECT_LEGACY_AUTH", "")).lower()
-        rep.record(FAIL if legacy in {"", "false", "0", "no", "off"} else PASS,
+        legacy = str(data.get("S43_REJECT_LEGACY_AUTH", ""))
+        rep.record(PASS if _is_explicitly_true(legacy) else FAIL,
                    "S43_REJECT_LEGACY_AUTH is true for this non-local target",
                    "the per-request X-S43-Password fallback (break-glass/"
                    "env-operator only; real dashboard/API consumers never "
