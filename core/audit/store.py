@@ -585,6 +585,70 @@ class AuditStore:
                 connection.close()
 
     # ------------------------------------------------------------------
+    # Read
+    # ------------------------------------------------------------------
+
+    def get_records(
+        self,
+        *,
+        component: str,
+        correlation_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Bounded, integrity-verified read of this store's own payloads.
+
+        Reuses verify_integrity() as-is (no new database, no new ledger) --
+        a caller must never see rows from a chain that fails verification.
+        ``component`` is mandatory and filters server-side before any row
+        reaches the caller, so a consumer scoped to one producer (e.g. the
+        Remote Gateway, passing component="remote_gateway") can never see
+        another producer's records (governance decisions, etc.) whose field
+        shape it hasn't examined. Returns payload dicts, oldest first,
+        capped at ``limit``.
+        """
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+
+        with self._lock:
+            connection = self._connect()
+            try:
+                result = self.verify_integrity(
+                    connection=connection
+                )
+                if not result.valid:
+                    raise AuditIntegrityError(
+                        f"Audit ledger failed integrity verification: {result.error}"
+                    )
+
+                cursor = connection.execute(
+                    "SELECT payload_json FROM audit_log ORDER BY id ASC"
+                )
+                rows = cursor.fetchall()
+            finally:
+                connection.close()
+
+        records: list[dict[str, Any]] = []
+        for (payload_json,) in rows:
+            try:
+                payload = json.loads(str(payload_json))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("component") != component:
+                continue
+            if (
+                correlation_id is not None
+                and payload.get("correlation_id") != correlation_id
+            ):
+                continue
+            records.append(payload)
+            if len(records) >= limit:
+                break
+
+        return records
+
+    # ------------------------------------------------------------------
     # Append
     # ------------------------------------------------------------------
 

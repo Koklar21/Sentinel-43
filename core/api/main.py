@@ -1521,7 +1521,7 @@ async def _start_audit_store() -> None:
     """
     from pathlib import Path
 
-    from core.audit import AuditConfig, AuditStore
+    from core.audit import AuditConfig, AuditStore, set_audit_store
 
     signing_key = _env_str("S43_AUDIT_HMAC_KEY")
     required = _env_bool("S43_GOVERNANCE_ENABLED", False) or not IS_LOCAL_ENV
@@ -1533,6 +1533,15 @@ async def _start_audit_store() -> None:
                 "store cannot be keyed. It is mandatory outside "
                 "development/local/test and whenever S43_GOVERNANCE_ENABLED=true."
             )
+        # Intentionally selecting the unconfigured local path: clear both
+        # the runtime handle and the canonical cross-package registry, not
+        # just leave them at their initial None. Within one long-lived
+        # process (the test suite booting the app's lifespan repeatedly),
+        # a *previous* lifespan may have registered a real store; without
+        # this, a later, deliberately-unconfigured run would silently
+        # inherit and keep using it.
+        runtime.audit_store = None
+        set_audit_store(None)
         runtime.subsystems.mark_unconfigured(
             SUBSYS_AUDIT,
             ("S43_AUDIT_HMAC_KEY",),
@@ -1566,6 +1575,10 @@ async def _start_audit_store() -> None:
         ) from exc
 
     runtime.audit_store = store
+    # Also register in the canonical cross-package registry, mirroring
+    # set_monitoring_manager(), so late callers (e.g. the Remote Gateway)
+    # can reach the authoritative store without importing core.api back.
+    set_audit_store(store)
     runtime.subsystems.mark_active(
         SUBSYS_AUDIT, "HMAC-chained audit store initialized and verified."
     )
@@ -1907,6 +1920,21 @@ async def _shutdown_runtime() -> None:
                     "MonitoringManager deregistration failed",
                     exc_info=True,
                 )
+
+    # Deregister the audit store the same way, so late callers (e.g. the
+    # Remote Gateway) see "no store" rather than a closed/stale one, and so
+    # a subsequent lifespan in the same process (tests booting the app
+    # repeatedly) never inherits a previous run's registration.
+    runtime.audit_store = None
+    try:
+        from core.audit import set_audit_store
+
+        set_audit_store(None)
+    except Exception:
+        logger.debug(
+            "AuditStore deregistration failed",
+            exc_info=True,
+        )
 
     async with runtime.ws_lock:
         clients = list(runtime.ws_clients.values())
