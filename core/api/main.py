@@ -1023,7 +1023,7 @@ async def _session_still_valid(
             client.sid,
             exc_info=True,
         )
-        return False, "auth_service_unavailable"
+        return False, "service_unavailable"
 
 
 # =============================================================================
@@ -2623,8 +2623,8 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 )
                 await _ws_safe_close(
                     websocket,
-                    code=1011,
-                    reason="auth_service_unavailable",
+                    code=1008,
+                    reason="service_unavailable",
                 )
                 return
 
@@ -2692,8 +2692,8 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                     )
                     await _ws_safe_close(
                         websocket,
-                        code=1011,
-                        reason="auth_service_unavailable",
+                        code=1008,
+                        reason="service_unavailable",
                     )
                     return
 
@@ -2745,9 +2745,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                     await _ws_send_error_then_close(
                         websocket,
                         error=reason,
-                        code=1011
-                        if reason == "auth_service_unavailable"
-                        else 1008,
+                        code=1008,
                         reason=reason,
                     )
                     return
@@ -2767,9 +2765,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 await _ws_send_error_then_close(
                     websocket,
                     error=reason,
-                    code=1011
-                    if reason == "auth_service_unavailable"
-                    else 1008,
+                    code=1008,
                     reason=reason,
                 )
                 return
