@@ -6,22 +6,28 @@
 # S43_TRUSTED_HOSTS / S43_ALLOWED_ORIGINS: a ConfigMap patch REPLACES the
 # key, it does not append to base's value (see the beta overlay's own
 # comment) -- so the in-cluster name "s43-api" and the loopback origins
-# must be repeated here alongside the addition below, or Fenrir's own
+# must be repeated here if you add to either list, or Fenrir's own
 # callback to http://s43-api:8000/... (Host: s43-api:8000) and ordinary
 # localhost dev access would stop matching.
 #
-# CHANGEME: 192.168.1.233 is this host's current private LAN IPv4 address
-# (Wi-Fi, /24), added so the s43-api-lb LoadBalancer Service -- already
-# reachable on this address via Docker Desktop's own port mapping, no
-# Service/NodePort change needed -- is actually usable from another device
-# on the same LAN: without it, GET requests already succeed (TrustedHostGuard
-# has nothing to check against an empty allow-list) but POST /auth/login
-# from a browser that loaded the dashboard at http://192.168.1.233:8000
-# fails closed with "Origin not allowed" before credentials are ever
-# checked. A DHCP lease change on this host will require updating this
-# value; kubelet's own /health and /ready probes are exempt from the host
-# check regardless (core/api/middleware/security_headers.py's
-# _HOST_CHECK_EXEMPT_PATHS), so this does not affect liveness/readiness.
+# To reach the dashboard from another device on your own LAN (the
+# s43-api-lb LoadBalancer Service is already reachable there via Docker
+# Desktop's own port mapping -- no Service/NodePort change needed):
+# GET requests already succeed without any change (TrustedHostGuard has
+# nothing to check against an empty allow-list), but POST /auth/login from
+# a browser at http://<your-LAN-IP>:8000 fails closed with "Origin not
+# allowed" before credentials are ever checked, since neither list above
+# includes it. This file stays portable (no machine-specific IP committed
+# here, since a DHCP lease change breaks it and another developer would
+# inherit a stale address) -- add your own IP to a local, uncommitted copy
+# instead:
+#   git update-index --skip-worktree deploy/kubernetes/overlays/dev/configmap-patch.yaml
+#   # then edit S43_TRUSTED_HOSTS / S43_ALLOWED_ORIGINS below locally,
+#   # e.g. "s43-api,192.0.2.10" / "...,http://192.0.2.10:8000"
+# `git update-index --no-skip-worktree ...` reverts to tracking it normally.
+# kubelet's own /health and /ready probes are exempt from the host check
+# regardless (core/api/middleware/security_headers.py's
+# _HOST_CHECK_EXEMPT_PATHS), so none of this affects liveness/readiness.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -30,5 +36,5 @@ metadata:
 data:
   SENTINEL_ENV: "development"
   S43_ENV: "development"
-  S43_TRUSTED_HOSTS: "s43-api,192.168.1.233"
-  S43_ALLOWED_ORIGINS: "http://localhost:8000,http://127.0.0.1:8000,http://192.168.1.233:8000"
+  S43_TRUSTED_HOSTS: "s43-api"
+  S43_ALLOWED_ORIGINS: "http://localhost:8000,http://127.0.0.1:8000"
