@@ -188,9 +188,10 @@ def test_v1_accepts_valid_token_and_password(client: TestClient):
     """A properly authenticated caller reaches the route handler itself --
     proven by getting the route's own deliberate 501 (POST /v1/assess is
     disposed as DEPRECATED, see core/api/routers/routers.py's module
-    docstring and S43_BASELINE_VERIFICATION_REPORT.md Section I Defect 4),
-    not an auth rejection. This file only owns the auth boundary; it does
-    not assert anything about /v1/assess's own (deprecated) behavior."""
+    docstring and docs/reconstruction/S43_BASELINE_VERIFICATION_REPORT.md
+    Section I Defect 4), not an auth rejection. This file only owns the
+    auth boundary; it does not assert anything about /v1/assess's own
+    (deprecated) behavior."""
     response = client.post(
         ASSESS_URL,
         json={},

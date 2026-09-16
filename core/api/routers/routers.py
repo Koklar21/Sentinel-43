@@ -25,9 +25,9 @@ baseline verification confirmed every route in this router 500s
 unconditionally in a standard deployment.
 
 Rather than inventing a new production Store/Engine (explicitly out of
-scope -- see S43_BASELINE_VERIFICATION_REPORT.md Section I, Defect 4), each
-route below is honestly dispositioned against the modern, working,
-canonical backend that superseded it:
+scope -- see docs/reconstruction/S43_BASELINE_VERIFICATION_REPORT.md
+Section I, Defect 4), each route below is honestly dispositioned against
+the modern, working, canonical backend that superseded it:
 
     /v1/actions               REPLACE -> wired directly to the same
                                in-memory action ledger + _list_actions()
