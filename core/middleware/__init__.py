@@ -43,46 +43,27 @@ imports of the form
 
 continue to work regardless of which physical file currently backs them.
 
-Fix (public-beta hardening) — what changed and why
-----------------------------------------------------
-This shim previously tried core.api.middleware.sentinel_firewall_middleware
-FIRST, falling back to core/middleware/sentinel_firewall.py (the original
-location) SECOND. That ordering caused a real, reproduced production
-outage: the "new" relocated copy was an older snapshot that predated
-FirewallConfig.from_env() being added to the original file, and the two
-were never synced. The app silently loaded the broken copy on every boot.
-The resulting error -- "FirewallConfig has no attribute from_env" -- gave
-no indication that a second, correct copy of the same class existed one
-import path away. Tracking that down cost real debugging time.
+Current structure (no longer two independently-editable copies)
+------------------------------------------------------------------
+core/api/middleware/sentinel_firewall_middleware.py is the implementation.
+core/middleware/sentinel_firewall.py is a thin canonical wrapper: it
+imports FirewallConfig/SentinelFirewall/BlockReason FROM that
+implementation module and adds environment parsing (FirewallConfig.
+from_env()) on top. This is intentional layering, not duplication -- the
+implementation lives in exactly one file.
 
-This shim now does three things differently:
-
-  1. Prefers the original, verified-correct location first. The relocated
-     path is only used as a fallback if the original is missing entirely
-     (e.g. once a relocation is actually completed and the original file
-     is deleted for real).
-  2. Logs a warning whenever the fallback path is used, since that path
-     is known to have been stale at least once already. Silent precedence
-     between two near-duplicate files is what turned this into a
-     debugging session in the first place -- this makes it visible
-     instead.
-  3. Validates the loaded FirewallConfig actually has from_env() at
-     import time, regardless of which path supplied it, and raises a
-     specific, actionable ImportError immediately if not. This is the
-     real fix: it converts "confusing AttributeError three layers deep
-     inside main.py's middleware registration, with zero clue which of
-     two files is at fault" into "clear failure at the moment the wrong
-     file gets loaded, naming the file and the missing attribute."
-
-TODO (not blocking, but should happen): reconcile the two physical files.
-Either bring core/api/middleware/sentinel_firewall_middleware.py up to
-date with core/middleware/sentinel_firewall.py and finish the relocation
-properly -- delete the old file and remove the fallback branch below
-entirely -- or abandon the relocation and delete the new file. Keeping
-two independently-editable copies of the same class indefinitely is what
-caused this bug, and the consistency check below only catches drift in
-from_env() specifically; it won't catch every way these two files could
-diverge.
+History, for context: this shim once tried the implementation module
+FIRST and core/middleware/sentinel_firewall.py SECOND, back when both were
+genuinely independent, divergence-prone copies. That ordering caused a
+real, reproduced production outage (a stale copy missing from_env(), the
+app silently loading it on every boot, and a confusing "FirewallConfig has
+no attribute from_env" three layers deep in main.py's middleware
+registration). Since core/middleware/sentinel_firewall.py now wraps rather
+than duplicates the implementation, that specific divergence class can no
+longer occur -- but the defensive ordering (prefer the wrapper, which
+always succeeds if the implementation module is intact), the warning on
+the fallback branch, and the from_env() presence check below are kept as
+cheap, still-correct insurance against a future accidental re-duplication.
 """
 
 from __future__ import annotations
@@ -107,11 +88,10 @@ try:
 
 except ImportError:
     try:
-        # Relocated copy. Known stale as of the fix described above
-        # (missing from_env() at the time this bug was found) -- only
-        # reached if the original location is unimportable, e.g. it has
-        # since been deleted as part of finishing the relocation for
-        # real.
+        # Only reached if the wrapper module itself is unimportable (e.g.
+        # a syntax error, or it was deleted). Falls back to importing the
+        # implementation directly -- see module docstring for the history
+        # of why this fallback exists and is still kept as insurance.
         from core.api.middleware.sentinel_firewall_middleware import (  # type: ignore[no-redef]
             BlockReason,
             FirewallConfig,
@@ -121,12 +101,13 @@ except ImportError:
         _source = "core.api.middleware.sentinel_firewall_middleware"
 
         logger.warning(
-            "core.middleware: loaded SentinelFirewall/FirewallConfig from "
-            "the relocated path (core.api.middleware."
-            "sentinel_firewall_middleware) because core/middleware/"
-            "sentinel_firewall.py was not importable. This path was found "
-            "to be a stale, out-of-sync copy once already -- confirm it "
-            "has been brought up to date before trusting it in production."
+            "core.middleware: loaded SentinelFirewall/FirewallConfig "
+            "directly from the implementation module (core.api.middleware."
+            "sentinel_firewall_middleware) because the canonical wrapper "
+            "(core.middleware.sentinel_firewall) was not importable. "
+            "FirewallConfig.from_env() is normally added by that wrapper, "
+            "so this path is missing it unless the implementation module "
+            "has since grown its own -- see the check below."
         )
 
     except ImportError:
@@ -144,11 +125,11 @@ except ImportError:
 if not hasattr(FirewallConfig, "from_env"):
     raise ImportError(
         f"core.middleware: FirewallConfig loaded from {_source!r} has no "
-        "from_env() classmethod. This package has two candidate source "
-        "files for FirewallConfig and they have drifted out of sync -- "
-        "see this module's docstring. Reconcile core/middleware/"
-        "sentinel_firewall.py and core/api/middleware/"
-        "sentinel_firewall_middleware.py before continuing."
+        "from_env() classmethod. The canonical wrapper (core.middleware."
+        "sentinel_firewall) normally adds this; either it was bypassed "
+        "(see this module's docstring for the fallback path) or "
+        "from_env() was removed from it. Fix core/middleware/"
+        "sentinel_firewall.py before continuing."
     )
 
 
