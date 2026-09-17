@@ -20,7 +20,16 @@ authoritative audit trail, and staging for an explicit human decision.
 
 State machine, and nothing beyond it:
 
-    OBSERVE -> ASSESS -> RECOMMEND -> STAGE -> WAIT FOR HUMAN DECISION
+    OBSERVE -> ASSESS -> DEDUPLICATE -> CORROBORATE -> APPLY BUDGET/RATE LIMIT
+    -> RECORD DURABLE AUDIT -> STAGE RECOMMENDATION -> NOTIFY EXISTING
+    CONSUMERS -> WAIT FOR AUTHENTICATED HUMAN APPROVAL OR VETO
+
+A staged recommendation is mirrored into the application's own canonical
+action/dashboard system via an injected :class:`ActionSink` -- there is
+deliberately no separate Heart-only queue. ``SentinelCoreStore`` remains the
+durable source of truth (it survives a restart; the in-memory canonical
+action store does not), and the sink is a best-effort mirror of that source
+of truth into the existing operator-facing surface, not a second one.
 
 Responsibilities:
     - dedupe/replay-protection for repeated identical findings
@@ -29,6 +38,9 @@ Responsibilities:
     - create HUMAN_GATED staged actions for explicit human approval/veto
     - append authoritative audit records for every step, including
       SHADOW-mode observation and corroboration-pending states
+    - report its own health truthfully via an injected callback, so a
+      composition root can fail /ready closed without a second health
+      framework
 
 Non-responsibilities (by design, not by omission):
     - autonomous enforcement
@@ -39,6 +51,12 @@ Non-responsibilities (by design, not by omission):
       security review, not something this module does implicitly.
     - background/timer-driven state transitions
     - storage backend selection beyond the stores it is given
+
+Invariant enforced structurally, not just documented: a recommendation is
+never reported as successfully staged unless the durable audit record for
+that exact stage was accepted first. If audit acceptance fails after the
+durable row was written, the row is compensated (transitioned to EXPIRED)
+and the call raises -- it does not return a soft "staged anyway" result.
 """
 
 from __future__ import annotations
@@ -47,6 +65,7 @@ import logging
 import threading
 import time
 from collections import OrderedDict, deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -77,6 +96,19 @@ class AuditWriter(Protocol):
 
 class MonitoringSink(Protocol):
     def analyze_event(self, event: dict[str, Any]) -> Any: ...
+
+
+class ActionSink(Protocol):
+    """Mirrors a Heart-originated recommendation into the canonical,
+    already-existing action/dashboard system (see module docstring).
+
+    Implementations must be synchronously callable from a worker thread --
+    the composition root is expected to bridge back to its own event loop
+    internally (e.g. via ``asyncio.run_coroutine_threadsafe``) rather than
+    require the Heart to know anything about asyncio.
+    """
+
+    def stage(self, record: dict[str, Any]) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +158,8 @@ class ThreatGovernor:
         default_mode: GovernanceMode | str = GovernanceMode.HUMAN_GATED,
         config: HeartConfig | None = None,
         monitoring_manager: MonitoringSink | None = None,
+        action_sink: ActionSink | None = None,
+        on_health_change: Callable[[bool, str], None] | None = None,
     ) -> None:
         self.audit_store = audit_store
         self.velocity_guard = velocity_guard
@@ -133,6 +167,8 @@ class ThreatGovernor:
         self.default_mode = self._normalize_mode(default_mode)
         self.config = config or HeartConfig()
         self._monitoring_manager = monitoring_manager
+        self._action_sink = action_sink
+        self._on_health_change = on_health_change
 
         self._lock = threading.RLock()
         self._corroboration: OrderedDict[
@@ -150,6 +186,15 @@ class ThreatGovernor:
             raise ValueError(
                 "heart mode must be SHADOW or HUMAN_GATED"
             ) from exc
+
+    def _report_health(self, healthy: bool, detail: str) -> None:
+        callback = self._on_health_change
+        if callback is None:
+            return
+        try:
+            callback(healthy, detail)
+        except Exception:
+            logger.debug("Heart health-change callback failed", exc_info=True)
 
     def _notify_monitoring(self, event: dict[str, Any]) -> None:
         manager = self._monitoring_manager
@@ -258,11 +303,14 @@ class ThreatGovernor:
         *,
         mode: GovernanceMode | str | None = None,
     ) -> HeartDecision:
-        """OBSERVE -> ASSESS -> RECOMMEND -> STAGE for one threat assessment.
+        """OBSERVE -> ASSESS -> DEDUPLICATE -> CORROBORATE -> BUDGET/RATE
+        LIMIT -> DURABLE AUDIT -> STAGE, for one threat assessment.
 
-        Never raises for an ordinary policy outcome. Only a durable-audit
-        failure propagates -- a decision that cannot be recorded must not be
-        reported as having happened (mirrors SystemOrchestrator).
+        Raises on any infrastructure failure (audit, dedupe store, velocity
+        guard) rather than returning a decision that misrepresents what
+        actually happened -- callers must not treat a normal return value as
+        proof the Heart is healthy if they never call this at all, but they
+        may treat an exception as proof it is not.
         """
         effective_mode = (
             self._normalize_mode(mode) if mode is not None else self.default_mode
@@ -272,6 +320,30 @@ class ThreatGovernor:
         kind = assessment.threat_kind.value
         now = time.time()
 
+        try:
+            decision = self._observe_unguarded(
+                assessment,
+                effective_mode=effective_mode,
+                target_key=target_key,
+                kind=kind,
+                now=now,
+            )
+        except Exception:
+            self._report_health(False, "observe_failed")
+            raise
+
+        self._report_health(True, "observe_ok")
+        return decision
+
+    def _observe_unguarded(
+        self,
+        assessment: ThreatAssessment,
+        *,
+        effective_mode: GovernanceMode,
+        target_key: str,
+        kind: str,
+        now: float,
+    ) -> HeartDecision:
         allowed_velocity, velocity_reason = self.velocity_guard.allow(target_key)
         if not allowed_velocity:
             self._append_audit(
@@ -309,6 +381,9 @@ class ThreatGovernor:
                     status="OBSERVED", reason="AWAITING_CORROBORATION"
                 )
 
+        # Deduplicate: this exact target+kind combination must not flood the
+        # human-decision queue with repeats of a recommendation already
+        # staged (or already decided) within the configured window.
         stage_dedupe_key = f"heart:stage:{target_key}:{kind}"
         already_staged_recently = not self.core_store.dedupe_allow(
             stage_dedupe_key, ttl_seconds=self.config.dedupe_ttl_seconds
@@ -341,7 +416,22 @@ class ThreatGovernor:
             )
             return HeartDecision(status="OBSERVED", reason="POLICY_OBSERVED")
 
-        action_id = str(uuid4())
+        return self._stage(assessment, target_key=target_key, kind=kind, now=now)
+
+    def _stage(
+        self,
+        assessment: ThreatAssessment,
+        *,
+        target_key: str,
+        kind: str,
+        now: float,
+    ) -> HeartDecision:
+        # Must satisfy the canonical action store's ACTION_ID_RE
+        # (^[A-Z0-9_-]{1,64}$, core/api/main.py) -- this same id is used as
+        # both the SentinelCoreStore key and the canonical action_store
+        # key, deliberately, so there is one id per recommendation, not a
+        # separate id-mapping to keep in sync between two stores.
+        action_id = f"HEART-{uuid4().hex.upper()}"
 
         action = PendingAction(
             action_id=action_id,
@@ -363,6 +453,10 @@ class ThreatGovernor:
             system_id="heart",
         )
 
+        # Durable staging happens first, but a successful *response* requires
+        # the audit record too (see below) -- this ordering only ever
+        # produces an unaudited row transiently, inside this one function,
+        # never as something reported to a caller as a successful stage.
         self.core_store.insert_pending(action)
 
         try:
@@ -375,15 +469,75 @@ class ThreatGovernor:
                 )
             )
         except Exception:
-            # The staged row still exists; a human can still see and resolve
-            # it via list_pending()/resolve_human_decision() even though this
-            # particular STAGED audit line failed to append. Do not attempt
-            # to roll back the insert -- vanishing a staged action would be
-            # worse than a delayed/missing STAGED audit line, since the
-            # underlying finding is still real and still awaits a decision.
-            return HeartDecision(
-                status="STAGED", reason="AUDIT_APPEND_FAILED", action_id=action_id
-            )
+            # Heart invariant: no consequential staging without durable
+            # audit. Compensate the row rather than leave a silent,
+            # unaudited PENDING action a human could still approve/veto
+            # without any audit trail of it ever having been staged, then
+            # propagate -- this call must not return a success.
+            try:
+                self.core_store.transition_status(
+                    action_id,
+                    expected=ActionStatus.PENDING,
+                    new_status=ActionStatus.EXPIRED,
+                    operator_reason="audit_append_failed_at_stage_time",
+                )
+            except Exception:
+                logger.error(
+                    "Failed to compensate unaudited staged action %s "
+                    "after an audit append failure -- it remains PENDING "
+                    "in SentinelCoreStore without a STAGED audit record",
+                    action_id,
+                    exc_info=True,
+                )
+            raise
+
+        record = {
+            "id": action_id,
+            # Deliberately NOT "THREAT_ACTION" -- that string is already
+            # the pre-existing generic default action_type for synthetic/
+            # dashboard-created actions that go through the regular
+            # SystemOrchestrator governance path (see
+            # core/api/main.py::_create_synthetic_action and
+            # dashboard/assets/js/dashboard.js). Colliding with it would
+            # silently misroute those actions' approve/veto calls into the
+            # Heart instead. This value is unique to Heart-originated
+            # recommendations.
+            "action_type": "HEART_RECOMMENDATION",
+            "status": "STAGED",
+            "created_at": _utc_now_iso(),
+            "decision_reason": "",
+            "operator": "",
+            "payload": {
+                "source": "heart",
+                "identity": assessment.identity,
+                "source_ip": assessment.source_ip,
+                "ip": assessment.source_ip,
+                "threat_kind": kind,
+                "severity": assessment.severity.value,
+                "source_kind": assessment.source_kind.value,
+                "score": assessment.score,
+                "indicators": dict(assessment.indicators),
+                "supporting_tags": list(assessment.supporting_tags),
+            },
+        }
+
+        sink = self._action_sink
+        if sink is not None:
+            try:
+                sink.stage(record)
+            except Exception:
+                # The durable stage + audit already succeeded above -- this
+                # is a lesser, recoverable failure (the action will not
+                # appear in the dashboard's action list until reconciled)
+                # and must not be reported as a failed stage. Logged loudly,
+                # not swallowed at debug level, so it is actually observable.
+                logger.error(
+                    "Heart action_sink.stage failed for %s -- it is durably "
+                    "staged and audited in SentinelCoreStore but will not "
+                    "appear in the canonical action list until reconciled",
+                    action_id,
+                    exc_info=True,
+                )
 
         self._notify_monitoring(
             {
@@ -408,6 +562,16 @@ class ThreatGovernor:
         operator_id: str,
         reason: str = "",
     ) -> dict[str, Any]:
+        """WAIT FOR AUTHENTICATED HUMAN APPROVAL OR VETO's terminus.
+
+        The caller (the API composition root) is solely responsible for
+        proving ``operator_id`` is an authenticated, authorized human
+        session -- this method has no notion of identity and will act on
+        whatever operator_id it is given, exactly like
+        :meth:`core.governance.orchestrator.SystemOrchestrator.resolve_human_decision`.
+        A service credential or environment-derived identity must never
+        reach this method as ``operator_id``.
+        """
         action_id = action_id.strip()
         operator_id = operator_id.strip()
 
@@ -416,6 +580,34 @@ class ThreatGovernor:
         if not operator_id:
             raise ValueError("operator_id must not be empty")
 
+        try:
+            result = self._resolve_unguarded(
+                action_id,
+                approved=approved,
+                operator_id=operator_id,
+                reason=reason,
+            )
+        except (KeyError, RuntimeError):
+            # Expected business outcomes (action missing / already
+            # resolved) -- not a Heart health problem, so not reported as
+            # one; the caller maps these to 404/409 the same way governance
+            # already does.
+            raise
+        except Exception:
+            self._report_health(False, "resolve_failed")
+            raise
+
+        self._report_health(True, "resolve_ok")
+        return result
+
+    def _resolve_unguarded(
+        self,
+        action_id: str,
+        *,
+        approved: bool,
+        operator_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
         new_status = ActionStatus.APPROVED if approved else ActionStatus.VETOED
 
         transitioned = self.core_store.transition_status(
@@ -435,18 +627,41 @@ class ThreatGovernor:
                 f"(current status={current.value})"
             )
 
-        self._append_audit(
-            {
-                "subsystem": "heart",
-                "decision_id": action_id,
-                "decision": new_status.value,
-                "reason_code": (
-                    "HUMAN_APPROVED" if approved else "HUMAN_VETOED"
-                ),
-                "operator_id": operator_id,
-                "resolution_reason": reason,
-            }
-        )
+        try:
+            self._append_audit(
+                {
+                    "subsystem": "heart",
+                    "decision_id": action_id,
+                    "decision": new_status.value,
+                    "reason_code": (
+                        "HUMAN_APPROVED" if approved else "HUMAN_VETOED"
+                    ),
+                    "operator_id": operator_id,
+                    "resolution_reason": reason,
+                }
+            )
+        except Exception:
+            # Same invariant as staging: a decision that cannot be recorded
+            # must not be reported as having happened. Best-effort revert to
+            # PENDING so a human can retry the decision once audit recovers,
+            # rather than leaving an unaudited terminal state that a second
+            # approve/veto attempt would then find already resolved.
+            try:
+                self.core_store.transition_status(
+                    action_id,
+                    expected=new_status,
+                    new_status=ActionStatus.PENDING,
+                    operator_reason="reverted_unaudited_decision",
+                )
+            except Exception:
+                logger.error(
+                    "Failed to revert unaudited decision for action %s -- "
+                    "it remains %s without an audit record of this decision",
+                    action_id,
+                    new_status.value,
+                    exc_info=True,
+                )
+            raise
 
         self._notify_monitoring(
             {
@@ -466,10 +681,16 @@ class ThreatGovernor:
         }
 
     def list_pending(self, limit: int = 200) -> tuple[Any, ...]:
+        """Read-only introspection against the durable source of truth.
+
+        Not exposed as its own API surface (see module docstring) -- kept
+        for internal reconciliation/diagnostics and direct testing.
+        """
         return self.core_store.list_actions(status=ActionStatus.PENDING, limit=limit)
 
 
 __all__ = [
+    "ActionSink",
     "HeartConfig",
     "HeartDecision",
     "ThreatGovernor",
