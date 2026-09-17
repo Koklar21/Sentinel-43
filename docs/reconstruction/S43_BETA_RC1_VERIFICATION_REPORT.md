@@ -427,3 +427,138 @@ value. Resolved:
 No finding was dismissed without investigation, and no finding was
 resolved by weakening a claim rather than fixing or accurately describing
 the underlying gap.
+
+## K. Making the Heart beat
+
+Section I connected the Heart to the composition root; this section closes
+the gap between "imported and constructed" and actually beating: staged,
+observable, fail-closed, and usable in the beta profile. The owner's own
+review of Section I's initial cut identified five concrete defects, all
+independently re-verified before any fix:
+
+1. **A second, Heart-only action queue.** The endpoints Section I added
+   (`/governance/heart/pending`, `.../approve`, `.../veto`) operated on
+   `SentinelCoreStore` directly, entirely separate from the canonical
+   `/actions`/`/actions/{id}/approve`/`/actions/{id}/veto` system every
+   dashboard client, WebSocket consumer, and existing test already expects.
+   **Fixed**: those three endpoints are removed. A Heart recommendation is
+   now mirrored into the exact same `runtime.action_store` the dashboard
+   already reads (via a new `ActionSink` the Heart calls synchronously,
+   bridged onto the event loop with `asyncio.run_coroutine_threadsafe`
+   since `ThreatGovernor.observe()` runs in a worker thread), tagged
+   `action_type: "HEART_RECOMMENDATION"` — a real regression surfaced and
+   fixed during this same wave's own test run: an earlier draft used the
+   pre-existing generic `"THREAT_ACTION"` default
+   (`_create_synthetic_action()`, `dashboard.js`) as the discriminator,
+   which collided with unrelated existing synthetic/dashboard actions and
+   silently misrouted their approve/veto calls into the Heart, breaking
+   `core/tests/test_v1_legacy_disposition.py`'s two governance-path tests.
+   `_resolve_governance_and_commit_action` now branches on the
+   collision-free tag to resolve through `ThreatGovernor` instead of
+   `SystemOrchestrator` — the existing `/actions/{id}/approve`/`veto`
+   routes need no changes at all. `SentinelCoreStore` remains the durable
+   source of truth (it survives a restart; the in-memory canonical store
+   does not); the mirror is a best-effort view of that truth, not a second
+   one. Verified end-to-end via a temporary probe: a real `observe()` call
+   produced an action visible in `GET /actions`, approvable/vetoable only
+   through the canonical routes, with the durable `SentinelCoreStore`
+   status agreeing after resolution and after a full process restart; the
+   full isolated suite (including the two previously-broken
+   `test_v1_legacy_disposition.py` tests) re-ran clean afterward.
+2. **`S43_HEART_ENABLED` was absent from every beta configuration.** Not
+   set in the Kubernetes beta overlay, the Compose environment passthrough,
+   or `.env.example`, and not checked by `deploy_preflight.py` in either
+   phase. **Fixed**: added to
+   `deploy/kubernetes/overlays/beta/configmap-patch.yaml`,
+   `docker-compose.yml`'s environment passthrough (default `false`, so
+   local dev is unaffected), and `.env.example`. `deploy_preflight.py`
+   gained a prepare-phase check (fails a beta/non-local target that
+   doesn't explicitly set it `true`, for both Compose and Kubernetes) and
+   a verify-phase check that execs into the live container/every
+   non-terminating pod and reads the effective value the running process
+   actually has — refactored the existing legacy-auth runtime-check's
+   pod-iteration logic into a shared, parameterized helper rather than
+   duplicating ~90 lines of hardened JSON-parsing for a second variable.
+   Reuses the existing `_is_explicitly_true` boolean parser; no new one
+   was written. Verified: rendered the beta overlay
+   (`kubectl kustomize` → `S43_HEART_ENABLED: "true"` present), 129/129
+   `k8s_policy_check.py` assertions and 22/22 kubeconform resources still
+   pass; rendered `docker compose config` with the var set and confirmed
+   it resolves into the container's environment; `core/tests/test_deploy_preflight.py`
+   (64 tests, unchanged) still passes.
+3. **`S43_HEART_REQUIRED` defaulted to `false`, unlike governance's `true`.**
+   A beta profile that turned the Heart on would not have made a failed
+   Heart block `/ready` — an operator could deploy with a broken Heart and
+   the target would still report ready. **Fixed**: default now matches
+   `S43_GOVERNANCE_REQUIRED`'s own precedent exactly (`true`). Verified via
+   a temporary probe that forced a real Heart startup failure (an
+   unwritable SQLite parent path): `/ready` returned 503 with
+   `"blocking": ["heart"]`, while `/health` (liveness) correctly stayed
+   200 -- the process keeps running and diagnosable rather than
+   crash-looping, a deliberate difference from `_start_governance()`'s own
+   raise-on-required-failure (crashing here would take detection,
+   Watchtower, the dashboard, and auth down with it, when only
+   Heart-governed staging actually needs to stop). The Heart also now
+   self-reports health via an injected callback
+   (`on_health_change`, reused by both the Fenrir-ingestion path and the
+   HTTP approve/veto path) so a later runtime failure -- not just a
+   startup one -- flips `/ready` closed too, and a subsequent success
+   self-heals it, the same way Watchtower's own reachability flag does.
+4. **Audit-append failure during staging was a soft return, not a hard
+   failure.** The original `observe()` could report `status="STAGED"`
+   even when the durable audit record for that stage failed to append --
+   violating "no consequential staging without audit" outright. **Fixed**:
+   staging now compensates (transitions the row to `EXPIRED`) and raises
+   on audit failure instead of returning a decision that misrepresents
+   what happened; `resolve_human_decision()` got the equivalent fix
+   (reverts an unaudited decision back to `PENDING` and raises). Verified
+   by the same temporary `ThreatGovernor`-level probe used in Section I,
+   extended to assert the exception now propagates instead of returning a
+   soft "STAGED"/"AUDIT_APPEND_FAILED" value.
+5. **Fenrir's Heart hook could lose the fact that governance staging
+   never happened.** `heart is None` returned silently with no metric, no
+   log, nothing distinguishing "legitimately disabled" from "should be
+   staging but isn't." **Fixed**: added `heart_unavailable` and
+   `heart_observe_failed` counters to Fenrir's existing `metrics` dict,
+   and a log-once-until-recovered warning (never per-finding, so it can't
+   flood logs) when the Heart is unavailable. Raw detection/reporting
+   remain completely unaffected either way -- a Heart failure is never
+   reinterpreted as "no threat." Verified via a temporary probe that ran a
+   real `FenrirHunter` (its actual `SentinelThreatDetector`, fed 30
+   synthetic login-failure events) with `.heart` wired to a real,
+   running `ThreatGovernor`: the resulting finding reached the canonical
+   action store with zero `heart_unavailable`/`heart_observe_failed`
+   counts, proving the whole path -- detection to canonical dashboard
+   action -- beats end to end, not just the Heart in isolation.
+
+Also fixed in passing, found while generating Heart action ids for the
+canonical store: `observe()` built ids with bare `str(uuid4())`
+(lowercase, hyphenated), which does not match the canonical store's own
+`ACTION_ID_RE` (`^[A-Z0-9_-]{1,64}$`) -- every Heart-staged action would
+have 404'd against `/actions/{id}/approve`. Ids are now
+`f"HEART-{uuid4().hex.upper()}"`, used as the single id for both the
+canonical mirror and the durable `SentinelCoreStore` row (one id per
+recommendation, not a mapping to keep in sync between two stores).
+
+**Verification performed on this wave** (existing suites + temporary,
+uncommitted probes per this task's test policy -- no test file was
+created, modified, or weakened): full isolated suite and the disposable-
+PostgreSQL suite (both re-run after this wave's changes, results in the
+Final Report); the full targeted regression set from Section I
+(`test_pr275_corrections.py`, `test_policy_gate_smoke.py`,
+`test_package_integrity.py`, `test_fenrir_monitoring_integration.py`,
+`test_monitoring_event_pipeline.py`, `test_operator_findings.py`) plus
+`test_actions_test_inject_auth.py` and `test_jwt_auth.py` (the existing
+tests closest to the approve/veto/auth paths this wave changed): 280
+passed, 0 failed; `core/tests/test_deploy_preflight.py`: 64 passed, 0
+failed. Two temporary probes exercised the full real stack through a real
+FastAPI lifespan and `TestClient` (real JWT-based operator auth, real
+`ThreatGovernor`, real `SentinelCoreStore`, a real restart) and a real
+`FenrirHunter` instance; both were deleted before this wave's commits, per
+the same test policy honored throughout this task.
+
+**Non-goals held, unchanged from Section I:** still no `AUTONOMOUS_VETO`/
+`ACTIVE` mode anywhere, still no scheduler/timer/background thread that
+transitions a staged action to a terminal state on its own, still no real
+enforcement executor, still no historical `Sentinel-43/*.py` file read
+into or restored into any live path.
