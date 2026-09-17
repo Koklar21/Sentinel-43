@@ -813,6 +813,7 @@ class FenrirHunter:
         # Never required -- Fenrir's own detection/reporting must keep
         # working unchanged whether or not a Heart is wired in.
         self.heart: Any | None = None
+        self._heart_unavailable_logged = False
 
         self.detector = SentinelThreatDetector(
             cfg=DetectorConfig(
@@ -855,6 +856,8 @@ class FenrirHunter:
             "broadcast_failures": 0,
             "errors": 0,
             "state_transitions": 0,
+            "heart_unavailable": 0,
+            "heart_observe_failed": 0,
         }
 
     # ------------------------------------------------------------------
@@ -1086,16 +1089,32 @@ class FenrirHunter:
         self,
         assessment: ThreatAssessment,
     ) -> None:
-        """Best-effort hand-off to the Heart, if one is wired in.
+        """Hand-off to the Heart, if one is wired in.
 
-        Fenrir's own detection and reporting must never fail, slow down
-        materially, or change behavior because of this -- the Heart is
-        advisory bookkeeping on the side, not a dependency of detection
-        itself. Any exception here is logged and swallowed.
+        Fenrir's own detection and reporting continue unconditionally
+        either way (called from observe_signals() after the finding is
+        already built) -- raw evidence is never lost because the Heart is
+        unavailable, and this method never raises to its caller. But
+        unavailability itself must not be silent: an unresolved recommendation
+        that was never even attempted is different from a genuinely
+        corroboration-pending one, and an operator watching Fenrir's own
+        metrics/logs must be able to tell the two apart. Failure here is
+        never reinterpreted as "no threat" -- the finding was still real and
+        still reported through Fenrir's normal path; only Heart-governed
+        staging of it did not happen.
         """
         heart = self.heart
 
         if heart is None:
+            self.metrics["heart_unavailable"] += 1
+            if not self._heart_unavailable_logged:
+                self._heart_unavailable_logged = True
+                logger.warning(
+                    "Heart is not wired in -- Fenrir findings are reported "
+                    "as usual but are not entering human-governed staging. "
+                    "(Logged once; see the heart_unavailable metric for "
+                    "the ongoing count.)"
+                )
             return
 
         try:
@@ -1105,10 +1124,13 @@ class FenrirHunter:
                 assessment,
             )
         except Exception:
+            self.metrics["heart_observe_failed"] += 1
             logger.warning(
                 "Heart observation failed for a Fenrir finding",
                 exc_info=True,
             )
+        else:
+            self._heart_unavailable_logged = False
 
     async def observe_signals(
         self,

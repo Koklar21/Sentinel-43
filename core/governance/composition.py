@@ -121,6 +121,8 @@ def build_heart_from_settings(
     audit_store: AuditWriter,
     core_store: SentinelCoreStore,
     monitoring_manager: Any | None = None,
+    action_sink: Any | None = None,
+    on_health_change: Any | None = None,
 ) -> ThreatGovernor:
     """Build a ThreatGovernor (the "Heart") from a validated settings object.
 
@@ -169,6 +171,8 @@ def build_heart_from_settings(
         default_mode=default_mode,
         config=heart_config,
         monitoring_manager=monitoring_manager,
+        action_sink=action_sink,
+        on_health_change=on_health_change,
     )
 
 

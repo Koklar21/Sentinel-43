@@ -788,6 +788,21 @@ async def _resolve_governance_and_commit_action(
     reason: str,
     operator: str,
 ) -> dict[str, Any]:
+    """Resolve one action through whichever governance backend originated
+    it, then commit the shared, canonical action-store status.
+
+    There is exactly one staged-action source of truth for the dashboard's
+    /actions surface: a HEART_RECOMMENDATION (Heart-originated, see
+    core/governance/heart.py -- deliberately distinct from the pre-existing
+    generic "THREAT_ACTION" default used by _create_synthetic_action() and
+    the dashboard, which still goes through SystemOrchestrator below like
+    any other action) resolves through ThreatGovernor against its durable
+    SentinelCoreStore row; every other action resolves through
+    SystemOrchestrator against its in-memory pending review, exactly as
+    before. Either way, the in-memory action_store entry is committed only
+    after the owning governance backend accepts the decision -- never
+    independently, and never twice.
+    """
     # Snapshot and validate the action first, but do not mutate it until
     # governance resolution succeeds.
     action = await _get_action(action_id)
@@ -801,40 +816,79 @@ async def _resolve_governance_and_commit_action(
             ),
         )
 
-    resolved_decision_id = (
-        (decision_id or "").strip()
-        or str(action.get("payload", {}).get("decision_id") or "").strip()
-        or None
-    )
-
-    if runtime.orchestrator is not None:
-        if not resolved_decision_id:
+    if str(action.get("action_type") or "") == "HEART_RECOMMENDATION":
+        if runtime.heart is None:
             raise HTTPException(
                 status_code=409,
-                detail="governance decision_id is required while governance is enabled",
+                detail="The Heart is not enabled",
             )
         try:
             await asyncio.to_thread(
-                runtime.orchestrator.resolve_human_decision,
-                resolved_decision_id,
+                runtime.heart.resolve_human_decision,
+                action_id,
                 approved=approved,
                 operator_id=operator,
                 reason=reason,
             )
         except KeyError as exc:
             raise HTTPException(
+                status_code=404,
+                detail="Heart action does not exist",
+            ) from exc
+        except RuntimeError as exc:
+            raise HTTPException(
                 status_code=409,
-                detail="governance decision is not pending or does not exist",
+                detail=str(exc),
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=str(exc),
             ) from exc
         except Exception as exc:
             logger.exception(
-                "Governance resolution failed for decision_id=%s",
-                resolved_decision_id,
+                "Heart decision resolution failed for action_id=%s", action_id
             )
             raise HTTPException(
                 status_code=503,
-                detail="Governance decision service is unavailable",
+                detail="Heart decision service is unavailable",
             ) from exc
+
+    else:
+        resolved_decision_id = (
+            (decision_id or "").strip()
+            or str(action.get("payload", {}).get("decision_id") or "").strip()
+            or None
+        )
+
+        if runtime.orchestrator is not None:
+            if not resolved_decision_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="governance decision_id is required while governance is enabled",
+                )
+            try:
+                await asyncio.to_thread(
+                    runtime.orchestrator.resolve_human_decision,
+                    resolved_decision_id,
+                    approved=approved,
+                    operator_id=operator,
+                    reason=reason,
+                )
+            except KeyError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="governance decision is not pending or does not exist",
+                ) from exc
+            except Exception as exc:
+                logger.exception(
+                    "Governance resolution failed for decision_id=%s",
+                    resolved_decision_id,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Governance decision service is unavailable",
+                ) from exc
 
     # Commit dashboard state only after governance accepts the decision.
     return await _commit_action_status(
@@ -844,57 +898,6 @@ async def _resolve_governance_and_commit_action(
         reason=reason,
         operator=operator,
     )
-
-
-async def _resolve_heart_decision(
-    *,
-    action_id: str,
-    approved: bool,
-    operator: str,
-    reason: str,
-) -> dict[str, Any]:
-    """Resolve one Heart-staged action. The durable row transition (a CAS
-    against SentinelCoreStore) is itself the source of truth -- there is no
-    separate in-memory action_store to keep in sync, unlike
-    :func:`_resolve_governance_and_commit_action`.
-    """
-    if runtime.heart is None:
-        raise HTTPException(
-            status_code=409,
-            detail="The Heart is not enabled",
-        )
-
-    try:
-        return await asyncio.to_thread(
-            runtime.heart.resolve_human_decision,
-            action_id,
-            approved=approved,
-            operator_id=operator,
-            reason=reason,
-        )
-    except KeyError as exc:
-        raise HTTPException(
-            status_code=404,
-            detail="Heart action does not exist",
-        ) from exc
-    except RuntimeError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail=str(exc),
-        ) from exc
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=str(exc),
-        ) from exc
-    except Exception as exc:
-        logger.exception(
-            "Heart decision resolution failed for action_id=%s", action_id
-        )
-        raise HTTPException(
-            status_code=503,
-            detail="Heart decision service is unavailable",
-        ) from exc
 
 
 # =============================================================================
@@ -1333,7 +1336,10 @@ def _declare_subsystems() -> None:
         and _env_bool("S43_GOVERNANCE_ENABLED", False)
     )
     runtime.subsystems.declare(
-        SUBSYS_HEART, required=_env_bool("S43_HEART_REQUIRED", False)
+        # Mirrors SUBSYS_GOVERNANCE's pattern exactly: required defaults to
+        # True once enabled, so a beta profile that turns the Heart on gets
+        # a fail-closed /ready by default, not a silently-optional one.
+        SUBSYS_HEART, required=_env_bool("S43_HEART_REQUIRED", True)
         and _env_bool("S43_HEART_ENABLED", False)
     )
     runtime.subsystems.declare(SUBSYS_RELIABILITY, required=False)
@@ -1722,6 +1728,47 @@ async def _start_governance() -> None:
         logger.error("SystemOrchestrator failed to start", exc_info=True)
 
 
+def _report_heart_health(healthy: bool, detail: str) -> None:
+    """Given to ThreatGovernor so it can report its own health truthfully.
+
+    Reuses the exact SubsystemRegistry every other subsystem already
+    reports through -- no second health framework. A transient failure
+    that later succeeds again flips this back to ACTIVE on its own (see
+    core/governance/heart.py's on_health_change calls), the same way
+    Watchtower's own reachability flag self-heals.
+    """
+    if healthy:
+        runtime.subsystems.mark_active(SUBSYS_HEART, detail)
+    else:
+        runtime.subsystems.mark_failed(SUBSYS_HEART, detail)
+
+
+class _HeartActionSink:
+    """Mirrors a Heart-staged recommendation into the existing canonical
+    action store -- there is deliberately no separate Heart-only queue
+    (see core/governance/heart.py's module docstring).
+
+    ThreatGovernor.observe() runs in a worker thread (FenrirHunter offloads
+    it via run_in_executor); this bridges back onto the event loop that
+    owns runtime.action_store's asyncio.Lock, the same way any other
+    cross-thread call into asyncio-owned state must.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+
+    def stage(self, record: dict[str, Any]) -> None:
+        async def _do() -> None:
+            action = await _store_action(record)
+            await _broadcast_dashboard_event(
+                "action_created",
+                {"action": action},
+            )
+
+        future = asyncio.run_coroutine_threadsafe(_do(), self._loop)
+        future.result(timeout=10.0)
+
+
 async def _start_heart() -> None:
     """Build the "Heart" -- human-governed staging for threat assessments.
 
@@ -1730,16 +1777,29 @@ async def _start_heart() -> None:
     corroboration, authoritative audit, and staging for an explicit human
     decision. Disabled by default (S43_HEART_ENABLED) so enabling it is an
     explicit operator choice, not a silent behavior change from upgrading.
+
+    Unlike _start_governance(), a required-but-failed Heart never raises
+    here: it is marked FAILED and left there, which already makes /ready
+    report 503 through the exact required-subsystem mechanism every other
+    subsystem uses (core/lifecycle.py's blocks_readiness). Raising would
+    crash the whole process -- taking detection, Watchtower, the dashboard,
+    and auth down with it -- when only Heart-governed staging actually
+    needs to stop.
     """
     if not _env_bool("S43_HEART_ENABLED", False):
         runtime.subsystems.mark_disabled(SUBSYS_HEART)
         return
 
     if runtime.audit_store is None:
-        raise RuntimeError(
-            "The Heart requires an initialized authoritative audit store. "
-            "Refusing to start ThreatGovernor without one."
+        runtime.subsystems.mark_failed(
+            SUBSYS_HEART,
+            "Requires an initialized authoritative audit store.",
         )
+        logger.error(
+            "The Heart is enabled but the authoritative audit store is "
+            "not initialized; refusing to start ThreatGovernor."
+        )
+        return
 
     try:
         from pathlib import Path
@@ -1790,6 +1850,8 @@ async def _start_heart() -> None:
             audit_store=runtime.audit_store,
             core_store=core_store,
             monitoring_manager=runtime.monitoring_manager,
+            action_sink=_HeartActionSink(asyncio.get_running_loop()),
+            on_health_change=_report_heart_health,
         )
 
         if runtime.fenrir_instance is not None:
@@ -1802,11 +1864,11 @@ async def _start_heart() -> None:
         logger.info("Heart (ThreatGovernor) started (mode=%s)", resolved_default_mode)
     except Exception as exc:
         runtime.heart = None
+        if runtime.fenrir_instance is not None:
+            runtime.fenrir_instance.heart = None
         runtime.subsystems.mark_failed(
             SUBSYS_HEART, f"Failed to start: {type(exc).__name__}"
         )
-        if _env_bool("S43_HEART_REQUIRED", False):
-            raise
         logger.error("Heart failed to start", exc_info=True)
 
 
@@ -2065,6 +2127,20 @@ async def _shutdown_runtime() -> None:
                     "MonitoringManager deregistration failed",
                     exc_info=True,
                 )
+
+    # The Heart owns no unmanaged resource of its own (SentinelCoreStore
+    # connects per-call, like AuditStore's own connection discipline), but
+    # a stale reference must not survive shutdown -- a repeated lifespan in
+    # the same process (tests booting the app repeatedly) must never
+    # inherit a previous run's Heart, and a lingering runtime.heart while
+    # audit_store is about to close below would let a late caller stage an
+    # action whose audit append is guaranteed to fail. FenrirHunter's own
+    # shutdown, above, already stopped its scan loop (the only caller of
+    # .heart) before clearing runtime.fenrir_instance, so there is no
+    # remaining reference to that instance's .heart attribute to clear here.
+    runtime.heart = None
+    if runtime.subsystems.get(SUBSYS_HEART) is not None:
+        runtime.subsystems.mark_stopped(SUBSYS_HEART)
 
     # Close, then deregister, the audit store the same way, so late callers
     # (e.g. the Remote Gateway) see "no store" rather than a closed/stale
@@ -2595,82 +2671,15 @@ async def governance_pending_reviews(
     }
 
 
-@root_router.get("/governance/heart/pending")
-async def heart_pending_actions(
-    request: Request,
-    limit: int = 200,
-) -> dict[str, Any]:
-    """Threat assessments the Heart has staged, awaiting a human decision.
-
-    Distinct from /governance/pending (SystemOrchestrator's in-memory,
-    transaction-shaped reviews): the Heart's staged actions are durable rows
-    in its own SentinelCoreStore, sourced from detection-layer (Fenrir)
-    threat assessments rather than transactions. Kept as its own surface
-    rather than merged into /actions or /governance/pending, which have a
-    different, already-tested response shape.
-    """
-    await _require_operator(request)
-
-    if runtime.heart is None:
-        return {
-            "enabled": False,
-            "pending": [],
-            "timestamp": utc_now(),
-        }
-
-    try:
-        pending = await asyncio.to_thread(runtime.heart.list_pending, limit)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Heart service unavailable",
-        ) from exc
-
-    return {
-        "enabled": True,
-        "pending": pending,
-        "timestamp": utc_now(),
-    }
-
-
-@root_router.post("/governance/heart/actions/{action_id}/approve")
-async def heart_approve_action(
-    action_id: str,
-    body: DecisionBody,
-    request: Request,
-) -> dict[str, Any]:
-    operator = await _require_operator(request)
-    result = await _resolve_heart_decision(
-        action_id=action_id,
-        approved=True,
-        operator=operator,
-        reason=body.reason,
-    )
-    await _broadcast_dashboard_event(
-        "heart_action_status_changed",
-        {"decision": result},
-    )
-    return {"ok": True, "decision": result, "timestamp": utc_now()}
-
-
-@root_router.post("/governance/heart/actions/{action_id}/veto")
-async def heart_veto_action(
-    action_id: str,
-    body: DecisionBody,
-    request: Request,
-) -> dict[str, Any]:
-    operator = await _require_operator(request)
-    result = await _resolve_heart_decision(
-        action_id=action_id,
-        approved=False,
-        operator=operator,
-        reason=body.reason,
-    )
-    await _broadcast_dashboard_event(
-        "heart_action_status_changed",
-        {"decision": result},
-    )
-    return {"ok": True, "decision": result, "timestamp": utc_now()}
+# Heart-originated recommendations are not exposed through a second,
+# Heart-only API surface: they are staged and resolved through the exact
+# same /actions, /actions/{id}/approve, and /actions/{id}/veto routes above,
+# distinguished only by action_type == "HEART_RECOMMENDATION" (deliberately
+# distinct from the pre-existing generic "THREAT_ACTION" default used by
+# _create_synthetic_action() and the dashboard, which is unrelated)
+# (see _resolve_governance_and_commit_action and
+# core/governance/heart.py's ActionSink). There is one canonical
+# staged-action source of truth for the dashboard.
 
 
 # =============================================================================
