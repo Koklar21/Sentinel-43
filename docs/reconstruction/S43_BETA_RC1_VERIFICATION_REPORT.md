@@ -7,9 +7,11 @@ readiness statement.
 
 ## A. Release candidate identity
 
-- Source git SHA (branch `release/beta-rc1-20260917`, based directly on
-  `origin/main` with no additional commits — every acceptance check below
-  passed against main as-is, so no source change was required): `7c55ca33aa464831956545ae5801780a0061a761`
+- Source git SHA this branch is based on: `origin/main` at
+  `7c55ca33aa464831956545ae5801780a0061a761`, unchanged throughout this
+  release-candidate pass. Section I below documents one substantive addition
+  made on this branch after the initial zero-defect verification pass
+  recorded in Sections B–H: reconnecting the "Heart" governance subsystem.
 - Application version: no authoritative version number exists in this repo
   (`pyproject.toml`'s `version = "0.1.0"` is explicitly a template snippet,
   not confirmed live project metadata). README.md labels the current build
@@ -236,3 +238,107 @@ Passing every currently-runnable repository-level acceptance check is
 necessary but not sufficient for a beta claim without a verified target
 (Section G) — per this task's own instruction not to infer alpha/beta/
 production status from a successful build or test run alone.
+
+## I. Heart governance-kernel reconnection
+
+After Sections B–H's zero-defect verification pass, the repository owner
+identified that the "Heart" — a human-governed threat-assessment staging
+pipeline — had drifted out of the live composition root and needed to be
+reconnected as part of this release, not deferred. This section documents
+that work.
+
+**Scope discipline:** this is composition of already-live, already-tested
+primitives, not new invention, and not a restoration of the historical
+`Sentinel-43/*.py` files (which remain untouched, unimported, exactly as
+they were). Reused as-is: `core/audit/store.py::AuditStore`,
+`core/guards/velocity.py::VelocityGuard`,
+`core/sentinel43_core_db.py::SentinelCoreStore` (previously written but
+never wired to anything), and `core/detection/sentinel_threat_types.py`'s
+live `ThreatAssessment` type. New: `core/governance/heart.py::ThreatGovernor`
+— a sibling to `SystemOrchestrator` reusing its exact `GovernanceMode`
+(`SHADOW`/`HUMAN_GATED` — there is no third mode; `AUTONOMOUS_VETO`/`ACTIVE`
+does not exist anywhere in live code and is regression-tested absent by
+`core/tests/test_policy_gate_smoke.py`).
+
+**State machine implemented, and nothing beyond it:**
+OBSERVE → ASSESS (dedupe + corroboration + rate limit) → RECOMMEND → STAGE
+(HUMAN_GATED only) → WAIT FOR HUMAN DECISION. `resolve_human_decision()` is
+the pipeline's terminus: it transitions a staged action to APPROVED or
+VETOED and appends an audit record. **No executor exists.** The historical
+`IntegrationHub.execute()` was always a logging-only stub in every prior
+implementation; this reconnection does not add a real one either — that
+would be separate work requiring its own security review, not something to
+fold into this release.
+
+**Wiring:**
+- `core/governance/composition.py::build_heart_from_settings()` — mirrors
+  `build_orchestrator_from_settings()`.
+- `core/api/main.py::_start_heart()` — mirrors `_start_governance()`.
+  Gated behind `S43_HEART_ENABLED` (default `false`) and
+  `S43_HEART_REQUIRED` (default `false`): enabling it is an explicit
+  operator choice, never a silent behavior change from upgrading to this
+  release. Registers as subsystem `heart` in `SubsystemRegistry`
+  (`/ready`, `/system/status`).
+- `core/detection/feniri_hunter.py::FenrirHunter` gained an optional
+  `self.heart` attribute (default `None`, set by the composition root only
+  when Heart is enabled) and a best-effort `_observe_with_heart()` call at
+  the exact point Fenrir already decides a finding is worth reporting
+  (severity-threshold met or statistical-anomaly escalation) — the same
+  trigger Fenrir already uses for its own external reporting. Any Heart
+  failure is logged and swallowed; Fenrir's own detection/reporting path is
+  unchanged and never depends on the Heart being present.
+- `GET /governance/heart/pending`,
+  `POST /governance/heart/actions/{action_id}/approve`,
+  `POST /governance/heart/actions/{action_id}/veto` — new sibling endpoints
+  to the existing `/governance/pending`/`/actions/{id}/approve`/`veto`,
+  reusing the same `_require_operator` auth and `DecisionBody` shape.
+  Deliberately not merged into the existing endpoints: the Heart's staged
+  actions are durable `SentinelCoreStore` rows sourced from threat
+  assessments, structurally different from `SystemOrchestrator`'s
+  in-memory, transaction-shaped reviews — conflating the two response
+  shapes risked the existing, tested dashboard contract for no real
+  benefit. This is a deliberate, conservative choice the owner may revisit
+  (e.g., a second dashboard panel) rather than the literal single unified
+  list a first reading of "extend the existing contract" might suggest.
+
+**Verification performed (existing tests + temporary, uncommitted probes,
+per this task's test policy — no test file was created, modified, or
+weakened):**
+- Full isolated suite after this change: 1004 passed, 103 skipped (same
+  categories as Section B1), 1 xfailed, 0 failed.
+- `test_pr275_corrections.py` (exercises `SystemOrchestrator` end-to-end),
+  `test_policy_gate_smoke.py` (regression-asserts `AUTONOMOUS_VETO` stays
+  rejected), `test_package_integrity.py`, `test_fenrir_monitoring_integration.py`,
+  `test_monitoring_event_pipeline.py`, `test_operator_findings.py`: 236
+  passed, 0 failed, unchanged behavior.
+- Disposable-PostgreSQL suite rerun on this head: 95 passed, 0 skipped, 0
+  failed — unchanged from Section B1 (this addition touches nothing
+  PostgreSQL-related).
+- A temporary, uncommitted probe exercised `ThreatGovernor` directly:
+  velocity limiting, corroboration accumulation and its interaction with
+  stage-level dedupe (a real bug — an early version reset the corroboration
+  counter on success and could strand a genuine ongoing burst back in
+  "awaiting corroboration" — was found and fixed this way, before any
+  commit), SHADOW-mode never staging, and the full
+  approve/veto/double-resolve/unknown-action-id error paths. Deleted before
+  this commit.
+- A second temporary, uncommitted probe booted the real FastAPI lifespan
+  (`core.api.main.lifespan`) with `S43_GOVERNANCE_ENABLED=true` and
+  `S43_HEART_ENABLED=true` against disposable SQLite paths, confirmed
+  `runtime.heart` starts, the `heart` subsystem reports `ACTIVE`, and ran a
+  full observe → stage → resolve cycle through the real composition root
+  (not just the unit-level class). Deleted before this commit.
+- Compose, Kubernetes, browser/Playwright, and image-build/vulnerability
+  results are unchanged from Sections B2–B5: this addition changes no
+  Dockerfile, dependency, Compose file, or Kubernetes manifest, is disabled
+  by default, and the isolated suite (which imports and boots
+  `core.api.main`) together with the two probes above already exercise the
+  only code paths this change touches.
+
+**Non-goals held throughout, and still true after this change:** no
+`AUTONOMOUS_VETO`/`ACTIVE` mode value anywhere in new code; no
+scheduler/timer/background thread transitions a staged action to a terminal
+state; `test_policy_gate_smoke.py`'s absence-assertions pass unmodified;
+the historical `Sentinel-43/*.py` files were not read into, imported by, or
+restored into any live code path — this is a fresh, minimal implementation
+against current interfaces, not a resurrection of old files.

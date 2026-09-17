@@ -808,6 +808,12 @@ class FenrirHunter:
         self._started = False
         self._lifecycle_lock = asyncio.Lock()
 
+        # Optional: set post-construction by the API composition root once
+        # the Heart (core.governance.heart.ThreatGovernor) has started.
+        # Never required -- Fenrir's own detection/reporting must keep
+        # working unchanged whether or not a Heart is wired in.
+        self.heart: Any | None = None
+
         self.detector = SentinelThreatDetector(
             cfg=DetectorConfig(
                 window_seconds=self.config.detector_window_seconds,
@@ -1076,6 +1082,34 @@ class FenrirHunter:
             anomaly_map,
         )
 
+    async def _observe_with_heart(
+        self,
+        assessment: ThreatAssessment,
+    ) -> None:
+        """Best-effort hand-off to the Heart, if one is wired in.
+
+        Fenrir's own detection and reporting must never fail, slow down
+        materially, or change behavior because of this -- the Heart is
+        advisory bookkeeping on the side, not a dependency of detection
+        itself. Any exception here is logged and swallowed.
+        """
+        heart = self.heart
+
+        if heart is None:
+            return
+
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                self._ensure_executor(),
+                heart.observe,
+                assessment,
+            )
+        except Exception:
+            logger.warning(
+                "Heart observation failed for a Fenrir finding",
+                exc_info=True,
+            )
+
     async def observe_signals(
         self,
     ) -> list[dict[str, Any]]:
@@ -1128,6 +1162,8 @@ class FenrirHunter:
                 ] += 1
 
             if rank >= self._min_severity_rank:
+                await self._observe_with_heart(assessment)
+
                 findings.append(
                     self._assessment_to_finding(
                         assessment,
@@ -1140,6 +1176,8 @@ class FenrirHunter:
                 self.metrics[
                     "anomaly_escalations"
                 ] += 1
+
+                await self._observe_with_heart(assessment)
 
                 findings.append(
                     self._assessment_to_finding(

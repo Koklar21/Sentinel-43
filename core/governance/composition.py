@@ -32,7 +32,9 @@ from __future__ import annotations
 from typing import Any
 
 from core.guards.velocity import VelocityConfig, VelocityGuard
+from core.sentinel43_core_db import SentinelCoreStore
 
+from .heart import HeartConfig, ThreatGovernor
 from .orchestrator import (
     DEFAULT_REVIEW_TTL_SECONDS,
     MAX_PENDING_REVIEWS,
@@ -113,4 +115,61 @@ def build_orchestrator_from_settings(
     )
 
 
-__all__ = ["build_orchestrator_from_settings"]
+def build_heart_from_settings(
+    settings: Any,
+    *,
+    audit_store: AuditWriter,
+    core_store: SentinelCoreStore,
+    monitoring_manager: Any | None = None,
+) -> ThreatGovernor:
+    """Build a ThreatGovernor (the "Heart") from a validated settings object.
+
+    Mirrors :func:`build_orchestrator_from_settings`: ``settings`` is
+    duck-typed and owned by the API composition root, which does all
+    environment parsing. ``audit_store`` and ``core_store`` must already be
+    initialized -- this function performs no filesystem/network I/O.
+    """
+    if audit_store is None:
+        raise ValueError(
+            "build_heart_from_settings requires an explicit, initialized "
+            "authoritative audit_store"
+        )
+
+    if core_store is None:
+        raise ValueError(
+            "build_heart_from_settings requires an explicit, initialized "
+            "SentinelCoreStore"
+        )
+
+    default_mode = _validate_mode(_get(settings, "default_mode", "HUMAN_GATED"))
+
+    velocity_guard = VelocityGuard(
+        VelocityConfig(
+            window_seconds=float(
+                _get(settings, "velocity_window_seconds", 60.0)
+            ),
+            limit=int(_get(settings, "velocity_limit", 30)),
+        )
+    )
+
+    heart_config = HeartConfig(
+        dedupe_ttl_seconds=int(_get(settings, "dedupe_ttl_seconds", 300)),
+        corroboration_window_seconds=int(
+            _get(settings, "corroboration_window_seconds", 300)
+        ),
+        corroboration_min_signals_for_high=int(
+            _get(settings, "corroboration_min_signals_for_high", 2)
+        ),
+    )
+
+    return ThreatGovernor(
+        audit_store=audit_store,
+        velocity_guard=velocity_guard,
+        core_store=core_store,
+        default_mode=default_mode,
+        config=heart_config,
+        monitoring_manager=monitoring_manager,
+    )
+
+
+__all__ = ["build_heart_from_settings", "build_orchestrator_from_settings"]
