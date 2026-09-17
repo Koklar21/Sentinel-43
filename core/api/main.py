@@ -423,6 +423,7 @@ class RuntimeState:
     monitoring_manager: Any | None = None
     audit_store: Any | None = None
     orchestrator: Any | None = None
+    heart: Any | None = None
     sparta_instance: Any | None = None
     sparta_task: asyncio.Task[Any] | None = None
     fenrir_instance: Any | None = None
@@ -845,6 +846,57 @@ async def _resolve_governance_and_commit_action(
     )
 
 
+async def _resolve_heart_decision(
+    *,
+    action_id: str,
+    approved: bool,
+    operator: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Resolve one Heart-staged action. The durable row transition (a CAS
+    against SentinelCoreStore) is itself the source of truth -- there is no
+    separate in-memory action_store to keep in sync, unlike
+    :func:`_resolve_governance_and_commit_action`.
+    """
+    if runtime.heart is None:
+        raise HTTPException(
+            status_code=409,
+            detail="The Heart is not enabled",
+        )
+
+    try:
+        return await asyncio.to_thread(
+            runtime.heart.resolve_human_decision,
+            action_id,
+            approved=approved,
+            operator_id=operator,
+            reason=reason,
+        )
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail="Heart action does not exist",
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        logger.exception(
+            "Heart decision resolution failed for action_id=%s", action_id
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Heart decision service is unavailable",
+        ) from exc
+
+
 # =============================================================================
 # WebSocket manager
 # =============================================================================
@@ -1253,6 +1305,7 @@ SUBSYS_SPARTA = "sparta"
 SUBSYS_FENRIR = "fenrir"
 SUBSYS_AUDIT = "audit_store"
 SUBSYS_GOVERNANCE = "governance"
+SUBSYS_HEART = "heart"
 SUBSYS_RELIABILITY = "reliability"
 
 
@@ -1278,6 +1331,10 @@ def _declare_subsystems() -> None:
     runtime.subsystems.declare(
         SUBSYS_GOVERNANCE, required=_env_bool("S43_GOVERNANCE_REQUIRED", True)
         and _env_bool("S43_GOVERNANCE_ENABLED", False)
+    )
+    runtime.subsystems.declare(
+        SUBSYS_HEART, required=_env_bool("S43_HEART_REQUIRED", False)
+        and _env_bool("S43_HEART_ENABLED", False)
     )
     runtime.subsystems.declare(SUBSYS_RELIABILITY, required=False)
 
@@ -1665,6 +1722,94 @@ async def _start_governance() -> None:
         logger.error("SystemOrchestrator failed to start", exc_info=True)
 
 
+async def _start_heart() -> None:
+    """Build the "Heart" -- human-governed staging for threat assessments.
+
+    Reconnects Fenrir/detection-layer findings to the same human-governed
+    pattern SystemOrchestrator already applies to transactions: dedupe,
+    corroboration, authoritative audit, and staging for an explicit human
+    decision. Disabled by default (S43_HEART_ENABLED) so enabling it is an
+    explicit operator choice, not a silent behavior change from upgrading.
+    """
+    if not _env_bool("S43_HEART_ENABLED", False):
+        runtime.subsystems.mark_disabled(SUBSYS_HEART)
+        return
+
+    if runtime.audit_store is None:
+        raise RuntimeError(
+            "The Heart requires an initialized authoritative audit store. "
+            "Refusing to start ThreatGovernor without one."
+        )
+
+    try:
+        from pathlib import Path
+
+        from core.governance import build_heart_from_settings
+        from core.sentinel43_core_db import CoreStoreConfig, SentinelCoreStore
+
+        resolved_default_mode = _env_str(
+            "S43_HEART_DEFAULT_MODE",
+            _env_str("S43_DEFAULT_MODE", "HUMAN_GATED"),
+        ).upper()
+
+        class Settings:
+            default_mode = resolved_default_mode
+            velocity_window_seconds = _env_int(
+                "S43_HEART_VELOCITY_WINDOW_SECONDS", 60, minimum=1, maximum=3600
+            )
+            velocity_limit = _env_int(
+                "S43_HEART_VELOCITY_LIMIT", 30, minimum=1, maximum=100_000
+            )
+            dedupe_ttl_seconds = _env_int(
+                "S43_HEART_DEDUPE_TTL_SECONDS", 300, minimum=1, maximum=86_400
+            )
+            corroboration_window_seconds = _env_int(
+                "S43_HEART_CORROBORATION_WINDOW_SECONDS",
+                300,
+                minimum=1,
+                maximum=86_400,
+            )
+            corroboration_min_signals_for_high = _env_int(
+                "S43_HEART_CORROBORATION_MIN_SIGNALS", 2, minimum=1, maximum=100
+            )
+
+        core_store = SentinelCoreStore(
+            CoreStoreConfig(
+                db_path=Path(
+                    _env_str(
+                        "S43_HEART_SQLITE_PATH",
+                        "sentinel43_state/heart.sqlite3",
+                    )
+                )
+            )
+        )
+        await asyncio.to_thread(core_store.initialize)
+
+        runtime.heart = build_heart_from_settings(
+            Settings(),
+            audit_store=runtime.audit_store,
+            core_store=core_store,
+            monitoring_manager=runtime.monitoring_manager,
+        )
+
+        if runtime.fenrir_instance is not None:
+            runtime.fenrir_instance.heart = runtime.heart
+
+        runtime.subsystems.mark_active(
+            SUBSYS_HEART,
+            f"Human-gated threat staging active (mode={resolved_default_mode}).",
+        )
+        logger.info("Heart (ThreatGovernor) started (mode=%s)", resolved_default_mode)
+    except Exception as exc:
+        runtime.heart = None
+        runtime.subsystems.mark_failed(
+            SUBSYS_HEART, f"Failed to start: {type(exc).__name__}"
+        )
+        if _env_bool("S43_HEART_REQUIRED", False):
+            raise
+        logger.error("Heart failed to start", exc_info=True)
+
+
 async def _start_reliability() -> None:
     """Build the event delivery reliability layer.
 
@@ -1998,6 +2143,7 @@ async def lifespan(api: FastAPI):
         await _start_audit_store()
         await _start_reliability()
         await _start_governance()
+        await _start_heart()
         await _register_remote_dispatch_handlers()
 
         # Registration failures are observable, but do not necessarily mean
@@ -2447,6 +2593,84 @@ async def governance_pending_reviews(
         "pending": pending,
         "timestamp": utc_now(),
     }
+
+
+@root_router.get("/governance/heart/pending")
+async def heart_pending_actions(
+    request: Request,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Threat assessments the Heart has staged, awaiting a human decision.
+
+    Distinct from /governance/pending (SystemOrchestrator's in-memory,
+    transaction-shaped reviews): the Heart's staged actions are durable rows
+    in its own SentinelCoreStore, sourced from detection-layer (Fenrir)
+    threat assessments rather than transactions. Kept as its own surface
+    rather than merged into /actions or /governance/pending, which have a
+    different, already-tested response shape.
+    """
+    await _require_operator(request)
+
+    if runtime.heart is None:
+        return {
+            "enabled": False,
+            "pending": [],
+            "timestamp": utc_now(),
+        }
+
+    try:
+        pending = await asyncio.to_thread(runtime.heart.list_pending, limit)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Heart service unavailable",
+        ) from exc
+
+    return {
+        "enabled": True,
+        "pending": pending,
+        "timestamp": utc_now(),
+    }
+
+
+@root_router.post("/governance/heart/actions/{action_id}/approve")
+async def heart_approve_action(
+    action_id: str,
+    body: DecisionBody,
+    request: Request,
+) -> dict[str, Any]:
+    operator = await _require_operator(request)
+    result = await _resolve_heart_decision(
+        action_id=action_id,
+        approved=True,
+        operator=operator,
+        reason=body.reason,
+    )
+    await _broadcast_dashboard_event(
+        "heart_action_status_changed",
+        {"decision": result},
+    )
+    return {"ok": True, "decision": result, "timestamp": utc_now()}
+
+
+@root_router.post("/governance/heart/actions/{action_id}/veto")
+async def heart_veto_action(
+    action_id: str,
+    body: DecisionBody,
+    request: Request,
+) -> dict[str, Any]:
+    operator = await _require_operator(request)
+    result = await _resolve_heart_decision(
+        action_id=action_id,
+        approved=False,
+        operator=operator,
+        reason=body.reason,
+    )
+    await _broadcast_dashboard_event(
+        "heart_action_status_changed",
+        {"decision": result},
+    )
+    return {"ok": True, "decision": result, "timestamp": utc_now()}
 
 
 # =============================================================================
