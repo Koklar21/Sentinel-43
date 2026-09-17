@@ -650,6 +650,14 @@ def check_compose_config(rep: Report, env_file: str, hostname: str,
                "env-operator only; real dashboard/API consumers never need "
                "it) must be rejected outside local/dev")
 
+    heart = env.get("S43_HEART_ENABLED", "")
+    rep.record(PASS if _is_explicitly_true(heart) else FAIL,
+               "S43_HEART_ENABLED is true for this non-local target",
+               "the Heart (human-governed threat-assessment staging, "
+               "core/governance/heart.py) must be explicitly enabled for a "
+               "controlled-beta target -- missing, malformed, false, or "
+               "ambiguous values all fail this gate")
+
 
 def check_kube_prereqs(rep: Report, context: str, namespace: str) -> None:
     print("\n== kubernetes prerequisites ==")
@@ -702,6 +710,14 @@ def check_kube_prereqs(rep: Report, context: str, namespace: str) -> None:
                    "the per-request X-S43-Password fallback (break-glass/"
                    "env-operator only; real dashboard/API consumers never "
                    "need it) must be rejected outside local/dev")
+
+        heart = str(data.get("S43_HEART_ENABLED", ""))
+        rep.record(PASS if _is_explicitly_true(heart) else FAIL,
+                   "S43_HEART_ENABLED is true for this non-local target",
+                   "the Heart (human-governed threat-assessment staging, "
+                   "core/governance/heart.py) must be explicitly enabled "
+                   "for a controlled-beta target -- missing, malformed, "
+                   "false, or ambiguous values all fail this gate")
 
 
 # =============================================================================
@@ -983,61 +999,86 @@ _LEGACY_AUTH_CHECK_DETAIL = (
     "only; real dashboard/API consumers never need it) must be rejected "
     "outside local/dev"
 )
-_PRINTENV_LEGACY_AUTH = "printenv S43_REJECT_LEGACY_AUTH 2>/dev/null || true"
+
+_HEART_CHECK_NAME = (
+    "S43_HEART_ENABLED is true for the running target's actual process"
+)
+_HEART_CHECK_DETAIL = (
+    "the Heart (human-governed threat-assessment staging, "
+    "core/governance/heart.py) must be enabled on the live process, not "
+    "just in the ConfigMap/.env it was deployed from"
+)
 
 
-def check_compose_legacy_auth_runtime(rep: Report, project: str, env_file: str,
-                                      files: list[str]) -> None:
-    """Verify-phase companion to check_compose_config's prepare-phase check.
-
-    A target can drift after deploy (an operator edits .env and restarts
-    the proxy but not s43-api, a stale container image, a rollback) so a
+def _check_compose_env_var_runtime(rep: Report, project: str, env_file: str,
+                                   files: list[str], *, env_var: str,
+                                   check_name: str, check_detail: str) -> None:
+    """Shared verify-phase runtime inspection for one boolean env var,
+    inside the live s43-api Compose container rather than any file on disk
+    -- a target can drift after deploy (an operator edits .env and
+    restarts the proxy but not s43-api, a stale image, a rollback), so a
     prepare-phase pass against the repo's own .env is not evidence about
-    what the currently-running s43-api process actually has. This inspects
-    the live container's own environment instead of any file on disk.
+    what the currently-running process actually has.
     """
-    print("\n== compose runtime: effective S43_REJECT_LEGACY_AUTH ==")
     base = compose_base_cmd(project, env_file, files)
-    rc, out = _run(base + ["exec", "-T", "s43-api", "sh", "-c", _PRINTENV_LEGACY_AUTH])
+    printenv_cmd = f"printenv {env_var} 2>/dev/null || true"
+    rc, out = _run(base + ["exec", "-T", "s43-api", "sh", "-c", printenv_cmd])
     if rc != 0:
-        rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+        rep.record(INCOMPLETE, check_name,
                    f"could not inspect the running s43-api container: "
                    f"{out.strip()[:120]}")
         return
     rep.record(PASS if _is_explicitly_true(out.strip()) else FAIL,
-               _LEGACY_AUTH_CHECK_NAME, _LEGACY_AUTH_CHECK_DETAIL)
+               check_name, check_detail)
 
 
-def check_kube_legacy_auth_runtime(rep: Report, context: str, namespace: str) -> None:
-    """Verify-phase companion to check_kube_prereqs's prepare-phase check.
+def check_compose_legacy_auth_runtime(rep: Report, project: str, env_file: str,
+                                      files: list[str]) -> None:
+    """Verify-phase companion to check_compose_config's prepare-phase check."""
+    print("\n== compose runtime: effective S43_REJECT_LEGACY_AUTH ==")
+    _check_compose_env_var_runtime(
+        rep, project, env_file, files, env_var="S43_REJECT_LEGACY_AUTH",
+        check_name=_LEGACY_AUTH_CHECK_NAME, check_detail=_LEGACY_AUTH_CHECK_DETAIL)
 
-    check_kube_prereqs only reads the ConfigMap the operator intends to
-    deploy -- a running pod started before a `kubectl apply` (no rollout
-    triggered, e.g. an unrelated field changed) can still be running with
-    an older ConfigMap's values. This execs into every actual running
-    s43-api pod and reads what that process was started with instead.
+
+def check_compose_heart_runtime(rep: Report, project: str, env_file: str,
+                                files: list[str]) -> None:
+    """Verify-phase companion to check_compose_config's S43_HEART_ENABLED check."""
+    print("\n== compose runtime: effective S43_HEART_ENABLED ==")
+    _check_compose_env_var_runtime(
+        rep, project, env_file, files, env_var="S43_HEART_ENABLED",
+        check_name=_HEART_CHECK_NAME, check_detail=_HEART_CHECK_DETAIL)
+
+
+def _check_kube_env_var_runtime(rep: Report, context: str, namespace: str, *,
+                                env_var: str, check_name: str,
+                                check_detail: str) -> None:
+    """Shared verify-phase runtime inspection for one boolean env var,
+    inside every actual running s43-api pod rather than the ConfigMap the
+    operator intends to deploy -- check_kube_prereqs only reads that
+    ConfigMap, but a running pod started before a `kubectl apply` (no
+    rollout triggered, e.g. an unrelated field changed) can still be
+    running with an older ConfigMap's values.
     """
-    print("\n== kubernetes runtime: effective S43_REJECT_LEGACY_AUTH ==")
     if not context or not namespace:
-        rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
-                   "pass --context and --namespace")
+        rep.record(INCOMPLETE, check_name, "pass --context and --namespace")
         return
     kc = ["kubectl", "--context", context, "-n", namespace]
+    printenv_cmd = f"printenv {env_var} 2>/dev/null || true"
 
     # Separate stdout/stderr: a successful `kubectl get` (rc=0) that also
     # writes a warning to stderr must not corrupt the JSON this parses from
     # stdout -- see _run_split()'s own docstring.
     rc, out, err = _run_split(kc + ["get", "pods", "-l", "app=s43-api", "-o", "json"])
     if rc != 0:
-        rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+        rep.record(INCOMPLETE, check_name,
                    f"could not list s43-api pods: {(err or out).strip()[:160]}")
         return
 
     try:
         root = json.loads(out)
     except ValueError as exc:
-        rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
-                   f"unparseable pod list: {exc}")
+        rep.record(INCOMPLETE, check_name, f"unparseable pod list: {exc}")
         return
 
     # `kubectl get ... -o json` is expected to return a single List object
@@ -1046,13 +1087,13 @@ def check_kube_legacy_auth_runtime(rep: Report, context: str, namespace: str) ->
     # {"items": null}, a non-object item, ...) must report INCOMPLETE, not
     # raise AttributeError/TypeError out of this preflight check.
     if not isinstance(root, dict):
-        rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+        rep.record(INCOMPLETE, check_name,
                    f"unexpected pod list shape: expected a JSON object, "
                    f"got {type(root).__name__}")
         return
     items = root.get("items")
     if not isinstance(items, list):
-        rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+        rep.record(INCOMPLETE, check_name,
                    f"unexpected pod list shape: 'items' is "
                    f"{type(items).__name__}, expected a list")
         return
@@ -1068,26 +1109,26 @@ def check_kube_legacy_auth_runtime(rep: Report, context: str, namespace: str) ->
     pods: list[str] = []
     for item in items:
         if not isinstance(item, dict):
-            rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+            rep.record(INCOMPLETE, check_name,
                        "unexpected pod list shape: a pod entry is not a "
                        "JSON object")
             return
         metadata, status = item.get("metadata"), item.get("status")
         if not isinstance(metadata, dict) or not isinstance(status, dict):
-            rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+            rep.record(INCOMPLETE, check_name,
                        "unexpected pod list shape: metadata/status is not "
                        "a JSON object")
             return
         name = metadata.get("name")
         if not isinstance(name, str) or not name:
-            rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+            rep.record(INCOMPLETE, check_name,
                        "unexpected pod list shape: a pod has no valid name")
             return
         if status.get("phase") == "Running" and not metadata.get("deletionTimestamp"):
             pods.append(name)
 
     if not pods:
-        rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+        rep.record(INCOMPLETE, check_name,
                    "no non-terminating Running s43-api pod found")
         return
 
@@ -1100,7 +1141,7 @@ def check_kube_legacy_auth_runtime(rep: Report, context: str, namespace: str) ->
     inspection_failed: list[str] = []
     for pod in pods:
         rc, out = _run(kc + [
-            "exec", pod, "-c", "s43-api", "--", "sh", "-c", _PRINTENV_LEGACY_AUTH,
+            "exec", pod, "-c", "s43-api", "--", "sh", "-c", printenv_cmd,
         ])
         if rc != 0:
             inspection_failed.append(pod)
@@ -1109,14 +1150,30 @@ def check_kube_legacy_auth_runtime(rep: Report, context: str, namespace: str) ->
             failing.append(pod)
 
     if failing:
-        rep.record(FAIL, _LEGACY_AUTH_CHECK_NAME,
-                   f"{_LEGACY_AUTH_CHECK_DETAIL} (failing pod(s): {', '.join(failing)})")
+        rep.record(FAIL, check_name,
+                   f"{check_detail} (failing pod(s): {', '.join(failing)})")
         return
     if inspection_failed:
-        rep.record(INCOMPLETE, _LEGACY_AUTH_CHECK_NAME,
+        rep.record(INCOMPLETE, check_name,
                    f"could not exec into pod(s): {', '.join(inspection_failed)}")
         return
-    rep.record(PASS, _LEGACY_AUTH_CHECK_NAME, _LEGACY_AUTH_CHECK_DETAIL)
+    rep.record(PASS, check_name, check_detail)
+
+
+def check_kube_legacy_auth_runtime(rep: Report, context: str, namespace: str) -> None:
+    """Verify-phase companion to check_kube_prereqs's prepare-phase check."""
+    print("\n== kubernetes runtime: effective S43_REJECT_LEGACY_AUTH ==")
+    _check_kube_env_var_runtime(
+        rep, context, namespace, env_var="S43_REJECT_LEGACY_AUTH",
+        check_name=_LEGACY_AUTH_CHECK_NAME, check_detail=_LEGACY_AUTH_CHECK_DETAIL)
+
+
+def check_kube_heart_runtime(rep: Report, context: str, namespace: str) -> None:
+    """Verify-phase companion to check_kube_prereqs's S43_HEART_ENABLED check."""
+    print("\n== kubernetes runtime: effective S43_HEART_ENABLED ==")
+    _check_kube_env_var_runtime(
+        rep, context, namespace, env_var="S43_HEART_ENABLED",
+        check_name=_HEART_CHECK_NAME, check_detail=_HEART_CHECK_DETAIL)
 
 
 # =============================================================================
@@ -1179,6 +1236,8 @@ def run(args: argparse.Namespace) -> int:
                                   args.compose_files)
             check_compose_legacy_auth_runtime(rep, args.project, args.env_file,
                                               args.compose_files)
+            check_compose_heart_runtime(rep, args.project, args.env_file,
+                                        args.compose_files)
     else:
         if args.phase == "prepare":
             check_tools(rep, ["kubectl", "openssl"])
@@ -1192,6 +1251,7 @@ def run(args: argparse.Namespace) -> int:
                                args.from_external_host)
             check_kube_runtime(rep, args.context, args.namespace)
             check_kube_legacy_auth_runtime(rep, args.context, args.namespace)
+            check_kube_heart_runtime(rep, args.context, args.namespace)
 
     code = rep.exit_code()
     s = rep.summary()
