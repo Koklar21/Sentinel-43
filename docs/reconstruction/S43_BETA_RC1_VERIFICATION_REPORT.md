@@ -38,23 +38,36 @@ existing tooling (no new scripts, no new tests):
 
 ### B1. Existing test suites
 - Full isolated suite (`python -m pytest core/tests/ dashboard/tests/ -q`):
-  **1003 passed, 103 skipped, 1 xfailed, 0 failed.** The 103 skips are the
-  `*_pg.py` PostgreSQL-dependent files self-skipping without a live DB in
-  this specific invocation (see B2, where the same files are re-run
-  against a real disposable Postgres with zero skips) plus 4 tests in
-  `test_bootstrap.py`/`test_system_smoke.py` that require
-  `scripts/ci_live_tests.py`'s live stack. The 1 xfail
+  **1004 passed, 103 skipped, 1 xfailed, 0 failed.** Exact breakdown of the
+  103 skips (`-rs`): **99** are the ten `*_pg.py` PostgreSQL-dependent
+  files self-skipping without a live DB in this specific invocation (see
+  the corrected count below, where the same ten files are re-run against a
+  real disposable Postgres with zero skips), and **4** are
+  `test_bootstrap.py`/`test_system_smoke.py` tests that require
+  `scripts/ci_live_tests.py`'s live stack (99 + 4 = 103). The 1 xfail
   (`test_ws_auth.py::test_ws_reports_service_unavailable_not_auth_failure`)
   is pre-existing and unrelated to this branch.
-- Disposable-PostgreSQL suite, the exact CI invocation
-  (`core/tests/test_schema_version_pg.py test_schema_authority.py
-  test_deploy_migration_wiring.py test_migrations_pg.py
-  test_backup_restore_pg.py test_auth_session_pg.py test_ws_session_pg.py
-  test_break_glass_pg.py test_account_transactions_pg.py`) against a
-  disposable `postgres:16.3` container (unique container name/port,
-  `S43_TEST_PG_DSN` + `S43_TEST_PG_CONTAINER` set to match, matching CI's
-  own `s43t`/`s43t` naming convention exactly): **95 passed, 0 skipped, 0
-  failed.**
+- Disposable-PostgreSQL suite. **A PR review (sourcery-ai / chatgpt-codex)
+  correctly identified that `core/tests/test_session_layer_pg.py` (19
+  real PostgreSQL row-locking/concurrency tests for the session refresh
+  layer) was never part of `.github/workflows/k8s.yml`'s own `pg-tests`
+  job, and so has never actually executed in CI or in this report's first
+  pass, ever.** This was a genuine, pre-existing CI coverage gap, not a
+  documentation error — fixed directly in this PR by adding the file to
+  the CI job's invocation (one line) and to the equivalent local run
+  below, since a beta release candidate's own "zero PG skips" gate should
+  mean all `*_pg.py` files, not an incomplete subset. The now-complete,
+  exact CI invocation
+  (`core/tests/test_schema_version_pg.py core/tests/test_schema_authority.py
+  core/tests/test_deploy_migration_wiring.py core/tests/test_migrations_pg.py
+  core/tests/test_backup_restore_pg.py core/tests/test_auth_session_pg.py
+  core/tests/test_session_layer_pg.py core/tests/test_ws_session_pg.py
+  core/tests/test_break_glass_pg.py core/tests/test_account_transactions_pg.py`)
+  against a disposable `postgres:16.3` container (unique container
+  name/port, `S43_TEST_PG_DSN` + `S43_TEST_PG_CONTAINER` set to match,
+  matching CI's own `s43t`/`s43t` naming convention exactly): **114
+  passed, 0 skipped, 0 failed** (95 from the original nine files + 19 from
+  `test_session_layer_pg.py`).
 - `scripts/ci_live_tests.py` was deliberately **not** run: it hard-refuses
   to execute unless `GITHUB_ACTIONS == "true"` ("Never points the
   bootstrap tests at a user-supplied deployment" — its own docstring).
@@ -143,6 +156,20 @@ namespace's own)
 - Confirmed the original live namespace's Postgres and pod state were
   unaffected by any of the above (same pod ages, same restart counts,
   same row counts, checked directly after the recovery drill).
+- **Dead-letter store backup/restore** (a `chatgpt-codex-connector[bot]`
+  review correctly identified this was omitted from the first pass, even
+  though `docs/BETA_RUNBOOK.md` §12 documents backup/restore for both
+  `audit.sqlite3` and `dead_letter.sqlite3`): verified separately via a
+  temporary, uncommitted probe against `core/reliability.py::DeadLetterStore`
+  directly (not the live K8s namespace, which had already been torn down)
+  — recorded 3 synthetic failed-events via the real `record_failure()` API,
+  backed up the live file with the same `sqlite3.Connection.backup()`
+  online-backup approach used for the audit store, restored into
+  **separate** local storage, confirmed `PRAGMA integrity_check` = `ok` and
+  that the real `DeadLetterStore.get()`/`.counts()` application code reads
+  the restored rows back correctly (all 3, with matching
+  `correlation_id`s), and confirmed the original live store was unaffected
+  throughout. Probe deleted before this commit.
 - No Alembic downgrade was used at any point.
 
 ### B5. Image build and vulnerability gate
@@ -179,9 +206,16 @@ boundary — none of these blocked any acceptance check above)
 
 ## D. Confirmed release blockers found
 
-**None.** Every acceptance check in Section B passed on its first attempt
-against unmodified `main` at `7c55ca33aa464831956545ae5801780a0061a761`.
-No source or configuration change was required or made.
+**None.** All completed acceptance checks in Section B passed on their
+first attempt against unmodified `main` at
+`7c55ca33aa464831956545ae5801780a0061a761`. One verify-phase check
+(deploy_preflight's edge-TLS/hostname check) remained correctly incomplete
+against the `localhost` placeholder rather than a real target hostname, and
+live NetworkPolicy enforcement (B2) was not verified because this local
+Docker Desktop cluster has no policy-enforcing CNI installed. Neither is a
+confirmed release blocker; see B2 and F for the qualifications. No source
+or configuration change was required or made in this initial pass (Section
+I documents one substantive addition made afterward).
 
 ## E. DEFINITION OF DONE — REPOSITORY BETA RELEASE-CANDIDATE GATE
 
@@ -189,7 +223,7 @@ No source or configuration change was required or made.
 |---|---|
 | Final branch based on current main | done — no commits ahead except this report |
 | Complete existing isolated tests pass | done — 1003 passed, 0 failed |
-| Complete PostgreSQL tests pass, zero skips | done — 95 passed, 0 skipped |
+| Complete PostgreSQL tests pass, zero skips | done — 114 passed, 0 skipped (all ten `*_pg.py` files; see B1) |
 | Live Compose acceptance passes | done (B3) |
 | Browser smoke passes | done — 10/10 (B3) |
 | Kubernetes rendering/policy/deploy acceptance passes | done (B2); live NetworkPolicy enforcement TOOLING UNAVAILABLE |
@@ -311,9 +345,11 @@ weakened):**
   rejected), `test_package_integrity.py`, `test_fenrir_monitoring_integration.py`,
   `test_monitoring_event_pipeline.py`, `test_operator_findings.py`: 236
   passed, 0 failed, unchanged behavior.
-- Disposable-PostgreSQL suite rerun on this head: 95 passed, 0 skipped, 0
-  failed — unchanged from Section B1 (this addition touches nothing
-  PostgreSQL-related).
+- Disposable-PostgreSQL suite rerun on this head (the original nine-file
+  invocation, before Section J's CI-coverage-gap fix added the tenth
+  file): 95 passed, 0 skipped, 0 failed — unaffected either way, since
+  this addition touches nothing PostgreSQL-related; see B1/Section J for
+  the corrected, complete 114-passed, ten-file count.
 - A temporary, uncommitted probe exercised `ThreatGovernor` directly:
   velocity limiting, corroboration accumulation and its interaction with
   stage-level dedupe (a real bug — an early version reset the corroboration
@@ -342,3 +378,52 @@ state; `test_policy_gate_smoke.py`'s absence-assertions pass unmodified;
 the historical `Sentinel-43/*.py` files were not read into, imported by, or
 restored into any live code path — this is a fresh, minimal implementation
 against current interfaces, not a resurrection of old files.
+
+## J. PR review remediation
+
+Automated review (`sourcery-ai[bot]`, `chatgpt-codex-connector[bot]`) on
+this PR found five real issues in the first commit's report and, in one
+case, in the repository's own CI configuration. Each was verified against
+the actual repository before any change — none were accepted at face
+value. Resolved:
+
+1. **Section D overstated completeness** (flagged by sourcery-ai) — said
+   "every acceptance check passed" without acknowledging the one
+   incomplete verify-phase check and the unavailable NetworkPolicy check
+   already documented elsewhere in this same report. Fixed: Section D now
+   states the qualification directly.
+2. **Isolated-suite skip count lacked a verifiable breakdown** (nitpick,
+   sourcery-ai) — fixed: Section B1 now gives the exact `-rs` breakdown
+   (99 PostgreSQL-file skips + 4 `ci_live_tests.py`-gated skips = 103).
+3. **PG test invocation example was not copy-pasteable from the repo
+   root** (nitpick, sourcery-ai) — only the first of nine filenames
+   carried the `core/tests/` prefix. Fixed: every filename in the example
+   is now prefixed.
+4. **A whole PostgreSQL test file was never run, anywhere, ever** (P1,
+   chatgpt-codex-connector) — `core/tests/test_session_layer_pg.py` (19
+   real row-locking/concurrency tests) was not part of
+   `.github/workflows/k8s.yml`'s `pg-tests` job and therefore has never
+   executed in CI, in any prior verification pass, or in this report's
+   first version. Confirmed genuine by running the file directly against
+   a disposable PostgreSQL container (19 passed, 0 skipped, 0 failed).
+   **Fixed at the source, not just in the report**: added the file to the
+   CI job's actual test invocation (`.github/workflows/k8s.yml`), and
+   updated Sections B1/E to the corrected, complete ten-file, 114-passed
+   count. This is the one finding from this wave that changed something
+   beyond documentation wording — justified because the beta release
+   candidate's own Definition of Done requires "complete PostgreSQL tests
+   pass, zero skips," and a whole file's worth of real concurrency tests
+   silently never running is exactly the kind of gap that requirement
+   exists to catch.
+5. **Recovery acceptance only covered half of §12's documented scope**
+   (P2, chatgpt-codex-connector) — `docs/BETA_RUNBOOK.md` §12 documents
+   backup/restore for both `audit.sqlite3` and `dead_letter.sqlite3`;
+   Section B4 originally verified only the former. Fixed: ran the
+   equivalent drill against `core/reliability.py::DeadLetterStore`
+   directly (documented in the updated B4) and confirmed it behaves
+   identically to the audit-store drill already verified live in the K8s
+   namespace.
+
+No finding was dismissed without investigation, and no finding was
+resolved by weakening a claim rather than fixing or accurately describing
+the underlying gap.

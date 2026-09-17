@@ -197,6 +197,7 @@ jobs:
           core/tests/test_migrations_pg.py
           core/tests/test_backup_restore_pg.py
           core/tests/test_auth_session_pg.py
+          core/tests/test_session_layer_pg.py
           core/tests/test_ws_session_pg.py
           core/tests/test_break_glass_pg.py
           core/tests/test_account_transactions_pg.py
