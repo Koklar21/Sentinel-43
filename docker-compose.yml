@@ -209,6 +209,12 @@ services:
       S43_GOVERNANCE_ENABLED: ${S43_GOVERNANCE_ENABLED:-false}
       S43_DEFAULT_MODE: ${S43_DEFAULT_MODE:-HUMAN_GATED}
 
+      # Heart (human-governed threat-assessment staging, core/governance/heart.py).
+      # Set S43_HEART_ENABLED=true in .env for a beta Compose deployment --
+      # local dev stays disabled by this same default (false) that
+      # core/api/main.py::_start_heart already applies at the code level.
+      S43_HEART_ENABLED: ${S43_HEART_ENABLED:-false}
+
       # Fenrir
       S43_FENRIR_ENABLED: ${S43_FENRIR_ENABLED:-true}
       S43_FENRIR_NODE_ID: ${S43_FENRIR_NODE_ID:-sentinel-43-primary}

@@ -48,6 +48,22 @@
 # are unaffected -- this overlay is what actually turns it off for beta.
 # scripts/deploy_preflight.py's "verify" mode now fails a beta/non-local
 # target that still permits legacy auth, matching this.
+#
+# S43_HEART_ENABLED: "true" here, and only here. The Heart
+# (core/governance/heart.py::ThreatGovernor) is the human-governed
+# threat-assessment staging pipeline: OBSERVE -> ASSESS -> DEDUPLICATE ->
+# CORROBORATE -> STAGE -> WAIT FOR HUMAN DECISION. The code-level default
+# stays false (core/api/main.py::_start_heart) so local dev and the
+# existing test suite are unaffected -- this overlay is what turns it on
+# for beta. It requires the authoritative audit store, which base's own
+# non-local startup validation already makes mandatory regardless of this
+# flag (core/api/main.py::_start_audit_store), so no additional secret is
+# needed beyond what beta already requires. Required by default
+# (S43_HEART_REQUIRED, code-level default true) once enabled: if it fails
+# to start, /ready reports 503 rather than silently serving without
+# human-governed staging. scripts/deploy_preflight.py's "prepare" mode
+# fails a beta/non-local target that leaves this unset or not explicitly
+# "true"; "verify" mode inspects the effective value inside the live pod.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -59,3 +75,4 @@ data:
   S43_ALLOWED_ORIGINS: "https://beta.example.invalid"   # CHANGEME -> https://<your host>
   S43_TLS_TERMINATED_AT_TRUSTED_EDGE: "true"
   S43_REJECT_LEGACY_AUTH: "true"
+  S43_HEART_ENABLED: "true"
