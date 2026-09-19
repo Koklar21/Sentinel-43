@@ -612,16 +612,22 @@ mode exists in the live `core/` runtime path; historical quarantined
 prototypes still contain those concepts but are neither shipped nor executed.
 
 **WebSocket.** An unavailable authentication/session backend now closes the
-socket with code 1008 and reason `service_unavailable` (previously code 1011,
-reason `auth_service_unavailable`, whose text matched the dashboard's
-auth-failure heuristic). Credential/session failures keep their existing
-reasons.
+socket with code 1011 (server error) and reason `service_unavailable`
+(previously code 1011, reason `auth_service_unavailable`, whose text matched
+the dashboard's `auth|token|password|credential|session|login` heuristic and
+so could be classified as a client authentication failure). Code 1011 is
+retained deliberately: the dashboard reconnects with backoff after 1011 but
+never after 1008. Genuine credential/session failures keep code 1008 and their
+existing reasons. Every outage path still fails closed: the socket is closed
+before the client is registered or any event is delivered.
+
 The one xfailed test described in Section B1 as pre-existing
 (`core/tests/test_ws_auth.py::test_ws_reports_service_unavailable_not_auth_failure`)
-now XPASSes. Its `xfail(strict=False)` marker and stale reason text remain in
-that test file, unmodified by this pass under the no-test-changes policy; the
-owner may remove the marker separately. The Section B1 counts remain evidence
-for the SHA they were run against.
+remains XFAIL. It pins close code 1008 for this outage, which would suppress
+dashboard reconnect after a transient outage; production behavior was not
+changed to satisfy it. The test file is unmodified under the no-test-changes
+policy, and the owner may correct or remove that xfail separately. The
+Section B1 counts remain evidence for the SHA they were run against.
 
 **Readiness tiers — distinct, and none is established by this report:**
 
