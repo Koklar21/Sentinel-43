@@ -122,6 +122,15 @@ Thumbs.db
 *.rar
 
 # -----------------------------------------------------------------------------
+# Historical design prototypes (preserved in git, NOT part of the runtime).
+# The nested Sentinel-43/ directory contains superseded Heart/Shadow files
+# whose design history includes ACTIVE / AUTONOMOUS_VETO concepts that are
+# prohibited from the live runtime. They must never ship inside an image.
+# See Sentinel-43/README.md.
+# -----------------------------------------------------------------------------
+Sentinel-43/
+
+# -----------------------------------------------------------------------------
 # Local developer tooling (gitignored, machine-local -- CI's fresh checkout
 # never has this directory, but a local build on a machine that does would
 # otherwise COPY these straight into the image). Found via a local Trivy
