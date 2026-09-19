@@ -323,16 +323,6 @@ def test_ws_rejects_valid_token_wrong_password(client: TestClient):
         _expect_rejection(ws, expected_error_substring="invalid password")
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Current WS handler closes a reverify 503 with code 1011 and reason "
-        "'auth_service_unavailable' -- the reason still matches the client's "
-        "auth|token|... heuristic, so an outage is still classifiable as an "
-        "auth failure. Production-side fix (outage-flavoured close reason) is "
-        "tracked separately; this test pins the intended behaviour."
-    ),
-    strict=False,
-)
 def test_ws_reports_service_unavailable_not_auth_failure(client: TestClient):
     """
     P0 security remediation, item 2: reverify_password() now raises
@@ -343,6 +333,11 @@ def test_ws_reports_service_unavailable_not_auth_failure(client: TestClient):
     auth|token|password|credential|session|login) will NOT classify as an
     auth failure, so the client doesn't misreport "wrong password" for a
     backend outage.
+
+    The close code must be 1011 (server error), not 1008 (policy violation):
+    websocket.js reconnects with backoff after 1011 but never after 1008
+    (NO_RECONNECT_CODES), so a transient outage must not permanently
+    disconnect the dashboard. The connection is closed fail-closed either way.
     """
     from fastapi import HTTPException
 
@@ -365,7 +360,7 @@ def test_ws_reports_service_unavailable_not_auth_failure(client: TestClient):
             assert "unavailable" in frame["payload"]["error"].lower()
             with pytest.raises(WebSocketDisconnect) as exc_info:
                 ws.receive_text()
-            assert exc_info.value.code == 1008
+            assert exc_info.value.code == 1011
             reason = exc_info.value.reason or ""
             assert reason == "service_unavailable"
             import re
