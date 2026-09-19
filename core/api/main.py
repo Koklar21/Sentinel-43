@@ -904,6 +904,14 @@ async def _resolve_governance_and_commit_action(
 # WebSocket manager
 # =============================================================================
 
+# Close reason used when the authentication/session BACKEND is unavailable
+# (a platform outage, not a bad credential). It deliberately contains none of
+# auth|token|password|credential|session|login, which the dashboard
+# (websocket.js _reasonIndicatesAuthFailure) treats as a client auth failure.
+# Every use fails closed: the connection is closed, never authenticated.
+WS_REASON_AUTH_BACKEND_UNAVAILABLE = "service_unavailable"
+
+
 async def _ws_safe_close(
     websocket: WebSocket,
     code: int = 1008,
@@ -1078,7 +1086,7 @@ async def _session_still_valid(
             client.sid,
             exc_info=True,
         )
-        return False, "auth_service_unavailable"
+        return False, WS_REASON_AUTH_BACKEND_UNAVAILABLE
 
 
 # =============================================================================
@@ -2856,8 +2864,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 )
                 await _ws_safe_close(
                     websocket,
-                    code=1011,
-                    reason="auth_service_unavailable",
+                    reason=WS_REASON_AUTH_BACKEND_UNAVAILABLE,
                 )
                 return
 
@@ -2925,8 +2932,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                     )
                     await _ws_safe_close(
                         websocket,
-                        code=1011,
-                        reason="auth_service_unavailable",
+                        reason=WS_REASON_AUTH_BACKEND_UNAVAILABLE,
                     )
                     return
 
@@ -2978,9 +2984,6 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                     await _ws_send_error_then_close(
                         websocket,
                         error=reason,
-                        code=1011
-                        if reason == "auth_service_unavailable"
-                        else 1008,
                         reason=reason,
                     )
                     return
@@ -3000,9 +3003,6 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 await _ws_send_error_then_close(
                     websocket,
                     error=reason,
-                    code=1011
-                    if reason == "auth_service_unavailable"
-                    else 1008,
                     reason=reason,
                 )
                 return
