@@ -904,12 +904,23 @@ async def _resolve_governance_and_commit_action(
 # WebSocket manager
 # =============================================================================
 
-# Close reason used when the authentication/session BACKEND is unavailable
-# (a platform outage, not a bad credential). It deliberately contains none of
-# auth|token|password|credential|session|login, which the dashboard
-# (websocket.js _reasonIndicatesAuthFailure) treats as a client auth failure.
+# Close contract when the authentication/session BACKEND is unavailable (a
+# platform outage, not a bad credential):
+#   - reason contains none of auth|token|password|credential|session|login,
+#     which the dashboard (websocket.js _reasonIndicatesAuthFailure) treats as
+#     a client authentication failure;
+#   - code is 1011 (server error), NOT 1008 (policy violation): the dashboard
+#     reconnects with backoff after 1011 but never after 1008, so a transient
+#     outage must not permanently disconnect the client.
 # Every use fails closed: the connection is closed, never authenticated.
 WS_REASON_AUTH_BACKEND_UNAVAILABLE = "service_unavailable"
+WS_CLOSE_AUTH_BACKEND_UNAVAILABLE = 1011
+
+
+def _ws_close_code_for_reason(reason: str) -> int:
+    if reason == WS_REASON_AUTH_BACKEND_UNAVAILABLE:
+        return WS_CLOSE_AUTH_BACKEND_UNAVAILABLE
+    return 1008
 
 
 async def _ws_safe_close(
@@ -2864,6 +2875,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 )
                 await _ws_safe_close(
                     websocket,
+                    code=WS_CLOSE_AUTH_BACKEND_UNAVAILABLE,
                     reason=WS_REASON_AUTH_BACKEND_UNAVAILABLE,
                 )
                 return
@@ -2932,6 +2944,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                     )
                     await _ws_safe_close(
                         websocket,
+                        code=WS_CLOSE_AUTH_BACKEND_UNAVAILABLE,
                         reason=WS_REASON_AUTH_BACKEND_UNAVAILABLE,
                     )
                     return
@@ -2984,6 +2997,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                     await _ws_send_error_then_close(
                         websocket,
                         error=reason,
+                        code=_ws_close_code_for_reason(reason),
                         reason=reason,
                     )
                     return
@@ -3003,6 +3017,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 await _ws_send_error_then_close(
                     websocket,
                     error=reason,
+                    code=_ws_close_code_for_reason(reason),
                     reason=reason,
                 )
                 return
