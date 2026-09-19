@@ -8,10 +8,14 @@ readiness statement.
 ## A. Release candidate identity
 
 - Source git SHA this branch is based on: `origin/main` at
-  `7c55ca33aa464831956545ae5801780a0061a761`, unchanged throughout this
-  release-candidate pass. Section I below documents one substantive addition
-  made on this branch after the initial zero-defect verification pass
-  recorded in Sections B–H: reconnecting the "Heart" governance subsystem.
+  `7c55ca33aa464831956545ae5801780a0061a761`, unchanged throughout the
+  original verification pass (Sections B–H, 2026-09-17). That pass made no
+  source or configuration change. Sections I–K document substantive source,
+  CI and configuration changes made on this branch AFTER that pass: reconnecting
+  the "Heart" governance subsystem, one CI workflow fix, and making the Heart
+  fail-closed and usable in the beta profile. Sections B–H are point-in-time
+  evidence tied to the SHA above; the merged post-RC state is recorded in
+  Section L.
 - Application version: no authoritative version number exists in this repo
   (`pyproject.toml`'s `version = "0.1.0"` is explicitly a template snippet,
   not confirmed live project metadata). README.md labels the current build
@@ -221,7 +225,7 @@ I documents one substantive addition made afterward).
 
 | Requirement | Status |
 |---|---|
-| Final branch based on current main | done — no commits ahead except this report |
+| Final branch based on current main | point-in-time (2026-09-17): done, the only commit ahead was this report. Superseded by Section L (later commits, rebase-merged) |
 | Complete existing isolated tests pass | done — 1003 passed, 0 failed |
 | Complete PostgreSQL tests pass, zero skips | done — 114 passed, 0 skipped (all ten `*_pg.py` files; see B1) |
 | Live Compose acceptance passes | done (B3) |
@@ -233,8 +237,8 @@ I documents one substantive addition made afterward).
 | Non-local docs exposure closed | done, verified live (B2) |
 | Internal services remain internal | done, verified live (B2/B5) |
 | No unresolved confirmed P0/P1 beta blocker | none found |
-| All hosted CI jobs run against the final head | pending push — see PR |
-| Branch conflict-free and rebase-mergeable | yes — no commits ahead of main besides this report |
+| All hosted CI jobs run against the final head | point-in-time (2026-09-17, before push): pending. Post-merge outcome: see Section L |
+| Branch conflict-free and rebase-mergeable | point-in-time (2026-09-17): yes, at that moment the only commit ahead of main was this report. Superseded — the branch later gained the Section I–K commits and was rebase-merged (Section L) |
 
 ## F. What this report does not establish
 
@@ -290,9 +294,12 @@ they were). Reused as-is: `core/audit/store.py::AuditStore`,
 never wired to anything), and `core/detection/sentinel_threat_types.py`'s
 live `ThreatAssessment` type. New: `core/governance/heart.py::ThreatGovernor`
 — a sibling to `SystemOrchestrator` reusing its exact `GovernanceMode`
-(`SHADOW`/`HUMAN_GATED` — there is no third mode; `AUTONOMOUS_VETO`/`ACTIVE`
-does not exist anywhere in live code and is regression-tested absent by
-`core/tests/test_policy_gate_smoke.py`).
+(`SHADOW`/`HUMAN_GATED` — there is no third mode). `AUTONOMOUS_VETO`/`ACTIVE`
+does not exist anywhere in the live `core/` runtime path and is
+regression-tested absent there by `core/tests/test_policy_gate_smoke.py`.
+Historical, quarantined prototypes under `Sentinel-43/` still contain those
+concepts; they are preserved as design history, are not imported or executed
+by any live code, and are excluded from application images (see Section L).
 
 **State machine implemented, and nothing beyond it:**
 OBSERVE → ASSESS (dedupe + corroboration + rate limit) → RECOMMEND → STAGE
@@ -308,10 +315,13 @@ fold into this release.
 - `core/governance/composition.py::build_heart_from_settings()` — mirrors
   `build_orchestrator_from_settings()`.
 - `core/api/main.py::_start_heart()` — mirrors `_start_governance()`.
-  Gated behind `S43_HEART_ENABLED` (default `false`) and
-  `S43_HEART_REQUIRED` (default `false`): enabling it is an explicit
-  operator choice, never a silent behavior change from upgrading to this
-  release. Registers as subsystem `heart` in `SubsystemRegistry`
+  Gated behind `S43_HEART_ENABLED` (code default `false`; the beta overlay
+  sets it `true`) and `S43_HEART_REQUIRED`. As first written in this section
+  `S43_HEART_REQUIRED` defaulted to `false`; Section K corrected that, and the
+  current code default is `true` (`core/api/main.py`, matching
+  `S43_GOVERNANCE_REQUIRED`), so an enabled Heart that fails blocks `/ready`.
+  Enabling the Heart is an explicit operator choice, never a silent behavior
+  change from upgrading to this release. Registers as subsystem `heart` in `SubsystemRegistry`
   (`/ready`, `/system/status`).
 - `core/detection/feniri_hunter.py::FenrirHunter` gained an optional
   `self.heart` attribute (default `None`, set by the composition root only
@@ -365,14 +375,17 @@ weakened):**
   full observe → stage → resolve cycle through the real composition root
   (not just the unit-level class). Deleted before this commit.
 - Compose, Kubernetes, browser/Playwright, and image-build/vulnerability
-  results are unchanged from Sections B2–B5: this addition changes no
-  Dockerfile, dependency, Compose file, or Kubernetes manifest, is disabled
+  results are unchanged from Sections B2–B5 as of this section's own commit
+  (point-in-time; later sections did change CI and beta configuration): this
+  addition changes no Dockerfile, dependency, Compose file, or Kubernetes
+  manifest, is disabled
   by default, and the isolated suite (which imports and boots
   `core.api.main`) together with the two probes above already exercise the
   only code paths this change touches.
 
 **Non-goals held throughout, and still true after this change:** no
-`AUTONOMOUS_VETO`/`ACTIVE` mode value anywhere in new code; no
+`AUTONOMOUS_VETO`/`ACTIVE` mode value anywhere in new code or the live
+runtime path; no
 scheduler/timer/background thread transitions a staged action to a terminal
 state; `test_policy_gate_smoke.py`'s absence-assertions pass unmodified;
 the historical `Sentinel-43/*.py` files were not read into, imported by, or
@@ -558,7 +571,66 @@ FastAPI lifespan and `TestClient` (real JWT-based operator auth, real
 the same test policy honored throughout this task.
 
 **Non-goals held, unchanged from Section I:** still no `AUTONOMOUS_VETO`/
-`ACTIVE` mode anywhere, still no scheduler/timer/background thread that
+`ACTIVE` mode in the live runtime path (historical quarantined prototypes
+excepted — Section L), still no scheduler/timer/background thread that
 transitions a staged action to a terminal state on its own, still no real
 enforcement executor, still no historical `Sentinel-43/*.py` file read
 into or restored into any live path.
+
+## L. Post-merge reconciliation (2026-09-19)
+
+This section supersedes the pre-merge wording in Sections A, E, I and K where
+they differ, and records the repository's state after merge. Historical test
+counts elsewhere in this report are evidence tied to the exact source SHA that
+was verified at the time; they were not re-run or rewritten here.
+
+**Merge record.** PR #287 was merged into `main` by REBASE AND MERGE. A rebase
+merge rewrites commit SHAs, so the PR commits and the resulting `main` commits
+are different objects with identical content:
+
+| Item | SHA |
+|---|---|
+| Final tested PR #287 head (`release/beta-rc1-20260917`) | `54d911bf2ccbaceab339ca7d4c4f3b38719de14f` |
+| Resulting `main` head after the rebase-merge | `5a249e71cc46a6006eb884da9d16066057cf3d25` |
+| Git tree of both (`git rev-parse <sha>^{tree}`) | `b9c6431251347283a3a8d514a8fc30ba294e6d2d` |
+
+The PR-head tree and the merged-`main` tree are identical, so every file is
+blob-identical between the tested PR head and merged `main` (verified with
+`git rev-parse` on both trees and an empty `git diff --stat`).
+
+**Heart.** The live Heart is `core/governance/heart.py`. The beta overlay sets
+`S43_HEART_ENABLED=true`; `S43_HEART_REQUIRED` defaults to `true` in code, so
+when enabled a failed Heart blocks `/ready` while `/health` stays up.
+
+**Historical prototypes.** The nested `Sentinel-43/` directory is preserved
+unchanged as design history. It is not imported, launched or shipped by any
+live path: it is excluded from application images by `.dockerignore` and
+documented as non-runtime in `Sentinel-43/README.md`. It contains
+`ACTIVE`/`AUTONOMOUS_VETO` concepts, which are prohibited from the live
+runtime. The accurate statement is therefore: no `ACTIVE`/`AUTONOMOUS_VETO`
+mode exists in the live `core/` runtime path; historical quarantined
+prototypes still contain those concepts but are neither shipped nor executed.
+
+**WebSocket.** An unavailable authentication/session backend now closes the
+socket with code 1008 and reason `service_unavailable` (previously code 1011,
+reason `auth_service_unavailable`, whose text matched the dashboard's
+auth-failure heuristic). Credential/session failures keep their existing
+reasons.
+The one xfailed test described in Section B1 as pre-existing
+(`core/tests/test_ws_auth.py::test_ws_reports_service_unavailable_not_auth_failure`)
+now XPASSes. Its `xfail(strict=False)` marker and stale reason text remain in
+that test file, unmodified by this pass under the no-test-changes policy; the
+owner may remove the marker separately. The Section B1 counts remain evidence
+for the SHA they were run against.
+
+**Readiness tiers — distinct, and none is established by this report:**
+
+| Tier | Status |
+|---|---|
+| Repository beta release candidate | Repository-level acceptance recorded in Sections B–K |
+| Controlled-beta target verification | NOT DONE — no named target (Section G) |
+| Production readiness | NOT ESTABLISHED |
+| Public-sector readiness | NOT ESTABLISHED |
+
+README.md continues to classify the public project as "Late Alpha"; this
+report does not change that label.
