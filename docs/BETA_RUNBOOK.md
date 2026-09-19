@@ -520,9 +520,8 @@ peer is trusted, `X-Forwarded-For` is never honored, and every request is
 attributed to the ingress controller's own IP in the firewall/audit trail
 until you set the real CIDR. Never set this broader than the actual
 proxy's network (never `0.0.0.0/0`). See `docs/security/trusted_proxy_handling.md`
-for the full rationale — note that document's own prose about the
-placeholder string is stale relative to the actual YAML above; the YAML is
-the source of truth.
+for the full rationale (its prose about the beta overlay's value was
+reconciled with the YAML on 2026-09-19; the YAML remains the source of truth).
 
 `S43_TRUSTED_HOSTS` must keep `s43-api` alongside your real hostname (a
 ConfigMap patch replaces the whole value; dropping the in-cluster name
@@ -641,10 +640,15 @@ kubectl exec -n sentinel43 netpol-test -- timeout 5 nc -zv s43-db 5432    # must
 kubectl exec -n sentinel43 netpol-test -- timeout 5 nc -zv s43-core 9100  # must hang/fail
 kubectl delete pod netpol-test -n sentinel43
 ```
-This is a **manual** procedure — it is not run in CI today
-(`scripts/k8s_policy_check.py` only statically checks that NetworkPolicy
-objects exist and reference real selectors; it does not prove enforcement
-at runtime). Run it against your actual cluster's CNI before trusting the
+This is a **manual** procedure — it is not run in CI today.
+`scripts/k8s_policy_check.py` only statically checks that NetworkPolicy
+objects exist and reference real selectors, and the hosted `kind smoke deploy`
+job installs Calico and runs a *positive* smoke (rollout, `/ready`, posture
+assertions, health/bootstrap over the Host header) with the policies applied.
+Installing Calico and seeing the workload come up is **not** proof that
+forbidden connections are refused; no CI job runs the negative connectivity
+test above. (A one-time development run against a kind cluster with Calico is
+recorded in `deploy/kubernetes/README.md`, not in CI.) Run it against your actual cluster's CNI before trusting the
 policies are doing anything — enforcement depends on the CNI, not just the
 manifest.
 

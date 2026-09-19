@@ -73,14 +73,18 @@ proxy-trust control — a deployment behind a real reverse proxy sets **both**
 - In `deploy/kubernetes/`, `S43_TRUSTED_PROXIES` is left empty in the shared
   base and in the `dev` overlay (no ingress in dev — direct
   `kubectl port-forward` access, so there's no proxy to trust). The `beta`
-  overlay, which adds an Ingress, ships `S43_TRUSTED_PROXIES` as the
-  placeholder string `CHANGEME_SET_TO_YOUR_INGRESS_CONTROLLER_POD_CIDR` in
-  `deploy/kubernetes/overlays/beta/configmap-patch.yaml` — it is **not**
-  filled in with a real value, since ingress-controller pod CIDRs vary per
-  cluster/CNI and can't be guessed generically. As of Pass 2 that
-  placeholder is not a silent no-op: `_env_cidr_csv` rejects it as an
-  invalid CIDR and the API refuses to start (fail-closed) until an operator
-  replaces it with a real CIDR. See `deploy/kubernetes/README.md`.
+  overlay, which adds an Ingress, ships `S43_TRUSTED_PROXIES: ""` (empty) in
+  `deploy/kubernetes/overlays/beta/configmap-patch.yaml`, flagged
+  `# CHANGEME` — it is **not** filled in with a real value, since
+  ingress-controller pod CIDRs vary per cluster/CNI and can't be guessed
+  generically. Empty fails closed safely: no peer is trusted, `X-Forwarded-For`
+  is never honored, and every request is attributed to the ingress
+  controller's own address until an operator sets the real, narrow CIDR.
+  (An earlier revision shipped a non-CIDR placeholder string that made the API
+  refuse to start; that was replaced by the empty value, and this document was
+  corrected on 2026-09-19 to match the YAML, which is the source of truth.
+  A non-empty value that is not a valid CIDR is still rejected at startup.)
+  See `deploy/kubernetes/README.md`.
 
 ## What Pass 2 changed for existing deployments
 
