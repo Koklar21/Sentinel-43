@@ -32,7 +32,9 @@
 
 from __future__ import annotations
 
+import importlib
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any, Generator
 
@@ -87,6 +89,31 @@ JWT_ISSUER = os.environ["S43_JWT_ISSUER"]
 JWT_AUDIENCE = os.environ["S43_JWT_AUDIENCE"]
 
 WRONG_SECRET = "a-completely-different-secret-also-used-in-test-jwt-auth"
+
+# ---------------------------------------------------------------------------
+# setup_module -- re-applies this module's environment immediately before its
+# first test. The setdefault() calls above run once, at collection time. If
+# another module that mutates and later restores the same variables (e.g.
+# test_ws_auth.py, whose teardown_module pops any variable that was unset when
+# IT was imported and then reloads core.api.main) is collected first and runs
+# first, that teardown removes the JWT/env values this module depends on, and
+# the app's startup validation then fails before any assertion runs. Restoring
+# the same values this module already captured, and reloading main so its
+# module-level constants pick them up, makes this module independent of
+# collection/execution order without changing any assertion or production code.
+# ---------------------------------------------------------------------------
+
+def setup_module(module: Any) -> None:
+    os.environ["SENTINEL_ENV"] = "test"
+    os.environ.setdefault("S43_ENV", "test")
+    os.environ["S43_JWT_SECRET"] = JWT_SECRET
+    os.environ["S43_JWT_ALGORITHM"] = JWT_ALGORITHM
+    os.environ["S43_JWT_ISSUER"] = JWT_ISSUER
+    os.environ["S43_JWT_AUDIENCE"] = JWT_AUDIENCE
+    os.environ["S43_OPERATOR_USERNAME"] = TEST_USERNAME
+    os.environ["S43_OPERATOR_PASSWORD_HASH"] = TEST_PASSWORD_HASH
+    importlib.reload(sys.modules["core.api.main"])
+
 
 # ---------------------------------------------------------------------------
 # Pytest Fixtures

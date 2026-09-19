@@ -111,9 +111,10 @@ namespace was never touched)
   reachability). Pod logs scanned for credential/token material: clean.
 - **NetworkPolicy live enforcement was not verified** — this local Docker
   Desktop cluster has no policy-enforcing CNI installed (confirmed: no
-  Calico/Cilium/etc. in `kube-system`), which is exactly why
+  Calico/Cilium/etc. in `kube-system`), which is why
   `.github/workflows/k8s.yml`'s own kind-based job installs Calico
-  deliberately. Installing a CNI addon here would be a cluster-wide
+  deliberately (that job runs a positive smoke with the policies applied; it
+  does not run the negative connectivity test — see Section M). Installing a CNI addon here would be a cluster-wide
   change risking the pre-existing `sentinel43` namespace, so this item is
   **TOOLING UNAVAILABLE** in this environment, not silently passed. The
   manifests themselves render and validate correctly (structural check
@@ -641,3 +642,83 @@ Section B1 counts remain evidence for the SHA they were run against.
 
 README.md continues to classify the public project as "Late Alpha"; this
 report does not change that label.
+
+## M. Controlled-beta handoff reconciliation (2026-09-19)
+
+Dated reconciliation after PR #288 merged. Nothing here re-runs or rewrites the
+results above; it records what is now verified, what was discovered about the
+target, and what is still missing. **No deployment, registry publish, live
+migration, secret rotation, or readiness promotion occurred.**
+
+**Merged baseline.** `main` = `7194bb0aee737ff1f6ff79ad9b06b71e63bebd9d`. The
+tested PR #288 head `3fed0799ee98ce2e0d1511906b5fa3f2b89e178d` and `main` have
+the identical git tree `4600c4591844faed89e7ef6d128b7137efde3eb4`
+(`git rev-parse <sha>^{tree}` on both; empty two-commit `git diff --stat`), so
+CI evidence for the PR head applies to `main`'s content. Hosted CI passed all
+six jobs on the PR head (pull_request run 35457777806) and again on `main`
+(push run 35457863248, `7194bb0`): manifests, pytest, disposable-PostgreSQL
+pytest, image build + Trivy, kind smoke deploy, Playwright SPA smoke.
+
+**What CI does and does not prove.** Hosted CI proves the repository release
+candidate against a *disposable* stack and cluster. It is not target
+verification. In particular, the `kind smoke deploy` job installs Calico and
+runs a positive smoke (rollout, `/ready`, posture assertions, health/bootstrap
+over the Host header); it does not test that forbidden connections are refused.
+Negative NetworkPolicy connectivity (`docs/BETA_RUNBOOK.md` §20) has not been
+run in CI and must be run on the real target.
+
+**Test-isolation defect (reproduced, fixed).** `core/tests/test_auth_login.py`
+errored when run after `core/tests/test_ws_auth.py`
+(`pytest core/tests/test_ws_auth.py core/tests/test_auth_login.py`: 15 passed,
+1 error, `S43_WS_REQUIRE_AUTH=true but S43_JWT_SECRET is not configured`), while
+the reverse order and the full default-order suite passed. Cause:
+`test_ws_auth.teardown_module` restores variables that were unset when it was
+imported by popping them and reloading `core.api.main`, which removed the values
+`test_auth_login` had set once at import time. Fixed with a `setup_module` hook
+in the existing `test_auth_login.py` that re-applies its own environment and
+reloads `main` (the pattern `test_ws_auth.py` already uses). No assertion, test
+case, skip or production code changed; both orders now pass (31 passed).
+
+**Target discovery (read-only; no secret values read or printed).** No
+controlled-beta target is defined anywhere discoverable:
+
+| Input | Finding |
+|---|---|
+| Deployment path | Not chosen. Local Kubernetes context is only `docker-desktop` (a development cluster with no NetworkPolicy-enforcing CNI); the local Compose stack is a development stack (`SENTINEL_ENV=development`, localhost origins). |
+| Hostname / DNS | None. Only placeholders (`beta.example.invalid`) and the disposable browser-test name `s43.beta.test:8443` (`.env.browser`, test-only). |
+| TLS | None. The Compose proxy's certificate is a self-signed `CN=localhost` development certificate (gitignored). No cert-manager `ClusterIssuer` is known. |
+| Registry | Not chosen. Docker Hub and `dhi.io` have stored logins on this machine, but neither was selected for Sentinel-43; the overlay still ships `REGISTRY_PLACEHOLDER` with an all-zero digest. GHCR could not be inspected (token lacks `read:packages`). |
+| Allowed origin / trusted hosts / trusted-proxy CIDR | Placeholders (`https://beta.example.invalid`, `beta.example.invalid,s43-api`, empty CIDR). No real ingress or proxy network is known. |
+| External verification vantage | None identified. |
+| GitHub-side | No environments, variables, secret names, deployments or homepage are configured for the repository. |
+
+`python scripts/deploy_preflight.py kube --phase prepare` against the repository
+as shipped: 2 passed, 0 failed, **3 incomplete** (hostname, immutable image
+identity, kube context/namespace) — `PREPARE INCOMPLETE`, not a pass. Placeholder
+values are not evidence.
+
+**Deployment sequence prepared for operator review (nothing executed).**
+Constraints carried unchanged: single replica with `Recreate`, session-only
+authentication (`S43_REJECT_LEGACY_AUTH=true`), mandatory durable audit,
+Heart enabled and required (`S43_HEART_ENABLED=true`, `S43_HEART_REQUIRED`
+default true), Remote Gateway disabled.
+
+| # | Step (runbook §) | Status |
+|---|---|---|
+| 0 | Operator supplies the target inputs listed above | BLOCKED — inputs missing |
+| 1 | Pin the source revision (`main` at or after `7194bb0`); build from a clean `git archive` of that exact commit with the OCI revision label set to it (§8) | READY — not executed |
+| 2 | Push to the chosen registry; read the returned digest; verify it resolves from the registry itself; pin `repo@sha256:<digest>` in the overlay (§8) | BLOCKED — no registry |
+| 3 | Generate secrets and the Argon2id operator hash, kept out of Git (§4, §5) | READY — operator action, values never committed |
+| 4 | Replace the three `CHANGEME` values (trusted hosts, allowed origin, trusted-proxy CIDR); select real TLS (§13, §14) | BLOCKED — hostname, TLS, CIDR |
+| 5 | `deploy_preflight.py <compose\|kube> --phase prepare` with real inputs; must pass with no incomplete mandatory check (§15) | INCOMPLETE — 3 incomplete as shipped |
+| 6 | Run the migration Job/service first; wait for the schema-version gate (`/ready` 503 until at head) before serving traffic (§9, §10) | READY — live migration not authorized in this phase |
+| 7 | Apply; confirm one replica/`Recreate`, Heart subsystem active, legacy auth rejected, audit store healthy (§16) | BLOCKED — depends on 2, 4 |
+| 8 | `deploy_preflight.py ... --phase verify --from-external-host` from an outside vantage (TLS chain and hostname, HSTS, docs closed, internal ports unreachable) (§15) | BLOCKED — target and vantage missing |
+| 9 | `browser_tests/run_target.sh` read-only edge suite, then authenticated suite with designated operator credential file (never bootstrap; admin-mutation opt-in only with throwaway accounts) (§17) | BLOCKED — target and accounts missing |
+| 10 | Negative NetworkPolicy connectivity on the real cluster's CNI (§20) — Kubernetes path only | BLOCKED — no cluster; CI Calico is not this proof |
+| 11 | Backups before first user, restore drill on scratch storage, rollback = previous pinned digest with a `Recreate` outage (§11, §12, §19) | READY as procedure; destructive recovery not authorized in this phase |
+| 12 | Retain evidence: commit SHA + digest, preflight outputs for both phases, netpol output, acceptance output, secret-rotation date, backup timestamps (§21) | Pending steps above |
+
+**Readiness.** Repository beta release candidate: recorded above (Sections B–L).
+Controlled-beta target verification: NOT DONE. Production and public-sector
+readiness: NOT ESTABLISHED. README's "Late Alpha" label is unchanged.
