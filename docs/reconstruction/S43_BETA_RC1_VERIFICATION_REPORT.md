@@ -623,10 +623,11 @@ before the client is registered or any event is delivered.
 
 The one xfailed test described in Section B1 as pre-existing
 (`core/tests/test_ws_auth.py::test_ws_reports_service_unavailable_not_auth_failure`)
-remains XFAIL. It pins close code 1008 for this outage, which would suppress
-dashboard reconnect after a transient outage; production behavior was not
-changed to satisfy it. The test file is unmodified under the no-test-changes
-policy, and the owner may correct or remove that xfail separately. The
+was resolved by correcting that existing test, not by adding one. It had pinned
+close code 1008 for this outage, which would have suppressed dashboard
+reconnect after a transient outage; it now asserts code 1011 with reason
+`service_unavailable`, and its obsolete `xfail` marker was removed. It now
+PASSES as an ordinary test with all of its other assertions unchanged. The
 Section B1 counts remain evidence for the SHA they were run against.
 
 **Readiness tiers — distinct, and none is established by this report:**
