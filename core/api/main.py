@@ -1089,7 +1089,11 @@ async def _session_still_valid(
         if resolved is None:
             return False, "session_revoked"
         return True, ""
-    except HTTPException:
+    except HTTPException as exc:
+        # resolve_session_subject raises 503 when the session SERVICE is
+        # unavailable (an outage) and 401 for a genuinely invalid session.
+        if exc.status_code == 503:
+            return False, WS_REASON_AUTH_BACKEND_UNAVAILABLE
         return False, "session_revoked"
     except Exception:
         logger.warning(
@@ -2850,7 +2854,24 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
 
             try:
                 resolved = await resolve_session_subject(claims)
-            except HTTPException:
+            except HTTPException as exc:
+                if exc.status_code == 503:
+                    # Session service unavailable: an outage, not a revoked
+                    # session. Fail closed with the outage contract.
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "payload": {
+                                "error": "Authentication service unavailable"
+                            },
+                        }
+                    )
+                    await _ws_safe_close(
+                        websocket,
+                        code=WS_CLOSE_AUTH_BACKEND_UNAVAILABLE,
+                        reason=WS_REASON_AUTH_BACKEND_UNAVAILABLE,
+                    )
+                    return
                 await websocket.send_json(
                     {
                         "type": "error",
