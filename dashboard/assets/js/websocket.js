@@ -560,6 +560,9 @@ function _handleAuthRequired() {
 function _markConnected(parsed) {
     _authenticated = true;
     _connected     = true;
+    // Authentication accepted: this is the boundary at which a reconnect
+    // sequence is over. A later outage starts a fresh sequence.
+    _reconnectAttempts = 0;
     _lastMessageAt = Date.now();
     _startHeartbeat();
     _subscribeConfiguredChannels();
@@ -673,7 +676,11 @@ function connect() {
     _sock.addEventListener("open", () => {
         if (_ws !== _sock) return;
         _socketOpen        = true;
-        _reconnectAttempts = 0;
+        // NOT reset here: an open transport is not an authenticated session.
+        // _reconnectAttempts is reset only in _markConnected(), after the
+        // server accepts authentication, so repeated pre-authentication
+        // closes (e.g. 1011/service_unavailable during an auth-backend
+        // outage) keep growing the bounded backoff instead of restarting it.
         _lastMessageAt     = Date.now();
         _dispatch("sentinel:ws:open", { timestamp: _nowIso() });
         if (WS_CONFIG.AUTH_FIRST_WHEN_TOKEN_PRESENT) {
