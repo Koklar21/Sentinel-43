@@ -237,6 +237,9 @@ class ThreatGovernor:
     ) -> dict[str, Any]:
         record: dict[str, Any] = {
             "subsystem": "heart",
+            # Lookup keys for AuditStore.get_records(); lets recovery confirm
+            # a durable row really has an authenticated STAGED audit record.
+            "component": "heart",
             "identity": assessment.identity,
             "source_ip": assessment.source_ip,
             "threat_kind": assessment.threat_kind.value,
@@ -250,6 +253,7 @@ class ThreatGovernor:
         }
         if decision_id is not None:
             record["decision_id"] = decision_id
+            record["correlation_id"] = decision_id
         if operator_id is not None:
             record["operator_id"] = operator_id
         if resolution_reason:

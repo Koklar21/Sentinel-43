@@ -1810,9 +1810,32 @@ async def _rehydrate_heart_pending() -> int:
 
     rows = await asyncio.to_thread(heart.list_pending, 1000)
     restored = 0
+    quarantined: list[str] = []
     for row in rows:
         action_id = str(row["action_id"])
         target = str(row["target_value"])
+
+        # Recovery trusts the audit ledger, not the row alone: a pending row
+        # is reloaded only if the HMAC-verified ledger holds a STAGED record
+        # for the same id, target and kind. Anything else is quarantined --
+        # never shown as approvable. A ledger read failure propagates, so
+        # Heart start fails closed (and blocks readiness when required).
+        audited = await asyncio.to_thread(
+            heart.audit_store.get_records,
+            component="heart",
+            correlation_id=action_id,
+            limit=50,
+        )
+        if not any(
+            rec.get("decision") == "STAGED"
+            and rec.get("decision_id") == action_id
+            and f"{rec.get('identity')}|{rec.get('source_ip')}" == target
+            and rec.get("threat_kind") == str(row["kind"])
+            for rec in audited
+        ):
+            quarantined.append(action_id)
+            continue
+
         identity, _, source_ip = target.rpartition("|")
         created = datetime.fromtimestamp(
             int(row["created_at_ms"]) / 1000, tz=timezone.utc
@@ -1842,6 +1865,13 @@ async def _rehydrate_heart_pending() -> int:
             restored += 1
         except HTTPException:
             continue
+    if quarantined:
+        logger.error(
+            "Heart: %d pending row(s) have no matching STAGED audit record "
+            "and were NOT restored (quarantined): %s",
+            len(quarantined),
+            ", ".join(quarantined[:20]),
+        )
     return restored
 
 
