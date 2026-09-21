@@ -174,6 +174,9 @@ class ThreatGovernor:
         self._corroboration: OrderedDict[
             tuple[str, str], deque[float]
         ] = OrderedDict()
+        # Highest detector evidence sequence already counted per key. A
+        # signal only counts if it carries strictly newer evidence.
+        self._last_evidence_seq: dict[tuple[str, str], int] = {}
 
     @staticmethod
     def _normalize_mode(mode: GovernanceMode | str) -> GovernanceMode:
@@ -261,6 +264,7 @@ class ThreatGovernor:
         kind: str,
         *,
         now: float,
+        evidence_seq: int | None,
     ) -> tuple[int, bool]:
         key = (target_key, kind)
 
@@ -268,7 +272,8 @@ class ThreatGovernor:
             if key not in self._corroboration and (
                 len(self._corroboration) >= self.config.max_tracked_targets
             ):
-                self._corroboration.popitem(last=False)
+                evicted_key, _ = self._corroboration.popitem(last=False)
+                self._last_evidence_seq.pop(evicted_key, None)
 
             signals = self._corroboration.get(key)
             if signals is None:
@@ -281,7 +286,15 @@ class ThreatGovernor:
             while signals and signals[0] < cutoff:
                 signals.popleft()
 
-            signals.append(now)
+            # An observation is independent only if the detector saw new
+            # evidence since the last one counted. Rescanning an unchanged
+            # window, or a retried event, must not manufacture corroboration.
+            # Without evidence provenance nothing is counted, so the finding
+            # stays pending instead of the threshold being lowered.
+            last_seq = self._last_evidence_seq.get(key, 0)
+            if evidence_seq is not None and evidence_seq > last_seq:
+                signals.append(now)
+                self._last_evidence_seq[key] = evidence_seq
             count = len(signals)
 
             corroborated = (
@@ -360,8 +373,14 @@ class ThreatGovernor:
         # enough independent signals to be staged in the first place. Dedupe
         # (below) only gates the final stage/observe decision, once made.
         if assessment.severity in _CORROBORATION_REQUIRED_SEVERITIES:
+            raw_seq = assessment.indicators.get("evidence_seq")
+            evidence_seq = (
+                raw_seq
+                if isinstance(raw_seq, int) and not isinstance(raw_seq, bool)
+                else None
+            )
             signal_count, corroborated = self._record_signal_locked(
-                target_key, kind, now=now
+                target_key, kind, now=now, evidence_seq=evidence_seq
             )
             if not corroborated:
                 self._append_audit(

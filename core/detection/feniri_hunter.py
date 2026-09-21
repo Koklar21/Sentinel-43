@@ -814,6 +814,11 @@ class FenrirHunter:
         # working unchanged whether or not a Heart is wired in.
         self.heart: Any | None = None
         self._heart_unavailable_logged = False
+        # (identity, ip, kind) -> evidence_seq last handed to the Heart
+        # successfully. Bounded; unchanged evidence is not re-submitted.
+        self._heart_observed_seq: OrderedDict[
+            tuple[str, str, str], int
+        ] = OrderedDict()
 
         self.detector = SentinelThreatDetector(
             cfg=DetectorConfig(
@@ -1117,6 +1122,20 @@ class FenrirHunter:
                 )
             return
 
+        seq_key = (
+            str(assessment.identity),
+            str(assessment.source_ip),
+            assessment.threat_kind.value,
+        )
+        raw_seq = assessment.indicators.get("evidence_seq")
+        seq = (
+            raw_seq
+            if isinstance(raw_seq, int) and not isinstance(raw_seq, bool)
+            else None
+        )
+        if seq is not None and self._heart_observed_seq.get(seq_key, 0) >= seq:
+            return
+
         try:
             await asyncio.get_running_loop().run_in_executor(
                 self._ensure_executor(),
@@ -1131,6 +1150,11 @@ class FenrirHunter:
             )
         else:
             self._heart_unavailable_logged = False
+            if seq is not None:
+                self._heart_observed_seq[seq_key] = seq
+                self._heart_observed_seq.move_to_end(seq_key)
+                while len(self._heart_observed_seq) > 10_000:
+                    self._heart_observed_seq.popitem(last=False)
 
     async def observe_signals(
         self,
