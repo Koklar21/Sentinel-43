@@ -27,7 +27,10 @@ It intentionally does not:
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -91,6 +94,19 @@ class WatchtowerNodeScanner:
         second store.
         """
         return self._node.recent_event_snapshot(limit)
+
+logger = logging.getLogger(__name__)
+
+# Producers whose events carry a trusted, proxy-resolved client IP and describe
+# hostile traffic. Heart, Fenrir and every derived event are deliberately
+# absent: ingesting the Heart's own notifications (or a finding derived from
+# earlier events) would let the pipeline manufacture its own evidence.
+DEFAULT_THREAT_INGEST_SOURCES: frozenset[str] = frozenset({"sentinel-firewall"})
+
+_INGEST_SEEN_IDS_MAX = 10_000
+_INGEST_RATE_KEYS_MAX = 10_000
+_INGEST_RATE_LIMIT = 600
+_INGEST_RATE_WINDOW_SECONDS = 60.0
 
 
 @runtime_checkable
@@ -186,11 +202,132 @@ class MonitoringManager:
         self._threat_detector = threat_detector
         self._telemetry_sink = telemetry_sink
 
+        self._threat_ingestor: Any | None = None
+        self._ingest_sources: frozenset[str] = DEFAULT_THREAT_INGEST_SOURCES
+        self._ingest_seen_ids: OrderedDict[str, None] = OrderedDict()
+        self._ingest_rate: OrderedDict[tuple[str, str], deque[float]] = (
+            OrderedDict()
+        )
+        self._ingest_counts = {
+            "ingested": 0,
+            "skipped_source": 0,
+            "skipped_replay": 0,
+            "skipped_rate_limited": 0,
+            "failed": 0,
+        }
+
         self._lock = threading.Lock()
         self._started = False
         self._scan_count = 0
         self._alert_count = 0
         self._failure_count = 0
+
+    def attach_threat_ingestor(
+        self,
+        ingestor: Any | None,
+        *,
+        sources: frozenset[str] | None = None,
+    ) -> None:
+        """Feed allowlisted originating events into the ONE detector instance
+        that Fenrir evaluates (an object exposing ``ingest(EventContext)``)."""
+        with self._lock:
+            self._threat_ingestor = ingestor
+            if sources is not None:
+                self._ingest_sources = frozenset(sources)
+
+    def _ingest_threat_event(
+        self,
+        raw: dict[str, Any] | BaseEvent,
+        normalized: BaseEvent,
+        *,
+        source_ip: str | None,
+        source_identity: str | None,
+    ) -> None:
+        """Best-effort: never raises, never breaks monitoring, but counts."""
+        ingestor = self._threat_ingestor
+        if ingestor is None:
+            return
+
+        counts = self._ingest_counts
+        ip = str(source_ip or "").strip()
+        identity = str(
+            normalized.source_identity or source_identity or ""
+        ).strip()
+
+        if (
+            normalized.source not in self._ingest_sources
+            or normalized.parent_event_id
+            or not ip
+            or not identity
+        ):
+            with self._lock:
+                counts["skipped_source"] += 1
+            return
+
+        raw_id = (
+            raw.get("event_id") if isinstance(raw, dict) else None
+        ) or ""
+        event_id = str(raw_id).strip()
+        now = time.time()
+
+        with self._lock:
+            if event_id:
+                if event_id in self._ingest_seen_ids:
+                    counts["skipped_replay"] += 1
+                    return
+                self._ingest_seen_ids[event_id] = None
+                while len(self._ingest_seen_ids) > _INGEST_SEEN_IDS_MAX:
+                    self._ingest_seen_ids.popitem(last=False)
+
+            rate_key = (identity, ip)
+            stamps = self._ingest_rate.get(rate_key)
+            if stamps is None:
+                if len(self._ingest_rate) >= _INGEST_RATE_KEYS_MAX:
+                    self._ingest_rate.popitem(last=False)
+                stamps = deque()
+                self._ingest_rate[rate_key] = stamps
+            else:
+                self._ingest_rate.move_to_end(rate_key)
+            while stamps and stamps[0] < now - _INGEST_RATE_WINDOW_SECONDS:
+                stamps.popleft()
+            if len(stamps) >= _INGEST_RATE_LIMIT:
+                counts["skipped_rate_limited"] += 1
+                return
+            stamps.append(now)
+
+        try:
+            from core.detection.sentinel_threat_detector import EventContext
+
+            raw_type = (
+                raw.get("event_type") if isinstance(raw, dict) else None
+            )
+            ingestor.ingest(
+                EventContext(
+                    source_identity=identity,
+                    source_ip=ip,
+                    event_type=str(raw_type or normalized.kind),
+                    timestamp=now,
+                    success=(
+                        False
+                        if isinstance(raw, dict)
+                        and str(raw.get("status") or "") == "blocked"
+                        else None
+                    ),
+                    metadata={"event_id": event_id} if event_id else {},
+                )
+            )
+        except Exception:
+            with self._lock:
+                counts["failed"] += 1
+            logger.warning(
+                "Threat-detector ingestion failed for source=%s",
+                normalized.source,
+                exc_info=True,
+            )
+            return
+
+        with self._lock:
+            counts["ingested"] += 1
 
     def _emit(
         self,
@@ -339,6 +476,13 @@ class MonitoringManager:
 
         normalized = normalized_result.event
 
+        self._ingest_threat_event(
+            event,
+            normalized,
+            source_ip=source_ip,
+            source_identity=source_identity,
+        )
+
         try:
             window = self._build_window(
                 event=normalized,
@@ -415,6 +559,9 @@ class MonitoringManager:
                 is not None,
                 "threat_detector_enabled": self._threat_detector
                 is not None,
+                "threat_ingestion_enabled": self._threat_ingestor
+                is not None,
+                "threat_ingestion": dict(self._ingest_counts),
             }
 
         return {

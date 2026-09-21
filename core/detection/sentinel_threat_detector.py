@@ -276,6 +276,31 @@ class SequenceWindow:
             maxlen=self.max_events
         )
 
+        # Detector-global sequence number of the newest accepted event.
+        self.last_seq = 0
+
+        # Bounded set of explicit producer event ids, for replay suppression.
+        self._seen_ids: OrderedDict[
+            str,
+            None,
+        ] = OrderedDict()
+
+    def seen_event_id(
+        self,
+        event_id: str,
+    ) -> bool:
+        if event_id in self._seen_ids:
+            return True
+
+        self._seen_ids[event_id] = None
+
+        while len(self._seen_ids) > self.max_events * 2:
+            self._seen_ids.popitem(
+                last=False
+            )
+
+        return False
+
     def add_event(
         self,
         event: EventContext,
@@ -368,6 +393,10 @@ class SentinelThreatDetector:
             SequenceWindow,
         ] = OrderedDict()
 
+        # Monotonic across window pruning/recreation, so an "evidence_seq"
+        # indicator never goes backwards for the same source.
+        self._ingest_seq = 0
+
     def ingest(
         self,
         event: EventContext,
@@ -421,9 +450,26 @@ class SentinelThreatDetector:
                     key
                 )
 
-            window.add_event(
+            event_id = str(
+                (event.metadata or {}).get(
+                    "event_id"
+                )
+                or ""
+            ).strip()
+
+            # A retried/replayed event (same explicit id) or an out-of-order
+            # one is not new evidence: it must not advance the evidence
+            # sequence that Heart uses to tell independent observations apart.
+            if not (
+                event_id
+                and window.seen_event_id(
+                    event_id
+                )
+            ) and window.add_event(
                 event
-            )
+            ):
+                self._ingest_seq += 1
+                window.last_seq = self._ingest_seq
 
             window.prune(
                 now=now,
@@ -527,6 +573,13 @@ class SentinelThreatDetector:
             str,
             Any,
         ] = {
+            "evidence_seq": int(
+                getattr(
+                    window,
+                    "last_seq",
+                    0,
+                )
+            ),
             "event_count": event_count,
             "failure_count": failure_count,
             "max_payload_bytes": payload_max,

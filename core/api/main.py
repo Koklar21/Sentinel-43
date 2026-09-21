@@ -1582,6 +1582,13 @@ async def _start_fenrir() -> None:
 
         runtime.fenrir_instance = FenrirHunter()
         await runtime.fenrir_instance.start()
+        # Feed allowlisted originating events into the SAME detector instance
+        # Fenrir evaluates (no second detector, queue or bus).
+        attach = getattr(
+            runtime.monitoring_manager, "attach_threat_ingestor", None
+        )
+        if callable(attach):
+            attach(runtime.fenrir_instance.detector)
         runtime.subsystems.mark_active(
             SUBSYS_FENRIR, "Hunting and reporting through the API bridge."
         )
@@ -1792,6 +1799,52 @@ class _HeartActionSink:
         future.result(timeout=10.0)
 
 
+async def _rehydrate_heart_pending() -> int:
+    """Reload durably staged, still-PENDING Heart rows into the canonical
+    action store after a restart, so they stay visible in /actions and can
+    still be approved or vetoed (the store is in-memory; the row is not).
+    Idempotent: an id already present (409) is skipped."""
+    heart = runtime.heart
+    if heart is None:
+        return 0
+
+    rows = await asyncio.to_thread(heart.list_pending, 1000)
+    restored = 0
+    for row in rows:
+        action_id = str(row["action_id"])
+        target = str(row["target_value"])
+        identity, _, source_ip = target.rpartition("|")
+        created = datetime.fromtimestamp(
+            int(row["created_at_ms"]) / 1000, tz=timezone.utc
+        ).isoformat()
+        record = {
+            "id": action_id,
+            "action_type": "HEART_RECOMMENDATION",
+            "status": "STAGED",
+            "created_at": created,
+            "decision_reason": "",
+            "operator": "",
+            "payload": {
+                "source": "heart",
+                "identity": identity,
+                "source_ip": source_ip,
+                "ip": source_ip,
+                "threat_kind": str(row["kind"]),
+                "severity": str(row["severity"]),
+                "source_kind": str(row["source_kind"]),
+                "score": row["score"],
+                "reason": str(row["reason"]),
+                "rehydrated": True,
+            },
+        }
+        try:
+            await _store_action(record)
+            restored += 1
+        except HTTPException:
+            continue
+    return restored
+
+
 async def _start_heart() -> None:
     """Build the "Heart" -- human-governed staging for threat assessments.
 
@@ -1879,6 +1932,13 @@ async def _start_heart() -> None:
 
         if runtime.fenrir_instance is not None:
             runtime.fenrir_instance.heart = runtime.heart
+
+        restored = await _rehydrate_heart_pending()
+        if restored:
+            logger.info(
+                "Heart: restored %d pending recommendation(s) after restart",
+                restored,
+            )
 
         runtime.subsystems.mark_active(
             SUBSYS_HEART,
