@@ -171,8 +171,9 @@ class ThreatGovernor:
         self._on_health_change = on_health_change
 
         self._lock = threading.RLock()
+        # (target, kind) -> {independent producer kind -> last observed time}
         self._corroboration: OrderedDict[
-            tuple[str, str], deque[float]
+            tuple[str, str], dict[str, float]
         ] = OrderedDict()
         # Highest detector evidence sequence already counted per key. A
         # signal only counts if it carries strictly newer evidence.
@@ -269,7 +270,18 @@ class ThreatGovernor:
         *,
         now: float,
         evidence_seq: int | None,
+        sources: tuple[str, ...],
     ) -> tuple[int, bool]:
+        """Count INDEPENDENT trusted sources, not observations.
+
+        A source is a canonical producer kind attested by in-process
+        provenance (see MonitoringManager). Repeated events, rescans, extra
+        events from one producer, a renamed source label or a rotated
+        credential add nothing: only a new distinct producer kind raises the
+        count. An observation is considered at all only when the detector saw
+        newer evidence, and never without provenance -- in that case the
+        finding stays pending; the threshold is not lowered.
+        """
         key = (target_key, kind)
 
         with self._lock:
@@ -279,27 +291,23 @@ class ThreatGovernor:
                 evicted_key, _ = self._corroboration.popitem(last=False)
                 self._last_evidence_seq.pop(evicted_key, None)
 
-            signals = self._corroboration.get(key)
-            if signals is None:
-                signals = deque()
-                self._corroboration[key] = signals
+            seen = self._corroboration.get(key)
+            if seen is None:
+                seen = {}
+                self._corroboration[key] = seen
             else:
                 self._corroboration.move_to_end(key)
 
             cutoff = now - self.config.corroboration_window_seconds
-            while signals and signals[0] < cutoff:
-                signals.popleft()
+            for producer in [p for p, ts in seen.items() if ts < cutoff]:
+                del seen[producer]
 
-            # An observation is independent only if the detector saw new
-            # evidence since the last one counted. Rescanning an unchanged
-            # window, or a retried event, must not manufacture corroboration.
-            # Without evidence provenance nothing is counted, so the finding
-            # stays pending instead of the threshold being lowered.
             last_seq = self._last_evidence_seq.get(key, 0)
             if evidence_seq is not None and evidence_seq > last_seq:
-                signals.append(now)
                 self._last_evidence_seq[key] = evidence_seq
-            count = len(signals)
+                for producer in sources:
+                    seen[producer] = now
+            count = len(seen)
 
             corroborated = (
                 count >= self.config.corroboration_min_signals_for_high
@@ -309,9 +317,6 @@ class ThreatGovernor:
             # further signal within the window must keep re-corroborating
             # (cheaply -- it's an in-memory count) and fall through to the
             # stage-dedupe check below, which is the actual anti-flood guard.
-            # Clearing here would drop the count back under threshold and
-            # strand a real, still-ongoing burst in AWAITING_CORROBORATION
-            # forever instead of recognizing it as an already-staged repeat.
             return count, corroborated
 
     def observe(
@@ -383,8 +388,26 @@ class ThreatGovernor:
                 if isinstance(raw_seq, int) and not isinstance(raw_seq, bool)
                 else None
             )
+            raw_sources = assessment.indicators.get("evidence_sources")
+            sources = tuple(
+                sorted(
+                    {
+                        str(item)
+                        for item in (
+                            raw_sources
+                            if isinstance(raw_sources, (list, tuple))
+                            else ()
+                        )
+                        if isinstance(item, str) and item
+                    }
+                )
+            )
             signal_count, corroborated = self._record_signal_locked(
-                target_key, kind, now=now, evidence_seq=evidence_seq
+                target_key,
+                kind,
+                now=now,
+                evidence_seq=evidence_seq,
+                sources=sources,
             )
             if not corroborated:
                 self._append_audit(
@@ -397,6 +420,10 @@ class ThreatGovernor:
                             "signals_required": (
                                 self.config.corroboration_min_signals_for_high
                             ),
+                            "corroboration": (
+                                "insufficient_independent_sources"
+                            ),
+                            "evidence_sources": list(sources),
                         },
                     )
                 )
@@ -654,6 +681,8 @@ class ThreatGovernor:
             self._append_audit(
                 {
                     "subsystem": "heart",
+                    "component": "heart",
+                    "correlation_id": action_id,
                     "decision_id": action_id,
                     "decision": new_status.value,
                     "reason_code": (

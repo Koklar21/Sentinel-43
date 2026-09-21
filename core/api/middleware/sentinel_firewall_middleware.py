@@ -1180,12 +1180,19 @@ class SentinelFirewall:
 
         async def invoke() -> None:
             try:
-                result = manager.analyze_event(
-                    event,
-                    source_ip=client_ip or None,
+                accepted = inspect.signature(manager.analyze_event).parameters
+                takes_any = any(
+                    p.kind is inspect.Parameter.VAR_KEYWORD
+                    for p in accepted.values()
                 )
-            except TypeError:
-                result = manager.analyze_event(event)
+            except (TypeError, ValueError):
+                accepted, takes_any = {}, False
+            kwargs: dict[str, Any] = {}
+            if takes_any or "source_ip" in accepted:
+                kwargs["source_ip"] = client_ip or None
+            if takes_any or "trusted_producer" in accepted:
+                kwargs["trusted_producer"] = "firewall"
+            result = manager.analyze_event(event, **kwargs)
 
             if inspect.isawaitable(result):
                 await result

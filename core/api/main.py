@@ -1588,7 +1588,18 @@ async def _start_fenrir() -> None:
             runtime.monitoring_manager, "attach_threat_ingestor", None
         )
         if callable(attach):
-            attach(runtime.fenrir_instance.detector)
+            attach(
+                runtime.fenrir_instance.detector,
+                producers={
+                    "firewall": (
+                        os.getenv(
+                            "S43_FIREWALL_MONITORING_SOURCE",
+                            "sentinel-firewall",
+                        ).strip()
+                        or "sentinel-firewall"
+                    )
+                },
+            )
         runtime.subsystems.mark_active(
             SUBSYS_FENRIR, "Hunting and reporting through the API bridge."
         )
@@ -1799,79 +1810,210 @@ class _HeartActionSink:
         future.result(timeout=10.0)
 
 
+_HEART_RECOVERY_PAGE = 1000
+_HEART_TERMINAL_DECISIONS = frozenset({"APPROVED", "VETOED", "EXECUTED", "EXPIRED"})
+
+
+class HeartRecoveryError(RuntimeError):
+    """Recovery could not establish a trustworthy view of pending actions.
+
+    Raised (not swallowed) so _start_heart marks the Heart FAILED, which
+    blocks /ready through the required-subsystem mechanism while liveness
+    stays truthful.
+    """
+
+
+def _heart_row_problem(
+    row: Mapping[str, Any], audited: list[dict[str, Any]]
+) -> str | None:
+    """Why a parsed pending row must NOT be exposed for a human decision.
+
+    The persisted row alone is never trusted: the HMAC-verified ledger must
+    hold exactly one STAGED record whose security-relevant contents match,
+    and no later terminal decision.
+    """
+    action_id = str(row["action_id"])
+    staged = [
+        rec
+        for rec in audited
+        if rec.get("decision") == "STAGED"
+        and rec.get("decision_id") == action_id
+    ]
+    if len(staged) != 1:
+        return "no_unique_staged_audit_record"
+    rec = staged[0]
+    if any(
+        other.get("decision") in _HEART_TERMINAL_DECISIONS
+        for other in audited
+    ):
+        return "terminal_decision_already_audited"
+    if f"{rec.get('identity')}|{rec.get('source_ip')}" != row["target_value"]:
+        return "audit_target_mismatch"
+    if rec.get("threat_kind") != row["kind"]:
+        return "audit_kind_mismatch"
+    if rec.get("severity") != row["severity"]:
+        return "audit_severity_mismatch"
+    if rec.get("source_kind") != row["source_kind"]:
+        return "audit_source_kind_mismatch"
+    try:
+        if abs(float(rec.get("score")) - float(row["score"])) > 1e-6:
+            return "audit_score_mismatch"
+    except (TypeError, ValueError):
+        return "audit_score_mismatch"
+    return None
+
+
 async def _rehydrate_heart_pending() -> int:
     """Reload durably staged, still-PENDING Heart rows into the canonical
     action store after a restart, so they stay visible in /actions and can
     still be approved or vetoed (the store is in-memory; the row is not).
-    Idempotent: an id already present (409) is skipped."""
+
+    Fail-closed contract:
+      * more pending rows than one page, or more than the canonical store can
+        hold without evicting, blocks readiness (HeartRecoveryError);
+      * a malformed row blocks readiness rather than being skipped;
+      * a row without a matching authenticated STAGED audit record is
+        quarantined (moved to a terminal state, never re-exposed) and no audit
+        record is ever fabricated for it;
+      * only a verified-equivalent duplicate already in the store is skipped;
+        any other error propagates.
+    """
+    from core.sentinel43_core_db import ActionStatus
+
     heart = runtime.heart
     if heart is None:
         return 0
 
-    rows = await asyncio.to_thread(heart.list_pending, 1000)
-    restored = 0
-    quarantined: list[str] = []
-    for row in rows:
-        action_id = str(row["action_id"])
-        target = str(row["target_value"])
+    rows = await asyncio.to_thread(heart.list_pending, _HEART_RECOVERY_PAGE)
+    if len(rows) >= _HEART_RECOVERY_PAGE:
+        raise HeartRecoveryError(
+            f"{len(rows)}+ pending Heart rows; recovery cannot enumerate "
+            "them all -- resolve or expire pending rows before restart"
+        )
+    if not rows:
+        return 0
 
-        # Recovery trusts the audit ledger, not the row alone: a pending row
-        # is reloaded only if the HMAC-verified ledger holds a STAGED record
-        # for the same id, target and kind. Anything else is quarantined --
-        # never shown as approvable. A ledger read failure propagates, so
-        # Heart start fails closed (and blocks readiness when required).
+    verification = await asyncio.to_thread(heart.audit_store.verify_integrity)
+    if not getattr(verification, "valid", False):
+        raise HeartRecoveryError(
+            "audit ledger failed integrity verification during Heart recovery"
+        )
+
+    verified: list[dict[str, Any]] = []
+    quarantine: list[tuple[str, str]] = []
+    malformed: list[str] = []
+
+    for row in rows:
+        try:
+            action_id = _validate_action_id(str(row["action_id"]))
+            created_ms = int(row["created_at_ms"])
+            target = str(row["target_value"])
+            identity, sep, source_ip = target.rpartition("|")
+            if not sep or not identity or not source_ip:
+                raise ValueError("target_value is not identity|source_ip")
+            created = datetime.fromtimestamp(
+                created_ms / 1000, tz=timezone.utc
+            ).isoformat()
+            float(row["score"])
+            kind = str(row["kind"])
+            severity = str(row["severity"])
+            source_kind = str(row["source_kind"])
+            reason = str(row["reason"])
+        except Exception:
+            malformed.append(str(row.get("action_id", "?"))[:64])
+            continue
+
         audited = await asyncio.to_thread(
             heart.audit_store.get_records,
             component="heart",
             correlation_id=action_id,
             limit=50,
         )
-        if not any(
-            rec.get("decision") == "STAGED"
-            and rec.get("decision_id") == action_id
-            and f"{rec.get('identity')}|{rec.get('source_ip')}" == target
-            and rec.get("threat_kind") == str(row["kind"])
-            for rec in audited
-        ):
-            quarantined.append(action_id)
+        problem = (
+            "audit_history_too_long"
+            if len(audited) >= 50
+            else _heart_row_problem(row, audited)
+        )
+        if problem is not None:
+            quarantine.append((action_id, problem))
             continue
 
-        identity, _, source_ip = target.rpartition("|")
-        created = datetime.fromtimestamp(
-            int(row["created_at_ms"]) / 1000, tz=timezone.utc
-        ).isoformat()
-        record = {
-            "id": action_id,
-            "action_type": "HEART_RECOMMENDATION",
-            "status": "STAGED",
-            "created_at": created,
-            "decision_reason": "",
-            "operator": "",
-            "payload": {
-                "source": "heart",
-                "identity": identity,
-                "source_ip": source_ip,
-                "ip": source_ip,
-                "threat_kind": str(row["kind"]),
-                "severity": str(row["severity"]),
-                "source_kind": str(row["source_kind"]),
-                "score": row["score"],
-                "reason": str(row["reason"]),
-                "rehydrated": True,
-            },
-        }
+        verified.append(
+            {
+                "id": action_id,
+                "action_type": "HEART_RECOMMENDATION",
+                "status": "STAGED",
+                "created_at": created,
+                "decision_reason": "",
+                "operator": "",
+                "payload": {
+                    "source": "heart",
+                    "identity": identity,
+                    "source_ip": source_ip,
+                    "ip": source_ip,
+                    "threat_kind": kind,
+                    "severity": severity,
+                    "source_kind": source_kind,
+                    "score": float(row["score"]),
+                    "reason": reason,
+                    "rehydrated": True,
+                },
+            }
+        )
+
+    if malformed:
+        raise HeartRecoveryError(
+            f"{len(malformed)} malformed pending Heart row(s): "
+            + ", ".join(malformed[:20])
+        )
+
+    async with runtime.action_lock:
+        existing_ids = set(runtime.action_store)
+    new_records = [r for r in verified if r["id"] not in existing_ids]
+    if len(existing_ids) + len(new_records) > MAX_DASHBOARD_ACTIONS:
+        raise HeartRecoveryError(
+            "restoring pending Heart actions would exceed the canonical "
+            f"action store limit ({MAX_DASHBOARD_ACTIONS}) and evict live "
+            "actions"
+        )
+
+    for action_id, problem in quarantine:
+        await asyncio.to_thread(
+            heart.core_store.transition_status,
+            action_id,
+            expected=ActionStatus.PENDING,
+            new_status=ActionStatus.EXPIRED,
+            operator_reason=f"quarantined_at_recovery:{problem}",
+        )
+        logger.error(
+            "Heart recovery quarantined %s (%s); it is not actionable",
+            action_id,
+            problem,
+        )
+
+    restored = 0
+    for record in verified:
         try:
             await _store_action(record)
             restored += 1
-        except HTTPException:
-            continue
-    if quarantined:
-        logger.error(
-            "Heart: %d pending row(s) have no matching STAGED audit record "
-            "and were NOT restored (quarantined): %s",
-            len(quarantined),
-            ", ".join(quarantined[:20]),
-        )
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+            async with runtime.action_lock:
+                current = runtime.action_store.get(record["id"]) or {}
+            cur_payload = current.get("payload") or {}
+            new_payload = record["payload"]
+            if not (
+                current.get("action_type") == record["action_type"]
+                and all(
+                    cur_payload.get(k) == new_payload[k]
+                    for k in ("identity", "source_ip", "threat_kind")
+                )
+            ):
+                raise HeartRecoveryError(
+                    f"action {record['id']} already exists with different "
+                    "contents"
+                ) from exc
     return restored
 
 
@@ -1936,7 +2078,7 @@ async def _start_heart() -> None:
                 maximum=86_400,
             )
             corroboration_min_signals_for_high = _env_int(
-                "S43_HEART_CORROBORATION_MIN_SIGNALS", 2, minimum=1, maximum=100
+                "S43_HEART_CORROBORATION_MIN_SIGNALS", 2, minimum=2, maximum=100
             )
 
         core_store = SentinelCoreStore(
@@ -1960,15 +2102,18 @@ async def _start_heart() -> None:
             on_health_change=_report_heart_health,
         )
 
-        if runtime.fenrir_instance is not None:
-            runtime.fenrir_instance.heart = runtime.heart
-
+        # Recovery finishes BEFORE Fenrir may stage live, otherwise a row
+        # inserted but not yet audited would be read as unaudited and
+        # quarantined while it is being legitimately staged.
         restored = await _rehydrate_heart_pending()
         if restored:
             logger.info(
                 "Heart: restored %d pending recommendation(s) after restart",
                 restored,
             )
+
+        if runtime.fenrir_instance is not None:
+            runtime.fenrir_instance.heart = runtime.heart
 
         runtime.subsystems.mark_active(
             SUBSYS_HEART,
