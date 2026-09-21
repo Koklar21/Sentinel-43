@@ -285,21 +285,22 @@ class SequenceWindow:
             None,
         ] = OrderedDict()
 
-    def seen_event_id(
+    def has_event_id(
         self,
         event_id: str,
     ) -> bool:
-        if event_id in self._seen_ids:
-            return True
+        return event_id in self._seen_ids
 
+    def mark_event_id(
+        self,
+        event_id: str,
+    ) -> None:
         self._seen_ids[event_id] = None
 
         while len(self._seen_ids) > self.max_events * 2:
             self._seen_ids.popitem(
                 last=False
             )
-
-        return False
 
     def add_event(
         self,
@@ -462,12 +463,16 @@ class SentinelThreatDetector:
             # sequence that Heart uses to tell independent observations apart.
             if not (
                 event_id
-                and window.seen_event_id(
+                and window.has_event_id(
                     event_id
                 )
             ) and window.add_event(
                 event
             ):
+                if event_id:
+                    window.mark_event_id(
+                        event_id
+                    )
                 self._ingest_seq += 1
                 window.last_seq = self._ingest_seq
 
@@ -505,6 +510,7 @@ class SentinelThreatDetector:
         event_count = 0
         failure_count = 0
         payload_max = 0
+        producers: set[str] = set()
 
         status_counter: Counter[int] = Counter()
         type_counter: Counter[str] = Counter()
@@ -514,6 +520,12 @@ class SentinelThreatDetector:
                 continue
 
             event_count += 1
+
+            # Set only by the trusted manager, from in-process provenance
+            # (never from a payload label).
+            trusted = (event.metadata or {}).get("trusted_producer")
+            if isinstance(trusted, str) and trusted:
+                producers.add(trusted)
 
             if event.status_code is not None:
                 status_counter[
@@ -580,6 +592,7 @@ class SentinelThreatDetector:
                     0,
                 )
             ),
+            "evidence_sources": sorted(producers),
             "event_count": event_count,
             "failure_count": failure_count,
             "max_payload_bytes": payload_max,

@@ -97,11 +97,10 @@ class WatchtowerNodeScanner:
 
 logger = logging.getLogger(__name__)
 
-# Producers whose events carry a trusted, proxy-resolved client IP and describe
-# hostile traffic. Heart, Fenrir and every derived event are deliberately
-# absent: ingesting the Heart's own notifications (or a finding derived from
-# earlier events) would let the pipeline manufacture its own evidence.
-DEFAULT_THREAT_INGEST_SOURCES: frozenset[str] = frozenset({"sentinel-firewall"})
+# Heart, Fenrir and every derived event are deliberately never ingested:
+# ingesting the Heart's own notifications (or a finding derived from earlier
+# events) would let the pipeline manufacture its own evidence. Only producers
+# registered through attach_threat_ingestor() are trusted.
 
 _INGEST_SEEN_IDS_MAX = 10_000
 _INGEST_RATE_KEYS_MAX = 10_000
@@ -203,8 +202,9 @@ class MonitoringManager:
         self._telemetry_sink = telemetry_sink
 
         self._threat_ingestor: Any | None = None
-        self._ingest_sources: frozenset[str] = DEFAULT_THREAT_INGEST_SOURCES
-        self._ingest_seen_ids: OrderedDict[str, None] = OrderedDict()
+        self._ingest_producers: dict[str, str] = {}
+        self._ingest_done_ids: OrderedDict[str, None] = OrderedDict()
+        self._ingest_inflight_ids: set[str] = set()
         self._ingest_rate: OrderedDict[tuple[str, str], deque[float]] = (
             OrderedDict()
         )
@@ -226,14 +226,22 @@ class MonitoringManager:
         self,
         ingestor: Any | None,
         *,
-        sources: frozenset[str] | None = None,
+        producers: dict[str, str] | None = None,
     ) -> None:
-        """Feed allowlisted originating events into the ONE detector instance
-        that Fenrir evaluates (an object exposing ``ingest(EventContext)``)."""
+        """Feed trusted originating events into the ONE detector instance
+        that Fenrir evaluates (an object exposing ``ingest(EventContext)``).
+
+        ``producers`` maps a canonical producer kind (e.g. "firewall") to the
+        source label that producer is CONFIGURED to emit. Trust comes from the
+        in-process ``trusted_producer`` argument to analyze_event(), never
+        from the payload's own ``source`` string; the label must additionally
+        match the configured one. The canonical kind, not the label, is what
+        corroboration counts as an independent source.
+        """
         with self._lock:
             self._threat_ingestor = ingestor
-            if sources is not None:
-                self._ingest_sources = frozenset(sources)
+            if producers is not None:
+                self._ingest_producers = dict(producers)
 
     def _ingest_threat_event(
         self,
@@ -242,6 +250,7 @@ class MonitoringManager:
         *,
         source_ip: str | None,
         source_identity: str | None,
+        trusted_producer: str | None,
     ) -> None:
         """Best-effort: never raises, never breaks monitoring, but counts."""
         ingestor = self._threat_ingestor
@@ -254,8 +263,10 @@ class MonitoringManager:
             normalized.source_identity or source_identity or ""
         ).strip()
 
+        expected_label = self._ingest_producers.get(trusted_producer or "")
         if (
-            normalized.source not in self._ingest_sources
+            expected_label is None
+            or normalized.source != expected_label
             or normalized.parent_event_id
             or not ip
             or not identity
@@ -264,22 +275,22 @@ class MonitoringManager:
                 counts["skipped_source"] += 1
             return
 
-        raw_id = (
-            raw.get("event_id") if isinstance(raw, dict) else None
-        ) or ""
-        event_id = str(raw_id).strip()
+        # The canonical normalized id (so "id", "event_id" and BaseEvent
+        # inputs are all the same event), not a raw payload key.
+        event_id = normalized.event_id
         now = time.time()
+        rate_key = (identity, ip)
 
         with self._lock:
-            if event_id:
-                if event_id in self._ingest_seen_ids:
-                    counts["skipped_replay"] += 1
-                    return
-                self._ingest_seen_ids[event_id] = None
-                while len(self._ingest_seen_ids) > _INGEST_SEEN_IDS_MAX:
-                    self._ingest_seen_ids.popitem(last=False)
+            # Completed OR in-flight: a concurrent duplicate is not new
+            # evidence, and a failed attempt is neither (see rollback below).
+            if (
+                event_id in self._ingest_done_ids
+                or event_id in self._ingest_inflight_ids
+            ):
+                counts["skipped_replay"] += 1
+                return
 
-            rate_key = (identity, ip)
             stamps = self._ingest_rate.get(rate_key)
             if stamps is None:
                 if len(self._ingest_rate) >= _INGEST_RATE_KEYS_MAX:
@@ -291,9 +302,12 @@ class MonitoringManager:
             while stamps and stamps[0] < now - _INGEST_RATE_WINDOW_SECONDS:
                 stamps.popleft()
             if len(stamps) >= _INGEST_RATE_LIMIT:
+                # Rejected before reservation: replay-eligible later.
                 counts["skipped_rate_limited"] += 1
                 return
+
             stamps.append(now)
+            self._ingest_inflight_ids.add(event_id)
 
         try:
             from core.detection.sentinel_threat_detector import EventContext
@@ -313,11 +327,21 @@ class MonitoringManager:
                         and str(raw.get("status") or "") == "blocked"
                         else None
                     ),
-                    metadata={"event_id": event_id} if event_id else {},
+                    metadata={
+                        "event_id": event_id,
+                        "trusted_producer": trusted_producer,
+                    },
                 )
             )
         except Exception:
             with self._lock:
+                # Roll back only THIS attempt's reservation; completed ids and
+                # other attempts' stamps are untouched, so a retry can succeed.
+                self._ingest_inflight_ids.discard(event_id)
+                try:
+                    stamps.remove(now)
+                except ValueError:
+                    pass
                 counts["failed"] += 1
             logger.warning(
                 "Threat-detector ingestion failed for source=%s",
@@ -327,6 +351,10 @@ class MonitoringManager:
             return
 
         with self._lock:
+            self._ingest_inflight_ids.discard(event_id)
+            self._ingest_done_ids[event_id] = None
+            while len(self._ingest_done_ids) > _INGEST_SEEN_IDS_MAX:
+                self._ingest_done_ids.popitem(last=False)
             counts["ingested"] += 1
 
     def _emit(
@@ -461,6 +489,7 @@ class MonitoringManager:
         *,
         source_ip: str | None = None,
         source_identity: str | None = None,
+        trusted_producer: str | None = None,
     ) -> MonitoringResult:
         with self._lock:
             started = self._started
@@ -481,6 +510,7 @@ class MonitoringManager:
             normalized,
             source_ip=source_ip,
             source_identity=source_identity,
+            trusted_producer=trusted_producer,
         )
 
         try:
