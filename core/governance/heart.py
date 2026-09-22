@@ -63,7 +63,6 @@ and the call raises -- it does not return a soft "staged anyway" result.
 
 from __future__ import annotations
 
-import ipaddress
 import logging
 import threading
 import time
@@ -76,15 +75,12 @@ from uuid import uuid4
 
 from core.detection.sentinel_threat_types import ThreatAssessment, ThreatSeverity
 from core.guards.velocity import VelocityGuard
-from core.policy_gate import GovernanceAction
-from core.security_context import IdentityType
 from core.sentinel43_core_db import ActionStatus, SentinelCoreStore
 
 from .orchestrator import (
     DecisionPrincipal,
     GovernanceMode,
     PolicyRefused,
-    ProposedOperation,
     RecommendationAuthorityUnavailable,
     ThreatRecommendation,
     UnauthorizedDecision,
@@ -93,12 +89,6 @@ from .orchestrator import (
 
 logger = logging.getLogger("sentinel43.heart")
 
-
-# The operation a Heart recommendation asks a human to authorize for an
-# unauthenticated remote source, in the established policy vocabulary
-# (core.policy_gate). The historical Nexus recommendation was
-# IntegrationHub.execute_firewall_block. Nothing here executes it.
-HEART_POLICY_ACTION = GovernanceAction.NETWORK_BLOCK
 
 _CORROBORATION_REQUIRED_SEVERITIES = frozenset(
     {ThreatSeverity.HIGH, ThreatSeverity.CRITICAL}
@@ -212,32 +202,6 @@ class ThreatGovernor:
         # Highest detector evidence sequence already counted per key. A
         # signal only counts if it carries strictly newer evidence.
         self._last_evidence_seq: dict[tuple[str, str], int] = {}
-
-    @staticmethod
-    def _proposed_operation(assessment: ThreatAssessment) -> ProposedOperation | None:
-        """What approving this recommendation would authorize, stated exactly.
-
-        The Heart's trusted evidence today is the firewall: requests from a
-        remote address refused before authentication, keyed by
-        (identity="anonymous", source_ip). The containment that addresses an
-        unauthenticated remote source is blocking that address, which the
-        policy vocabulary names NETWORK_BLOCK. For an AUTHENTICATED principal
-        the matching containment would be locking or revoking that identity;
-        the vocabulary has no such operation, so it stays explicitly
-        unsupported rather than being relabeled as a network block.
-        """
-        source_ip = str(assessment.source_ip).strip()
-        if str(assessment.identity).strip() != IdentityType.ANONYMOUS.value:
-            return None
-        try:
-            ipaddress.ip_address(source_ip)
-        except ValueError:
-            return None
-        return ProposedOperation(
-            action=HEART_POLICY_ACTION.value,
-            target_type="source_ip",
-            target=source_ip,
-        )
 
     @staticmethod
     def _evidence(assessment: ThreatAssessment) -> dict[str, Any]:
@@ -522,18 +486,11 @@ class ThreatGovernor:
             )
             return HeartDecision(status="OBSERVED", reason="DUPLICATE_SUPPRESSED")
 
+        # Report the finding to the orchestration core. What response it
+        # warrants, and whether anything is staged, is the core's decision.
         recommendation = ThreatRecommendation(
             subject_key=target_key,
-            kind=kind,
-            severity=assessment.severity.value,
-            source_kind=assessment.source_kind.value,
-            score=float(assessment.score),
-            reason=(
-                f"{kind} from {assessment.source_ip} "
-                f"(score={assessment.score:.1f}, "
-                f"tags={','.join(assessment.supporting_tags) or 'none'})"
-            ),
-            operation=self._proposed_operation(assessment),
+            assessment=assessment,
             evidence=self._evidence(assessment),
             requested_mode=effective_mode,
             created_at=now,
@@ -562,7 +519,8 @@ class ThreatGovernor:
                 assessment,
                 kind=kind,
                 action_id=outcome.action_id,
-                operation=recommendation.operation,
+                operations=list(outcome.operations),
+                engine_plan=outcome.engine_plan,
             )
         elif outcome.reason == "POLICY_OBSERVED":
             self._notify_monitoring(
@@ -586,7 +544,8 @@ class ThreatGovernor:
         *,
         kind: str,
         action_id: str,
-        operation: ProposedOperation | None,
+        operations: list[Any],
+        engine_plan: Any,
     ) -> None:
         """Mirror an orchestrator-staged recommendation into the canonical
         action/dashboard surface. Presentation only: the durable row and its
@@ -610,7 +569,8 @@ class ThreatGovernor:
                 "severity": assessment.severity.value,
                 "source_kind": assessment.source_kind.value,
                 "score": assessment.score,
-                "operation": operation.to_dict() if operation else None,
+                "operations": [dict(op) for op in operations],
+                "engine_plan": dict(engine_plan) if engine_plan else None,
                 "indicators": dict(assessment.indicators),
                 "supporting_tags": list(assessment.supporting_tags),
             },
@@ -704,7 +664,6 @@ class ThreatGovernor:
 __all__ = [
     "ActionSink",
     "DecisionPrincipal",
-    "HEART_POLICY_ACTION",
     "PolicyRefused",
     "HeartConfig",
     "HeartDecision",

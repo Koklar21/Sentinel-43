@@ -122,13 +122,15 @@ Thumbs.db
 *.rar
 
 # -----------------------------------------------------------------------------
-# Historical design prototypes (preserved in git, NOT part of the runtime).
-# The nested Sentinel-43/ directory contains superseded Heart/Shadow files
-# whose design history includes ACTIVE / AUTONOMOUS_VETO concepts that are
-# prohibited from the live runtime. They must never ship inside an image.
-# See Sentinel-43/README.md.
+# Owner-designated orchestration core (Sentinel-43/).
+# Shadow_mode.py ships because the runtime loads its Sentinel43ResponseEngine
+# as the orchestration engine (core/governance/sentinel43_engine.py), with its
+# execution paths contained. The other prototypes are not loaded and do not
+# ship. See Sentinel-43/README.md.
 # -----------------------------------------------------------------------------
-Sentinel-43/
+Sentinel-43/*
+!Sentinel-43/Shadow_mode.py
+!Sentinel-43/README.md
 
 # -----------------------------------------------------------------------------
 # Local developer tooling (gitignored, machine-local -- CI's fresh checkout
