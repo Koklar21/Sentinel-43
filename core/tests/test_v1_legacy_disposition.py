@@ -171,31 +171,65 @@ def test_v1_actions_maps_staged_to_pending_decision(client, staged_action):
 # REPLACE: POST /v1/actions/{id}/approve and /veto
 # ---------------------------------------------------------------------------
 
-def test_v1_approve_commits_through_the_real_governance_path(client, staged_action):
+def test_v1_approve_is_refused_when_no_governance_backend_is_configured(
+    client, staged_action
+):
+    """Missing required orchestration rejects the decision.
+
+    This is the DEFAULT configuration (S43_GOVERNANCE_ENABLED is false), and
+    it previously committed the approval with no governance evaluation and no
+    durable audit of the decision.
+    """
+    assert main_module.runtime.orchestrator is None
+
     response = client.post(
         f"/v1/actions/{staged_action['id']}/approve",
         json={"operator_id": "v1-disposition-operator", "reason": "approved via v1 disposition test"},
         headers=_headers(),
     )
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["result"] is True
-    assert body["action"]["decision"] == "approved"
+    assert response.status_code == 409, response.text
+    assert "governance is not enabled" in response.text.lower()
 
-    # The modern route sees the exact same committed state.
+    # The action is untouched -- not approved, still awaiting a decision.
     modern = client.get("/actions", headers=_headers())
     committed = next(a for a in modern.json() if a["id"] == staged_action["id"])
-    assert committed["status"] == "APPROVED"
+    assert committed["status"] == "STAGED"
+    assert committed["operator"] == ""
+    assert committed["decision_reason"] == ""
 
 
-def test_v1_veto_commits_through_the_real_governance_path(client, staged_action):
+def test_v1_veto_is_refused_when_no_governance_backend_is_configured(
+    client, staged_action
+):
+    assert main_module.runtime.orchestrator is None
+
     response = client.post(
         f"/v1/actions/{staged_action['id']}/veto",
         json={"operator_id": "v1-disposition-operator", "reason": "vetoed via v1 disposition test"},
         headers=_headers(),
     )
-    assert response.status_code == 200, response.text
-    assert response.json()["action"]["decision"] == "vetoed"
+    assert response.status_code == 409, response.text
+
+    modern = client.get("/actions", headers=_headers())
+    committed = next(a for a in modern.json() if a["id"] == staged_action["id"])
+    assert committed["status"] == "STAGED"
+
+
+def test_the_modern_route_is_refused_on_the_same_terms(client, staged_action):
+    """Proof that this is not a v1-only control: the modern route shares the
+    one choke point and refuses identically, so there is no alternate route."""
+    assert main_module.runtime.orchestrator is None
+
+    response = client.post(
+        f"/actions/{staged_action['id']}/approve",
+        json={"reason": "approved via the modern route"},
+        headers=_headers(),
+    )
+    assert response.status_code == 409, response.text
+
+    modern = client.get("/actions", headers=_headers())
+    committed = next(a for a in modern.json() if a["id"] == staged_action["id"])
+    assert committed["status"] == "STAGED"
 
 
 def test_v1_approve_rejects_an_action_id_mismatch_without_touching_the_ledger(client, staged_action):
@@ -239,3 +273,164 @@ def test_v1_approve_still_requires_operator_auth(client, staged_action):
         json={"operator_id": "nobody", "reason": "no auth supplied at all"},
     )
     assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Legitimate success through the REAL orchestration path
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def governed_action(monkeypatch):
+    """A staged action backed by a genuine SystemOrchestrator pending review.
+
+    Produced by the orchestrator's own producer (process_transaction), so the
+    decision_id the route resolves is one governance actually issued.
+    """
+    import asyncio
+    import tempfile
+    from datetime import datetime, timezone as _tz
+    from pathlib import Path
+
+    from core.audit import AuditConfig, AuditStore
+    from core.governance import build_orchestrator_from_settings
+    from core.governance.orchestrator import CallerContext, DecisionStatus
+
+    directory = Path(tempfile.mkdtemp(prefix="s43-v1-governed-"))
+    audit = AuditStore(
+        AuditConfig(sqlite_path=directory / "audit.sqlite3", signing_key="k" * 48)
+    )
+    audit.initialize()
+
+    class Settings:
+        default_mode = "HUMAN_GATED"
+        velocity_window_seconds = 60.0
+        velocity_limit = 10_000
+        velocity_gc_interval_seconds = 300.0
+        velocity_max_tracked_users = 10_000
+
+    orchestrator = build_orchestrator_from_settings(Settings(), audit_store=audit)
+
+    caller = CallerContext(
+        caller_id="v1-governed-admin",
+        caller_roles=frozenset({"admin"}),
+        authenticated_at=datetime.now(_tz.utc),
+    )
+    decision = orchestrator.process_transaction(
+        caller=caller,
+        user_id="governed-user",
+        amount_str="25.00",
+        metadata={"source": "v1-disposition-test"},
+        mode="HUMAN_GATED",
+        risk_score="75",
+    )
+    assert decision.status is DecisionStatus.REVIEW, decision
+    assert decision.decision_id
+
+    action = main_module._create_synthetic_action()
+    action["payload"]["decision_id"] = decision.decision_id
+    stored = asyncio.run(main_module._store_action(action))
+
+    monkeypatch.setattr(main_module.runtime, "orchestrator", orchestrator)
+    yield stored, orchestrator, audit, decision.decision_id
+
+
+def test_v1_approve_commits_through_the_real_governance_path(client, governed_action):
+    """Now literally true: the decision_id was issued by the orchestrator and
+    is resolved by it before the action store is touched."""
+    action, orchestrator, audit, decision_id = governed_action
+
+    response = client.post(
+        f"/v1/actions/{action['id']}/approve",
+        json={"operator_id": "ignored-by-design", "reason": "approved via v1 disposition test"},
+        headers=_headers(),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["action"]["decision"] == "approved"
+
+    modern = client.get("/actions", headers=_headers())
+    committed = next(a for a in modern.json() if a["id"] == action["id"])
+    assert committed["status"] == "APPROVED"
+
+    # The decision really was consumed by governance, not merely committed.
+    assert decision_id not in {
+        review["decision_id"] for review in orchestrator.list_pending_reviews()
+    }
+
+
+def test_v1_veto_commits_through_the_real_governance_path(client, governed_action):
+    action, orchestrator, audit, decision_id = governed_action
+
+    response = client.post(
+        f"/v1/actions/{action['id']}/veto",
+        json={"operator_id": "ignored-by-design", "reason": "vetoed via v1 disposition test"},
+        headers=_headers(),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["action"]["decision"] == "vetoed"
+
+
+def test_v1_records_the_authenticated_subject_not_the_request_body(
+    client, governed_action
+):
+    """The caller-supplied operator_id must not become the recorded decider."""
+    action, orchestrator, audit, decision_id = governed_action
+
+    response = client.post(
+        f"/v1/actions/{action['id']}/approve",
+        json={"operator_id": "somebody-else-entirely", "reason": "approved via v1 disposition test"},
+        headers=_headers(),
+    )
+    assert response.status_code == 200, response.text
+
+    modern = client.get("/actions", headers=_headers())
+    committed = next(a for a in modern.json() if a["id"] == action["id"])
+    assert committed["operator"] == "v1-disposition-operator"
+    assert committed["operator"] != "somebody-else-entirely"
+
+
+def test_a_second_decision_on_a_resolved_action_is_refused(client, governed_action):
+    """Duplicate decisions fail safely rather than resolving twice."""
+    action, orchestrator, audit, decision_id = governed_action
+
+    first = client.post(
+        f"/v1/actions/{action['id']}/approve",
+        json={"operator_id": "ignored-by-design", "reason": "approved via v1 disposition test"},
+        headers=_headers(),
+    )
+    assert first.status_code == 200, first.text
+
+    second = client.post(
+        f"/v1/actions/{action['id']}/approve",
+        json={"operator_id": "ignored-by-design", "reason": "approved a second time"},
+        headers=_headers(),
+    )
+    assert second.status_code == 409, second.text
+
+    third = client.post(
+        f"/v1/actions/{action['id']}/veto",
+        json={"operator_id": "ignored-by-design", "reason": "flipping the decision"},
+        headers=_headers(),
+    )
+    assert third.status_code == 409, third.text
+
+
+def test_unauthenticated_and_service_callers_cannot_resolve(client, governed_action):
+    """Unauthorized humans and service identities are rejected at the door."""
+    action, orchestrator, audit, decision_id = governed_action
+
+    unauthenticated = client.post(
+        f"/v1/actions/{action['id']}/approve",
+        json={"operator_id": "ignored-by-design", "reason": "no credential presented"},
+    )
+    assert unauthenticated.status_code in (401, 403), unauthenticated.text
+
+    bad_token = {"Authorization": "Bearer not-a-real-token", "X-S43-Password": PASSWORD}
+    forged = client.post(
+        f"/v1/actions/{action['id']}/approve",
+        json={"operator_id": "ignored-by-design", "reason": "forged credential"},
+        headers=bad_token,
+    )
+    assert forged.status_code in (401, 403), forged.text
+
+    modern = client.get("/actions", headers=_headers())
+    committed = next(a for a in modern.json() if a["id"] == action["id"])
+    assert committed["status"] == "STAGED"

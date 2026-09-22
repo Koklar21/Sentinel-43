@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import functools
 import json
 import logging
 import os
@@ -88,6 +89,7 @@ from ..monitoring.event_types import EVENT_SCHEMA_VERSION, would_loop
 from ..security_context import (
     IdentityType,
     get_security_context,
+    identity_of,
     new_id as new_event_id,
     set_identity as _set_identity,
 )
@@ -787,6 +789,7 @@ async def _resolve_governance_and_commit_action(
     new_status: str,
     reason: str,
     operator: str,
+    principal: Any | None = None,
 ) -> dict[str, Any]:
     """Resolve one action through whichever governance backend originated
     it, then commit the shared, canonical action-store status.
@@ -822,13 +825,18 @@ async def _resolve_governance_and_commit_action(
                 status_code=409,
                 detail="The Heart is not enabled",
             )
+        from core.governance import UnauthorizedDecision
+
         try:
             await asyncio.to_thread(
-                runtime.heart.resolve_human_decision,
-                action_id,
-                approved=approved,
-                operator_id=operator,
-                reason=reason,
+                functools.partial(
+                    runtime.heart.resolve_human_decision,
+                    action_id,
+                    approved=approved,
+                    operator_id=operator,
+                    reason=reason,
+                    principal=principal,
+                )
             )
         except KeyError as exc:
             raise HTTPException(
@@ -839,6 +847,11 @@ async def _resolve_governance_and_commit_action(
             raise HTTPException(
                 status_code=409,
                 detail=str(exc),
+            ) from exc
+        except UnauthorizedDecision as exc:
+            raise HTTPException(
+                status_code=403,
+                detail="operator is not authorized to resolve this action",
             ) from exc
         except ValueError as exc:
             raise HTTPException(
@@ -861,34 +874,47 @@ async def _resolve_governance_and_commit_action(
             or None
         )
 
-        if runtime.orchestrator is not None:
-            if not resolved_decision_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail="governance decision_id is required while governance is enabled",
-                )
-            try:
-                await asyncio.to_thread(
-                    runtime.orchestrator.resolve_human_decision,
-                    resolved_decision_id,
-                    approved=approved,
-                    operator_id=operator,
-                    reason=reason,
-                )
-            except KeyError as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail="governance decision is not pending or does not exist",
-                ) from exc
-            except Exception as exc:
-                logger.exception(
-                    "Governance resolution failed for decision_id=%s",
-                    resolved_decision_id,
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail="Governance decision service is unavailable",
-                ) from exc
+        # Fail closed, exactly as the HEART_RECOMMENDATION branch above.
+        # Previously this whole block was SKIPPED when no orchestrator was
+        # configured, and the decision was committed to the in-memory
+        # store with no governance and no durable audit -- the default
+        # path, since S43_GOVERNANCE_ENABLED defaults false.
+        if runtime.orchestrator is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Governance is not enabled; this action cannot be "
+                    "resolved"
+                ),
+            )
+
+        if not resolved_decision_id:
+            raise HTTPException(
+                status_code=409,
+                detail="governance decision_id is required while governance is enabled",
+            )
+        try:
+            await asyncio.to_thread(
+                runtime.orchestrator.resolve_human_decision,
+                resolved_decision_id,
+                approved=approved,
+                operator_id=operator,
+                reason=reason,
+            )
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="governance decision is not pending or does not exist",
+            ) from exc
+        except Exception as exc:
+            logger.exception(
+                "Governance resolution failed for decision_id=%s",
+                resolved_decision_id,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Governance decision service is unavailable",
+            ) from exc
 
     # Commit dashboard state only after governance accepts the decision.
     return await _commit_action_status(
@@ -1769,6 +1795,49 @@ async def _start_governance() -> None:
         logger.error("SystemOrchestrator failed to start", exc_info=True)
 
 
+def _heart_operator_authenticator(principal: Any) -> bool:
+    """Kernel-level authorization for a Heart approve/veto.
+
+    Decides from the identity the request pipeline RECORDED when it
+    verified the credential -- not from the operator string the caller
+    sent, which on the v1 routes is request-body data. First production
+    consumer of ``IdentityType.is_human``, which until now was only
+    ever written and never read.
+    """
+    if not principal.is_human:
+        return False
+    if principal.identity_type != IdentityType.OPERATOR.value:
+        return False
+
+    subject = principal.subject.strip()
+    if not subject or subject == IdentityType.ANONYMOUS.value:
+        return False
+
+    # Belt and braces: the trusted context above is the real control, but a
+    # token minted with a service NAME as its subject must not be recorded as
+    # a human decision either.
+    return not any(
+        identity.is_service and subject == identity.value
+        for identity in IdentityType
+    )
+
+
+def _decision_principal(request: Request, operator: str) -> Any:
+    """Build the Heart's principal from the SERVER-side identity.
+
+    ``identity_of`` reads the security context the authentication
+    dependency attached to this request; nothing here is caller data.
+    """
+    from core.governance import DecisionPrincipal
+
+    identity = identity_of(request)
+    return DecisionPrincipal(
+        subject=operator,
+        identity_type=identity.value,
+        is_human=identity.is_human,
+    )
+
+
 def _report_heart_health(healthy: bool, detail: str) -> None:
     """Given to ThreatGovernor so it can report its own health truthfully.
 
@@ -1811,6 +1880,9 @@ class _HeartActionSink:
 
 
 _HEART_RECOVERY_PAGE = 1000
+# Rejected decision attempts are audited against the same correlation id,
+# so this window must stay well clear of a legitimate action's history.
+_HEART_AUDIT_LOOKUP_LIMIT = 500
 _HEART_TERMINAL_DECISIONS = frozenset({"APPROVED", "VETOED", "EXECUTED", "EXPIRED"})
 
 
@@ -1927,11 +1999,11 @@ async def _rehydrate_heart_pending() -> int:
             heart.audit_store.get_records,
             component="heart",
             correlation_id=action_id,
-            limit=50,
+            limit=_HEART_AUDIT_LOOKUP_LIMIT,
         )
         problem = (
             "audit_history_too_long"
-            if len(audited) >= 50
+            if len(audited) >= _HEART_AUDIT_LOOKUP_LIMIT
             else _heart_row_problem(row, audited)
         )
         if problem is not None:
@@ -2053,7 +2125,11 @@ async def _start_heart() -> None:
         from pathlib import Path
 
         from core.governance import build_heart_from_settings
-        from core.sentinel43_core_db import CoreStoreConfig, SentinelCoreStore
+        from core.sentinel43_core_db import (
+            ActionStatus,
+            CoreStoreConfig,
+            SentinelCoreStore,
+        )
 
         resolved_default_mode = _env_str(
             "S43_HEART_DEFAULT_MODE",
@@ -2080,6 +2156,14 @@ async def _start_heart() -> None:
             corroboration_min_signals_for_high = _env_int(
                 "S43_HEART_CORROBORATION_MIN_SIGNALS", 2, minimum=2, maximum=100
             )
+            # Must stay below _HEART_RECOVERY_PAGE so a restart can always
+            # enumerate what staging was allowed to create.
+            max_pending_actions = _env_int(
+                "S43_HEART_MAX_PENDING_ACTIONS",
+                500,
+                minimum=1,
+                maximum=_HEART_RECOVERY_PAGE - 1,
+            )
 
         core_store = SentinelCoreStore(
             CoreStoreConfig(
@@ -2100,6 +2184,7 @@ async def _start_heart() -> None:
             monitoring_manager=runtime.monitoring_manager,
             action_sink=_HeartActionSink(asyncio.get_running_loop()),
             on_health_change=_report_heart_health,
+            operator_authenticator=_heart_operator_authenticator,
         )
 
         # Recovery finishes BEFORE Fenrir may stage live, otherwise a row
@@ -2115,10 +2200,33 @@ async def _start_heart() -> None:
         if runtime.fenrir_instance is not None:
             runtime.fenrir_instance.heart = runtime.heart
 
-        runtime.subsystems.mark_active(
-            SUBSYS_HEART,
-            f"Human-gated threat staging active (mode={resolved_default_mode}).",
+        # A store that is ALREADY at or over the ceiling keeps working and
+        # keeps observing, but cannot stage. The new limit stops that state
+        # getting worse; it does not repair it, so say so rather than
+        # reporting an unqualified "active".
+        backlog = await asyncio.to_thread(
+            core_store.count_actions, status=ActionStatus.PENDING
         )
+        ceiling = runtime.heart.config.max_pending_actions
+        if backlog >= ceiling:
+            detail = (
+                f"Human-gated threat staging SUSPENDED (mode="
+                f"{resolved_default_mode}): {backlog} pending recommendations "
+                f"at the ceiling of {ceiling}. Observation continues; resolve "
+                f"pending decisions to resume staging."
+            )
+            logger.error(
+                "Heart started with a pending backlog of %d at the ceiling of "
+                "%d -- staging is suspended until decisions are resolved",
+                backlog,
+                ceiling,
+            )
+        else:
+            detail = (
+                f"Human-gated threat staging active "
+                f"(mode={resolved_default_mode}, pending={backlog}/{ceiling})."
+            )
+        runtime.subsystems.mark_active(SUBSYS_HEART, detail)
         logger.info("Heart (ThreatGovernor) started (mode=%s)", resolved_default_mode)
     except Exception as exc:
         runtime.heart = None
@@ -2857,6 +2965,7 @@ async def dashboard_approve_action(
         new_status="APPROVED",
         reason=body.reason,
         operator=operator,
+        principal=_decision_principal(request, operator),
     )
 
     await _broadcast_dashboard_event(
@@ -2886,6 +2995,7 @@ async def dashboard_veto_action(
         new_status="VETOED",
         reason=body.reason,
         operator=operator,
+        principal=_decision_principal(request, operator),
     )
 
     await _broadcast_dashboard_event(

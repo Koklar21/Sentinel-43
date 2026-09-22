@@ -123,6 +123,7 @@ def build_heart_from_settings(
     monitoring_manager: Any | None = None,
     action_sink: Any | None = None,
     on_health_change: Any | None = None,
+    operator_authenticator: Any | None = None,
 ) -> ThreatGovernor:
     """Build a ThreatGovernor (the "Heart") from a validated settings object.
 
@@ -155,6 +156,7 @@ def build_heart_from_settings(
     )
 
     heart_config = HeartConfig(
+        max_pending_actions=int(_get(settings, "max_pending_actions", 500)),
         dedupe_ttl_seconds=int(_get(settings, "dedupe_ttl_seconds", 300)),
         corroboration_window_seconds=int(
             _get(settings, "corroboration_window_seconds", 300)
@@ -173,6 +175,7 @@ def build_heart_from_settings(
         monitoring_manager=monitoring_manager,
         action_sink=action_sink,
         on_health_change=on_health_change,
+        operator_authenticator=operator_authenticator,
     )
 
 

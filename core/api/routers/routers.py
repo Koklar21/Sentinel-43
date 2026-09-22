@@ -57,7 +57,15 @@ import re
 import uuid
 from typing import Any, Final
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    status,
+)
 
 from core.api.deps import require_operator
 from core.api.models import (
@@ -280,7 +288,9 @@ def _validate_action_id_match(
 async def approve_action(
     action_id: str,
     body: ActionRequest,
+    request: Request,
     request_id: str = Depends(dep_request_id),
+    operator: str = Depends(require_operator),
 ) -> ActionResponse:
     """REPLACE disposition: wired to the same human-gated commit path
     POST /actions/{action_id}/approve uses (core.api.main
@@ -297,6 +307,9 @@ async def approve_action(
     )
 
     from core.api import main as _core_main
+    from core.security_context import IdentityType, set_identity
+
+    set_identity(request, IdentityType.OPERATOR, operator)
 
     try:
         action = await _core_main._resolve_governance_and_commit_action(
@@ -306,7 +319,8 @@ async def approve_action(
             allowed_statuses={"STAGED"},
             new_status="APPROVED",
             reason=body.reason,
-            operator=body.operator_id,
+            operator=operator,
+            principal=_core_main._decision_principal(request, operator),
         )
     except HTTPException:
         raise
@@ -337,7 +351,9 @@ async def approve_action(
 async def veto_action(
     action_id: str,
     body: ActionRequest,
+    request: Request,
     request_id: str = Depends(dep_request_id),
+    operator: str = Depends(require_operator),
 ) -> ActionResponse:
     """REPLACE disposition: same as approve_action, approved=False."""
     _validate_action_id_match(
@@ -347,6 +363,9 @@ async def veto_action(
     )
 
     from core.api import main as _core_main
+    from core.security_context import IdentityType, set_identity
+
+    set_identity(request, IdentityType.OPERATOR, operator)
 
     try:
         action = await _core_main._resolve_governance_and_commit_action(
@@ -356,7 +375,8 @@ async def veto_action(
             allowed_statuses={"PENDING", "STAGED"},
             new_status="VETOED",
             reason=body.reason,
-            operator=body.operator_id,
+            operator=operator,
+            principal=_core_main._decision_principal(request, operator),
         )
     except HTTPException:
         raise
