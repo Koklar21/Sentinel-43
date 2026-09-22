@@ -752,3 +752,202 @@ def test_concurrent_decisions_resolve_exactly_once():
 
     assert outcomes.count("ok") == 1, outcomes
     assert core.get_status(action_id) == ActionStatus.APPROVED
+
+
+# ---------------------------------------------------------------------------
+# Governance through the established policy authority (core.policy_gate),
+# exercised through the PRODUCTION composition, not a test-built component.
+# ---------------------------------------------------------------------------
+def _start_production_heart(client, monkeypatch, directory: Path, audit):
+    """Compose the Heart exactly as the running app does, with a real Fenrir."""
+    import core.detection.feniri_hunter as fenrir_module
+
+    monkeypatch.setenv("S43_HEART_ENABLED", "true")
+    monkeypatch.setenv("S43_HEART_SQLITE_PATH", str(directory / "heart.sqlite3"))
+    fenrir = fenrir_module.FenrirHunter()
+    main_module.runtime.audit_store = audit
+    main_module.runtime.fenrir_instance = fenrir
+    client.portal.call(main_module._start_heart)
+    assert main_module.runtime.heart is not None
+    assert fenrir.heart is main_module.runtime.heart
+    return fenrir
+
+
+def _feed_two_trusted_producers(fenrir, ip: str) -> None:
+    import uuid as _uuid
+
+    from core.detection.sentinel_threat_detector import EventContext
+
+    for producer in ("firewall", "sparta"):
+        for _ in range(40):
+            fenrir.detector.ingest(
+                EventContext(
+                    source_identity="anonymous",
+                    source_ip=ip,
+                    event_type="firewall_block",
+                    success=False,
+                    metadata={
+                        "trusted_producer": producer,
+                        "event_id": str(_uuid.uuid4()),
+                    },
+                )
+            )
+
+
+def test_production_staging_is_decided_by_the_policy_authority(client, monkeypatch):
+    directory, audit, _, _ = _stack()
+    fenrir = _start_production_heart(client, monkeypatch, directory, audit)
+    _feed_two_trusted_producers(fenrir, "203.0.113.120")
+
+    client.portal.call(fenrir.observe_signals)
+
+    staged = [
+        r for r in audit.get_records(component="heart", limit=500)
+        if r.get("decision") == "STAGED"
+    ]
+    assert len(staged) == 1, staged
+    policy = staged[0]["policy"]
+    assert policy["status"] == "REQUIRES_HUMAN"
+    assert policy["action"] == "network_block"
+    assert policy["mode"] == "HUMAN_GATED"
+    assert policy["human_approved"] is False
+    assert policy["reasons"] == ["HUMAN_APPROVAL_REQUIRED"]
+
+    # ...and that staged recommendation is the one the canonical surface shows.
+    action_id = staged[0]["decision_id"]
+    assert main_module.runtime.action_store[action_id]["action_type"] == (
+        "HEART_RECOMMENDATION"
+    )
+
+
+def test_production_approval_is_permitted_by_the_policy_authority(client, monkeypatch):
+    directory, audit, _, _ = _stack()
+    fenrir = _start_production_heart(client, monkeypatch, directory, audit)
+    _feed_two_trusted_producers(fenrir, "203.0.113.121")
+    client.portal.call(fenrir.observe_signals)
+    action_id = next(
+        r["decision_id"] for r in audit.get_records(component="heart", limit=500)
+        if r.get("decision") == "STAGED"
+    )
+
+    response = client.post(
+        f"/actions/{action_id}/approve",
+        headers=_headers(),
+        json={"reason": "reviewed by operator"},
+    )
+    assert response.status_code == 200, response.text
+
+    approved = audit.get_records(component="heart", correlation_id=action_id)[-1]
+    assert approved["decision"] == "APPROVED"
+    assert approved["policy"]["status"] == "ALLOW"
+    assert approved["policy"]["human_approved"] is True
+    assert approved["policy"]["actor_id"] == "heart-op"
+
+
+def test_shadow_observation_is_decided_by_the_policy_authority():
+    directory, audit, core, _ = _stack()
+
+    class Settings:
+        default_mode = "SHADOW"
+        velocity_window_seconds = 60
+        velocity_limit = 100_000
+        dedupe_ttl_seconds = 300
+        corroboration_window_seconds = 300
+        corroboration_min_signals_for_high = 2
+
+    heart = build_heart_from_settings(
+        Settings(),
+        audit_store=audit,
+        core_store=core,
+        operator_authenticator=main_module._heart_operator_authenticator,
+    )
+    decision = heart.observe(
+        ThreatAssessment(
+            identity="anonymous",
+            source_ip="203.0.113.122",
+            threat_kind=list(ThreatKind)[0],
+            severity=ThreatSeverity.HIGH,
+            source_kind=ThreatSourceKind.MIXED_OR_UNKNOWN,
+            score=80.0,
+            indicators={"evidence_seq": 1, "evidence_sources": ["firewall", "sparta"]},
+            supporting_tags=["t"],
+            window_size=5,
+        )
+    )
+    assert decision.reason == "POLICY_OBSERVED"
+    observed = [
+        r for r in audit.get_records(component="heart", limit=500)
+        if r.get("reason_code") == "POLICY_OBSERVED"
+    ]
+    assert observed and observed[-1]["policy"]["status"] == "OBSERVE"
+    assert heart.list_pending() == ()
+
+
+def test_policy_refusal_stops_staging_without_acting(monkeypatch):
+    """If the policy authority does not permit the operation, the Heart
+    records that and stages nothing -- it never resolves a disagreement by
+    acting. PRIVILEGE_ESCALATION is in the REAL rule table's always_deny set,
+    so this exercises the real evaluator, not a mock."""
+    import core.governance.heart as heart_module
+    from core.policy_gate import GovernanceAction
+
+    _, audit, core, heart = _stack()
+    monkeypatch.setattr(
+        heart_module, "HEART_POLICY_ACTION", GovernanceAction.PRIVILEGE_ESCALATION
+    )
+
+    decision = heart.observe(
+        ThreatAssessment(
+            identity="anonymous",
+            source_ip="203.0.113.123",
+            threat_kind=list(ThreatKind)[0],
+            severity=ThreatSeverity.HIGH,
+            source_kind=ThreatSourceKind.MIXED_OR_UNKNOWN,
+            score=80.0,
+            indicators={"evidence_seq": 1, "evidence_sources": ["firewall", "sparta"]},
+            supporting_tags=["t"],
+            window_size=5,
+        )
+    )
+    assert decision.reason == "POLICY_REFUSED"
+    assert heart.list_pending() == ()
+    refused = [
+        r for r in audit.get_records(component="heart", limit=500)
+        if r.get("reason_code") == "POLICY_REFUSED"
+    ]
+    assert refused[-1]["policy"]["status"] == "DENY"
+    assert refused[-1]["policy"]["reasons"] == ["ALWAYS_DENIED"]
+
+
+def test_policy_refusal_blocks_approval_and_leaves_the_action_pending(
+    client, monkeypatch
+):
+    import core.governance.heart as heart_module
+    from core.policy_gate import GovernanceAction
+
+    _, audit, core, heart = _stack()
+    action_id = _stage(heart, "203.0.113.124")
+    _use(heart)
+    assert _recover(client) == 1
+
+    monkeypatch.setattr(
+        heart_module, "HEART_POLICY_ACTION", GovernanceAction.PRIVILEGE_ESCALATION
+    )
+    response = client.post(
+        f"/actions/{action_id}/approve",
+        headers=_headers(),
+        json={"reason": "reviewed by operator"},
+    )
+    assert response.status_code == 409, response.text
+    assert core.get_status(action_id) == ActionStatus.PENDING
+    last = audit.get_records(component="heart", correlation_id=action_id)[-1]
+    assert last["decision"] == "DENIED" and last["reason_code"] == "POLICY_REFUSED"
+
+    # A veto declines the operation, so policy does not stand in its way.
+    vetoed = client.post(
+        f"/actions/{action_id}/veto",
+        headers=_headers(),
+        json={"reason": "declining under policy refusal"},
+    )
+    assert vetoed.status_code == 200, vetoed.text
+    assert core.get_status(action_id) == ActionStatus.VETOED
