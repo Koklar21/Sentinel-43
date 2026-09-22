@@ -65,6 +65,36 @@ ENGINE_RELATIVE_PATH = Path("Sentinel-43") / "Shadow_mode.py"
 ENGINE_CLASS_NAME = "Sentinel43ResponseEngine"
 _ENGINE_MODULE_NAME = "sentinel43_owner_shadow_mode"
 
+#: sha256 of the owner-designated Shadow_mode.py this adapter was reviewed
+#: against. A different file (edited, replaced, or a stale image) is refused,
+#: so nothing decides with an engine nobody reviewed. Changing the owner file
+#: is a deliberate act that must update this pin in the same change.
+EXPECTED_ENGINE_SHA256 = (
+    "6dcad6db464a134ea80e2950bfc8f3f3c0c547bbf7b254d00dfb2d9b76877301"
+)
+
+
+def validated_subject_key(identity: Any, source_ip: Any) -> str:
+    """``identity|source_ip`` with both parts checked.
+
+    The identity must be a server-assigned identity type (never free text, so
+    no value can contain the separator or impersonate another subject) and
+    the address must parse as an IP address.
+    """
+    import ipaddress
+
+    from core.security_context import IdentityType
+
+    identity_value = str(identity).strip()
+    if identity_value not in {member.value for member in IdentityType}:
+        raise ValueError(f"subject identity {identity_value!r} is not a known identity type")
+    ip_value = str(source_ip).strip()
+    try:
+        normalized = str(ipaddress.ip_address(ip_value))
+    except ValueError as exc:
+        raise ValueError(f"subject source address {ip_value!r} is not an IP address") from exc
+    return f"{identity_value}|{normalized}"
+
 
 class EngineUnavailable(RuntimeError):
     """The owner-designated engine could not be loaded; nothing may decide."""
@@ -110,6 +140,12 @@ def load_engine_module(root: Path | None = None) -> tuple[ModuleType, EngineIden
                 "ship Sentinel-43/Shadow_mode.py"
             )
         source = path.read_bytes()
+        digest = hashlib.sha256(source).hexdigest()
+        if digest != EXPECTED_ENGINE_SHA256:
+            raise EngineUnavailable(
+                f"engine file {path} has sha256 {digest}, not the reviewed "
+                f"{EXPECTED_ENGINE_SHA256}; refusing to load it"
+            )
         spec = importlib.util.spec_from_file_location(_ENGINE_MODULE_NAME, path)
         if spec is None or spec.loader is None:
             raise EngineUnavailable(f"cannot load engine module from {path}")
@@ -125,7 +161,7 @@ def load_engine_module(root: Path | None = None) -> tuple[ModuleType, EngineIden
             raise EngineUnavailable(f"{path} does not define {ENGINE_CLASS_NAME}")
         identity = EngineIdentity(
             path=str(ENGINE_RELATIVE_PATH).replace("\\", "/"),
-            sha256=hashlib.sha256(source).hexdigest(),
+            sha256=digest,
             engine_class=ENGINE_CLASS_NAME,
             system_id=str(getattr(module, "SYSTEM_ID", "")),
         )
@@ -135,17 +171,182 @@ def load_engine_module(root: Path | None = None) -> tuple[ModuleType, EngineIden
 
 
 # ---------------------------------------------------------------------------
-# Operation vocabulary: engine ResponseAction -> established policy action
+# What each engine action means, what it targets, and what the EXISTING
+# policy authority (core.policy_gate) can say about it
 # ---------------------------------------------------------------------------
-#: Only engine actions the policy vocabulary can state EXACTLY are mapped.
-#: Everything else the engine recommends (step-up auth, rate limiting,
-#: identity blocks, incidents, review flags) has no policy operation and is
-#: recorded as unsupported -- never relabeled to obtain an allowed result.
-_SUPPORTED_ENGINE_ACTIONS: Mapping[str, tuple[str, str]] = {
-    "TEMP_BLOCK_IP": ("network_block", "source_ip"),
-    "HARD_BLOCK_IP": ("network_block", "source_ip"),
-    "QUARANTINE_SESSION": ("quarantine", "session"),
+#: Item statuses. Only APPROVABLE items become authorizable operations; the
+#: FULFILLED ones are satisfied by the staged review and its audit record;
+#: every other status blocks approval of the whole recommendation, because
+#: approving the rest would authorize a different set than the human reviewed.
+APPROVABLE = "APPROVABLE"
+FULFILLED = "FULFILLED_BY_REVIEW_RECORD"
+POLICY_DECISION_REQUIRED = "POLICY_DECISION_REQUIRED"
+NO_VALID_TARGET = "NO_VALID_TARGET"
+NOT_INTEGRATED = "NOT_INTEGRATED"
+UNKNOWN_ACTION = "UNKNOWN_ACTION"
+_BLOCKING = frozenset({POLICY_DECISION_REQUIRED, NO_VALID_TARGET, NOT_INTEGRATED, UNKNOWN_ACTION})
+
+#: engine action -> (meaning, target type, existing policy action or None).
+#: A policy action is listed ONLY where core.policy_gate already names that
+#: exact meaning. Rate limiting, step-up authentication and identity blocks
+#: are not network blocks and are not mapped to one.
+ACTION_CATALOG: Mapping[str, tuple[str, str | None, str | None]] = {
+    "TEMP_BLOCK_IP": (
+        "Block traffic from the source address for the engine's temporary "
+        "block period (ResponsePolicy.temp_block_seconds, default 15 minutes).",
+        "source_ip",
+        "network_block",
+    ),
+    "HARD_BLOCK_IP": (
+        "Block traffic from the source address for the engine's extended "
+        "block period (ResponsePolicy.hard_block_seconds, default 6 hours).",
+        "source_ip",
+        "network_block",
+    ),
+    "QUARANTINE_SESSION": (
+        "Quarantine the principal's authenticated session(s).",
+        "session",
+        "quarantine",
+    ),
+    "STEP_UP_AUTH": (
+        "Require the principal to re-authenticate with a stronger factor.",
+        "identity",
+        None,
+    ),
+    "RATE_LIMIT": (
+        "Throttle requests from the principal (for an unauthenticated source, "
+        "its address).",
+        "identity",
+        None,
+    ),
+    "TEMP_BLOCK_IDENTITY": (
+        "Block the principal's account for the temporary block period.",
+        "identity",
+        None,
+    ),
+    "HARD_BLOCK_IDENTITY": (
+        "Block the principal's account for the extended block period.",
+        "identity",
+        None,
+    ),
+    "OPEN_INCIDENT": (
+        "Open an incident record for follow-up.",
+        "incident",
+        None,
+    ),
+    "REQUIRE_HUMAN_REVIEW": (
+        "A human must review this recommendation.",
+        None,
+        None,
+    ),
+    "LOG_ONLY": ("Record the finding.", None, None),
+    "FLAG_SUSPICIOUS": ("Flag the principal as suspicious.", None, None),
 }
+
+_FULFILLED_ACTIONS = frozenset({"REQUIRE_HUMAN_REVIEW", "LOG_ONLY", "FLAG_SUSPICIOUS"})
+_IDENTITY_ACTIONS = frozenset(
+    {"STEP_UP_AUTH", "RATE_LIMIT", "TEMP_BLOCK_IDENTITY", "HARD_BLOCK_IDENTITY"}
+)
+_ANONYMOUS = "anonymous"
+
+
+def assess_actions(
+    engine_actions: tuple[str, ...] | list[str],
+    *,
+    subject_key: str,
+) -> dict[str, Any]:
+    """Classify every action of one engine recommendation, and decide whether
+    the recommendation as a whole can be approved under existing policy."""
+    identity, _sep, source_ip = str(subject_key).rpartition("|")
+    unauthenticated = identity == _ANONYMOUS
+    items: list[dict[str, Any]] = []
+    operations: list[dict[str, str]] = []
+
+    for raw in engine_actions:
+        name = str(raw)
+        entry = ACTION_CATALOG.get(name)
+        if entry is None:
+            items.append(
+                {
+                    "engine_action": name,
+                    "meaning": None,
+                    "target_type": None,
+                    "target": None,
+                    "policy_action": None,
+                    "status": UNKNOWN_ACTION,
+                    "reason": "The engine produced an action this build does not know.",
+                }
+            )
+            continue
+        meaning, target_type, policy_action = entry
+        target = (
+            source_ip
+            if target_type == "source_ip"
+            else subject_key
+            if target_type is not None
+            else None
+        )
+        item: dict[str, Any] = {
+            "engine_action": name,
+            "meaning": meaning,
+            "target_type": target_type,
+            "target": target,
+            "policy_action": policy_action,
+        }
+        if name in _FULFILLED_ACTIONS:
+            item["status"] = FULFILLED
+            item["reason"] = (
+                "Satisfied by the staged human review and its audit record."
+            )
+        elif name == "OPEN_INCIDENT":
+            item["status"] = NOT_INTEGRATED
+            item["reason"] = (
+                "No incident-management integration exists; approving could "
+                "not open one."
+            )
+        elif name == "QUARANTINE_SESSION" and unauthenticated:
+            item["status"] = NO_VALID_TARGET
+            item["reason"] = (
+                "An unauthenticated source has no session to quarantine."
+            )
+        elif policy_action is not None:
+            item["status"] = APPROVABLE
+            item["reason"] = f"Existing policy action '{policy_action}'."
+            operation = {
+                "action": policy_action,
+                "target_type": str(target_type),
+                "target": str(target),
+                "engine_action": name,
+            }
+            if operation not in operations:
+                operations.append(operation)
+        else:
+            item["status"] = POLICY_DECISION_REQUIRED
+            item["reason"] = (
+                "The policy vocabulary (core.policy_gate) has no operation with "
+                "this meaning."
+                + (
+                    " An unauthenticated source also has no account for it to "
+                    "act on."
+                    if unauthenticated and name in _IDENTITY_ACTIONS
+                    else ""
+                )
+            )
+        items.append(item)
+
+    blocking = [item for item in items if item["status"] in _BLOCKING]
+    reasons = [f"{item['engine_action']}: {item['reason']}" for item in blocking]
+    if not operations and not blocking:
+        reasons.append("The recommendation contains no operation to authorize.")
+    return {
+        "items": items,
+        "operations": operations,
+        "approval": {
+            "available": bool(operations) and not blocking,
+            "reasons": reasons,
+            "blocking_actions": [item["engine_action"] for item in blocking],
+        },
+    }
 
 
 def engine_operations(
@@ -153,26 +354,15 @@ def engine_operations(
     *,
     subject_key: str,
 ) -> tuple[list[dict[str, str]], list[str]]:
-    """(authorizable operations, unsupported engine actions) for a directive."""
-    identity, _sep, source_ip = str(subject_key).rpartition("|")
-    operations: list[dict[str, str]] = []
-    unsupported: list[str] = []
-    for name in engine_actions:
-        mapped = _SUPPORTED_ENGINE_ACTIONS.get(str(name))
-        if mapped is None:
-            unsupported.append(str(name))
-            continue
-        action, target_type = mapped
-        target = source_ip if target_type == "source_ip" else f"{identity}|{source_ip}"
-        operation = {
-            "action": action,
-            "target_type": target_type,
-            "target": target,
-            "engine_action": str(name),
-        }
-        if operation not in operations:
-            operations.append(operation)
-    return operations, unsupported
+    """(authorizable operations, actions that are neither authorizable nor
+    satisfied by the review record) for one recommendation."""
+    assessed = assess_actions(engine_actions, subject_key=subject_key)
+    unsupported = [
+        item["engine_action"]
+        for item in assessed["items"]
+        if item["status"] not in (APPROVABLE, FULFILLED)
+    ]
+    return assessed["operations"], unsupported
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +379,13 @@ class _StagingContext:
 
 _staging: contextvars.ContextVar[_StagingContext | None] = contextvars.ContextVar(
     "sentinel43_engine_staging", default=None
+)
+
+#: The server-verified human principal of the decision in progress. Set only
+#: by GovernedEngine.approve/veto, for the duration of one call, in the
+#: calling thread's context copy; never visible to other requests or threads.
+_deciding_principal: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
+    "sentinel43_engine_principal", default=None
 )
 
 
@@ -284,6 +481,14 @@ class CoreStoreActionStore:
         operator_reason: str | None,
         expected_status: Any,
     ) -> bool:
+        if _deciding_principal.get() is None:
+            # Only SystemOrchestrator.resolve_recommendation opens a decision
+            # context. A direct call on this store -- or on the engine --
+            # outside it changes nothing.
+            raise PermissionError(
+                "engine store transitions are only permitted inside a governed "
+                "human decision"
+            )
         new_core = self._core_status(new_status)
         if new_core not in (CoreStatus.APPROVED, CoreStatus.VETOED):
             raise RuntimeError(f"engine transition to {new_core.value} is not permitted")
@@ -333,11 +538,6 @@ class _NoExecutionIntegration:
 # ---------------------------------------------------------------------------
 # The contained engine and its principal-bound authenticator
 # ---------------------------------------------------------------------------
-_deciding_principal: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
-    "sentinel43_engine_principal", default=None
-)
-
-
 class GovernedEngine:
     """The owner engine, running with storage, execution and authentication
     adapted as described in the module docstring."""
@@ -392,8 +592,9 @@ class GovernedEngine:
         # attackers would collapse into one principal and all but the first
         # would be suppressed. The Heart's subject ("identity|source_ip") is
         # the principal actually being assessed.
+        subject_key = validated_subject_key(assessment.identity, assessment.source_ip)
         return m.ThreatAssessment(
-            identity=f"{assessment.identity}|{assessment.source_ip}",
+            identity=subject_key,
             source_ip=str(assessment.source_ip),
             threat_kind=member(m.ThreatKind, assessment.threat_kind.value, "UNKNOWN"),
             severity=member(m.ThreatSeverity, assessment.severity.value, "LOW"),
@@ -486,7 +687,11 @@ __all__ = [
     "ENGINE_RELATIVE_PATH",
     "EngineIdentity",
     "EngineUnavailable",
+    "ACTION_CATALOG",
+    "EXPECTED_ENGINE_SHA256",
     "GovernedEngine",
+    "validated_subject_key",
+    "assess_actions",
     "engine_operations",
     "engine_source_path",
     "load_engine_module",

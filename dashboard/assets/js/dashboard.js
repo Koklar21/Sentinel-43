@@ -745,7 +745,7 @@ function updateBulkBar() {
         .map(id => allActions.find(a => a.id === id))
         .filter(Boolean);
     if (el.bulkApproveBtn) {
-        el.bulkApproveBtn.disabled = !selected.some(a => a.status === "STAGED");
+        el.bulkApproveBtn.disabled = !selected.some(canApproveAction);
     }
     if (el.bulkVetoBtn) {
         el.bulkVetoBtn.disabled = !selected.some(a =>
@@ -809,6 +809,20 @@ function restoreFocus(previousId) {
 }
 
 // =============================================================================
+// Approval availability (set by the orchestration core; the server enforces it)
+// =============================================================================
+function approvalBlock(action) {
+    const approval = action?.payload?.approval;
+    if (!approval || approval.available !== false) return null;
+    const reasons = Array.isArray(approval.reasons) ? approval.reasons : [];
+    return reasons.length ? reasons : ["Approval is unavailable for this recommendation."];
+}
+
+function canApproveAction(action) {
+    return action?.status === "STAGED" && !approvalBlock(action);
+}
+
+// =============================================================================
 // Render
 // =============================================================================
 function renderActions() {
@@ -834,12 +848,16 @@ function renderActions() {
         const createdStyle = action.createdBad
             ? "color:var(--red);font-size:10px;"
             : "color:var(--muted);font-size:10px;";
-        const canApprove = action.status === "STAGED";
+        const canApprove = canApproveAction(action);
+        const blocked = action.status === "STAGED" ? approvalBlock(action) : null;
         const canVeto = ["PENDING", "STAGED"].includes(action.status);
         const controls = canApprove || canVeto
             ? `<div class="act-btns">` +
               (canApprove
                   ? `<button class="btn green" type="button" style="padding:3px 7px" data-approve="${escHtml(action.id)}" aria-label="Approve ${escHtml(action.id)}" title="Approve (A)">✓</button>`
+                  : "") +
+              (blocked
+                  ? `<span class="tag unknown" style="padding:3px 6px;cursor:help" title="${escHtml("Approval unavailable: " + blocked.join(" | "))}" aria-label="Approval unavailable for ${escHtml(action.id)}">no approve</span>`
                   : "") +
               (canVeto
                   ? `<button class="btn red" type="button" style="padding:3px 7px" data-veto="${escHtml(action.id)}" aria-label="Veto ${escHtml(action.id)}" title="Veto (V)">✕</button>`
@@ -865,6 +883,22 @@ function renderActions() {
 // =============================================================================
 // Expand Rows
 // =============================================================================
+function renderRecommendationDetail(action) {
+    const rec = action?.payload?.recommendation;
+    const approval = action?.payload?.approval;
+    if (!rec && !approval) return "";
+    const blocked = approvalBlock(action);
+    const approvalText = blocked
+        ? "UNAVAILABLE — " + blocked.join(" | ")
+        : (approval ? "available" : "—");
+    const items = Array.isArray(rec?.items) ? rec.items : [];
+    const itemsText = items.length
+        ? items.map(i => `${i.engine_action}: ${i.status}` + (i.meaning ? ` — ${i.meaning}` : "")).join("\n")
+        : "—";
+    return `<div class="expand-kv"><div class="k">APPROVAL</div><div class="v">${escHtml(approvalText)}</div></div>` +
+        `<div class="expand-kv"><div class="k">RECOMMENDED</div><div class="v" style="white-space:pre-wrap">${escHtml(itemsText)}</div></div>`;
+}
+
 function toggleExpand(actionId) {
     const existing = el.actionsBody?.querySelector(`.expand-row[data-for="${CSS.escape(actionId)}"]`);
     const button = el.actionsBody?.querySelector(`[data-expand="${CSS.escape(actionId)}"]`);
@@ -888,6 +922,7 @@ function toggleExpand(actionId) {
         `<div class="expand-kv"><div class="k">CREATED</div><div class="v">${escHtml(action.createdAt ?? "MISSING / INVALID")}</div></div>` +
         `<div class="expand-kv"><div class="k">OPERATOR</div><div class="v">${escHtml(action.operator || "—")}</div></div>` +
         `<div class="expand-kv"><div class="k">REASON</div><div class="v">${escHtml(action.decisionReason || "—")}</div></div>` +
+        renderRecommendationDetail(action) +
         `</div></td>`;
     row.after(expansion);
     if (button) button.textContent = "▼";
@@ -1185,6 +1220,11 @@ async function revalidateAction(actionId, expectedStatuses) {
 // Approve / Veto
 // =============================================================================
 async function doApprove(actionId, button) {
+    const blocked = approvalBlock(allActions.find(a => a.id === actionId));
+    if (blocked) {
+        log(`Approval unavailable — ${actionId}: ${blocked.join(" | ")}`, "warn");
+        return false;
+    }
     const reason = await openReasonModal({
         title: `Approve ${actionId}`,
         subtitle: "Describe why this action should proceed.",
@@ -1256,7 +1296,7 @@ async function runBulkAction(kind) {
     const expected = isApprove ? ["STAGED"] : ["PENDING", "STAGED"];
     const eligible = requestedIds.filter(id => {
         const a = allActions.find(x => x.id === id);
-        return a && expected.includes(a.status);
+        return a && expected.includes(a.status) && (!isApprove || canApproveAction(a));
     });
     if (eligible.length !== requestedIds.length) {
         log(`Bulk ${kind}: skipped ${requestedIds.length - eligible.length} ineligible selection(s).`, "warn");

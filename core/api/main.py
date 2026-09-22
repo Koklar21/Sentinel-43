@@ -89,8 +89,8 @@ from ..monitoring.event_types import EVENT_SCHEMA_VERSION, would_loop
 from core.governance.orchestrator import (
     LEGACY_REVIEW_ACTION,
     operations_for_row,
-    same_operations,
-    staged_operations_of,
+    recommendation_for_row,
+    staging_record_matches_row,
 )
 from ..security_context import (
     IdentityType,
@@ -1971,7 +1971,7 @@ def _heart_row_problem(
     # The durable row must propose exactly the operations the authenticated
     # staging record bound. A record from before operations were recorded can
     # only back a row that also predates them.
-    if not same_operations(staged_operations_of(rec), operations_for_row(row)):
+    if not staging_record_matches_row(rec, row):
         return "audit_operation_mismatch"
     if rec.get("threat_kind") != row["kind"]:
         return "audit_kind_mismatch"
@@ -2116,6 +2116,8 @@ async def _rehydrate_heart_pending() -> int:
                     "reason": reason,
                     "operations": operations_for_row(row),
                     "actions": list(row.get("actions") or ()),
+                    "recommendation": recommendation_for_row(row),
+                    "approval": recommendation_for_row(row)["approval"],
                     "legacy": str(row["primary_action"]) == LEGACY_REVIEW_ACTION,
                     "rehydrated": True,
                 },

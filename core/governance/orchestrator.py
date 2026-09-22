@@ -290,14 +290,38 @@ class RecommendationOutcome:
     policy: Any = None
     operations: tuple[Mapping[str, str], ...] = ()
     engine_plan: Mapping[str, Any] | None = None
+    recommendation: Mapping[str, Any] | None = None
 
 
-def _operation_key(operation: Mapping[str, Any]) -> tuple[str, str, str]:
+#: Recorded on every approval: a human decision was made and audited; no
+#: enforcement is performed, because no executor exists.
+APPROVAL_ENFORCEMENT_NOTE: Final[str] = (
+    "not_performed: approval records an audited human decision; no executor exists"
+)
+
+
+def _operation_key(operation: Mapping[str, Any]) -> tuple[str, str, str, str]:
     return (
         str(operation.get("action")),
         str(operation.get("target_type")),
         str(operation.get("target")),
+        str(operation.get("engine_action") or ""),
     )
+
+
+def _is_single_operation_row(row: Mapping[str, Any]) -> bool:
+    """Rows written by the pre-engine orchestrator: system_id "heart" and a
+    single policy action. Engine rows carry the engine's system_id, so editing
+    an engine row's primary_action cannot switch it onto this path."""
+    return str(row.get("system_id") or "") == RECOMMENDATION_COMPONENT and is_action_known(
+        str(row["primary_action"] or "")
+    )
+
+
+def _engine_row_consistent(row: Mapping[str, Any]) -> bool:
+    """The engine always records its primary action as its first action."""
+    actions = [str(a) for a in (row.get("actions") or ())]
+    return bool(actions) and actions[0] == str(row["primary_action"] or "")
 
 
 def operations_for_row(row: Mapping[str, Any]) -> list[dict[str, str]] | None:
@@ -307,7 +331,7 @@ def operations_for_row(row: Mapping[str, Any]) -> list[dict[str, str]] | None:
     if primary == LEGACY_REVIEW_ACTION:
         return None
     subject_key = str(row["target_value"])
-    if is_action_known(primary):
+    if _is_single_operation_row(row):
         # A single explicit operation (recorded before the engine ran).
         _identity, _sep, source_ip = subject_key.rpartition("|")
         return [{"action": primary, "target_type": "source_ip", "target": source_ip}]
@@ -317,6 +341,63 @@ def operations_for_row(row: Mapping[str, Any]) -> list[dict[str, str]] | None:
         tuple(row.get("actions") or ()), subject_key=subject_key
     )
     return operations
+
+
+def recommendation_for_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """The approval assessment for a durable row, derived only from what the
+    row records (so it is identical at staging, decision and recovery)."""
+    primary = str(row["primary_action"] or "")
+    if primary == LEGACY_REVIEW_ACTION:
+        return {
+            "items": [],
+            "operations": [],
+            "approval": {
+                "available": False,
+                "reasons": [
+                    "Staged before operations were recorded: there is no "
+                    "recorded operation to approve."
+                ],
+                "blocking_actions": [],
+            },
+        }
+    if _is_single_operation_row(row):
+        operations = operations_for_row(row) or []
+        return {
+            "items": [],
+            "operations": operations,
+            "approval": {"available": True, "reasons": [], "blocking_actions": []},
+        }
+    from .sentinel43_engine import assess_actions
+
+    assessed = assess_actions(
+        tuple(row.get("actions") or ()), subject_key=str(row["target_value"])
+    )
+    if not _engine_row_consistent(row):
+        assessed["approval"] = {
+            "available": False,
+            "reasons": ["The durable row is internally inconsistent."],
+            "blocking_actions": [],
+        }
+    return assessed
+
+
+def staging_record_matches_row(
+    record: Mapping[str, Any],
+    row: Mapping[str, Any],
+) -> bool:
+    """Does the authenticated STAGED record bind exactly what the row
+    proposes? Engine records bind the engine's full action list, so no action
+    can be added, dropped, reordered or swapped (temporary for hard) later."""
+    plan = record.get("engine_plan")
+    if isinstance(plan, Mapping) and isinstance(plan.get("actions"), list):
+        return (
+            not _is_single_operation_row(row)
+            and _engine_row_consistent(row)
+            and str(plan.get("primary_action") or "") == str(row["primary_action"])
+            and [str(a) for a in plan["actions"]]
+            == [str(a) for a in (row.get("actions") or ())]
+        )
+    return same_operations(staged_operations_of(record), operations_for_row(row))
 
 
 def staged_operations_of(record: Mapping[str, Any]) -> list[dict[str, Any]] | None:
@@ -1414,16 +1495,44 @@ class SystemOrchestrator:
         mode = self._effective_recommendation_mode(recommendation.requested_mode)
         assessment = recommendation.assessment
 
-        plan = engine.plan(assessment)
-        from .sentinel43_engine import engine_operations
+        from .sentinel43_engine import assess_actions, validated_subject_key
 
-        operations, unsupported = engine_operations(
-            plan["actions"], subject_key=recommendation.subject_key
-        )
+        try:
+            subject_ok = (
+                validated_subject_key(assessment.identity, assessment.source_ip)
+                == recommendation.subject_key
+            )
+        except ValueError:
+            subject_ok = False
+        if not subject_ok:
+            # The subject is the target every operation acts on; a malformed
+            # or ambiguous one must never reach the engine.
+            self._append_audit(
+                self._recommendation_record(
+                    recommendation,
+                    decision="OBSERVED",
+                    reason_code="INVALID_SUBJECT",
+                )
+            )
+            return RecommendationOutcome(status="OBSERVED", reason="INVALID_SUBJECT")
+
+        plan = engine.plan(assessment)
+        assessed = assess_actions(plan["actions"], subject_key=recommendation.subject_key)
+        operations = assessed["operations"]
+        unsupported = [
+            item["engine_action"]
+            for item in assessed["items"]
+            if item["status"] in ("POLICY_DECISION_REQUIRED", "NO_VALID_TARGET",
+                                  "NOT_INTEGRATED", "UNKNOWN_ACTION")
+        ]
         decision_context = {
             "engine_plan": plan["summary"],
             "operations": operations,
             "unsupported_actions": unsupported,
+            "recommendation": {
+                "items": assessed["items"],
+                "approval": assessed["approval"],
+            },
         }
 
         if plan["actions"] == ["LOG_ONLY"]:
@@ -1585,6 +1694,7 @@ class SystemOrchestrator:
             policy=policies,
             operations=tuple(operations),
             engine_plan=plan["summary"],
+            recommendation=decision_context["recommendation"],
         )
 
     def _staged_record(self, action_id: str) -> Mapping[str, Any] | None:
@@ -1674,30 +1784,20 @@ class SystemOrchestrator:
         if row is None:
             raise KeyError(action_id)
 
-        operations = operations_for_row(row)
+        assessed = recommendation_for_row(row)
+        operations = assessed["operations"]
         policies: list[dict[str, Any]] = []
         if approved:
-            if not operations:
-                # Nothing the policy vocabulary can express was recommended;
-                # approving would bind consent to no authorizable operation.
-                self._deny_recommendation_decision(
-                    action_id,
-                    operator_id=operator_id,
-                    reason_code="UNSUPPORTED_OPERATION",
-                    identity_type=identity_type,
-                    extra={
-                        "primary_action": str(row["primary_action"]),
-                        "actions": list(row.get("actions") or ()),
-                    },
-                )
-                raise PolicyRefused(
-                    "this recommendation has no operation that can be approved"
-                )
             staged_record = self._staged_record(action_id)
-            staged_ops = (
-                staged_operations_of(staged_record) if staged_record else None
-            )
-            if not same_operations(staged_ops, operations):
+            if staged_record is None or not staging_record_matches_row(
+                staged_record, row
+            ) or (
+                f"{staged_record.get('identity')}|{staged_record.get('source_ip')}"
+                != str(row["target_value"])
+            ):
+                staged_ops = (
+                    staged_operations_of(staged_record) if staged_record else None
+                )
                 self._deny_recommendation_decision(
                     action_id,
                     operator_id=operator_id,
@@ -1707,6 +1807,24 @@ class SystemOrchestrator:
                 )
                 raise PolicyRefused(
                     "the durable operations do not match what was staged"
+                )
+            if not assessed["approval"]["available"]:
+                # The recommendation is approved as a whole or not at all:
+                # approving only its supported part would authorize a
+                # different set than the human reviewed.
+                self._deny_recommendation_decision(
+                    action_id,
+                    operator_id=operator_id,
+                    reason_code="APPROVAL_UNAVAILABLE",
+                    identity_type=identity_type,
+                    extra={
+                        "actions": list(row.get("actions") or ()),
+                        "approval": assessed["approval"],
+                    },
+                )
+                raise PolicyRefused(
+                    "approval is unavailable for this recommendation: "
+                    + "; ".join(assessed["approval"]["reasons"])
                 )
             policies = [
                 self._operation_policy(
@@ -1766,6 +1884,8 @@ class SystemOrchestrator:
                     "identity_type": identity_type,
                     "resolution_reason": reason,
                     "operations": operations,
+                    "actions": list(row.get("actions") or ()),
+                    "enforcement": APPROVAL_ENFORCEMENT_NOTE if approved else None,
                     **({"policy": policies} if policies else {}),
                 }
             )
@@ -1793,6 +1913,7 @@ class SystemOrchestrator:
             "outcome": new_status.value,
             "operator_id": operator_id,
             "operations": operations,
+            "enforcement": APPROVAL_ENFORCEMENT_NOTE if approved else None,
             "resolved_at": _utc_now().isoformat(),
         }
 
@@ -1834,7 +1955,10 @@ __all__ = [
     "RecommendationOutcome",
     "ThreatRecommendation",
     "UnauthorizedDecision",
+    "APPROVAL_ENFORCEMENT_NOTE",
     "operations_for_row",
+    "recommendation_for_row",
     "same_operations",
+    "staging_record_matches_row",
     "staged_operations_of",
 ]

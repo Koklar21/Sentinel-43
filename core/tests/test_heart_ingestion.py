@@ -687,3 +687,24 @@ def test_a_store_already_over_the_ceiling_refuses_to_stage(tmp_path):
         )
     assert core.count_actions(status=ActionStatus.PENDING) == 2
     assert _stage_one(heart, 2, "203.0.113.211").status == "STAGED"
+
+
+@pytest.mark.parametrize(
+    "identity,source_ip",
+    [
+        ("anonymous|203.0.113.9", "198.51.100.1"),  # separator in identity
+        ("some-user-name", "198.51.100.1"),         # not a server identity type
+        ("anonymous", "not-an-address"),            # not an IP address
+        ("anonymous", "198.51.100.1|x"),            # separator in address
+    ],
+)
+def test_ingestion_refuses_a_malformed_subject(identity, source_ip):
+    ingestor = _RecordingIngestor()
+    manager = _manager(ingestor)
+    manager.analyze_event(
+        _event(source_identity=identity), source_ip=source_ip, trusted_producer="firewall"
+    )
+    counts = _counts(manager)
+    assert counts["ingested"] == 0
+    assert counts["skipped_invalid_subject"] == 1
+    assert ingestor.contexts == []
