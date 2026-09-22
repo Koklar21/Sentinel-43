@@ -64,6 +64,11 @@
 # human-governed staging. scripts/deploy_preflight.py's "prepare" mode
 # fails a beta/non-local target that leaves this unset or not explicitly
 # "true"; "verify" mode inspects the effective value inside the live pod.
+#
+# S43_GOVERNANCE_ENABLED: "true" with the Heart. Every Heart recommendation
+# is staged and resolved by SystemOrchestrator (core/governance/
+# orchestrator.py); the Heart has no decision authority of its own and
+# fails to start -- blocking /ready -- without the orchestrator.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -76,3 +81,4 @@ data:
   S43_TLS_TERMINATED_AT_TRUSTED_EDGE: "true"
   S43_REJECT_LEGACY_AUTH: "true"
   S43_HEART_ENABLED: "true"
+  S43_GOVERNANCE_ENABLED: "true"

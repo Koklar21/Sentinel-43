@@ -954,6 +954,68 @@ class AuditStore:
 
         return records
 
+    def get_records_without_component(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Bounded read of records written WITHOUT a ``component`` field.
+
+        Producers that predate the component/correlation_id lookup keys wrote
+        records ``get_records`` can never find, because it must filter on a
+        component. Recovery still has to see them: a legitimately audited
+        decision does not become unverifiable because the payload format
+        later gained fields. Same fail-closed guarantees as ``get_records``:
+        refuses to serve while the store is not HEALTHY, reads at most
+        ``limit`` rows in id order, and rejects any row whose denormalized
+        columns disagree with its authenticated payload. The caller must
+        treat ``len(result) == limit`` as "there may be more".
+        """
+        if not 0 < limit <= self._MAX_RECORDS_LIMIT:
+            raise ValueError(
+                f"limit must be in (0, {self._MAX_RECORDS_LIMIT}]"
+            )
+
+        if self.last_known_health != AuditStoreHealth.HEALTHY:
+            raise AuditIntegrityError(
+                "Audit store is not currently healthy "
+                f"(last_known_health={self.last_known_health.value}); "
+                "refusing to serve reads until verify_integrity() succeeds"
+            )
+
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT payload_json, component, correlation_id FROM audit_log "
+                "WHERE component IS NULL ORDER BY id ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        finally:
+            connection.close()
+
+        records: list[dict[str, Any]] = []
+        for payload_json, component_col, correlation_id_col in rows:
+            try:
+                payload = json.loads(str(payload_json))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if (
+                _normalize_lookup_value(component_col)
+                != _normalize_lookup_value(payload.get("component"))
+                or _normalize_lookup_value(correlation_id_col)
+                != _normalize_lookup_value(payload.get("correlation_id"))
+            ):
+                self._set_health(AuditStoreHealth.UNHEALTHY)
+                raise AuditIntegrityError(
+                    "Audit record's denormalized lookup metadata does not "
+                    "match its authenticated payload"
+                )
+            records.append(payload)
+
+        return records
+
     # ------------------------------------------------------------------
     # Append
     # ------------------------------------------------------------------

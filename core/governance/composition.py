@@ -120,6 +120,7 @@ def build_heart_from_settings(
     *,
     audit_store: AuditWriter,
     core_store: SentinelCoreStore,
+    authority: Any | None = None,
     monitoring_manager: Any | None = None,
     action_sink: Any | None = None,
     on_health_change: Any | None = None,
@@ -131,6 +132,12 @@ def build_heart_from_settings(
     duck-typed and owned by the API composition root, which does all
     environment parsing. ``audit_store`` and ``core_store`` must already be
     initialized -- this function performs no filesystem/network I/O.
+
+    ``authority`` is the SystemOrchestrator that governs every Heart
+    recommendation. It is bound here to the SAME ``core_store`` the Heart
+    was given, so there is exactly one durable pending-decision store, and
+    ``operator_authenticator`` becomes the authority's (fail-closed when
+    absent). With no authority the Heart stages and resolves nothing.
     """
     if audit_store is None:
         raise ValueError(
@@ -166,6 +173,13 @@ def build_heart_from_settings(
         ),
     )
 
+    if authority is not None:
+        authority.attach_recommendation_store(
+            core_store,
+            operator_authenticator=operator_authenticator,
+            max_pending_actions=heart_config.max_pending_actions,
+        )
+
     return ThreatGovernor(
         audit_store=audit_store,
         velocity_guard=velocity_guard,
@@ -175,7 +189,7 @@ def build_heart_from_settings(
         monitoring_manager=monitoring_manager,
         action_sink=action_sink,
         on_health_change=on_health_change,
-        operator_authenticator=operator_authenticator,
+        authority=authority,
     )
 
 

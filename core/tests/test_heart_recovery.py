@@ -42,6 +42,7 @@ from core.governance import (  # noqa: E402
     DecisionPrincipal,
     UnauthorizedDecision,
     build_heart_from_settings,
+    build_orchestrator_from_settings,
 )
 from core.security_context import IdentityType  # noqa: E402
 from core.sentinel43_core_db import (  # noqa: E402
@@ -74,6 +75,7 @@ def _auth_env(monkeypatch):
     monkeypatch.setattr(runtime, "heart", None)
     monkeypatch.setattr(runtime, "audit_store", None)
     monkeypatch.setattr(runtime, "fenrir_instance", None)
+    monkeypatch.setattr(runtime, "orchestrator", None)
     yield
     # Never leave a failed Heart behind for tests that share the process.
     runtime.subsystems.mark_disabled(main_module.SUBSYS_HEART)
@@ -109,9 +111,19 @@ def _stack():
         Settings(),
         audit_store=audit,
         core_store=core,
+        authority=_authority(audit),
         operator_authenticator=main_module._heart_operator_authenticator,
     )
     return directory, audit, core, heart
+
+
+def _authority(audit, mode: str = "HUMAN_GATED"):
+    """The governance orchestrator every Heart decision goes through."""
+
+    class GovernanceSettings:
+        default_mode = mode
+
+    return build_orchestrator_from_settings(GovernanceSettings(), audit_store=audit)
 
 
 def _stage(heart, ip: str):
@@ -198,7 +210,16 @@ def _recover(client) -> int:
 
 def _use(heart) -> None:
     main_module.runtime.heart = heart
+    main_module.runtime.orchestrator = heart._authority
     main_module.runtime.action_store.clear()
+
+
+def _start_production_governance(client, monkeypatch, audit) -> None:
+    """Run the real _start_governance, as the app lifespan does."""
+    monkeypatch.setenv("S43_GOVERNANCE_ENABLED", "true")
+    main_module.runtime.audit_store = audit
+    client.portal.call(main_module._start_governance)
+    assert main_module.runtime.orchestrator is not None
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +467,7 @@ def test_failed_recovery_blocks_readiness_but_not_liveness(monkeypatch):
     monkeypatch.setenv("S43_HEART_SQLITE_PATH", str(directory / "heart.sqlite3"))
 
     with TestClient(main_module.app) as test_client:
-        main_module.runtime.audit_store = audit
+        _start_production_governance(test_client, monkeypatch, audit)
         test_client.portal.call(main_module._start_heart)
 
         assert main_module.runtime.heart is None
@@ -482,7 +503,7 @@ def test_fenrir_is_wired_to_heart_only_after_recovery_completes(monkeypatch):
     monkeypatch.setattr(main_module, "_rehydrate_heart_pending", _recording_recovery)
 
     with TestClient(main_module.app) as test_client:
-        main_module.runtime.audit_store = audit
+        _start_production_governance(test_client, monkeypatch, audit)
         main_module.runtime.fenrir_instance = fenrir
         fenrir.heart = None
         test_client.portal.call(main_module._start_heart)
@@ -576,7 +597,10 @@ def test_kernel_fails_closed_when_no_authenticator_is_injected(tmp_path):
         corroboration_min_signals_for_high = 2
 
     heart = build_heart_from_settings(
-        Settings(), audit_store=audit, core_store=core
+        Settings(),
+        audit_store=audit,
+        core_store=core,
+        authority=_authority(audit),
     )  # no operator_authenticator
     action_id = _stage(heart, "203.0.113.83")
 
@@ -765,7 +789,7 @@ def _start_production_heart(client, monkeypatch, directory: Path, audit):
     monkeypatch.setenv("S43_HEART_ENABLED", "true")
     monkeypatch.setenv("S43_HEART_SQLITE_PATH", str(directory / "heart.sqlite3"))
     fenrir = fenrir_module.FenrirHunter()
-    main_module.runtime.audit_store = audit
+    _start_production_governance(client, monkeypatch, audit)
     main_module.runtime.fenrir_instance = fenrir
     client.portal.call(main_module._start_heart)
     assert main_module.runtime.heart is not None
@@ -859,6 +883,7 @@ def test_shadow_observation_is_decided_by_the_policy_authority():
         Settings(),
         audit_store=audit,
         core_store=core,
+        authority=_authority(audit),
         operator_authenticator=main_module._heart_operator_authenticator,
     )
     decision = heart.observe(
@@ -930,9 +955,25 @@ def test_policy_refusal_blocks_approval_and_leaves_the_action_pending(
     _use(heart)
     assert _recover(client) == 1
 
-    monkeypatch.setattr(
-        heart_module, "HEART_POLICY_ACTION", GovernanceAction.PRIVILEGE_ESCALATION
-    )
+    import core.governance.orchestrator as orchestrator_module
+    from core.policy_gate import PolicyContext, evaluate as real_evaluate
+
+    def refusing_policy(context):
+        # The real evaluator, asked about an operation its rule table
+        # always denies: the policy authority now refuses this approval.
+        return real_evaluate(
+            PolicyContext(
+                action=GovernanceAction.PRIVILEGE_ESCALATION,
+                actor_id=context.actor_id,
+                tenant_id=context.tenant_id,
+                resource=context.resource,
+                mode=context.mode,
+                human_approved=context.human_approved,
+                correlation_id=context.correlation_id,
+            )
+        )
+
+    monkeypatch.setattr(orchestrator_module, "evaluate", refusing_policy)
     response = client.post(
         f"/actions/{action_id}/approve",
         headers=_headers(),
@@ -951,3 +992,326 @@ def test_policy_refusal_blocks_approval_and_leaves_the_action_pending(
     )
     assert vetoed.status_code == 200, vetoed.text
     assert core.get_status(action_id) == ActionStatus.VETOED
+
+
+# ---------------------------------------------------------------------------
+# The orchestrator is the authority; the Heart cannot act on its own
+# ---------------------------------------------------------------------------
+def _assessment(ip: str, identity: str = "anonymous") -> ThreatAssessment:
+    return ThreatAssessment(
+        identity=identity,
+        source_ip=ip,
+        threat_kind=list(ThreatKind)[0],
+        severity=ThreatSeverity.HIGH,
+        source_kind=ThreatSourceKind.MIXED_OR_UNKNOWN,
+        score=80.0,
+        indicators={"evidence_seq": 1, "evidence_sources": ["firewall", "sparta"]},
+        supporting_tags=["t"],
+        window_size=5,
+    )
+
+
+def test_heart_source_contains_no_decision_writes():
+    """Structural: the only code that inserts or transitions a pending
+    decision is the orchestrator. The Heart module has no path to do it."""
+    import inspect
+
+    import core.governance.heart as heart_module
+    import core.governance.orchestrator as orchestrator_module
+
+    heart_source = inspect.getsource(heart_module)
+    for forbidden in ("insert_pending(", "transition_status(", "evaluate("):
+        assert forbidden not in heart_source, forbidden
+
+    orchestrator_source = inspect.getsource(orchestrator_module)
+    assert "insert_pending(" in orchestrator_source
+    assert "transition_status(" in orchestrator_source
+
+
+def test_a_heart_without_an_authority_stages_and_resolves_nothing(tmp_path):
+    audit = AuditStore(AuditConfig(sqlite_path=tmp_path / "a.sqlite3", signing_key="k" * 48))
+    audit.initialize()
+    core = SentinelCoreStore(CoreStoreConfig(db_path=tmp_path / "h.sqlite3"))
+    core.initialize()
+
+    class Settings:
+        default_mode = "HUMAN_GATED"
+
+    heart = build_heart_from_settings(Settings(), audit_store=audit, core_store=core)
+
+    decision = heart.observe(_assessment("203.0.113.130"))
+    assert decision.status == "OBSERVED" and decision.reason == "NO_GOVERNANCE_AUTHORITY"
+    assert core.count_actions() == 0
+
+    from core.governance.orchestrator import RecommendationAuthorityUnavailable
+
+    with pytest.raises(RecommendationAuthorityUnavailable):
+        heart.resolve_human_decision(
+            "HEART-ANYTHING0001",
+            approved=True,
+            operator_id="heart-op",
+            reason="no authority",
+            principal=_principal(),
+        )
+
+
+def test_staging_records_the_orchestrator_the_operation_and_its_target():
+    _, audit, core, heart = _stack()
+    action_id = _stage(heart, "203.0.113.131")
+
+    row = core.get_action(action_id)
+    assert row["primary_action"] == "network_block"
+
+    staged = audit.get_records(component="heart", correlation_id=action_id)[0]
+    assert staged["authority"] == "system_orchestrator"
+    assert staged["operation"] == {
+        "action": "network_block",
+        "target_type": "source_ip",
+        "target": "203.0.113.131",
+    }
+    # The policy decision is bound to that operation AND its target.
+    assert staged["policy"]["action"] == "network_block"
+    assert staged["policy"]["resource"] == "source_ip:203.0.113.131"
+
+
+def test_approval_is_bound_to_the_staged_operation_and_target(client):
+    _, audit, core, heart = _stack()
+    action_id = _stage(heart, "203.0.113.132")
+    _use(heart)
+    assert _recover(client) == 1
+
+    response = client.post(
+        f"/actions/{action_id}/approve",
+        headers=_headers(),
+        json={"reason": "reviewed by operator"},
+    )
+    assert response.status_code == 200, response.text
+
+    approved = audit.get_records(component="heart", correlation_id=action_id)[-1]
+    assert approved["authority"] == "system_orchestrator"
+    assert approved["identity_type"] == "operator"
+    assert approved["operation"]["target"] == "203.0.113.132"
+    assert approved["policy"]["resource"] == "source_ip:203.0.113.132"
+    assert approved["policy"]["human_approved"] is True
+
+
+def test_a_changed_operation_cannot_be_approved(client):
+    """Consent is to what was staged. If the durable row now proposes a
+    different operation, approval is refused and nothing changes."""
+    directory, audit, core, heart = _stack()
+    action_id = _stage(heart, "203.0.113.133")
+    _use(heart)
+    assert _recover(client) == 1
+
+    _sql(directory, "UPDATE pending_actions SET primary_action='quarantine' WHERE action_id=?", (action_id,))
+    response = client.post(
+        f"/actions/{action_id}/approve",
+        headers=_headers(),
+        json={"reason": "reviewed by operator"},
+    )
+    assert response.status_code == 409, response.text
+    assert core.get_status(action_id) == ActionStatus.PENDING
+    last = audit.get_records(component="heart", correlation_id=action_id)[-1]
+    assert last["reason_code"] == "OPERATION_DOES_NOT_MATCH_STAGING_RECORD"
+
+    # ...and a restart will not re-expose it either.
+    main_module.runtime.action_store.clear()
+    assert _recover(client) == 0
+    assert core.get_status(action_id) == ActionStatus.EXPIRED
+
+
+def test_an_unsupported_operation_is_recorded_not_relabeled():
+    """An authenticated principal would need an identity containment the
+    policy vocabulary does not have. It is not staged as a network block."""
+    _, audit, core, heart = _stack()
+    decision = heart.observe(_assessment("203.0.113.134", identity="operator"))
+
+    assert decision.status == "OBSERVED"
+    assert decision.reason == "UNSUPPORTED_OPERATION"
+    assert core.count_actions() == 0
+    record = [
+        r for r in audit.get_records(component="heart", limit=500)
+        if r.get("reason_code") == "UNSUPPORTED_OPERATION"
+    ][-1]
+    assert record["operation"] is None
+    assert record["authority"] == "system_orchestrator"
+
+
+def test_the_route_resolves_through_the_orchestrator_not_the_heart(client):
+    """With the Heart object gone the same authority still decides; with the
+    authority's store detached, nothing can be decided at all."""
+    _, audit, core, heart = _stack()
+    action_id = _stage(heart, "203.0.113.135")
+    _use(heart)
+    assert _recover(client) == 1
+
+    main_module.runtime.heart = None
+    response = client.post(
+        f"/actions/{action_id}/approve",
+        headers=_headers(),
+        json={"reason": "reviewed by operator"},
+    )
+    assert response.status_code == 200, response.text
+
+    second = _stage(heart, "203.0.113.136")
+    main_module.runtime.action_store.clear()
+    main_module.runtime.orchestrator = heart._authority
+    assert _recover(client) == 1
+    heart._authority.detach_recommendation_store()
+    refused = client.post(
+        f"/actions/{second}/approve",
+        headers=_headers(),
+        json={"reason": "reviewed by operator"},
+    )
+    assert refused.status_code == 409, refused.text
+    assert core.get_status(second) == ActionStatus.PENDING
+
+
+def test_an_enabled_heart_without_its_authority_blocks_readiness(monkeypatch):
+    directory, audit, _, _ = _stack()
+    monkeypatch.setenv("S43_HEART_ENABLED", "true")
+    monkeypatch.setenv("S43_HEART_REQUIRED", "true")
+    monkeypatch.setenv("S43_HEART_SQLITE_PATH", str(directory / "heart.sqlite3"))
+
+    with TestClient(main_module.app) as test_client:
+        main_module.runtime.audit_store = audit
+        main_module.runtime.orchestrator = None
+        test_client.portal.call(main_module._start_heart)
+
+        assert main_module.runtime.heart is None
+        status = main_module.runtime.subsystems.get(main_module.SUBSYS_HEART)
+        assert "governance orchestrator" in status.detail, status.detail
+        ready = test_client.get("/ready")
+        assert ready.status_code == 503, ready.text
+        assert "heart" in ready.text
+        assert test_client.get("/health").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Legacy recovery: records written before lookup fields / operations existed
+# ---------------------------------------------------------------------------
+def _legacy_staged(audit, action_id: str, *, with_component: bool) -> None:
+    record = {
+        "subsystem": "heart",
+        "identity": "anonymous",
+        "source_ip": "198.51.100.1",
+        "threat_kind": "x",
+        "severity": "HIGH",
+        "source_kind": "MIXED_OR_UNKNOWN",
+        "score": 80.0,
+        "supporting_tags": [],
+        "indicators": {},
+        "decision": "STAGED",
+        "reason_code": "STAGED_FOR_HUMAN_REVIEW",
+        "decision_id": action_id,
+    }
+    if with_component:
+        record["component"] = "heart"
+        record["correlation_id"] = action_id
+    audit.append(record)
+
+
+@pytest.mark.parametrize("with_component", [False, True], ids=["pre-lookup-fields", "pre-operation"])
+def test_legitimately_audited_legacy_rows_are_recovered_not_expired(client, with_component):
+    _, audit, core, heart = _stack()
+    _raw_row(core, "HEART-LEGACY000001")  # primary_action "human_review"
+    _legacy_staged(audit, "HEART-LEGACY000001", with_component=with_component)
+    _use(heart)
+
+    assert _recover(client) == 1
+    assert core.get_status("HEART-LEGACY000001") == ActionStatus.PENDING
+    restored = main_module.runtime.action_store["HEART-LEGACY000001"]
+    assert restored["payload"]["legacy"] is True
+    assert restored["payload"]["operation"] is None
+
+
+def test_a_legacy_recommendation_cannot_be_approved_but_can_be_vetoed(client):
+    """No operation was ever recorded for it, so approving would bind human
+    consent to something nobody proposed. It stays decidable by veto."""
+    _, audit, core, heart = _stack()
+    _raw_row(core, "HEART-LEGACY000002")
+    _legacy_staged(audit, "HEART-LEGACY000002", with_component=False)
+    _use(heart)
+    assert _recover(client) == 1
+
+    approve = client.post(
+        "/actions/HEART-LEGACY000002/approve",
+        headers=_headers(),
+        json={"reason": "reviewed by operator"},
+    )
+    assert approve.status_code == 409, approve.text
+    assert core.get_status("HEART-LEGACY000002") == ActionStatus.PENDING
+
+    veto = client.post(
+        "/actions/HEART-LEGACY000002/veto",
+        headers=_headers(),
+        json={"reason": "declining a legacy recommendation"},
+    )
+    assert veto.status_code == 200, veto.text
+    assert core.get_status("HEART-LEGACY000002") == ActionStatus.VETOED
+
+
+def test_a_legacy_row_with_a_legacy_terminal_decision_is_not_resurrected(client):
+    _, audit, core, heart = _stack()
+    _raw_row(core, "HEART-LEGACY000003")
+    _legacy_staged(audit, "HEART-LEGACY000003", with_component=False)
+    audit.append(
+        {
+            "subsystem": "heart",
+            "decision_id": "HEART-LEGACY000003",
+            "decision": "VETOED",
+            "reason_code": "HUMAN_VETOED",
+        }
+    )
+    _use(heart)
+
+    assert _recover(client) == 0
+    assert core.get_status("HEART-LEGACY000003") == ActionStatus.EXPIRED
+
+
+def test_a_legacy_row_whose_content_disagrees_is_quarantined(client):
+    directory, audit, core, heart = _stack()
+    _raw_row(core, "HEART-LEGACY000004")
+    _legacy_staged(audit, "HEART-LEGACY000004", with_component=False)
+    _sql(directory, "UPDATE pending_actions SET severity='CRITICAL' WHERE action_id='HEART-LEGACY000004'")
+    _use(heart)
+
+    assert _recover(client) == 0
+    assert core.get_status("HEART-LEGACY000004") == ActionStatus.EXPIRED
+
+
+def test_the_remote_gateway_cannot_decide_a_heart_recommendation(client):
+    """Same rule on the recommendation path: the real gateway handler carries
+    no authenticated human, so the orchestrator refuses and audits it."""
+    from fastapi import HTTPException
+
+    from core.api.routers import remote_gateway
+    from core.api.routers.remote_gateway import (
+        RemoteEventActivationRequest,
+        RemoteEventType,
+    )
+
+    _, audit, core, heart = _stack()
+    action_id = _stage(heart, "203.0.113.140")
+    _use(heart)
+    assert _recover(client) == 1
+
+    handler = remote_gateway._dispatch_registry[RemoteEventType.APPROVE_DECISION]
+    with pytest.raises(HTTPException) as refused:
+        client.portal.call(
+            handler,
+            RemoteEventActivationRequest(
+                operator_id="remote-admin",
+                target_id="sentinel43-api",
+                event_type=RemoteEventType.APPROVE_DECISION,
+                reason="remote decision attempt via the gateway",
+                correlation_id="gw-correlation-0002",
+                dry_run=False,
+                payload={"action_id": action_id, "decision_id": action_id},
+            ),
+        )
+    assert refused.value.status_code == 403
+    assert core.get_status(action_id) == ActionStatus.PENDING
+    last = audit.get_records(component="heart", correlation_id=action_id)[-1]
+    assert last["decision"] == "DENIED"
+    assert last["reason_code"] == "NO_AUTHENTICATION_CONTEXT"
