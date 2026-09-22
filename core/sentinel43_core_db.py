@@ -431,7 +431,16 @@ class SentinelCoreStore:
                 "SELECT * FROM pending_actions WHERE action_id = ?",
                 (normalized,),
             ).fetchone()
-        return dict(row) if row is not None else None
+        if row is None:
+            return None
+        item = dict(row)
+        try:
+            item["actions"] = tuple(json.loads(item.pop("actions_json")))
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"stored action {item.get('action_id')!r} contains invalid actions_json"
+            ) from exc
+        return item
 
     def count_actions(self, *, status: ActionStatus | None = None) -> int:
         """Row count only -- the staging back-pressure check must not pay

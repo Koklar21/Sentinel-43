@@ -267,50 +267,16 @@ class RecommendationAuthorityUnavailable(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class ProposedOperation:
-    """The exact operation a human is asked to authorize, and its target.
+class ThreatRecommendation:
+    """A detection-layer finding reported to the orchestration core.
 
-    Only operations in the established policy vocabulary can be expressed. An
-    operation the vocabulary cannot describe is not relabeled as something
-    it can: the recommendation carries ``operation=None`` and is recorded as
-    explicitly unsupported instead.
+    It carries the assessment and the Heart's evidence only. What response
+    the finding warrants, and whether anything is staged, is decided by the
+    owner-designated engine inside the orchestrator -- not by the reporter.
     """
 
-    action: str
-    target_type: str
-    target: str
-
-    def __post_init__(self) -> None:
-        if not is_action_known(self.action):
-            raise ValueError(
-                f"{self.action!r} is not an operation the policy authority knows"
-            )
-        if not self.target_type.strip() or not self.target.strip():
-            raise ValueError("an operation needs a target_type and a target")
-
-    @property
-    def resource(self) -> str:
-        return f"{self.target_type}:{self.target}"
-
-    def to_dict(self) -> dict[str, str]:
-        return {
-            "action": self.action,
-            "target_type": self.target_type,
-            "target": self.target,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class ThreatRecommendation:
-    """A detection-layer recommendation submitted for governance."""
-
     subject_key: str
-    kind: str
-    severity: str
-    source_kind: str
-    score: float
-    reason: str
-    operation: ProposedOperation | None
+    assessment: Any
     evidence: Mapping[str, Any]
     requested_mode: GovernanceMode
     created_at: float
@@ -321,21 +287,57 @@ class RecommendationOutcome:
     status: str
     reason: str
     action_id: str | None = None
-    policy: Mapping[str, Any] | None = None
+    policy: Any = None
+    operations: tuple[Mapping[str, str], ...] = ()
+    engine_plan: Mapping[str, Any] | None = None
 
 
-def _operation_from_row(row: Mapping[str, Any]) -> ProposedOperation | None:
-    """Rebuild the recorded operation from its durable row, if it has one."""
-    action = str(row["primary_action"] or "")
-    if not is_action_known(action):
-        return None
-    _identity, _sep, source_ip = str(row["target_value"]).rpartition("|")
-    return ProposedOperation(
-        action=action,
-        target_type="source_ip",
-        target=source_ip,
+def _operation_key(operation: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(operation.get("action")),
+        str(operation.get("target_type")),
+        str(operation.get("target")),
     )
 
+
+def operations_for_row(row: Mapping[str, Any]) -> list[dict[str, str]] | None:
+    """The authorizable operations a durable row proposes; None if it
+    predates recorded operations (a legacy review row)."""
+    primary = str(row["primary_action"] or "")
+    if primary == LEGACY_REVIEW_ACTION:
+        return None
+    subject_key = str(row["target_value"])
+    if is_action_known(primary):
+        # A single explicit operation (recorded before the engine ran).
+        _identity, _sep, source_ip = subject_key.rpartition("|")
+        return [{"action": primary, "target_type": "source_ip", "target": source_ip}]
+    from .sentinel43_engine import engine_operations
+
+    operations, _unsupported = engine_operations(
+        tuple(row.get("actions") or ()), subject_key=subject_key
+    )
+    return operations
+
+
+def staged_operations_of(record: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+    """The operations an authenticated STAGED record bound; None if the
+    record predates recorded operations."""
+    if "operations" in record:
+        value = record.get("operations")
+        return list(value) if isinstance(value, list) else []
+    if "operation" in record:
+        value = record.get("operation")
+        return [value] if isinstance(value, dict) else []
+    return None
+
+
+def same_operations(
+    left: list[Mapping[str, Any]] | None,
+    right: list[Mapping[str, Any]] | None,
+) -> bool:
+    if left is None or right is None:
+        return left is None and right is None
+    return sorted(map(_operation_key, left)) == sorted(map(_operation_key, right))
 
 class SystemOrchestrator:
     """Human-governed policy orchestration with authoritative audit."""
@@ -415,6 +417,7 @@ class SystemOrchestrator:
             lambda _principal: False
         )
         self._max_pending_recommendations = 500
+        self._engine: Any | None = None
 
     @staticmethod
     def _normalize_mode(
@@ -1261,7 +1264,7 @@ class SystemOrchestrator:
             ]
 
     # ------------------------------------------------------------------
-    # Threat-recommendation governance (see module section above)
+    # Threat-recommendation governance: the owner-designated engine decides
     # ------------------------------------------------------------------
 
     def attach_recommendation_store(
@@ -1271,21 +1274,31 @@ class SystemOrchestrator:
         operator_authenticator: Callable[[DecisionPrincipal], bool] | None,
         max_pending_actions: int,
     ) -> None:
-        """Bind the ONE durable store recommendation decisions live in.
+        """Bind the ONE durable store and start the owner engine on it.
 
-        ``operator_authenticator`` fails closed when absent: an orchestrator
-        with no authenticator authorizes no recommendation decision.
+        The engine (Sentinel-43/Shadow_mode.py Sentinel43ResponseEngine) plans,
+        stages and resolves; its authenticator is bound to the server-verified
+        principal and fails closed without ``operator_authenticator``. If the
+        engine cannot be loaded this raises, so nothing can be decided.
         """
+        from .sentinel43_engine import GovernedEngine
+
         if not 1 <= int(max_pending_actions) <= 100_000:
             raise ValueError("max_pending_actions must be between 1 and 100000")
+        authenticator = (
+            operator_authenticator
+            if operator_authenticator is not None
+            else (lambda _principal: False)
+        )
+        engine = GovernedEngine(store, human_authenticator=authenticator)
         with self._recommendation_lock:
+            previous = self._engine
             self._recommendation_store = store
-            self._operator_authenticator = (
-                operator_authenticator
-                if operator_authenticator is not None
-                else (lambda _principal: False)
-            )
+            self._operator_authenticator = authenticator
             self._max_pending_recommendations = int(max_pending_actions)
+            self._engine = engine
+        if previous is not None:
+            previous.shutdown()
 
     def record_denied_decision(
         self,
@@ -1295,12 +1308,7 @@ class SystemOrchestrator:
         reason_code: str,
         identity_type: str,
     ) -> None:
-        """Audit a transaction decision refused before it reached review.
-
-        The transaction adapter has no identity awareness of its own, so the
-        composition root checks the caller first; the refusal is still
-        recorded here, by the authority, before it is reported.
-        """
+        """Audit a transaction decision refused before it reached review."""
         self._append_audit(
             {
                 "component": "governance",
@@ -1316,18 +1324,27 @@ class SystemOrchestrator:
 
     def detach_recommendation_store(self) -> None:
         with self._recommendation_lock:
+            engine = self._engine
             self._recommendation_store = None
+            self._engine = None
             self._operator_authenticator = lambda _principal: False
+        if engine is not None:
+            engine.shutdown()
 
     @property
     def recommendation_store_attached(self) -> bool:
-        return self._recommendation_store is not None
+        return self._recommendation_store is not None and self._engine is not None
+
+    @property
+    def engine_identity(self) -> dict[str, str] | None:
+        engine = self._engine
+        return engine.identity.to_dict() if engine is not None else None
 
     def _require_recommendation_store(self) -> Any:
         store = self._recommendation_store
-        if store is None:
+        if store is None or self._engine is None:
             raise RecommendationAuthorityUnavailable(
-                "no durable recommendation store is attached to the orchestrator"
+                "no orchestration engine and durable store are attached"
             )
         return store
 
@@ -1336,7 +1353,7 @@ class SystemOrchestrator:
         requested: GovernanceMode,
     ) -> GovernanceMode:
         # The orchestrator's mode is a ceiling: a SHADOW orchestrator holds
-        # every recommendation in observation, whatever the producer asked.
+        # every recommendation in observation, whatever the reporter asked.
         if GovernanceMode.SHADOW in (requested, self.default_mode):
             return GovernanceMode.SHADOW
         return GovernanceMode.HUMAN_GATED
@@ -1344,7 +1361,7 @@ class SystemOrchestrator:
     @staticmethod
     def _operation_policy(
         *,
-        operation: ProposedOperation,
+        operation: Mapping[str, Any],
         actor_id: str,
         mode: GovernanceMode,
         human_approved: bool,
@@ -1352,10 +1369,10 @@ class SystemOrchestrator:
     ) -> Any:
         return evaluate(
             PolicyContext(
-                action=operation.action,
+                action=str(operation["action"]),
                 actor_id=actor_id,
                 tenant_id="default",
-                resource=operation.resource,
+                resource=f"{operation['target_type']}:{operation['target']}",
                 mode=mode.value,
                 human_approved=human_approved,
                 correlation_id=correlation_id,
@@ -1376,13 +1393,9 @@ class SystemOrchestrator:
                 "subsystem": RECOMMENDATION_COMPONENT,
                 "component": RECOMMENDATION_COMPONENT,
                 "authority": RECOMMENDATION_AUTHORITY,
+                "engine": self.engine_identity,
                 "decision": decision,
                 "reason_code": reason_code,
-                "operation": (
-                    recommendation.operation.to_dict()
-                    if recommendation.operation is not None
-                    else None
-                ),
             }
         )
         if extra:
@@ -1393,120 +1406,146 @@ class SystemOrchestrator:
         self,
         recommendation: ThreatRecommendation,
     ) -> RecommendationOutcome:
-        """Decide, record and (if permitted) durably stage one recommendation.
-
-        Every branch writes an authoritative audit record before returning,
-        and nothing is staged unless the policy authority's answer matches
-        the effective mode exactly. Count-then-insert is serialized so
-        concurrent submissions cannot collectively overshoot the ceiling.
-        """
+        """The engine plans the response; the policy authority must agree for
+        every authorizable operation; the engine then stages it into the one
+        durable store. Every branch is audited before returning."""
         store = self._require_recommendation_store()
-        operation = recommendation.operation
+        engine = self._engine
+        mode = self._effective_recommendation_mode(recommendation.requested_mode)
+        assessment = recommendation.assessment
 
-        if operation is None:
+        plan = engine.plan(assessment)
+        from .sentinel43_engine import engine_operations
+
+        operations, unsupported = engine_operations(
+            plan["actions"], subject_key=recommendation.subject_key
+        )
+        decision_context = {
+            "engine_plan": plan["summary"],
+            "operations": operations,
+            "unsupported_actions": unsupported,
+        }
+
+        if plan["actions"] == ["LOG_ONLY"]:
             self._append_audit(
                 self._recommendation_record(
                     recommendation,
                     decision="OBSERVED",
-                    reason_code="UNSUPPORTED_OPERATION",
+                    reason_code="ENGINE_LOG_ONLY",
+                    extra=decision_context,
                 )
             )
             return RecommendationOutcome(
-                status="OBSERVED", reason="UNSUPPORTED_OPERATION"
+                status="OBSERVED", reason="ENGINE_LOG_ONLY", engine_plan=plan["summary"]
             )
 
-        mode = self._effective_recommendation_mode(
-            recommendation.requested_mode
-        )
-        policy = self._operation_policy(
-            operation=operation,
-            actor_id=RECOMMENDATION_COMPONENT,
-            mode=mode,
-            human_approved=False,
-        )
-        policy_payload = policy.to_dict()
         expected = (
             STATUS_OBSERVE if mode is GovernanceMode.SHADOW else STATUS_REQUIRES_HUMAN
         )
+        policies = [
+            self._operation_policy(
+                operation=operation,
+                actor_id=RECOMMENDATION_COMPONENT,
+                mode=mode,
+                human_approved=False,
+            ).to_dict()
+            for operation in operations
+        ]
+        decision_context["policy"] = policies
 
-        if policy.status != expected:
+        refused = [p for p in policies if p["status"] != expected]
+        if refused:
             self._append_audit(
                 self._recommendation_record(
                     recommendation,
                     decision="OBSERVED",
                     reason_code="POLICY_REFUSED",
-                    extra={"policy": policy_payload},
+                    extra=decision_context,
                 )
             )
             logger.error(
-                "Recommendation refused by policy: status=%s (expected %s for "
-                "mode %s, operation %s)",
-                policy.status,
+                "Engine recommendation refused by policy: %s (expected %s, mode %s)",
+                [p["status"] for p in refused],
                 expected,
                 mode.value,
-                operation.action,
             )
             return RecommendationOutcome(
-                status="OBSERVED", reason="POLICY_REFUSED", policy=policy_payload
+                status="OBSERVED",
+                reason="POLICY_REFUSED",
+                policy=policies,
+                engine_plan=plan["summary"],
             )
 
-        if mode is GovernanceMode.SHADOW:
-            self._append_audit(
-                self._recommendation_record(
-                    recommendation,
-                    decision="OBSERVED",
-                    reason_code="POLICY_OBSERVED",
-                    extra={"policy": policy_payload},
-                )
-            )
-            return RecommendationOutcome(
-                status="OBSERVED", reason="POLICY_OBSERVED", policy=policy_payload
-            )
+        stage_kwargs = {
+            "mode_value": mode.value,
+            "subject_key": recommendation.subject_key,
+            "kind": assessment.threat_kind.value,
+            "severity": assessment.severity.value,
+            "source_kind": assessment.source_kind.value,
+            "score": float(assessment.score),
+        }
 
         with self._recommendation_lock:
-            pending = store.count_actions(status=ActionStatus.PENDING)
-            if pending >= self._max_pending_recommendations:
+            if mode is GovernanceMode.HUMAN_GATED:
+                pending = store.count_actions(status=ActionStatus.PENDING)
+                if pending >= self._max_pending_recommendations:
+                    self._append_audit(
+                        self._recommendation_record(
+                            recommendation,
+                            decision="OBSERVED",
+                            reason_code="BACKPRESSURE_LIMIT",
+                            extra={
+                                **decision_context,
+                                "pending_actions": pending,
+                                "pending_limit": self._max_pending_recommendations,
+                            },
+                        )
+                    )
+                    logger.error(
+                        "Recommendation not staged: %d pending at the limit of %d; "
+                        "resolve pending decisions to resume staging",
+                        pending,
+                        self._max_pending_recommendations,
+                    )
+                    return RecommendationOutcome(
+                        status="OBSERVED", reason="BACKPRESSURE_LIMIT"
+                    )
+
+            staged = engine.stage(plan["directive"], **stage_kwargs)
+
+            if staged is None:
                 self._append_audit(
                     self._recommendation_record(
                         recommendation,
                         decision="OBSERVED",
-                        reason_code="BACKPRESSURE_LIMIT",
-                        extra={
-                            "pending_actions": pending,
-                            "pending_limit": self._max_pending_recommendations,
-                        },
+                        reason_code="ENGINE_SUPPRESSED",
+                        extra=decision_context,
                     )
                 )
-                logger.error(
-                    "Recommendation not staged: %d pending at the limit of %d; "
-                    "resolve pending decisions to resume staging",
-                    pending,
-                    self._max_pending_recommendations,
-                )
                 return RecommendationOutcome(
-                    status="OBSERVED", reason="BACKPRESSURE_LIMIT"
+                    status="OBSERVED",
+                    reason="ENGINE_SUPPRESSED",
+                    engine_plan=plan["summary"],
                 )
 
-            # Must satisfy the canonical action store's ACTION_ID_RE. The same
-            # id keys the durable row, the audit history and the dashboard.
-            action_id = f"HEART-{uuid4().hex.upper()}"
-            store.insert_pending(
-                PendingAction(
-                    action_id=action_id,
-                    created_at_ms=int(recommendation.created_at * 1000),
-                    status=ActionStatus.PENDING,
-                    target_type="identity_source_ip",
-                    target_value=recommendation.subject_key,
-                    primary_action=operation.action,
-                    actions=(operation.action,),
-                    severity=recommendation.severity,
-                    kind=recommendation.kind,
-                    source_kind=recommendation.source_kind,
-                    score=float(recommendation.score),
-                    reason=recommendation.reason,
-                    system_id=RECOMMENDATION_COMPONENT,
+            action_id = str(staged.action_id)
+
+            if mode is GovernanceMode.SHADOW:
+                self._append_audit(
+                    self._recommendation_record(
+                        recommendation,
+                        decision="OBSERVED",
+                        reason_code="POLICY_OBSERVED",
+                        extra={**decision_context, "shadow_record_id": action_id},
+                    )
                 )
-            )
+                return RecommendationOutcome(
+                    status="OBSERVED",
+                    reason="POLICY_OBSERVED",
+                    policy=policies,
+                    operations=tuple(operations),
+                    engine_plan=plan["summary"],
+                )
 
             try:
                 self._append_audit(
@@ -1515,15 +1554,14 @@ class SystemOrchestrator:
                         decision="STAGED",
                         reason_code="STAGED_FOR_HUMAN_REVIEW",
                         extra={
+                            **decision_context,
                             "decision_id": action_id,
                             "correlation_id": action_id,
-                            "policy": policy_payload,
                         },
                     )
                 )
             except Exception:
-                # No consequential staging without durable audit: compensate
-                # the row rather than leave an unaudited, decidable action.
+                # No consequential staging without durable audit.
                 try:
                     store.transition_status(
                         action_id,
@@ -1544,11 +1582,12 @@ class SystemOrchestrator:
             status="STAGED",
             reason="STAGED_FOR_HUMAN_REVIEW",
             action_id=action_id,
-            policy=policy_payload,
+            policy=policies,
+            operations=tuple(operations),
+            engine_plan=plan["summary"],
         )
 
-    def _staged_operation(self, action_id: str) -> tuple[bool, dict[str, Any] | None]:
-        """(found, operation) from the authenticated STAGED record."""
+    def _staged_record(self, action_id: str) -> Mapping[str, Any] | None:
         records = self.audit_store.get_records(
             component=RECOMMENDATION_COMPONENT,
             correlation_id=action_id,
@@ -1560,10 +1599,7 @@ class SystemOrchestrator:
             if record.get("decision") == "STAGED"
             and record.get("decision_id") == action_id
         ]
-        if len(staged) != 1:
-            return False, None
-        operation = staged[0].get("operation")
-        return True, operation if isinstance(operation, dict) else None
+        return staged[0] if len(staged) == 1 else None
 
     def _deny_recommendation_decision(
         self,
@@ -1578,6 +1614,7 @@ class SystemOrchestrator:
             "subsystem": RECOMMENDATION_COMPONENT,
             "component": RECOMMENDATION_COMPONENT,
             "authority": RECOMMENDATION_AUTHORITY,
+            "engine": self.engine_identity,
             "correlation_id": action_id,
             "decision_id": action_id,
             "decision": "DENIED",
@@ -1598,15 +1635,15 @@ class SystemOrchestrator:
         reason: str = "",
         principal: DecisionPrincipal | None = None,
     ) -> dict[str, Any]:
-        """The one path by which a recommendation becomes APPROVED/VETOED.
+        """The one path by which a recommendation is approved or vetoed.
 
-        Order: authenticated human authority, then (for an approval) the
-        operation actually recorded at staging, then the policy authority for
-        that operation and its target, then an atomic durable transition,
-        then durable audit (with compensation). Every refusal is audited
-        before it is raised.
+        Server-verified human authority first; for an approval, the operations
+        recorded at staging and the policy authority for each of them; then
+        the ENGINE's own approve_action/veto_action (its authenticator bound
+        to this principal) performs the transition; then durable audit.
         """
         store = self._require_recommendation_store()
+        engine = self._engine
         action_id = action_id.strip()
         operator_id = operator_id.strip()
         if not action_id:
@@ -1637,83 +1674,88 @@ class SystemOrchestrator:
         if row is None:
             raise KeyError(action_id)
 
-        policy_payload: dict[str, Any] | None = None
-        operation = _operation_from_row(row)
+        operations = operations_for_row(row)
+        policies: list[dict[str, Any]] = []
         if approved:
-            found, staged_operation = self._staged_operation(action_id)
-            if operation is None or staged_operation is None:
-                # Nothing was ever recorded for a human to authorize. Approving
-                # would bind consent to an operation nobody proposed.
+            if not operations:
+                # Nothing the policy vocabulary can express was recommended;
+                # approving would bind consent to no authorizable operation.
                 self._deny_recommendation_decision(
                     action_id,
                     operator_id=operator_id,
                     reason_code="UNSUPPORTED_OPERATION",
                     identity_type=identity_type,
-                    extra={"primary_action": str(row["primary_action"])},
+                    extra={
+                        "primary_action": str(row["primary_action"]),
+                        "actions": list(row.get("actions") or ()),
+                    },
                 )
                 raise PolicyRefused(
-                    "this recommendation records no supported operation to approve"
+                    "this recommendation has no operation that can be approved"
                 )
-            if not found or staged_operation != operation.to_dict():
+            staged_record = self._staged_record(action_id)
+            staged_ops = (
+                staged_operations_of(staged_record) if staged_record else None
+            )
+            if not same_operations(staged_ops, operations):
                 self._deny_recommendation_decision(
                     action_id,
                     operator_id=operator_id,
                     reason_code="OPERATION_DOES_NOT_MATCH_STAGING_RECORD",
                     identity_type=identity_type,
-                    extra={
-                        "operation": operation.to_dict(),
-                        "staged_operation": staged_operation,
-                    },
+                    extra={"operations": operations, "staged_operations": staged_ops},
                 )
                 raise PolicyRefused(
-                    "the durable operation does not match what was staged"
+                    "the durable operations do not match what was staged"
                 )
-
-            policy = self._operation_policy(
-                operation=operation,
-                actor_id=operator_id,
-                mode=GovernanceMode.HUMAN_GATED,
-                human_approved=True,
-                correlation_id=action_id,
-            )
-            policy_payload = policy.to_dict()
-            if policy.status != STATUS_ALLOW:
+            policies = [
+                self._operation_policy(
+                    operation=operation,
+                    actor_id=operator_id,
+                    mode=GovernanceMode.HUMAN_GATED,
+                    human_approved=True,
+                    correlation_id=action_id,
+                ).to_dict()
+                for operation in operations
+            ]
+            if any(p["status"] != STATUS_ALLOW for p in policies):
                 self._deny_recommendation_decision(
                     action_id,
                     operator_id=operator_id,
                     reason_code="POLICY_REFUSED",
                     identity_type=identity_type,
-                    extra={
-                        "operation": operation.to_dict(),
-                        "policy": policy_payload,
-                    },
+                    extra={"operations": operations, "policy": policies},
                 )
-                raise PolicyRefused(
-                    f"policy did not permit approval (status={policy.status})"
-                )
+                raise PolicyRefused("policy did not permit approval")
 
-        new_status = ActionStatus.APPROVED if approved else ActionStatus.VETOED
-        if not store.transition_status(
-            action_id,
-            expected=ActionStatus.PENDING,
-            new_status=new_status,
-            operator_id=operator_id,
-            operator_reason=reason,
-        ):
+        decide = engine.approve if approved else engine.veto
+        if not decide(action_id, operator_id=operator_id, reason=reason, principal=principal):
             current = store.get_status(action_id)
             if current is None:
                 raise KeyError(action_id)
-            raise RuntimeError(
-                f"recommendation {action_id!r} is not awaiting a human decision "
-                f"(current status={current.value})"
+            if current is not ActionStatus.PENDING:
+                raise RuntimeError(
+                    f"recommendation {action_id!r} is not awaiting a human decision "
+                    f"(current status={current.value})"
+                )
+            self._deny_recommendation_decision(
+                action_id,
+                operator_id=operator_id,
+                reason_code="ENGINE_REFUSED",
+                identity_type=identity_type,
             )
+            raise UnauthorizedDecision("the orchestration engine refused this decision")
 
+        new_status = ActionStatus.APPROVED if approved else ActionStatus.VETOED
         try:
             self._append_audit(
                 {
                     "subsystem": RECOMMENDATION_COMPONENT,
                     "component": RECOMMENDATION_COMPONENT,
                     "authority": RECOMMENDATION_AUTHORITY,
+                    "engine": self.engine_identity,
+                    "decided_by": "Sentinel43ResponseEngine."
+                    + ("approve_action" if approved else "veto_action"),
                     "correlation_id": action_id,
                     "decision_id": action_id,
                     "decision": new_status.value,
@@ -1723,10 +1765,8 @@ class SystemOrchestrator:
                     "operator_id": operator_id,
                     "identity_type": identity_type,
                     "resolution_reason": reason,
-                    "operation": (
-                        operation.to_dict() if operation is not None else None
-                    ),
-                    **({"policy": policy_payload} if policy_payload else {}),
+                    "operations": operations,
+                    **({"policy": policies} if policies else {}),
                 }
             )
         except Exception:
@@ -1752,7 +1792,7 @@ class SystemOrchestrator:
             "decision_id": action_id,
             "outcome": new_status.value,
             "operator_id": operator_id,
-            "operation": operation.to_dict() if operation is not None else None,
+            "operations": operations,
             "resolved_at": _utc_now().isoformat(),
         }
 
@@ -1776,7 +1816,6 @@ class SystemOrchestrator:
             operator_reason=f"quarantined_at_recovery:{problem}",
         )
 
-
 __all__ = [
     "CallerContext",
     "Decision",
@@ -1789,11 +1828,13 @@ __all__ = [
     "DecisionPrincipal",
     "LEGACY_REVIEW_ACTION",
     "PolicyRefused",
-    "ProposedOperation",
     "RECOMMENDATION_AUTHORITY",
     "RECOMMENDATION_COMPONENT",
     "RecommendationAuthorityUnavailable",
     "RecommendationOutcome",
     "ThreatRecommendation",
     "UnauthorizedDecision",
+    "operations_for_row",
+    "same_operations",
+    "staged_operations_of",
 ]

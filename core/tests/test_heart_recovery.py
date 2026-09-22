@@ -127,14 +127,17 @@ def _authority(audit, mode: str = "HUMAN_GATED"):
 
 
 def _stage(heart, ip: str):
-    """Stage one real, audited pending action via two independent producers."""
+    """Stage one real, audited pending action via two independent producers.
+
+    An automation-like HIGH finding: the orchestration engine's own plan for
+    it includes TEMP_BLOCK_IP, an operation humans can approve."""
     decision = heart.observe(
         ThreatAssessment(
             identity="anonymous",
             source_ip=ip,
             threat_kind=list(ThreatKind)[0],
             severity=ThreatSeverity.HIGH,
-            source_kind=ThreatSourceKind.MIXED_OR_UNKNOWN,
+            source_kind=ThreatSourceKind.AI_AUTOMATION_LIKELY,
             score=80.0,
             indicators={"evidence_seq": 1, "evidence_sources": ["firewall", "sparta"]},
             supporting_tags=["t"],
@@ -830,12 +833,14 @@ def test_production_staging_is_decided_by_the_policy_authority(client, monkeypat
         if r.get("decision") == "STAGED"
     ]
     assert len(staged) == 1, staged
-    policy = staged[0]["policy"]
-    assert policy["status"] == "REQUIRES_HUMAN"
-    assert policy["action"] == "network_block"
-    assert policy["mode"] == "HUMAN_GATED"
-    assert policy["human_approved"] is False
-    assert policy["reasons"] == ["HUMAN_APPROVAL_REQUIRED"]
+    # The orchestration engine made this decision, and says so.
+    assert staged[0]["engine"]["class"] == "Sentinel43ResponseEngine"
+    assert staged[0]["engine"]["path"] == "Sentinel-43/Shadow_mode.py"
+    assert staged[0]["engine_plan"]["actions"]
+    for policy in staged[0]["policy"]:
+        assert policy["status"] == "REQUIRES_HUMAN"
+        assert policy["mode"] == "HUMAN_GATED"
+        assert policy["human_approved"] is False
 
     # ...and that staged recommendation is the one the canonical surface shows.
     action_id = staged[0]["decision_id"]
@@ -863,9 +868,12 @@ def test_production_approval_is_permitted_by_the_policy_authority(client, monkey
 
     approved = audit.get_records(component="heart", correlation_id=action_id)[-1]
     assert approved["decision"] == "APPROVED"
-    assert approved["policy"]["status"] == "ALLOW"
-    assert approved["policy"]["human_approved"] is True
-    assert approved["policy"]["actor_id"] == "heart-op"
+    assert approved["decided_by"] == "Sentinel43ResponseEngine.approve_action"
+    assert approved["operations"], "the real pipeline produced an approvable operation"
+    for policy in approved["policy"]:
+        assert policy["status"] == "ALLOW"
+        assert policy["human_approved"] is True
+        assert policy["actor_id"] == "heart-op"
 
 
 def test_shadow_observation_is_decided_by_the_policy_authority():
@@ -892,7 +900,7 @@ def test_shadow_observation_is_decided_by_the_policy_authority():
             source_ip="203.0.113.122",
             threat_kind=list(ThreatKind)[0],
             severity=ThreatSeverity.HIGH,
-            source_kind=ThreatSourceKind.MIXED_OR_UNKNOWN,
+            source_kind=ThreatSourceKind.AI_AUTOMATION_LIKELY,
             score=80.0,
             indicators={"evidence_seq": 1, "evidence_sources": ["firewall", "sparta"]},
             supporting_tags=["t"],
@@ -904,7 +912,8 @@ def test_shadow_observation_is_decided_by_the_policy_authority():
         r for r in audit.get_records(component="heart", limit=500)
         if r.get("reason_code") == "POLICY_OBSERVED"
     ]
-    assert observed and observed[-1]["policy"]["status"] == "OBSERVE"
+    assert observed and observed[-1]["policy"]
+    assert all(p["status"] == "OBSERVE" for p in observed[-1]["policy"])
     assert heart.list_pending() == ()
 
 
@@ -913,13 +922,26 @@ def test_policy_refusal_stops_staging_without_acting(monkeypatch):
     records that and stages nothing -- it never resolves a disagreement by
     acting. PRIVILEGE_ESCALATION is in the REAL rule table's always_deny set,
     so this exercises the real evaluator, not a mock."""
-    import core.governance.heart as heart_module
-    from core.policy_gate import GovernanceAction
+    import core.governance.orchestrator as orchestrator_module
+    from core.policy_gate import GovernanceAction, PolicyContext
+    from core.policy_gate import evaluate as real_evaluate
 
     _, audit, core, heart = _stack()
-    monkeypatch.setattr(
-        heart_module, "HEART_POLICY_ACTION", GovernanceAction.PRIVILEGE_ESCALATION
-    )
+
+    def refusing_policy(context):
+        return real_evaluate(
+            PolicyContext(
+                action=GovernanceAction.PRIVILEGE_ESCALATION,
+                actor_id=context.actor_id,
+                tenant_id=context.tenant_id,
+                resource=context.resource,
+                mode=context.mode,
+                human_approved=context.human_approved,
+                correlation_id=context.correlation_id,
+            )
+        )
+
+    monkeypatch.setattr(orchestrator_module, "evaluate", refusing_policy)
 
     decision = heart.observe(
         ThreatAssessment(
@@ -927,7 +949,7 @@ def test_policy_refusal_stops_staging_without_acting(monkeypatch):
             source_ip="203.0.113.123",
             threat_kind=list(ThreatKind)[0],
             severity=ThreatSeverity.HIGH,
-            source_kind=ThreatSourceKind.MIXED_OR_UNKNOWN,
+            source_kind=ThreatSourceKind.AI_AUTOMATION_LIKELY,
             score=80.0,
             indicators={"evidence_seq": 1, "evidence_sources": ["firewall", "sparta"]},
             supporting_tags=["t"],
@@ -940,8 +962,8 @@ def test_policy_refusal_stops_staging_without_acting(monkeypatch):
         r for r in audit.get_records(component="heart", limit=500)
         if r.get("reason_code") == "POLICY_REFUSED"
     ]
-    assert refused[-1]["policy"]["status"] == "DENY"
-    assert refused[-1]["policy"]["reasons"] == ["ALWAYS_DENIED"]
+    assert refused[-1]["policy"][0]["status"] == "DENY"
+    assert refused[-1]["policy"][0]["reasons"] == ["ALWAYS_DENIED"]
 
 
 def test_policy_refusal_blocks_approval_and_leaves_the_action_pending(
@@ -997,13 +1019,17 @@ def test_policy_refusal_blocks_approval_and_leaves_the_action_pending(
 # ---------------------------------------------------------------------------
 # The orchestrator is the authority; the Heart cannot act on its own
 # ---------------------------------------------------------------------------
-def _assessment(ip: str, identity: str = "anonymous") -> ThreatAssessment:
+def _assessment(
+    ip: str,
+    identity: str = "anonymous",
+    source_kind: ThreatSourceKind = ThreatSourceKind.AI_AUTOMATION_LIKELY,
+) -> ThreatAssessment:
     return ThreatAssessment(
         identity=identity,
         source_ip=ip,
         threat_kind=list(ThreatKind)[0],
         severity=ThreatSeverity.HIGH,
-        source_kind=ThreatSourceKind.MIXED_OR_UNKNOWN,
+        source_kind=source_kind,
         score=80.0,
         indicators={"evidence_seq": 1, "evidence_sources": ["firewall", "sparta"]},
         supporting_tags=["t"],
@@ -1023,9 +1049,14 @@ def test_heart_source_contains_no_decision_writes():
     for forbidden in ("insert_pending(", "transition_status(", "evaluate("):
         assert forbidden not in heart_source, forbidden
 
+    import core.governance.sentinel43_engine as engine_module
+
+    engine_source = inspect.getsource(engine_module)
+    assert "insert_pending(" in engine_source
+    assert "transition_status(" in engine_source
     orchestrator_source = inspect.getsource(orchestrator_module)
-    assert "insert_pending(" in orchestrator_source
-    assert "transition_status(" in orchestrator_source
+    assert "engine.stage(" in orchestrator_source
+    assert "engine.approve if approved else engine.veto" in orchestrator_source
 
 
 def test_a_heart_without_an_authority_stages_and_resolves_nothing(tmp_path):
@@ -1060,18 +1091,24 @@ def test_staging_records_the_orchestrator_the_operation_and_its_target():
     action_id = _stage(heart, "203.0.113.131")
 
     row = core.get_action(action_id)
-    assert row["primary_action"] == "network_block"
+    assert "TEMP_BLOCK_IP" in row["actions"]  # the engine's own plan
+    assert row["system_id"] == "SENTINEL-43-NEXUS-01"
 
     staged = audit.get_records(component="heart", correlation_id=action_id)[0]
     assert staged["authority"] == "system_orchestrator"
-    assert staged["operation"] == {
-        "action": "network_block",
-        "target_type": "source_ip",
-        "target": "203.0.113.131",
-    }
+    assert staged["engine"]["class"] == "Sentinel43ResponseEngine"
+    assert staged["operations"] == [
+        {
+            "action": "network_block",
+            "target_type": "source_ip",
+            "target": "203.0.113.131",
+            "engine_action": "TEMP_BLOCK_IP",
+        }
+    ]
+    assert "RATE_LIMIT" in staged["unsupported_actions"]
     # The policy decision is bound to that operation AND its target.
-    assert staged["policy"]["action"] == "network_block"
-    assert staged["policy"]["resource"] == "source_ip:203.0.113.131"
+    assert staged["policy"][0]["action"] == "network_block"
+    assert staged["policy"][0]["resource"] == "source_ip:203.0.113.131"
 
 
 def test_approval_is_bound_to_the_staged_operation_and_target(client):
@@ -1090,9 +1127,10 @@ def test_approval_is_bound_to_the_staged_operation_and_target(client):
     approved = audit.get_records(component="heart", correlation_id=action_id)[-1]
     assert approved["authority"] == "system_orchestrator"
     assert approved["identity_type"] == "operator"
-    assert approved["operation"]["target"] == "203.0.113.132"
-    assert approved["policy"]["resource"] == "source_ip:203.0.113.132"
-    assert approved["policy"]["human_approved"] is True
+    assert approved["decided_by"] == "Sentinel43ResponseEngine.approve_action"
+    assert approved["operations"][0]["target"] == "203.0.113.132"
+    assert approved["policy"][0]["resource"] == "source_ip:203.0.113.132"
+    assert approved["policy"][0]["human_approved"] is True
 
 
 def test_a_changed_operation_cannot_be_approved(client):
@@ -1120,21 +1158,39 @@ def test_a_changed_operation_cannot_be_approved(client):
     assert core.get_status(action_id) == ActionStatus.EXPIRED
 
 
-def test_an_unsupported_operation_is_recorded_not_relabeled():
-    """An authenticated principal would need an identity containment the
-    policy vocabulary does not have. It is not staged as a network block."""
+def test_an_unsupported_recommendation_is_staged_but_not_approvable(client):
+    """For an ordinary-source HIGH finding the engine recommends step-up auth,
+    rate limiting and an identity block -- none of which the policy
+    vocabulary can state. The engine's staging decision stands, but no human
+    can approve an operation that does not exist; it can only be vetoed."""
     _, audit, core, heart = _stack()
-    decision = heart.observe(_assessment("203.0.113.134", identity="operator"))
+    decision = heart.observe(
+        _assessment("203.0.113.134", source_kind=ThreatSourceKind.MIXED_OR_UNKNOWN)
+    )
+    assert decision.status == "STAGED"
+    staged = audit.get_records(component="heart", correlation_id=decision.action_id)[0]
+    assert staged["operations"] == []
+    assert set(staged["unsupported_actions"]) >= {"RATE_LIMIT", "TEMP_BLOCK_IDENTITY"}
 
-    assert decision.status == "OBSERVED"
-    assert decision.reason == "UNSUPPORTED_OPERATION"
-    assert core.count_actions() == 0
-    record = [
-        r for r in audit.get_records(component="heart", limit=500)
-        if r.get("reason_code") == "UNSUPPORTED_OPERATION"
-    ][-1]
-    assert record["operation"] is None
-    assert record["authority"] == "system_orchestrator"
+    _use(heart)
+    assert _recover(client) == 1
+    approve = client.post(
+        f"/actions/{decision.action_id}/approve",
+        headers=_headers(),
+        json={"reason": "reviewed by operator"},
+    )
+    assert approve.status_code == 409, approve.text
+    assert core.get_status(decision.action_id) == ActionStatus.PENDING
+    last = audit.get_records(component="heart", correlation_id=decision.action_id)[-1]
+    assert last["reason_code"] == "UNSUPPORTED_OPERATION"
+
+    veto = client.post(
+        f"/actions/{decision.action_id}/veto",
+        headers=_headers(),
+        json={"reason": "declining an unsupported recommendation"},
+    )
+    assert veto.status_code == 200, veto.text
+    assert core.get_status(decision.action_id) == ActionStatus.VETOED
 
 
 def test_the_route_resolves_through_the_orchestrator_not_the_heart(client):
@@ -1222,7 +1278,7 @@ def test_legitimately_audited_legacy_rows_are_recovered_not_expired(client, with
     assert core.get_status("HEART-LEGACY000001") == ActionStatus.PENDING
     restored = main_module.runtime.action_store["HEART-LEGACY000001"]
     assert restored["payload"]["legacy"] is True
-    assert restored["payload"]["operation"] is None
+    assert restored["payload"]["operations"] is None
 
 
 def test_a_legacy_recommendation_cannot_be_approved_but_can_be_vetoed(client):
@@ -1315,3 +1371,91 @@ def test_the_remote_gateway_cannot_decide_a_heart_recommendation(client):
     last = audit.get_records(component="heart", correlation_id=action_id)[-1]
     assert last["decision"] == "DENIED"
     assert last["reason_code"] == "NO_AUTHENTICATION_CONTEXT"
+
+
+# ---------------------------------------------------------------------------
+# The owner-designated engine is the running decider, and it is contained
+# ---------------------------------------------------------------------------
+def test_the_running_engine_is_the_unmodified_owner_file():
+    import hashlib
+
+    from core.governance.sentinel43_engine import engine_source_path
+
+    _, _, _, heart = _stack()
+    identity = heart._authority.engine_identity
+    on_disk = hashlib.sha256(engine_source_path().read_bytes()).hexdigest()
+    assert identity["sha256"] == on_disk
+    assert identity["class"] == "Sentinel43ResponseEngine"
+
+
+def test_the_engine_has_no_live_executor_and_refuses_execution():
+    import threading
+    import time
+
+    from core.governance.sentinel43_engine import CoreStoreActionStore
+
+    _, _, core, heart = _stack()
+    time.sleep(0.2)
+    assert not [t for t in threading.enumerate() if "executor" in t.name]
+
+    store = CoreStoreActionStore(core)
+    assert store.fetch_due_pending(now_ms=0, limit=10) == []
+    assert store.mark_pending_executing("HEART-ANY") is False
+    assert store.expire_overdue(now_ms=10**15) == 0
+    with pytest.raises(RuntimeError):
+        store.finalize_execution("HEART-ANY", ok=True)
+
+
+def test_active_mode_is_refused_by_the_engine_adapter():
+    _, _, _, heart = _stack()
+    engine = heart._authority._engine
+    plan = engine.plan(_assessment("203.0.113.150"))
+    with pytest.raises(RuntimeError, match="no autonomous execution"):
+        engine.stage(
+            plan["directive"],
+            mode_value="ACTIVE",
+            subject_key="anonymous|203.0.113.150",
+            kind="GENERIC_INTRUSION",
+            severity="HIGH",
+            source_kind="AI_AUTOMATION_LIKELY",
+            score=80.0,
+        )
+
+
+def test_the_engine_authenticator_refuses_outside_a_governed_decision():
+    """Calling the engine's own approve_action directly -- bypassing the
+    orchestrator -- gets nothing: its authenticator is bound to a principal
+    that only the orchestrator supplies."""
+    _, _, core, heart = _stack()
+    action_id = _stage(heart, "203.0.113.151")
+    raw_engine = heart._authority._engine._engine
+
+    assert raw_engine.approve_action(action_id, "heart-op", "direct call") is False
+    assert raw_engine.veto_action(action_id, "heart-op", "direct call") is False
+    assert core.get_status(action_id) == ActionStatus.PENDING
+
+
+def test_distinct_anonymous_sources_are_not_collapsed_by_the_engine():
+    """All firewall evidence is identity "anonymous"; the engine must still
+    treat each source as its own principal."""
+    _, _, core, heart = _stack()
+    first = _stage(heart, "203.0.113.160")
+    second = _stage(heart, "203.0.113.161")
+    assert first != second
+    assert core.count_actions(status=ActionStatus.PENDING) == 2
+
+
+def test_each_containment_layer_refuses_active_on_its_own():
+    """Two independent layers refuse ACTIVE: the adapter's mode check, and the
+    store, which will not accept an auto-executing (PENDING-with-timer) row."""
+    from types import SimpleNamespace
+
+    from core.governance.sentinel43_engine import CoreStoreActionStore
+
+    _, _, core, heart = _stack()
+    with pytest.raises(RuntimeError, match="no autonomous execution"):
+        heart._authority._engine._mode("ACTIVE")
+
+    store = CoreStoreActionStore(core)
+    with pytest.raises(RuntimeError, match="no autonomous execution"):
+        store.insert_pending_action(SimpleNamespace(status="PENDING"))

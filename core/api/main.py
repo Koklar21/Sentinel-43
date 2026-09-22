@@ -86,7 +86,12 @@ from ..monitoring.watchtower_client import (
 )
 from ..security.jwt_constants import APPROVED_JWT_ALGORITHMS
 from ..monitoring.event_types import EVENT_SCHEMA_VERSION, would_loop
-from core.governance.orchestrator import LEGACY_REVIEW_ACTION
+from core.governance.orchestrator import (
+    LEGACY_REVIEW_ACTION,
+    operations_for_row,
+    same_operations,
+    staged_operations_of,
+)
 from ..security_context import (
     IdentityType,
     get_security_context,
@@ -1963,20 +1968,10 @@ def _heart_row_problem(
         return "terminal_decision_already_audited"
     if f"{rec.get('identity')}|{rec.get('source_ip')}" != row["target_value"]:
         return "audit_target_mismatch"
-    if "operation" in rec:
-        # Recorded by the orchestrator: the durable row must propose exactly
-        # the operation and target that were staged.
-        _identity, _sep, source_ip = str(row["target_value"]).rpartition("|")
-        expected = {
-            "action": str(row["primary_action"]),
-            "target_type": "source_ip",
-            "target": source_ip,
-        }
-        if rec.get("operation") != expected:
-            return "audit_operation_mismatch"
-    elif str(row["primary_action"]) != LEGACY_REVIEW_ACTION:
-        # A staging record from before operations were recorded can only back
-        # a row that also predates them.
+    # The durable row must propose exactly the operations the authenticated
+    # staging record bound. A record from before operations were recorded can
+    # only back a row that also predates them.
+    if not same_operations(staged_operations_of(rec), operations_for_row(row)):
         return "audit_operation_mismatch"
     if rec.get("threat_kind") != row["kind"]:
         return "audit_kind_mismatch"
@@ -2119,15 +2114,8 @@ async def _rehydrate_heart_pending() -> int:
                     "source_kind": source_kind,
                     "score": float(row["score"]),
                     "reason": reason,
-                    "operation": (
-                        None
-                        if str(row["primary_action"]) == LEGACY_REVIEW_ACTION
-                        else {
-                            "action": str(row["primary_action"]),
-                            "target_type": "source_ip",
-                            "target": source_ip,
-                        }
-                    ),
+                    "operations": operations_for_row(row),
+                    "actions": list(row.get("actions") or ()),
                     "legacy": str(row["primary_action"]) == LEGACY_REVIEW_ACTION,
                     "rehydrated": True,
                 },
