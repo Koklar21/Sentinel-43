@@ -117,6 +117,12 @@ class HeartConfig:
     corroboration_window_seconds: int = 300
     corroboration_min_signals_for_high: int = 2
     max_tracked_targets: int = 10_000
+    # The historical OversightEngine refused to stage past
+    # max_pending_or_gated (500). Restored, and load-bearing: restart
+    # recovery can only enumerate a bounded page of pending rows, so
+    # without a staging ceiling the Heart can reach a state it cannot
+    # recover from, which would block readiness permanently.
+    max_pending_actions: int = 500
     velocity_window_seconds: float = 60.0
     velocity_limit: int = 30
 
@@ -137,6 +143,10 @@ class HeartConfig:
             raise ValueError(
                 "max_tracked_targets must be between 1 and 1000000"
             )
+        if not 1 <= self.max_pending_actions <= 100_000:
+            raise ValueError(
+                "max_pending_actions must be between 1 and 100000"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +154,34 @@ class HeartDecision:
     status: str
     reason: str
     action_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionPrincipal:
+    """Who the SERVER decided the caller is, not who the caller says.
+
+    ``is_human`` and ``identity_type`` are copied from the identity the
+    request pipeline recorded when it verified the credential, so a
+    human-looking ``operator_id`` in a request body cannot stand in for
+    an authenticated human. ``subject`` is the authenticated subject and
+    must match the operator_id the decision is recorded under.
+    """
+
+    subject: str
+    identity_type: str
+    is_human: bool
+
+
+class UnauthorizedDecision(PermissionError):
+    """A human decision was attempted by an identity the kernel rejects.
+
+    Restores the historical Sentinel43ResponseEngine contract (see the
+    original Sentinel-43/Shadow_mode.py: an injected
+    ``operator_authenticator`` defaulting to ``lambda _op: False``, with
+    "Unauthorized approval attempt" recorded): the governance kernel
+    proves for itself that a decider is an authorized human instead of
+    trusting whatever the transport layer passes in.
+    """
 
 
 class ThreatGovernor:
@@ -160,6 +198,7 @@ class ThreatGovernor:
         monitoring_manager: MonitoringSink | None = None,
         action_sink: ActionSink | None = None,
         on_health_change: Callable[[bool, str], None] | None = None,
+        operator_authenticator: Callable[[DecisionPrincipal], bool] | None = None,
     ) -> None:
         self.audit_store = audit_store
         self.velocity_guard = velocity_guard
@@ -169,6 +208,13 @@ class ThreatGovernor:
         self._monitoring_manager = monitoring_manager
         self._action_sink = action_sink
         self._on_health_change = on_health_change
+        # Fail closed exactly as the historical engine did: with no
+        # authenticator injected, NO decision is authorized.
+        self._operator_authenticator = (
+            operator_authenticator
+            if operator_authenticator is not None
+            else (lambda _principal: False)
+        )
 
         self._lock = threading.RLock()
         # (target, kind) -> {independent producer kind -> last observed time}
@@ -466,6 +512,47 @@ class ThreatGovernor:
             )
             return HeartDecision(status="OBSERVED", reason="POLICY_OBSERVED")
 
+        # Counting and staging must be atomic with respect to each other, or
+        # N concurrent observations each see "under the limit" and overshoot
+        # it together. RLock, so the nested acquisitions below are fine.
+        with self._lock:
+            return self._stage_within_ceiling(
+                assessment, target_key=target_key, kind=kind, now=now
+            )
+
+    def _stage_within_ceiling(
+        self,
+        assessment: ThreatAssessment,
+        *,
+        target_key: str,
+        kind: str,
+        now: float,
+    ) -> HeartDecision:
+        pending_count = self.core_store.count_actions(
+            status=ActionStatus.PENDING
+        )
+        if pending_count >= self.config.max_pending_actions:
+            self._append_audit(
+                self._audit_record(
+                    assessment,
+                    decision="OBSERVED",
+                    reason_code="BACKPRESSURE_LIMIT",
+                    extra={
+                        "pending_actions": pending_count,
+                        "pending_limit": self.config.max_pending_actions,
+                    },
+                )
+            )
+            logger.error(
+                "Heart refused to stage: %d pending recommendations at the "
+                "limit of %d; resolve pending decisions to resume staging",
+                pending_count,
+                self.config.max_pending_actions,
+            )
+            return HeartDecision(
+                status="OBSERVED", reason="BACKPRESSURE_LIMIT"
+            )
+
         return self._stage(assessment, target_key=target_key, kind=kind, now=now)
 
     def _stage(
@@ -611,16 +698,17 @@ class ThreatGovernor:
         approved: bool,
         operator_id: str,
         reason: str = "",
+        principal: DecisionPrincipal | None = None,
     ) -> dict[str, Any]:
         """WAIT FOR AUTHENTICATED HUMAN APPROVAL OR VETO's terminus.
 
-        The caller (the API composition root) is solely responsible for
-        proving ``operator_id`` is an authenticated, authorized human
-        session -- this method has no notion of identity and will act on
-        whatever operator_id it is given, exactly like
-        :meth:`core.governance.orchestrator.SystemOrchestrator.resolve_human_decision`.
-        A service credential or environment-derived identity must never
-        reach this method as ``operator_id``.
+        The transport layer still authenticates the session, but it is no
+        longer the only thing standing between a credential and a
+        consequential decision: the injected ``operator_authenticator``
+        is consulted here, fails closed when absent, and a rejected
+        attempt is recorded in the authoritative ledger before this
+        raises, so a denied path leaves the same durable evidence an
+        approved one does.
         """
         action_id = action_id.strip()
         operator_id = operator_id.strip()
@@ -629,6 +717,38 @@ class ThreatGovernor:
             raise ValueError("action_id must not be empty")
         if not operator_id:
             raise ValueError("operator_id must not be empty")
+
+        # Fail closed on absent context: a caller that cannot prove who it
+        # is gets no decision, regardless of the operator_id it supplies.
+        denial: str | None = None
+        if principal is None:
+            denial = "NO_AUTHENTICATION_CONTEXT"
+        elif principal.subject.strip() != operator_id:
+            # The recorded decider must BE the authenticated subject.
+            denial = "OPERATOR_ID_DOES_NOT_MATCH_AUTHENTICATED_SUBJECT"
+        elif not self._operator_authenticator(principal):
+            denial = "UNAUTHORIZED_DECISION_ATTEMPT"
+
+        if denial is not None:
+            # Audited BEFORE raising, and _append_audit re-raises if the
+            # ledger rejects it, so a denial is never silently dropped.
+            self._append_audit(
+                {
+                    "subsystem": "heart",
+                    "component": "heart",
+                    "correlation_id": action_id,
+                    "decision_id": action_id,
+                    "decision": "DENIED",
+                    "reason_code": denial,
+                    "operator_id": operator_id,
+                    "identity_type": (
+                        principal.identity_type if principal else "none"
+                    ),
+                }
+            )
+            raise UnauthorizedDecision(
+                "operator is not authorized to resolve Heart decisions"
+            )
 
         try:
             result = self._resolve_unguarded(
@@ -743,7 +863,9 @@ class ThreatGovernor:
 
 __all__ = [
     "ActionSink",
+    "DecisionPrincipal",
     "HeartConfig",
     "HeartDecision",
     "ThreatGovernor",
+    "UnauthorizedDecision",
 ]

@@ -423,6 +423,24 @@ class SentinelCoreStore:
 
             return (cursor.rowcount or 0) == 1
 
+    def count_actions(self, *, status: ActionStatus | None = None) -> int:
+        """Row count only -- the staging back-pressure check must not pay
+        for materialising rows it will not read."""
+        with self._connect() as connection:
+            if status is None:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS n FROM pending_actions"
+                ).fetchone()
+            else:
+                if not isinstance(status, ActionStatus):
+                    raise TypeError("status must be ActionStatus")
+                row = connection.execute(
+                    "SELECT COUNT(*) AS n FROM pending_actions WHERE status = ?",
+                    (status.value,),
+                ).fetchone()
+
+        return int(row["n"]) if row is not None else 0
+
     def list_actions(
         self,
         *,
