@@ -86,6 +86,7 @@ from ..monitoring.watchtower_client import (
 )
 from ..security.jwt_constants import APPROVED_JWT_ALGORITHMS
 from ..monitoring.event_types import EVENT_SCHEMA_VERSION, would_loop
+from core.governance.orchestrator import LEGACY_REVIEW_ACTION
 from ..security_context import (
     IdentityType,
     get_security_context,
@@ -820,7 +821,11 @@ async def _resolve_governance_and_commit_action(
         )
 
     if str(action.get("action_type") or "") == "HEART_RECOMMENDATION":
-        if runtime.heart is None:
+        # Resolved by the orchestrator directly -- the same authority object
+        # the transaction branch below uses -- not by the Heart, which holds
+        # no decision authority of its own.
+        authority = runtime.orchestrator
+        if authority is None or not authority.recommendation_store_attached:
             raise HTTPException(
                 status_code=409,
                 detail="The Heart is not enabled",
@@ -830,7 +835,7 @@ async def _resolve_governance_and_commit_action(
         try:
             await asyncio.to_thread(
                 functools.partial(
-                    runtime.heart.resolve_human_decision,
+                    authority.resolve_recommendation,
                     action_id,
                     approved=approved,
                     operator_id=operator,
@@ -886,6 +891,42 @@ async def _resolve_governance_and_commit_action(
                     "Governance is not enabled; this action cannot be "
                     "resolved"
                 ),
+            )
+
+        # The transaction adapter trusts whatever operator_id it is handed,
+        # so an authenticated HUMAN is proven here, from the server-recorded
+        # identity -- the same rule the recommendation path enforces inside
+        # the orchestrator. A service credential (e.g. a remote-gateway role
+        # token with a self-asserted operator_id) cannot decide.
+        denial: str | None = None
+        if principal is None:
+            denial = "NO_AUTHENTICATION_CONTEXT"
+        elif principal.subject.strip() != operator.strip():
+            denial = "OPERATOR_ID_DOES_NOT_MATCH_AUTHENTICATED_SUBJECT"
+        elif not _heart_operator_authenticator(principal):
+            denial = "UNAUTHORIZED_DECISION_ATTEMPT"
+        if denial is not None:
+            try:
+                await asyncio.to_thread(
+                    functools.partial(
+                        runtime.orchestrator.record_denied_decision,
+                        resolved_decision_id or "",
+                        operator_id=operator,
+                        reason_code=denial,
+                        identity_type=(
+                            principal.identity_type if principal else "none"
+                        ),
+                    )
+                )
+            except Exception as exc:
+                logger.exception("Failed to audit a refused governance decision")
+                raise HTTPException(
+                    status_code=503,
+                    detail="Governance decision service is unavailable",
+                ) from exc
+            raise HTTPException(
+                status_code=403,
+                detail="an authenticated human operator is required to resolve this action",
             )
 
         if not resolved_decision_id:
@@ -1883,6 +1924,7 @@ _HEART_RECOVERY_PAGE = 1000
 # Rejected decision attempts are audited against the same correlation id,
 # so this window must stay well clear of a legitimate action's history.
 _HEART_AUDIT_LOOKUP_LIMIT = 500
+_HEART_LEGACY_AUDIT_LIMIT = 1000
 _HEART_TERMINAL_DECISIONS = frozenset({"APPROVED", "VETOED", "EXECUTED", "EXPIRED"})
 
 
@@ -1921,6 +1963,21 @@ def _heart_row_problem(
         return "terminal_decision_already_audited"
     if f"{rec.get('identity')}|{rec.get('source_ip')}" != row["target_value"]:
         return "audit_target_mismatch"
+    if "operation" in rec:
+        # Recorded by the orchestrator: the durable row must propose exactly
+        # the operation and target that were staged.
+        _identity, _sep, source_ip = str(row["target_value"]).rpartition("|")
+        expected = {
+            "action": str(row["primary_action"]),
+            "target_type": "source_ip",
+            "target": source_ip,
+        }
+        if rec.get("operation") != expected:
+            return "audit_operation_mismatch"
+    elif str(row["primary_action"]) != LEGACY_REVIEW_ACTION:
+        # A staging record from before operations were recorded can only back
+        # a row that also predates them.
+        return "audit_operation_mismatch"
     if rec.get("threat_kind") != row["kind"]:
         return "audit_kind_mismatch"
     if rec.get("severity") != row["severity"]:
@@ -1933,6 +1990,29 @@ def _heart_row_problem(
     except (TypeError, ValueError):
         return "audit_score_mismatch"
     return None
+
+
+def _legacy_heart_audit_index(audit_store: Any) -> dict[str, list[dict[str, Any]]]:
+    """Heart records that carry no ``component``, grouped by decision_id.
+
+    Bounded: if the legacy ledger is larger than one read, recovery cannot
+    prove it saw every relevant record, so it refuses rather than guess.
+    """
+    limit = _HEART_LEGACY_AUDIT_LIMIT
+    records = audit_store.get_records_without_component(limit=limit)
+    if len(records) >= limit:
+        raise HeartRecoveryError(
+            f"{len(records)}+ legacy audit records without a component; "
+            "recovery cannot enumerate them all"
+        )
+    index: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        if record.get("subsystem") != "heart":
+            continue
+        decision_id = str(record.get("decision_id") or "")
+        if decision_id:
+            index.setdefault(decision_id, []).append(record)
+    return index
 
 
 async def _rehydrate_heart_pending() -> int:
@@ -1950,13 +2030,13 @@ async def _rehydrate_heart_pending() -> int:
       * only a verified-equivalent duplicate already in the store is skipped;
         any other error propagates.
     """
-    from core.sentinel43_core_db import ActionStatus
-
-    heart = runtime.heart
-    if heart is None:
+    authority = runtime.orchestrator
+    if authority is None or not authority.recommendation_store_attached:
         return 0
 
-    rows = await asyncio.to_thread(heart.list_pending, _HEART_RECOVERY_PAGE)
+    rows = await asyncio.to_thread(
+        authority.list_pending_recommendations, _HEART_RECOVERY_PAGE
+    )
     if len(rows) >= _HEART_RECOVERY_PAGE:
         raise HeartRecoveryError(
             f"{len(rows)}+ pending Heart rows; recovery cannot enumerate "
@@ -1965,12 +2045,14 @@ async def _rehydrate_heart_pending() -> int:
     if not rows:
         return 0
 
-    verification = await asyncio.to_thread(heart.audit_store.verify_integrity)
+    audit_store = authority.audit_store
+    verification = await asyncio.to_thread(audit_store.verify_integrity)
     if not getattr(verification, "valid", False):
         raise HeartRecoveryError(
             "audit ledger failed integrity verification during Heart recovery"
         )
 
+    legacy_index: dict[str, list[dict[str, Any]]] | None = None
     verified: list[dict[str, Any]] = []
     quarantine: list[tuple[str, str]] = []
     malformed: list[str] = []
@@ -1996,11 +2078,20 @@ async def _rehydrate_heart_pending() -> int:
             continue
 
         audited = await asyncio.to_thread(
-            heart.audit_store.get_records,
+            audit_store.get_records,
             component="heart",
             correlation_id=action_id,
             limit=_HEART_AUDIT_LOOKUP_LIMIT,
         )
+        if not audited:
+            # Records written before the component/correlation_id lookup keys
+            # existed can only be found by content. A legitimately audited
+            # decision must not be expired just because it predates them.
+            if legacy_index is None:
+                legacy_index = await asyncio.to_thread(
+                    _legacy_heart_audit_index, audit_store
+                )
+            audited = legacy_index.get(action_id, [])
         problem = (
             "audit_history_too_long"
             if len(audited) >= _HEART_AUDIT_LOOKUP_LIMIT
@@ -2028,6 +2119,16 @@ async def _rehydrate_heart_pending() -> int:
                     "source_kind": source_kind,
                     "score": float(row["score"]),
                     "reason": reason,
+                    "operation": (
+                        None
+                        if str(row["primary_action"]) == LEGACY_REVIEW_ACTION
+                        else {
+                            "action": str(row["primary_action"]),
+                            "target_type": "source_ip",
+                            "target": source_ip,
+                        }
+                    ),
+                    "legacy": str(row["primary_action"]) == LEGACY_REVIEW_ACTION,
                     "rehydrated": True,
                 },
             }
@@ -2051,11 +2152,9 @@ async def _rehydrate_heart_pending() -> int:
 
     for action_id, problem in quarantine:
         await asyncio.to_thread(
-            heart.core_store.transition_status,
+            authority.expire_unverifiable_recommendation,
             action_id,
-            expected=ActionStatus.PENDING,
-            new_status=ActionStatus.EXPIRED,
-            operator_reason=f"quarantined_at_recovery:{problem}",
+            problem=problem,
         )
         logger.error(
             "Heart recovery quarantined %s (%s); it is not actionable",
@@ -2108,6 +2207,18 @@ async def _start_heart() -> None:
     """
     if not _env_bool("S43_HEART_ENABLED", False):
         runtime.subsystems.mark_disabled(SUBSYS_HEART)
+        return
+
+    if runtime.orchestrator is None:
+        runtime.subsystems.mark_failed(
+            SUBSYS_HEART,
+            "Requires the governance orchestrator (S43_GOVERNANCE_ENABLED=true): "
+            "the Heart has no decision authority of its own.",
+        )
+        logger.error(
+            "The Heart is enabled but the governance orchestrator is not "
+            "running; refusing to start the Heart without its authority."
+        )
         return
 
     if runtime.audit_store is None:
@@ -2182,6 +2293,7 @@ async def _start_heart() -> None:
             audit_store=runtime.audit_store,
             core_store=core_store,
             monitoring_manager=runtime.monitoring_manager,
+            authority=runtime.orchestrator,
             action_sink=_HeartActionSink(asyncio.get_running_loop()),
             on_health_change=_report_heart_health,
             operator_authenticator=_heart_operator_authenticator,
@@ -2205,7 +2317,7 @@ async def _start_heart() -> None:
         # getting worse; it does not repair it, so say so rather than
         # reporting an unqualified "active".
         backlog = await asyncio.to_thread(
-            core_store.count_actions, status=ActionStatus.PENDING
+            runtime.orchestrator.count_pending_recommendations
         )
         ceiling = runtime.heart.config.max_pending_actions
         if backlog >= ceiling:
@@ -2232,6 +2344,10 @@ async def _start_heart() -> None:
         runtime.heart = None
         if runtime.fenrir_instance is not None:
             runtime.fenrir_instance.heart = None
+        # A Heart that failed to start must not leave its decisions reachable
+        # through the orchestrator either.
+        if runtime.orchestrator is not None:
+            runtime.orchestrator.detach_recommendation_store()
         runtime.subsystems.mark_failed(
             SUBSYS_HEART, f"Failed to start: {type(exc).__name__}"
         )

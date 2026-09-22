@@ -47,6 +47,7 @@ from core.detection.sentinel_threat_types import (  # noqa: E402
 from core.governance import (  # noqa: E402
     HeartConfig,
     build_heart_from_settings,
+    build_orchestrator_from_settings,
 )
 from core.monitoring import manager as manager_module  # noqa: E402
 from core.monitoring.event_types import normalize_event  # noqa: E402
@@ -145,8 +146,18 @@ def _stores(
             if staged is not None:
                 staged.append(record)
 
+    class GovernanceSettings:
+        default_mode = "HUMAN_GATED"
+
+    authority = build_orchestrator_from_settings(
+        GovernanceSettings(), audit_store=audit
+    )
     heart = build_heart_from_settings(
-        Settings(), audit_store=audit, core_store=core, action_sink=Sink()
+        Settings(),
+        audit_store=audit,
+        core_store=core,
+        authority=authority,
+        action_sink=Sink(),
     )
     return audit, core, heart
 

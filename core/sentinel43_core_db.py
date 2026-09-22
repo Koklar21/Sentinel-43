@@ -423,6 +423,16 @@ class SentinelCoreStore:
 
             return (cursor.rowcount or 0) == 1
 
+    def get_action(self, action_id: str) -> Mapping[str, Any] | None:
+        """One durable row, or None. Read-only."""
+        normalized = self._normalize_action_id(action_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM pending_actions WHERE action_id = ?",
+                (normalized,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def count_actions(self, *, status: ActionStatus | None = None) -> int:
         """Row count only -- the staging back-pressure check must not pay
         for materialising rows it will not read."""

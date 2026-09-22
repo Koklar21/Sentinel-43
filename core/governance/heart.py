@@ -35,7 +35,9 @@ Responsibilities:
     - dedupe/replay-protection for repeated identical findings
     - two-signal corroboration before staging a HIGH/CRITICAL finding
     - rate limiting per target
-    - create HUMAN_GATED staged actions for explicit human approval/veto
+    - build each recommendation with the exact operation it proposes, and
+      submit it to the governance authority (SystemOrchestrator), which
+      alone decides, stages durably and resolves human decisions
     - append authoritative audit records for every step, including
       SHADOW-mode observation and corroboration-pending states
     - report its own health truthfully via an injected callback, so a
@@ -61,6 +63,7 @@ and the call raises -- it does not return a soft "staged anyway" result.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import threading
 import time
@@ -73,27 +76,28 @@ from uuid import uuid4
 
 from core.detection.sentinel_threat_types import ThreatAssessment, ThreatSeverity
 from core.guards.velocity import VelocityGuard
-from core.policy_gate import (
-    STATUS_ALLOW,
-    STATUS_OBSERVE,
-    STATUS_REQUIRES_HUMAN,
-    GovernanceAction,
-    PolicyContext,
-    evaluate as evaluate_policy,
-)
-from core.sentinel43_core_db import ActionStatus, PendingAction, SentinelCoreStore
+from core.policy_gate import GovernanceAction
+from core.security_context import IdentityType
+from core.sentinel43_core_db import ActionStatus, SentinelCoreStore
 
-from .orchestrator import GovernanceMode
+from .orchestrator import (
+    DecisionPrincipal,
+    GovernanceMode,
+    PolicyRefused,
+    ProposedOperation,
+    RecommendationAuthorityUnavailable,
+    ThreatRecommendation,
+    UnauthorizedDecision,
+)
 
 
 logger = logging.getLogger("sentinel43.heart")
 
 
-# What a Heart recommendation asks a human to authorize, in the established
-# policy vocabulary (core.policy_gate). The historical Nexus recommendation
-# was IntegrationHub.execute_firewall_block; nothing here executes it --
-# the Heart only asks the one policy authority whether staging and approval
-# are permitted, instead of deciding that from its own mode switch.
+# The operation a Heart recommendation asks a human to authorize for an
+# unauthenticated remote source, in the established policy vocabulary
+# (core.policy_gate). The historical Nexus recommendation was
+# IntegrationHub.execute_firewall_block. Nothing here executes it.
 HEART_POLICY_ACTION = GovernanceAction.NETWORK_BLOCK
 
 _CORROBORATION_REQUIRED_SEVERITIES = frozenset(
@@ -171,42 +175,6 @@ class HeartDecision:
     action_id: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class DecisionPrincipal:
-    """Who the SERVER decided the caller is, not who the caller says.
-
-    ``is_human`` and ``identity_type`` are copied from the identity the
-    request pipeline recorded when it verified the credential, so a
-    human-looking ``operator_id`` in a request body cannot stand in for
-    an authenticated human. ``subject`` is the authenticated subject and
-    must match the operator_id the decision is recorded under.
-    """
-
-    subject: str
-    identity_type: str
-    is_human: bool
-
-
-class PolicyRefused(RuntimeError):
-    """The policy authority did not permit a Heart operation.
-
-    A RuntimeError so the API maps it like any other "cannot be decided
-    now" outcome (409) and it is not mistaken for a Heart health fault.
-    """
-
-
-class UnauthorizedDecision(PermissionError):
-    """A human decision was attempted by an identity the kernel rejects.
-
-    Restores the historical Sentinel43ResponseEngine contract (see the
-    original Sentinel-43/Shadow_mode.py: an injected
-    ``operator_authenticator`` defaulting to ``lambda _op: False``, with
-    "Unauthorized approval attempt" recorded): the governance kernel
-    proves for itself that a decider is an authorized human instead of
-    trusting whatever the transport layer passes in.
-    """
-
-
 class ThreatGovernor:
     """Human-governed staging for detection-layer threat assessments."""
 
@@ -221,7 +189,7 @@ class ThreatGovernor:
         monitoring_manager: MonitoringSink | None = None,
         action_sink: ActionSink | None = None,
         on_health_change: Callable[[bool, str], None] | None = None,
-        operator_authenticator: Callable[[DecisionPrincipal], bool] | None = None,
+        authority: Any | None = None,
     ) -> None:
         self.audit_store = audit_store
         self.velocity_guard = velocity_guard
@@ -231,13 +199,10 @@ class ThreatGovernor:
         self._monitoring_manager = monitoring_manager
         self._action_sink = action_sink
         self._on_health_change = on_health_change
-        # Fail closed exactly as the historical engine did: with no
-        # authenticator injected, NO decision is authorized.
-        self._operator_authenticator = (
-            operator_authenticator
-            if operator_authenticator is not None
-            else (lambda _principal: False)
-        )
+        # The governance authority (SystemOrchestrator). The Heart evaluates
+        # evidence; every staging and every human decision is made by the
+        # authority. Without one the Heart stages and resolves nothing.
+        self._authority = authority
 
         self._lock = threading.RLock()
         # (target, kind) -> {independent producer kind -> last observed time}
@@ -249,25 +214,44 @@ class ThreatGovernor:
         self._last_evidence_seq: dict[tuple[str, str], int] = {}
 
     @staticmethod
-    def _policy(
-        *,
-        mode: GovernanceMode,
-        actor_id: str,
-        resource: str,
-        human_approved: bool,
-        correlation_id: str | None = None,
-    ) -> Any:
-        return evaluate_policy(
-            PolicyContext(
-                action=HEART_POLICY_ACTION,
-                actor_id=actor_id,
-                tenant_id="default",
-                resource=resource,
-                mode=mode.value,
-                human_approved=human_approved,
-                correlation_id=correlation_id,
-            )
+    def _proposed_operation(assessment: ThreatAssessment) -> ProposedOperation | None:
+        """What approving this recommendation would authorize, stated exactly.
+
+        The Heart's trusted evidence today is the firewall: requests from a
+        remote address refused before authentication, keyed by
+        (identity="anonymous", source_ip). The containment that addresses an
+        unauthenticated remote source is blocking that address, which the
+        policy vocabulary names NETWORK_BLOCK. For an AUTHENTICATED principal
+        the matching containment would be locking or revoking that identity;
+        the vocabulary has no such operation, so it stays explicitly
+        unsupported rather than being relabeled as a network block.
+        """
+        source_ip = str(assessment.source_ip).strip()
+        if str(assessment.identity).strip() != IdentityType.ANONYMOUS.value:
+            return None
+        try:
+            ipaddress.ip_address(source_ip)
+        except ValueError:
+            return None
+        return ProposedOperation(
+            action=HEART_POLICY_ACTION.value,
+            target_type="source_ip",
+            target=source_ip,
         )
+
+    @staticmethod
+    def _evidence(assessment: ThreatAssessment) -> dict[str, Any]:
+        return {
+            "subsystem": "heart",
+            "identity": assessment.identity,
+            "source_ip": assessment.source_ip,
+            "threat_kind": assessment.threat_kind.value,
+            "severity": assessment.severity.value,
+            "source_kind": assessment.source_kind.value,
+            "score": assessment.score,
+            "supporting_tags": list(assessment.supporting_tags),
+            "indicators": dict(assessment.indicators),
+        }
 
     @staticmethod
     def _normalize_mode(mode: GovernanceMode | str) -> GovernanceMode:
@@ -538,48 +522,49 @@ class ThreatGovernor:
             )
             return HeartDecision(status="OBSERVED", reason="DUPLICATE_SUPPRESSED")
 
-        policy = self._policy(
-            mode=effective_mode,
-            actor_id="heart",
-            resource=f"target:{target_key}",
-            human_approved=False,
+        recommendation = ThreatRecommendation(
+            subject_key=target_key,
+            kind=kind,
+            severity=assessment.severity.value,
+            source_kind=assessment.source_kind.value,
+            score=float(assessment.score),
+            reason=(
+                f"{kind} from {assessment.source_ip} "
+                f"(score={assessment.score:.1f}, "
+                f"tags={','.join(assessment.supporting_tags) or 'none'})"
+            ),
+            operation=self._proposed_operation(assessment),
+            evidence=self._evidence(assessment),
+            requested_mode=effective_mode,
+            created_at=now,
         )
-        policy_payload = policy.to_dict()
-        expected_status = (
-            STATUS_OBSERVE
-            if effective_mode is GovernanceMode.SHADOW
-            else STATUS_REQUIRES_HUMAN
-        )
-        if policy.status != expected_status:
-            # The policy authority and the Heart disagree about what this
-            # mode permits. Never resolve that by acting: record it and
-            # stage nothing.
+
+        authority = self._authority
+        if authority is None:
+            # The Heart holds no decision authority of its own: without the
+            # orchestrator it records the finding and stages nothing.
             self._append_audit(
                 self._audit_record(
                     assessment,
                     decision="OBSERVED",
-                    reason_code="POLICY_REFUSED",
-                    extra={"policy": policy_payload},
+                    reason_code="NO_GOVERNANCE_AUTHORITY",
                 )
             )
             logger.error(
-                "Heart staging refused by policy: status=%s (expected %s "
-                "for mode %s)",
-                policy.status,
-                expected_status,
-                effective_mode.value,
+                "Heart finding not staged: no governance authority is attached"
             )
-            return HeartDecision(status="OBSERVED", reason="POLICY_REFUSED")
+            return HeartDecision(status="OBSERVED", reason="NO_GOVERNANCE_AUTHORITY")
 
-        if effective_mode is GovernanceMode.SHADOW:
-            self._append_audit(
-                self._audit_record(
-                    assessment,
-                    decision="OBSERVED",
-                    reason_code="POLICY_OBSERVED",
-                    extra={"policy": policy_payload},
-                )
+        outcome = authority.stage_recommendation(recommendation)
+
+        if outcome.status == "STAGED" and outcome.action_id:
+            self._mirror_staged(
+                assessment,
+                kind=kind,
+                action_id=outcome.action_id,
+                operation=recommendation.operation,
             )
+        elif outcome.reason == "POLICY_OBSERVED":
             self._notify_monitoring(
                 {
                     "kind": "security",
@@ -588,144 +573,29 @@ class ThreatGovernor:
                     "source_ip": assessment.source_ip,
                 }
             )
-            return HeartDecision(status="OBSERVED", reason="POLICY_OBSERVED")
 
-        # Counting and staging must be atomic with respect to each other, or
-        # N concurrent observations each see "under the limit" and overshoot
-        # it together. RLock, so the nested acquisitions below are fine.
-        with self._lock:
-            return self._stage_within_ceiling(
-                assessment,
-                target_key=target_key,
-                kind=kind,
-                now=now,
-                policy=policy_payload,
-            )
+        return HeartDecision(
+            status=outcome.status,
+            reason=outcome.reason,
+            action_id=outcome.action_id,
+        )
 
-    def _stage_within_ceiling(
+    def _mirror_staged(
         self,
         assessment: ThreatAssessment,
         *,
-        target_key: str,
         kind: str,
-        now: float,
-        policy: dict[str, Any] | None = None,
-    ) -> HeartDecision:
-        pending_count = self.core_store.count_actions(
-            status=ActionStatus.PENDING
-        )
-        if pending_count >= self.config.max_pending_actions:
-            self._append_audit(
-                self._audit_record(
-                    assessment,
-                    decision="OBSERVED",
-                    reason_code="BACKPRESSURE_LIMIT",
-                    extra={
-                        "pending_actions": pending_count,
-                        "pending_limit": self.config.max_pending_actions,
-                    },
-                )
-            )
-            logger.error(
-                "Heart refused to stage: %d pending recommendations at the "
-                "limit of %d; resolve pending decisions to resume staging",
-                pending_count,
-                self.config.max_pending_actions,
-            )
-            return HeartDecision(
-                status="OBSERVED", reason="BACKPRESSURE_LIMIT"
-            )
-
-        return self._stage(
-            assessment, target_key=target_key, kind=kind, now=now, policy=policy
-        )
-
-    def _stage(
-        self,
-        assessment: ThreatAssessment,
-        *,
-        target_key: str,
-        kind: str,
-        now: float,
-        policy: dict[str, Any] | None = None,
-    ) -> HeartDecision:
-        # Must satisfy the canonical action store's ACTION_ID_RE
-        # (^[A-Z0-9_-]{1,64}$, core/api/main.py) -- this same id is used as
-        # both the SentinelCoreStore key and the canonical action_store
-        # key, deliberately, so there is one id per recommendation, not a
-        # separate id-mapping to keep in sync between two stores.
-        action_id = f"HEART-{uuid4().hex.upper()}"
-
-        action = PendingAction(
-            action_id=action_id,
-            created_at_ms=int(now * 1000),
-            status=ActionStatus.PENDING,
-            target_type="identity_source_ip",
-            target_value=target_key,
-            primary_action="human_review",
-            actions=("review", "escalate"),
-            severity=assessment.severity.value,
-            kind=kind,
-            source_kind=assessment.source_kind.value,
-            score=float(assessment.score),
-            reason=(
-                f"{kind} from {assessment.source_ip} "
-                f"(score={assessment.score:.1f}, "
-                f"tags={','.join(assessment.supporting_tags) or 'none'})"
-            ),
-            system_id="heart",
-        )
-
-        # Durable staging happens first, but a successful *response* requires
-        # the audit record too (see below) -- this ordering only ever
-        # produces an unaudited row transiently, inside this one function,
-        # never as something reported to a caller as a successful stage.
-        self.core_store.insert_pending(action)
-
-        try:
-            self._append_audit(
-                self._audit_record(
-                    assessment,
-                    decision="STAGED",
-                    reason_code="STAGED_FOR_HUMAN_REVIEW",
-                    decision_id=action_id,
-                    extra={"policy": policy} if policy else None,
-                )
-            )
-        except Exception:
-            # Heart invariant: no consequential staging without durable
-            # audit. Compensate the row rather than leave a silent,
-            # unaudited PENDING action a human could still approve/veto
-            # without any audit trail of it ever having been staged, then
-            # propagate -- this call must not return a success.
-            try:
-                self.core_store.transition_status(
-                    action_id,
-                    expected=ActionStatus.PENDING,
-                    new_status=ActionStatus.EXPIRED,
-                    operator_reason="audit_append_failed_at_stage_time",
-                )
-            except Exception:
-                logger.error(
-                    "Failed to compensate unaudited staged action %s "
-                    "after an audit append failure -- it remains PENDING "
-                    "in SentinelCoreStore without a STAGED audit record",
-                    action_id,
-                    exc_info=True,
-                )
-            raise
-
+        action_id: str,
+        operation: ProposedOperation | None,
+    ) -> None:
+        """Mirror an orchestrator-staged recommendation into the canonical
+        action/dashboard surface. Presentation only: the durable row and its
+        audit record already exist, written by the orchestrator."""
         record = {
             "id": action_id,
-            # Deliberately NOT "THREAT_ACTION" -- that string is already
-            # the pre-existing generic default action_type for synthetic/
-            # dashboard-created actions that go through the regular
-            # SystemOrchestrator governance path (see
-            # core/api/main.py::_create_synthetic_action and
-            # dashboard/assets/js/dashboard.js). Colliding with it would
-            # silently misroute those actions' approve/veto calls into the
-            # Heart instead. This value is unique to Heart-originated
-            # recommendations.
+            # Deliberately NOT "THREAT_ACTION": that is the generic default
+            # for synthetic/dashboard actions, which resolve through the
+            # transaction path instead.
             "action_type": "HEART_RECOMMENDATION",
             "status": "STAGED",
             "created_at": _utc_now_iso(),
@@ -740,6 +610,7 @@ class ThreatGovernor:
                 "severity": assessment.severity.value,
                 "source_kind": assessment.source_kind.value,
                 "score": assessment.score,
+                "operation": operation.to_dict() if operation else None,
                 "indicators": dict(assessment.indicators),
                 "supporting_tags": list(assessment.supporting_tags),
             },
@@ -750,15 +621,10 @@ class ThreatGovernor:
             try:
                 sink.stage(record)
             except Exception:
-                # The durable stage + audit already succeeded above -- this
-                # is a lesser, recoverable failure (the action will not
-                # appear in the dashboard's action list until reconciled)
-                # and must not be reported as a failed stage. Logged loudly,
-                # not swallowed at debug level, so it is actually observable.
                 logger.error(
                     "Heart action_sink.stage failed for %s -- it is durably "
-                    "staged and audited in SentinelCoreStore but will not "
-                    "appear in the canonical action list until reconciled",
+                    "staged and audited but will not appear in the canonical "
+                    "action list until reconciled",
                     action_id,
                     exc_info=True,
                 )
@@ -774,10 +640,6 @@ class ThreatGovernor:
             }
         )
 
-        return HeartDecision(
-            status="STAGED", reason="STAGED_FOR_HUMAN_REVIEW", action_id=action_id
-        )
-
     def resolve_human_decision(
         self,
         action_id: str,
@@ -787,190 +649,45 @@ class ThreatGovernor:
         reason: str = "",
         principal: DecisionPrincipal | None = None,
     ) -> dict[str, Any]:
-        """WAIT FOR AUTHENTICATED HUMAN APPROVAL OR VETO's terminus.
+        """Hand a human decision to the orchestrator, which alone decides.
 
-        The transport layer still authenticates the session, but it is no
-        longer the only thing standing between a credential and a
-        consequential decision: the injected ``operator_authenticator``
-        is consulted here, fails closed when absent, and a rejected
-        attempt is recorded in the authoritative ledger before this
-        raises, so a denied path leaves the same durable evidence an
-        approved one does.
+        The Heart only reports its own health around the call; authorization,
+        the operation binding, policy, the durable transition and its audit
+        all happen inside SystemOrchestrator.resolve_recommendation.
         """
-        action_id = action_id.strip()
-        operator_id = operator_id.strip()
-
-        if not action_id:
-            raise ValueError("action_id must not be empty")
-        if not operator_id:
-            raise ValueError("operator_id must not be empty")
-
-        # Fail closed on absent context: a caller that cannot prove who it
-        # is gets no decision, regardless of the operator_id it supplies.
-        denial: str | None = None
-        if principal is None:
-            denial = "NO_AUTHENTICATION_CONTEXT"
-        elif principal.subject.strip() != operator_id:
-            # The recorded decider must BE the authenticated subject.
-            denial = "OPERATOR_ID_DOES_NOT_MATCH_AUTHENTICATED_SUBJECT"
-        elif not self._operator_authenticator(principal):
-            denial = "UNAUTHORIZED_DECISION_ATTEMPT"
-
-        if denial is not None:
-            # Audited BEFORE raising, and _append_audit re-raises if the
-            # ledger rejects it, so a denial is never silently dropped.
-            self._append_audit(
-                {
-                    "subsystem": "heart",
-                    "component": "heart",
-                    "correlation_id": action_id,
-                    "decision_id": action_id,
-                    "decision": "DENIED",
-                    "reason_code": denial,
-                    "operator_id": operator_id,
-                    "identity_type": (
-                        principal.identity_type if principal else "none"
-                    ),
-                }
+        authority = self._authority
+        if authority is None:
+            raise RecommendationAuthorityUnavailable(
+                "the Heart has no governance authority attached"
             )
-            raise UnauthorizedDecision(
-                "operator is not authorized to resolve Heart decisions"
-            )
-
-        policy_payload: dict[str, Any] | None = None
-        if approved:
-            # Only HUMAN_GATED stages, so that is the mode an approval is
-            # evaluated under. A veto declines the operation and needs no
-            # permission beyond the authorization already checked above.
-            policy = self._policy(
-                mode=GovernanceMode.HUMAN_GATED,
-                actor_id=operator_id,
-                resource=f"heart-action:{action_id}",
-                human_approved=True,
-                correlation_id=action_id,
-            )
-            policy_payload = policy.to_dict()
-            if policy.status != STATUS_ALLOW:
-                self._append_audit(
-                    {
-                        "subsystem": "heart",
-                        "component": "heart",
-                        "correlation_id": action_id,
-                        "decision_id": action_id,
-                        "decision": "DENIED",
-                        "reason_code": "POLICY_REFUSED",
-                        "operator_id": operator_id,
-                        "policy": policy_payload,
-                    }
-                )
-                raise PolicyRefused(
-                    f"policy did not permit approval (status={policy.status})"
-                )
 
         try:
-            result = self._resolve_unguarded(
+            result = authority.resolve_recommendation(
                 action_id,
                 approved=approved,
                 operator_id=operator_id,
                 reason=reason,
-                policy=policy_payload,
+                principal=principal,
             )
-        except (KeyError, RuntimeError):
-            # Expected business outcomes (action missing / already
-            # resolved) -- not a Heart health problem, so not reported as
-            # one; the caller maps these to 404/409 the same way governance
-            # already does.
+        except (KeyError, RuntimeError, PermissionError, ValueError):
+            # Expected outcomes (missing, already decided, refused, invalid) --
+            # not a Heart health problem.
             raise
         except Exception:
             self._report_health(False, "resolve_failed")
             raise
 
         self._report_health(True, "resolve_ok")
-        return result
-
-    def _resolve_unguarded(
-        self,
-        action_id: str,
-        *,
-        approved: bool,
-        operator_id: str,
-        reason: str,
-        policy: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        new_status = ActionStatus.APPROVED if approved else ActionStatus.VETOED
-
-        transitioned = self.core_store.transition_status(
-            action_id,
-            expected=ActionStatus.PENDING,
-            new_status=new_status,
-            operator_id=operator_id,
-            operator_reason=reason,
-        )
-
-        if not transitioned:
-            current = self.core_store.get_status(action_id)
-            if current is None:
-                raise KeyError(action_id)
-            raise RuntimeError(
-                f"action {action_id!r} is not awaiting human decision "
-                f"(current status={current.value})"
-            )
-
-        try:
-            self._append_audit(
-                {
-                    "subsystem": "heart",
-                    "component": "heart",
-                    "correlation_id": action_id,
-                    "decision_id": action_id,
-                    "decision": new_status.value,
-                    "reason_code": (
-                        "HUMAN_APPROVED" if approved else "HUMAN_VETOED"
-                    ),
-                    "operator_id": operator_id,
-                    "resolution_reason": reason,
-                    **({"policy": policy} if policy else {}),
-                }
-            )
-        except Exception:
-            # Same invariant as staging: a decision that cannot be recorded
-            # must not be reported as having happened. Best-effort revert to
-            # PENDING so a human can retry the decision once audit recovers,
-            # rather than leaving an unaudited terminal state that a second
-            # approve/veto attempt would then find already resolved.
-            try:
-                self.core_store.transition_status(
-                    action_id,
-                    expected=new_status,
-                    new_status=ActionStatus.PENDING,
-                    operator_reason="reverted_unaudited_decision",
-                )
-            except Exception:
-                logger.error(
-                    "Failed to revert unaudited decision for action %s -- "
-                    "it remains %s without an audit record of this decision",
-                    action_id,
-                    new_status.value,
-                    exc_info=True,
-                )
-            raise
-
         self._notify_monitoring(
             {
                 "kind": "security",
                 "event_category": "heart_human_decision_resolved",
-                "decision_id": action_id,
-                "outcome": new_status.value,
-                "operator_id": operator_id,
+                "decision_id": result.get("decision_id"),
+                "outcome": result.get("outcome"),
+                "operator_id": result.get("operator_id"),
             }
         )
-
-        return {
-            "decision_id": action_id,
-            "outcome": new_status.value,
-            "operator_id": operator_id,
-            "resolved_at": _utc_now_iso(),
-        }
+        return result
 
     def list_pending(self, limit: int = 200) -> tuple[Any, ...]:
         """Read-only introspection against the durable source of truth.
@@ -978,6 +695,9 @@ class ThreatGovernor:
         Not exposed as its own API surface (see module docstring) -- kept
         for internal reconciliation/diagnostics and direct testing.
         """
+        authority = self._authority
+        if authority is not None:
+            return authority.list_pending_recommendations(limit)
         return self.core_store.list_actions(status=ActionStatus.PENDING, limit=limit)
 
 

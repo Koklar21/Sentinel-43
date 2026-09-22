@@ -44,7 +44,15 @@ from typing import Any, Final, Protocol
 from uuid import uuid4
 
 from core.guards.velocity import VelocityGuard
-from core.policy_gate import STATUS_OBSERVE, PolicyContext, evaluate
+from core.policy_gate import (
+    STATUS_ALLOW,
+    STATUS_OBSERVE,
+    STATUS_REQUIRES_HUMAN,
+    PolicyContext,
+    evaluate,
+    is_action_known,
+)
+from core.sentinel43_core_db import ActionStatus, PendingAction
 
 
 logger = logging.getLogger("sentinel43.governance")
@@ -199,6 +207,136 @@ class MonitoringSink(Protocol):
         ...
 
 
+# =============================================================================
+# Threat-recommendation governance
+#
+# SystemOrchestrator governs two kinds of consequential decision through one
+# authority. The transaction adapter above (process_transaction /
+# resolve_human_decision / list_pending_reviews) keeps its own in-memory review
+# queue and TTL, unchanged. Threat recommendations reuse the orchestration
+# responsibilities -- policy, authorization, staging, resolution and audit --
+# but DELEGATE durable pending state to the single SentinelCoreStore attached
+# below: there is no second queue, and nothing here expires a pending
+# recommendation.
+# =============================================================================
+
+#: Audit lookup key for recommendation records. Restart recovery finds a
+#: recommendation's history by (component, correlation_id), so this must not
+#: change without migrating existing records.
+RECOMMENDATION_COMPONENT: Final[str] = "heart"
+
+#: Recorded as ``authority`` on every record this layer writes, so the ledger
+#: itself shows which component made the decision.
+RECOMMENDATION_AUTHORITY: Final[str] = "system_orchestrator"
+
+#: The durable ``primary_action`` written by recommendation builds that
+#: predate explicit operations. No operation was ever recorded for them.
+LEGACY_REVIEW_ACTION: Final[str] = "human_review"
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionPrincipal:
+    """Who the SERVER decided the caller is, not who the caller says.
+
+    ``is_human`` and ``identity_type`` are copied from the identity the
+    request pipeline recorded when it verified the credential, so a
+    human-looking ``operator_id`` in a request body cannot stand in for an
+    authenticated human. ``subject`` must equal the operator_id the decision
+    is recorded under.
+    """
+
+    subject: str
+    identity_type: str
+    is_human: bool
+
+
+class UnauthorizedDecision(PermissionError):
+    """A human decision was attempted by an identity the authority rejects."""
+
+
+class PolicyRefused(RuntimeError):
+    """The policy authority did not permit the operation.
+
+    A RuntimeError so the API maps it like any other "cannot be decided now"
+    outcome (409) and it is not mistaken for a health fault.
+    """
+
+
+class RecommendationAuthorityUnavailable(RuntimeError):
+    """No durable recommendation store is attached to the orchestrator."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProposedOperation:
+    """The exact operation a human is asked to authorize, and its target.
+
+    Only operations in the established policy vocabulary can be expressed. An
+    operation the vocabulary cannot describe is not relabeled as something
+    it can: the recommendation carries ``operation=None`` and is recorded as
+    explicitly unsupported instead.
+    """
+
+    action: str
+    target_type: str
+    target: str
+
+    def __post_init__(self) -> None:
+        if not is_action_known(self.action):
+            raise ValueError(
+                f"{self.action!r} is not an operation the policy authority knows"
+            )
+        if not self.target_type.strip() or not self.target.strip():
+            raise ValueError("an operation needs a target_type and a target")
+
+    @property
+    def resource(self) -> str:
+        return f"{self.target_type}:{self.target}"
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "action": self.action,
+            "target_type": self.target_type,
+            "target": self.target,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ThreatRecommendation:
+    """A detection-layer recommendation submitted for governance."""
+
+    subject_key: str
+    kind: str
+    severity: str
+    source_kind: str
+    score: float
+    reason: str
+    operation: ProposedOperation | None
+    evidence: Mapping[str, Any]
+    requested_mode: GovernanceMode
+    created_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class RecommendationOutcome:
+    status: str
+    reason: str
+    action_id: str | None = None
+    policy: Mapping[str, Any] | None = None
+
+
+def _operation_from_row(row: Mapping[str, Any]) -> ProposedOperation | None:
+    """Rebuild the recorded operation from its durable row, if it has one."""
+    action = str(row["primary_action"] or "")
+    if not is_action_known(action):
+        return None
+    _identity, _sep, source_ip = str(row["target_value"]).rpartition("|")
+    return ProposedOperation(
+        action=action,
+        target_type="source_ip",
+        target=source_ip,
+    )
+
+
 class SystemOrchestrator:
     """Human-governed policy orchestration with authoritative audit."""
 
@@ -268,6 +406,15 @@ class SystemOrchestrator:
         self._pending_reviews_lock = (
             threading.RLock()
         )
+
+        # Threat-recommendation governance: nothing attached, nothing
+        # authorized, until the composition root binds the durable store.
+        self._recommendation_store: Any | None = None
+        self._recommendation_lock = threading.RLock()
+        self._operator_authenticator: Callable[[DecisionPrincipal], bool] = (
+            lambda _principal: False
+        )
+        self._max_pending_recommendations = 500
 
     @staticmethod
     def _normalize_mode(
@@ -1113,6 +1260,522 @@ class SystemOrchestrator:
                 in self._pending_reviews.values()
             ]
 
+    # ------------------------------------------------------------------
+    # Threat-recommendation governance (see module section above)
+    # ------------------------------------------------------------------
+
+    def attach_recommendation_store(
+        self,
+        store: Any,
+        *,
+        operator_authenticator: Callable[[DecisionPrincipal], bool] | None,
+        max_pending_actions: int,
+    ) -> None:
+        """Bind the ONE durable store recommendation decisions live in.
+
+        ``operator_authenticator`` fails closed when absent: an orchestrator
+        with no authenticator authorizes no recommendation decision.
+        """
+        if not 1 <= int(max_pending_actions) <= 100_000:
+            raise ValueError("max_pending_actions must be between 1 and 100000")
+        with self._recommendation_lock:
+            self._recommendation_store = store
+            self._operator_authenticator = (
+                operator_authenticator
+                if operator_authenticator is not None
+                else (lambda _principal: False)
+            )
+            self._max_pending_recommendations = int(max_pending_actions)
+
+    def record_denied_decision(
+        self,
+        decision_id: str,
+        *,
+        operator_id: str,
+        reason_code: str,
+        identity_type: str,
+    ) -> None:
+        """Audit a transaction decision refused before it reached review.
+
+        The transaction adapter has no identity awareness of its own, so the
+        composition root checks the caller first; the refusal is still
+        recorded here, by the authority, before it is reported.
+        """
+        self._append_audit(
+            {
+                "component": "governance",
+                "correlation_id": decision_id or None,
+                "authority": RECOMMENDATION_AUTHORITY,
+                "decision_id": decision_id or None,
+                "decision": "DENIED",
+                "reason_code": reason_code,
+                "operator_id": operator_id,
+                "identity_type": identity_type,
+            }
+        )
+
+    def detach_recommendation_store(self) -> None:
+        with self._recommendation_lock:
+            self._recommendation_store = None
+            self._operator_authenticator = lambda _principal: False
+
+    @property
+    def recommendation_store_attached(self) -> bool:
+        return self._recommendation_store is not None
+
+    def _require_recommendation_store(self) -> Any:
+        store = self._recommendation_store
+        if store is None:
+            raise RecommendationAuthorityUnavailable(
+                "no durable recommendation store is attached to the orchestrator"
+            )
+        return store
+
+    def _effective_recommendation_mode(
+        self,
+        requested: GovernanceMode,
+    ) -> GovernanceMode:
+        # The orchestrator's mode is a ceiling: a SHADOW orchestrator holds
+        # every recommendation in observation, whatever the producer asked.
+        if GovernanceMode.SHADOW in (requested, self.default_mode):
+            return GovernanceMode.SHADOW
+        return GovernanceMode.HUMAN_GATED
+
+    @staticmethod
+    def _operation_policy(
+        *,
+        operation: ProposedOperation,
+        actor_id: str,
+        mode: GovernanceMode,
+        human_approved: bool,
+        correlation_id: str | None = None,
+    ) -> Any:
+        return evaluate(
+            PolicyContext(
+                action=operation.action,
+                actor_id=actor_id,
+                tenant_id="default",
+                resource=operation.resource,
+                mode=mode.value,
+                human_approved=human_approved,
+                correlation_id=correlation_id,
+            )
+        )
+
+    def _recommendation_record(
+        self,
+        recommendation: ThreatRecommendation,
+        *,
+        decision: str,
+        reason_code: str,
+        extra: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        record = dict(recommendation.evidence)
+        record.update(
+            {
+                "subsystem": RECOMMENDATION_COMPONENT,
+                "component": RECOMMENDATION_COMPONENT,
+                "authority": RECOMMENDATION_AUTHORITY,
+                "decision": decision,
+                "reason_code": reason_code,
+                "operation": (
+                    recommendation.operation.to_dict()
+                    if recommendation.operation is not None
+                    else None
+                ),
+            }
+        )
+        if extra:
+            record.update(extra)
+        return record
+
+    def stage_recommendation(
+        self,
+        recommendation: ThreatRecommendation,
+    ) -> RecommendationOutcome:
+        """Decide, record and (if permitted) durably stage one recommendation.
+
+        Every branch writes an authoritative audit record before returning,
+        and nothing is staged unless the policy authority's answer matches
+        the effective mode exactly. Count-then-insert is serialized so
+        concurrent submissions cannot collectively overshoot the ceiling.
+        """
+        store = self._require_recommendation_store()
+        operation = recommendation.operation
+
+        if operation is None:
+            self._append_audit(
+                self._recommendation_record(
+                    recommendation,
+                    decision="OBSERVED",
+                    reason_code="UNSUPPORTED_OPERATION",
+                )
+            )
+            return RecommendationOutcome(
+                status="OBSERVED", reason="UNSUPPORTED_OPERATION"
+            )
+
+        mode = self._effective_recommendation_mode(
+            recommendation.requested_mode
+        )
+        policy = self._operation_policy(
+            operation=operation,
+            actor_id=RECOMMENDATION_COMPONENT,
+            mode=mode,
+            human_approved=False,
+        )
+        policy_payload = policy.to_dict()
+        expected = (
+            STATUS_OBSERVE if mode is GovernanceMode.SHADOW else STATUS_REQUIRES_HUMAN
+        )
+
+        if policy.status != expected:
+            self._append_audit(
+                self._recommendation_record(
+                    recommendation,
+                    decision="OBSERVED",
+                    reason_code="POLICY_REFUSED",
+                    extra={"policy": policy_payload},
+                )
+            )
+            logger.error(
+                "Recommendation refused by policy: status=%s (expected %s for "
+                "mode %s, operation %s)",
+                policy.status,
+                expected,
+                mode.value,
+                operation.action,
+            )
+            return RecommendationOutcome(
+                status="OBSERVED", reason="POLICY_REFUSED", policy=policy_payload
+            )
+
+        if mode is GovernanceMode.SHADOW:
+            self._append_audit(
+                self._recommendation_record(
+                    recommendation,
+                    decision="OBSERVED",
+                    reason_code="POLICY_OBSERVED",
+                    extra={"policy": policy_payload},
+                )
+            )
+            return RecommendationOutcome(
+                status="OBSERVED", reason="POLICY_OBSERVED", policy=policy_payload
+            )
+
+        with self._recommendation_lock:
+            pending = store.count_actions(status=ActionStatus.PENDING)
+            if pending >= self._max_pending_recommendations:
+                self._append_audit(
+                    self._recommendation_record(
+                        recommendation,
+                        decision="OBSERVED",
+                        reason_code="BACKPRESSURE_LIMIT",
+                        extra={
+                            "pending_actions": pending,
+                            "pending_limit": self._max_pending_recommendations,
+                        },
+                    )
+                )
+                logger.error(
+                    "Recommendation not staged: %d pending at the limit of %d; "
+                    "resolve pending decisions to resume staging",
+                    pending,
+                    self._max_pending_recommendations,
+                )
+                return RecommendationOutcome(
+                    status="OBSERVED", reason="BACKPRESSURE_LIMIT"
+                )
+
+            # Must satisfy the canonical action store's ACTION_ID_RE. The same
+            # id keys the durable row, the audit history and the dashboard.
+            action_id = f"HEART-{uuid4().hex.upper()}"
+            store.insert_pending(
+                PendingAction(
+                    action_id=action_id,
+                    created_at_ms=int(recommendation.created_at * 1000),
+                    status=ActionStatus.PENDING,
+                    target_type="identity_source_ip",
+                    target_value=recommendation.subject_key,
+                    primary_action=operation.action,
+                    actions=(operation.action,),
+                    severity=recommendation.severity,
+                    kind=recommendation.kind,
+                    source_kind=recommendation.source_kind,
+                    score=float(recommendation.score),
+                    reason=recommendation.reason,
+                    system_id=RECOMMENDATION_COMPONENT,
+                )
+            )
+
+            try:
+                self._append_audit(
+                    self._recommendation_record(
+                        recommendation,
+                        decision="STAGED",
+                        reason_code="STAGED_FOR_HUMAN_REVIEW",
+                        extra={
+                            "decision_id": action_id,
+                            "correlation_id": action_id,
+                            "policy": policy_payload,
+                        },
+                    )
+                )
+            except Exception:
+                # No consequential staging without durable audit: compensate
+                # the row rather than leave an unaudited, decidable action.
+                try:
+                    store.transition_status(
+                        action_id,
+                        expected=ActionStatus.PENDING,
+                        new_status=ActionStatus.EXPIRED,
+                        operator_reason="audit_append_failed_at_stage_time",
+                    )
+                except Exception:
+                    logger.error(
+                        "Failed to compensate unaudited staged recommendation "
+                        "%s -- it remains PENDING without a STAGED record",
+                        action_id,
+                        exc_info=True,
+                    )
+                raise
+
+        return RecommendationOutcome(
+            status="STAGED",
+            reason="STAGED_FOR_HUMAN_REVIEW",
+            action_id=action_id,
+            policy=policy_payload,
+        )
+
+    def _staged_operation(self, action_id: str) -> tuple[bool, dict[str, Any] | None]:
+        """(found, operation) from the authenticated STAGED record."""
+        records = self.audit_store.get_records(
+            component=RECOMMENDATION_COMPONENT,
+            correlation_id=action_id,
+            limit=500,
+        )
+        staged = [
+            record
+            for record in records
+            if record.get("decision") == "STAGED"
+            and record.get("decision_id") == action_id
+        ]
+        if len(staged) != 1:
+            return False, None
+        operation = staged[0].get("operation")
+        return True, operation if isinstance(operation, dict) else None
+
+    def _deny_recommendation_decision(
+        self,
+        action_id: str,
+        *,
+        operator_id: str,
+        reason_code: str,
+        identity_type: str,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        record: dict[str, Any] = {
+            "subsystem": RECOMMENDATION_COMPONENT,
+            "component": RECOMMENDATION_COMPONENT,
+            "authority": RECOMMENDATION_AUTHORITY,
+            "correlation_id": action_id,
+            "decision_id": action_id,
+            "decision": "DENIED",
+            "reason_code": reason_code,
+            "operator_id": operator_id,
+            "identity_type": identity_type,
+        }
+        if extra:
+            record.update(extra)
+        self._append_audit(record)
+
+    def resolve_recommendation(
+        self,
+        action_id: str,
+        *,
+        approved: bool,
+        operator_id: str,
+        reason: str = "",
+        principal: DecisionPrincipal | None = None,
+    ) -> dict[str, Any]:
+        """The one path by which a recommendation becomes APPROVED/VETOED.
+
+        Order: authenticated human authority, then (for an approval) the
+        operation actually recorded at staging, then the policy authority for
+        that operation and its target, then an atomic durable transition,
+        then durable audit (with compensation). Every refusal is audited
+        before it is raised.
+        """
+        store = self._require_recommendation_store()
+        action_id = action_id.strip()
+        operator_id = operator_id.strip()
+        if not action_id:
+            raise ValueError("action_id must not be empty")
+        if not operator_id:
+            raise ValueError("operator_id must not be empty")
+
+        identity_type = principal.identity_type if principal else "none"
+        denial: str | None = None
+        if principal is None:
+            denial = "NO_AUTHENTICATION_CONTEXT"
+        elif principal.subject.strip() != operator_id:
+            denial = "OPERATOR_ID_DOES_NOT_MATCH_AUTHENTICATED_SUBJECT"
+        elif not self._operator_authenticator(principal):
+            denial = "UNAUTHORIZED_DECISION_ATTEMPT"
+        if denial is not None:
+            self._deny_recommendation_decision(
+                action_id,
+                operator_id=operator_id,
+                reason_code=denial,
+                identity_type=identity_type,
+            )
+            raise UnauthorizedDecision(
+                "operator is not authorized to resolve this recommendation"
+            )
+
+        row = store.get_action(action_id)
+        if row is None:
+            raise KeyError(action_id)
+
+        policy_payload: dict[str, Any] | None = None
+        operation = _operation_from_row(row)
+        if approved:
+            found, staged_operation = self._staged_operation(action_id)
+            if operation is None or staged_operation is None:
+                # Nothing was ever recorded for a human to authorize. Approving
+                # would bind consent to an operation nobody proposed.
+                self._deny_recommendation_decision(
+                    action_id,
+                    operator_id=operator_id,
+                    reason_code="UNSUPPORTED_OPERATION",
+                    identity_type=identity_type,
+                    extra={"primary_action": str(row["primary_action"])},
+                )
+                raise PolicyRefused(
+                    "this recommendation records no supported operation to approve"
+                )
+            if not found or staged_operation != operation.to_dict():
+                self._deny_recommendation_decision(
+                    action_id,
+                    operator_id=operator_id,
+                    reason_code="OPERATION_DOES_NOT_MATCH_STAGING_RECORD",
+                    identity_type=identity_type,
+                    extra={
+                        "operation": operation.to_dict(),
+                        "staged_operation": staged_operation,
+                    },
+                )
+                raise PolicyRefused(
+                    "the durable operation does not match what was staged"
+                )
+
+            policy = self._operation_policy(
+                operation=operation,
+                actor_id=operator_id,
+                mode=GovernanceMode.HUMAN_GATED,
+                human_approved=True,
+                correlation_id=action_id,
+            )
+            policy_payload = policy.to_dict()
+            if policy.status != STATUS_ALLOW:
+                self._deny_recommendation_decision(
+                    action_id,
+                    operator_id=operator_id,
+                    reason_code="POLICY_REFUSED",
+                    identity_type=identity_type,
+                    extra={
+                        "operation": operation.to_dict(),
+                        "policy": policy_payload,
+                    },
+                )
+                raise PolicyRefused(
+                    f"policy did not permit approval (status={policy.status})"
+                )
+
+        new_status = ActionStatus.APPROVED if approved else ActionStatus.VETOED
+        if not store.transition_status(
+            action_id,
+            expected=ActionStatus.PENDING,
+            new_status=new_status,
+            operator_id=operator_id,
+            operator_reason=reason,
+        ):
+            current = store.get_status(action_id)
+            if current is None:
+                raise KeyError(action_id)
+            raise RuntimeError(
+                f"recommendation {action_id!r} is not awaiting a human decision "
+                f"(current status={current.value})"
+            )
+
+        try:
+            self._append_audit(
+                {
+                    "subsystem": RECOMMENDATION_COMPONENT,
+                    "component": RECOMMENDATION_COMPONENT,
+                    "authority": RECOMMENDATION_AUTHORITY,
+                    "correlation_id": action_id,
+                    "decision_id": action_id,
+                    "decision": new_status.value,
+                    "reason_code": (
+                        "HUMAN_APPROVED" if approved else "HUMAN_VETOED"
+                    ),
+                    "operator_id": operator_id,
+                    "identity_type": identity_type,
+                    "resolution_reason": reason,
+                    "operation": (
+                        operation.to_dict() if operation is not None else None
+                    ),
+                    **({"policy": policy_payload} if policy_payload else {}),
+                }
+            )
+        except Exception:
+            # A decision that cannot be recorded must not be reported as made.
+            try:
+                store.transition_status(
+                    action_id,
+                    expected=new_status,
+                    new_status=ActionStatus.PENDING,
+                    operator_reason="reverted_unaudited_decision",
+                )
+            except Exception:
+                logger.error(
+                    "Failed to revert unaudited decision for recommendation "
+                    "%s -- it remains %s without an audit record",
+                    action_id,
+                    new_status.value,
+                    exc_info=True,
+                )
+            raise
+
+        return {
+            "decision_id": action_id,
+            "outcome": new_status.value,
+            "operator_id": operator_id,
+            "operation": operation.to_dict() if operation is not None else None,
+            "resolved_at": _utc_now().isoformat(),
+        }
+
+    def list_pending_recommendations(self, limit: int = 200) -> tuple[Any, ...]:
+        return self._require_recommendation_store().list_actions(
+            status=ActionStatus.PENDING, limit=limit
+        )
+
+    def count_pending_recommendations(self) -> int:
+        return self._require_recommendation_store().count_actions(
+            status=ActionStatus.PENDING
+        )
+
+    def expire_unverifiable_recommendation(self, action_id: str, *, problem: str) -> bool:
+        """Take a pending row that cannot be verified out of reach of any
+        decision. No audit record is fabricated for it."""
+        return self._require_recommendation_store().transition_status(
+            action_id,
+            expected=ActionStatus.PENDING,
+            new_status=ActionStatus.EXPIRED,
+            operator_reason=f"quarantined_at_recovery:{problem}",
+        )
+
 
 __all__ = [
     "CallerContext",
@@ -1123,4 +1786,14 @@ __all__ = [
     "ReasonCode",
     "SystemOrchestrator",
     "TransactionContext",
+    "DecisionPrincipal",
+    "LEGACY_REVIEW_ACTION",
+    "PolicyRefused",
+    "ProposedOperation",
+    "RECOMMENDATION_AUTHORITY",
+    "RECOMMENDATION_COMPONENT",
+    "RecommendationAuthorityUnavailable",
+    "RecommendationOutcome",
+    "ThreatRecommendation",
+    "UnauthorizedDecision",
 ]
