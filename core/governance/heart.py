@@ -73,6 +73,14 @@ from uuid import uuid4
 
 from core.detection.sentinel_threat_types import ThreatAssessment, ThreatSeverity
 from core.guards.velocity import VelocityGuard
+from core.policy_gate import (
+    STATUS_ALLOW,
+    STATUS_OBSERVE,
+    STATUS_REQUIRES_HUMAN,
+    GovernanceAction,
+    PolicyContext,
+    evaluate as evaluate_policy,
+)
 from core.sentinel43_core_db import ActionStatus, PendingAction, SentinelCoreStore
 
 from .orchestrator import GovernanceMode
@@ -80,6 +88,13 @@ from .orchestrator import GovernanceMode
 
 logger = logging.getLogger("sentinel43.heart")
 
+
+# What a Heart recommendation asks a human to authorize, in the established
+# policy vocabulary (core.policy_gate). The historical Nexus recommendation
+# was IntegrationHub.execute_firewall_block; nothing here executes it --
+# the Heart only asks the one policy authority whether staging and approval
+# are permitted, instead of deciding that from its own mode switch.
+HEART_POLICY_ACTION = GovernanceAction.NETWORK_BLOCK
 
 _CORROBORATION_REQUIRED_SEVERITIES = frozenset(
     {ThreatSeverity.HIGH, ThreatSeverity.CRITICAL}
@@ -172,6 +187,14 @@ class DecisionPrincipal:
     is_human: bool
 
 
+class PolicyRefused(RuntimeError):
+    """The policy authority did not permit a Heart operation.
+
+    A RuntimeError so the API maps it like any other "cannot be decided
+    now" outcome (409) and it is not mistaken for a Heart health fault.
+    """
+
+
 class UnauthorizedDecision(PermissionError):
     """A human decision was attempted by an identity the kernel rejects.
 
@@ -224,6 +247,27 @@ class ThreatGovernor:
         # Highest detector evidence sequence already counted per key. A
         # signal only counts if it carries strictly newer evidence.
         self._last_evidence_seq: dict[tuple[str, str], int] = {}
+
+    @staticmethod
+    def _policy(
+        *,
+        mode: GovernanceMode,
+        actor_id: str,
+        resource: str,
+        human_approved: bool,
+        correlation_id: str | None = None,
+    ) -> Any:
+        return evaluate_policy(
+            PolicyContext(
+                action=HEART_POLICY_ACTION,
+                actor_id=actor_id,
+                tenant_id="default",
+                resource=resource,
+                mode=mode.value,
+                human_approved=human_approved,
+                correlation_id=correlation_id,
+            )
+        )
 
     @staticmethod
     def _normalize_mode(mode: GovernanceMode | str) -> GovernanceMode:
@@ -494,12 +538,46 @@ class ThreatGovernor:
             )
             return HeartDecision(status="OBSERVED", reason="DUPLICATE_SUPPRESSED")
 
+        policy = self._policy(
+            mode=effective_mode,
+            actor_id="heart",
+            resource=f"target:{target_key}",
+            human_approved=False,
+        )
+        policy_payload = policy.to_dict()
+        expected_status = (
+            STATUS_OBSERVE
+            if effective_mode is GovernanceMode.SHADOW
+            else STATUS_REQUIRES_HUMAN
+        )
+        if policy.status != expected_status:
+            # The policy authority and the Heart disagree about what this
+            # mode permits. Never resolve that by acting: record it and
+            # stage nothing.
+            self._append_audit(
+                self._audit_record(
+                    assessment,
+                    decision="OBSERVED",
+                    reason_code="POLICY_REFUSED",
+                    extra={"policy": policy_payload},
+                )
+            )
+            logger.error(
+                "Heart staging refused by policy: status=%s (expected %s "
+                "for mode %s)",
+                policy.status,
+                expected_status,
+                effective_mode.value,
+            )
+            return HeartDecision(status="OBSERVED", reason="POLICY_REFUSED")
+
         if effective_mode is GovernanceMode.SHADOW:
             self._append_audit(
                 self._audit_record(
                     assessment,
                     decision="OBSERVED",
                     reason_code="POLICY_OBSERVED",
+                    extra={"policy": policy_payload},
                 )
             )
             self._notify_monitoring(
@@ -517,7 +595,11 @@ class ThreatGovernor:
         # it together. RLock, so the nested acquisitions below are fine.
         with self._lock:
             return self._stage_within_ceiling(
-                assessment, target_key=target_key, kind=kind, now=now
+                assessment,
+                target_key=target_key,
+                kind=kind,
+                now=now,
+                policy=policy_payload,
             )
 
     def _stage_within_ceiling(
@@ -527,6 +609,7 @@ class ThreatGovernor:
         target_key: str,
         kind: str,
         now: float,
+        policy: dict[str, Any] | None = None,
     ) -> HeartDecision:
         pending_count = self.core_store.count_actions(
             status=ActionStatus.PENDING
@@ -553,7 +636,9 @@ class ThreatGovernor:
                 status="OBSERVED", reason="BACKPRESSURE_LIMIT"
             )
 
-        return self._stage(assessment, target_key=target_key, kind=kind, now=now)
+        return self._stage(
+            assessment, target_key=target_key, kind=kind, now=now, policy=policy
+        )
 
     def _stage(
         self,
@@ -562,6 +647,7 @@ class ThreatGovernor:
         target_key: str,
         kind: str,
         now: float,
+        policy: dict[str, Any] | None = None,
     ) -> HeartDecision:
         # Must satisfy the canonical action store's ACTION_ID_RE
         # (^[A-Z0-9_-]{1,64}$, core/api/main.py) -- this same id is used as
@@ -603,6 +689,7 @@ class ThreatGovernor:
                     decision="STAGED",
                     reason_code="STAGED_FOR_HUMAN_REVIEW",
                     decision_id=action_id,
+                    extra={"policy": policy} if policy else None,
                 )
             )
         except Exception:
@@ -750,12 +837,43 @@ class ThreatGovernor:
                 "operator is not authorized to resolve Heart decisions"
             )
 
+        policy_payload: dict[str, Any] | None = None
+        if approved:
+            # Only HUMAN_GATED stages, so that is the mode an approval is
+            # evaluated under. A veto declines the operation and needs no
+            # permission beyond the authorization already checked above.
+            policy = self._policy(
+                mode=GovernanceMode.HUMAN_GATED,
+                actor_id=operator_id,
+                resource=f"heart-action:{action_id}",
+                human_approved=True,
+                correlation_id=action_id,
+            )
+            policy_payload = policy.to_dict()
+            if policy.status != STATUS_ALLOW:
+                self._append_audit(
+                    {
+                        "subsystem": "heart",
+                        "component": "heart",
+                        "correlation_id": action_id,
+                        "decision_id": action_id,
+                        "decision": "DENIED",
+                        "reason_code": "POLICY_REFUSED",
+                        "operator_id": operator_id,
+                        "policy": policy_payload,
+                    }
+                )
+                raise PolicyRefused(
+                    f"policy did not permit approval (status={policy.status})"
+                )
+
         try:
             result = self._resolve_unguarded(
                 action_id,
                 approved=approved,
                 operator_id=operator_id,
                 reason=reason,
+                policy=policy_payload,
             )
         except (KeyError, RuntimeError):
             # Expected business outcomes (action missing / already
@@ -777,6 +895,7 @@ class ThreatGovernor:
         approved: bool,
         operator_id: str,
         reason: str,
+        policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         new_status = ActionStatus.APPROVED if approved else ActionStatus.VETOED
 
@@ -810,6 +929,7 @@ class ThreatGovernor:
                     ),
                     "operator_id": operator_id,
                     "resolution_reason": reason,
+                    **({"policy": policy} if policy else {}),
                 }
             )
         except Exception:
@@ -864,6 +984,8 @@ class ThreatGovernor:
 __all__ = [
     "ActionSink",
     "DecisionPrincipal",
+    "HEART_POLICY_ACTION",
+    "PolicyRefused",
     "HeartConfig",
     "HeartDecision",
     "ThreatGovernor",
