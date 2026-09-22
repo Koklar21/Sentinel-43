@@ -127,24 +127,60 @@ def _authority(audit, mode: str = "HUMAN_GATED"):
 
 
 def _stage(heart, ip: str):
-    """Stage one real, audited pending action via two independent producers.
+    """Stage a recommendation composed ONLY of policy-supported operations.
 
-    An automation-like HIGH finding: the orchestration engine's own plan for
-    it includes TEMP_BLOCK_IP, an operation humans can approve."""
-    decision = heart.observe(
-        ThreatAssessment(
-            identity="anonymous",
-            source_ip=ip,
-            threat_kind=list(ThreatKind)[0],
-            severity=ThreatSeverity.HIGH,
-            source_kind=ThreatSourceKind.AI_AUTOMATION_LIKELY,
-            score=80.0,
-            indicators={"evidence_seq": 1, "evidence_sources": ["firewall", "sparta"]},
-            supporting_tags=["t"],
-            window_size=5,
+    The current engine policy never produces such a plan by itself (every
+    MEDIUM/HIGH plan includes RATE_LIMIT; see
+    test_real_engine_plans_are_not_approvable), so for this one submission the
+    engine's plan is fixed to TEMP_BLOCK_IP + REQUIRE_HUMAN_REVIEW, built from
+    the engine's own ResponseDirective type. Staging, dedupe, approval and veto
+    still run through the engine's own code. This exercises the approval path
+    that exists for recommendations a human can legitimately approve.
+    """
+    engine = heart._authority._engine
+    module = engine.module
+    original = engine.plan
+
+    def approvable_plan(assessment):
+        plan = original(assessment)
+        base = plan["directive"]
+        directive = module.ResponseDirective(
+            identity=base.identity,
+            source_ip=base.source_ip,
+            primary_action=module.ResponseAction.TEMP_BLOCK_IP,
+            additional_actions=[module.ResponseAction.REQUIRE_HUMAN_REVIEW],
+            reason=base.reason,
+            expires_at=base.expires_at,
+            threat_kind=base.threat_kind,
+            threat_severity=base.threat_severity,
+            source_kind=base.source_kind,
+            score=base.score,
         )
-    )
-    assert decision.status == "STAGED" and decision.action_id
+        actions = ["TEMP_BLOCK_IP", "REQUIRE_HUMAN_REVIEW"]
+        return {
+            "directive": directive,
+            "actions": actions,
+            "summary": {**plan["summary"], "primary_action": actions[0], "actions": actions},
+        }
+
+    engine.plan = approvable_plan
+    try:
+        decision = heart.observe(
+            ThreatAssessment(
+                identity="anonymous",
+                source_ip=ip,
+                threat_kind=list(ThreatKind)[0],
+                severity=ThreatSeverity.HIGH,
+                source_kind=ThreatSourceKind.AI_AUTOMATION_LIKELY,
+                score=80.0,
+                indicators={"evidence_seq": 1, "evidence_sources": ["firewall", "sparta"]},
+                supporting_tags=["t"],
+                window_size=5,
+            )
+        )
+    finally:
+        del engine.plan
+    assert decision.status == "STAGED" and decision.action_id, decision
     return decision.action_id
 
 
@@ -849,31 +885,42 @@ def test_production_staging_is_decided_by_the_policy_authority(client, monkeypat
     )
 
 
-def test_production_approval_is_permitted_by_the_policy_authority(client, monkeypatch):
+def test_production_recommendation_states_why_it_cannot_be_approved(client, monkeypatch):
+    """Through the production composition, the real engine's plan for real
+    detector evidence includes operations the policy vocabulary cannot state.
+    It is preserved, marked unavailable-for-approval with exact reasons, and
+    remains vetoable."""
     directory, audit, _, _ = _stack()
     fenrir = _start_production_heart(client, monkeypatch, directory, audit)
     _feed_two_trusted_producers(fenrir, "203.0.113.121")
     client.portal.call(fenrir.observe_signals)
-    action_id = next(
-        r["decision_id"] for r in audit.get_records(component="heart", limit=500)
+    staged = next(
+        r for r in audit.get_records(component="heart", limit=500)
         if r.get("decision") == "STAGED"
     )
+    action_id = staged["decision_id"]
+    approval = staged["recommendation"]["approval"]
+    assert approval["available"] is False and approval["reasons"]
+
+    shown = main_module.runtime.action_store[action_id]["payload"]["approval"]
+    assert shown == approval
 
     response = client.post(
         f"/actions/{action_id}/approve",
         headers=_headers(),
         json={"reason": "reviewed by operator"},
     )
-    assert response.status_code == 200, response.text
+    assert response.status_code == 409, response.text
+    assert "approval is unavailable" in response.text
 
-    approved = audit.get_records(component="heart", correlation_id=action_id)[-1]
-    assert approved["decision"] == "APPROVED"
-    assert approved["decided_by"] == "Sentinel43ResponseEngine.approve_action"
-    assert approved["operations"], "the real pipeline produced an approvable operation"
-    for policy in approved["policy"]:
-        assert policy["status"] == "ALLOW"
-        assert policy["human_approved"] is True
-        assert policy["actor_id"] == "heart-op"
+    veto = client.post(
+        f"/actions/{action_id}/veto",
+        headers=_headers(),
+        json={"reason": "declining the recommendation"},
+    )
+    assert veto.status_code == 200, veto.text
+    vetoed = audit.get_records(component="heart", correlation_id=action_id)[-1]
+    assert vetoed["decided_by"] == "Sentinel43ResponseEngine.veto_action"
 
 
 def test_shadow_observation_is_decided_by_the_policy_authority():
@@ -1091,7 +1138,7 @@ def test_staging_records_the_orchestrator_the_operation_and_its_target():
     action_id = _stage(heart, "203.0.113.131")
 
     row = core.get_action(action_id)
-    assert "TEMP_BLOCK_IP" in row["actions"]  # the engine's own plan
+    assert list(row["actions"]) == ["TEMP_BLOCK_IP", "REQUIRE_HUMAN_REVIEW"]
     assert row["system_id"] == "SENTINEL-43-NEXUS-01"
 
     staged = audit.get_records(component="heart", correlation_id=action_id)[0]
@@ -1105,7 +1152,8 @@ def test_staging_records_the_orchestrator_the_operation_and_its_target():
             "engine_action": "TEMP_BLOCK_IP",
         }
     ]
-    assert "RATE_LIMIT" in staged["unsupported_actions"]
+    assert staged["unsupported_actions"] == []
+    assert staged["recommendation"]["approval"]["available"] is True
     # The policy decision is bound to that operation AND its target.
     assert staged["policy"][0]["action"] == "network_block"
     assert staged["policy"][0]["resource"] == "source_ip:203.0.113.131"
@@ -1128,6 +1176,8 @@ def test_approval_is_bound_to_the_staged_operation_and_target(client):
     assert approved["authority"] == "system_orchestrator"
     assert approved["identity_type"] == "operator"
     assert approved["decided_by"] == "Sentinel43ResponseEngine.approve_action"
+    assert approved["enforcement"].startswith("not_performed")
+    assert response.json()["action"]["status"] == "APPROVED"
     assert approved["operations"][0]["target"] == "203.0.113.132"
     assert approved["policy"][0]["resource"] == "source_ip:203.0.113.132"
     assert approved["policy"][0]["human_approved"] is True
@@ -1182,7 +1232,13 @@ def test_an_unsupported_recommendation_is_staged_but_not_approvable(client):
     assert approve.status_code == 409, approve.text
     assert core.get_status(decision.action_id) == ActionStatus.PENDING
     last = audit.get_records(component="heart", correlation_id=decision.action_id)[-1]
-    assert last["reason_code"] == "UNSUPPORTED_OPERATION"
+    assert last["reason_code"] == "APPROVAL_UNAVAILABLE"
+    assert set(last["approval"]["blocking_actions"]) >= {"RATE_LIMIT", "TEMP_BLOCK_IDENTITY"}
+    # The limitation is visible through the API the dashboard reads.
+    listed = client.get("/actions", headers=_headers())
+    shown = next(a for a in listed.json() if a["id"] == decision.action_id)
+    assert shown["payload"]["approval"]["available"] is False
+    assert any("RATE_LIMIT" in r for r in shown["payload"]["approval"]["reasons"])
 
     veto = client.post(
         f"/actions/{decision.action_id}/veto",
@@ -1459,3 +1515,221 @@ def test_each_containment_layer_refuses_active_on_its_own():
     store = CoreStoreActionStore(core)
     with pytest.raises(RuntimeError, match="no autonomous execution"):
         store.insert_pending_action(SimpleNamespace(status="PENDING"))
+
+
+# ---------------------------------------------------------------------------
+# Operational honesty: what each engine action means and whether it is approvable
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "severity,source_kind,kind",
+    [
+        ("HIGH", "MIXED_OR_UNKNOWN", "CREDENTIAL_ATTACK"),
+        ("HIGH", "AI_AUTOMATION_LIKELY", "RATE_ANOMALY"),
+        ("MEDIUM", "MIXED_OR_UNKNOWN", "PAYLOAD_ABUSE"),
+        ("CRITICAL", "MIXED_OR_UNKNOWN", "GENERIC_INTRUSION"),
+    ],
+)
+def test_real_engine_plans_are_not_approvable(severity, source_kind, kind):
+    """Every plan the current engine policy produces for these findings
+    contains at least one action the policy vocabulary cannot state -- so
+    approval is unavailable, with a reason per blocking action."""
+    from core.governance.sentinel43_engine import assess_actions
+
+    _, _, _, heart = _stack()
+    plan = heart._authority._engine.plan(
+        ThreatAssessment(
+            identity="anonymous",
+            source_ip="203.0.113.170",
+            threat_kind=ThreatKind[kind],
+            severity=ThreatSeverity[severity],
+            source_kind=ThreatSourceKind[source_kind],
+            score=80.0,
+        )
+    )
+    assessed = assess_actions(plan["actions"], subject_key="anonymous|203.0.113.170")
+    assert assessed["approval"]["available"] is False
+    assert assessed["approval"]["blocking_actions"]
+    assert len(assessed["approval"]["reasons"]) == len(
+        assessed["approval"]["blocking_actions"]
+    )
+
+
+def test_identity_actions_are_never_relabeled_as_network_blocks():
+    from core.governance.sentinel43_engine import assess_actions
+
+    assessed = assess_actions(
+        ["STEP_UP_AUTH", "RATE_LIMIT", "TEMP_BLOCK_IDENTITY", "HARD_BLOCK_IDENTITY"],
+        subject_key="anonymous|203.0.113.171",
+    )
+    assert assessed["operations"] == []
+    assert {i["status"] for i in assessed["items"]} == {"POLICY_DECISION_REQUIRED"}
+    assert all(i["policy_action"] is None for i in assessed["items"])
+
+
+def test_session_quarantine_needs_a_session():
+    from core.governance.sentinel43_engine import assess_actions
+
+    anonymous = assess_actions(["QUARANTINE_SESSION"], subject_key="anonymous|203.0.113.172")
+    assert anonymous["items"][0]["status"] == "NO_VALID_TARGET"
+    assert anonymous["approval"]["available"] is False
+
+    operator = assess_actions(["QUARANTINE_SESSION"], subject_key="operator|203.0.113.172")
+    assert operator["items"][0]["status"] == "APPROVABLE"
+    assert operator["operations"] == [
+        {
+            "action": "quarantine",
+            "target_type": "session",
+            "target": "operator|203.0.113.172",
+            "engine_action": "QUARANTINE_SESSION",
+        }
+    ]
+
+
+def test_a_mixed_recommendation_is_not_partially_approved():
+    """Supported and unsupported together: approval is unavailable for the
+    whole recommendation -- never a quiet approval of the supported part."""
+    from core.governance.sentinel43_engine import assess_actions
+
+    assessed = assess_actions(
+        ["RATE_LIMIT", "TEMP_BLOCK_IP", "REQUIRE_HUMAN_REVIEW"],
+        subject_key="anonymous|203.0.113.173",
+    )
+    assert assessed["operations"]  # the IP block IS expressible...
+    assert assessed["approval"]["available"] is False  # ...but not on its own
+    assert assessed["approval"]["blocking_actions"] == ["RATE_LIMIT"]
+
+
+# ---------------------------------------------------------------------------
+# Security review findings (bounded to the authority boundary and adapters)
+# ---------------------------------------------------------------------------
+def test_engine_store_cannot_transition_outside_a_governed_decision():
+    from core.governance.sentinel43_engine import CoreStoreActionStore
+
+    _, _, core, heart = _stack()
+    action_id = _stage(heart, "203.0.113.180")
+    store = CoreStoreActionStore(core)
+    with pytest.raises(PermissionError):
+        store.update_action_status(
+            action_id,
+            "APPROVED",
+            operator_id="anyone",
+            operator_reason="direct store call",
+            expected_status="STAGED",
+        )
+    assert core.get_status(action_id) == ActionStatus.PENDING
+
+
+def test_decision_authority_does_not_leak_to_a_concurrent_direct_call():
+    """While one governed approval is in progress in another thread, a direct
+    engine call in this thread still sees no authority."""
+    import threading
+
+    _, _, core, heart = _stack()
+    first = _stage(heart, "203.0.113.181")
+    second = _stage(heart, "203.0.113.182")
+    raw_engine = heart._authority._engine._engine
+
+    inside = threading.Event()
+    release = threading.Event()
+    original = core.transition_status
+
+    def slow_transition(action_id, **kwargs):
+        if action_id == first:
+            inside.set()
+            release.wait(5)
+        return original(action_id, **kwargs)
+
+    core.transition_status = slow_transition
+    worker = threading.Thread(
+        target=lambda: heart.resolve_human_decision(
+            first,
+            approved=True,
+            operator_id="heart-op",
+            reason="governed approval in progress",
+            principal=_principal(),
+        )
+    )
+    worker.start()
+    assert inside.wait(5)
+    try:
+        assert raw_engine.approve_action(second, "heart-op", "direct call") is False
+    finally:
+        release.set()
+        worker.join(5)
+        del core.transition_status
+
+    assert core.get_status(first) == ActionStatus.APPROVED
+    assert core.get_status(second) == ActionStatus.PENDING
+
+
+def test_a_swapped_engine_action_is_detected(client):
+    """Temporary and hard blocks are the same policy action on the same
+    target; the binding still distinguishes them."""
+    import json as _json
+
+    directory, audit, core, heart = _stack()
+    action_id = _stage(heart, "203.0.113.183")
+    _use(heart)
+    assert _recover(client) == 1
+    _sql(
+        directory,
+        "UPDATE pending_actions SET primary_action='HARD_BLOCK_IP', actions_json=? WHERE action_id=?",
+        (_json.dumps(["HARD_BLOCK_IP", "REQUIRE_HUMAN_REVIEW"]), action_id),
+    )
+    response = client.post(
+        f"/actions/{action_id}/approve", headers=_headers(), json={"reason": "reviewed by operator"}
+    )
+    assert response.status_code == 409, response.text
+    assert core.get_status(action_id) == ActionStatus.PENDING
+
+
+def test_an_unreviewed_engine_file_is_refused(tmp_path):
+    from core.governance.sentinel43_engine import (
+        EngineUnavailable,
+        engine_source_path,
+        load_engine_module,
+    )
+
+    (tmp_path / "Sentinel-43").mkdir()
+    altered = engine_source_path().read_bytes() + b"\n# altered\n"
+    (tmp_path / "Sentinel-43" / "Shadow_mode.py").write_bytes(altered)
+    with pytest.raises(EngineUnavailable, match="sha256"):
+        load_engine_module(root=tmp_path)
+
+
+def test_a_malformed_subject_never_reaches_the_engine():
+    _, audit, core, heart = _stack()
+    authority = heart._authority
+    from core.governance.orchestrator import GovernanceMode, ThreatRecommendation
+
+    outcome = authority.stage_recommendation(
+        ThreatRecommendation(
+            subject_key="anonymous|203.0.113.184",
+            assessment=ThreatAssessment(
+                identity="anonymous|203.0.113.9",  # forged separator
+                source_ip="203.0.113.184",
+                threat_kind=list(ThreatKind)[0],
+                severity=ThreatSeverity.HIGH,
+                source_kind=ThreatSourceKind.AI_AUTOMATION_LIKELY,
+                score=80.0,
+            ),
+            evidence={"subsystem": "heart"},
+            requested_mode=GovernanceMode.HUMAN_GATED,
+            created_at=time.time(),
+        )
+    )
+    assert outcome.reason == "INVALID_SUBJECT"
+    assert core.count_actions() == 0
+
+
+def test_restored_actions_carry_their_approval_state(client):
+    _, _, _, heart = _stack()
+    action_id = _stage(heart, "203.0.113.185")
+    _use(heart)
+    assert _recover(client) == 1
+    payload = main_module.runtime.action_store[action_id]["payload"]
+    assert payload["approval"]["available"] is True
+    assert [i["engine_action"] for i in payload["recommendation"]["items"]] == [
+        "TEMP_BLOCK_IP",
+        "REQUIRE_HUMAN_REVIEW",
+    ]

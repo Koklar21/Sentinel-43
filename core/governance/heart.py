@@ -521,6 +521,7 @@ class ThreatGovernor:
                 action_id=outcome.action_id,
                 operations=list(outcome.operations),
                 engine_plan=outcome.engine_plan,
+                recommendation=outcome.recommendation,
             )
         elif outcome.reason == "POLICY_OBSERVED":
             self._notify_monitoring(
@@ -546,6 +547,7 @@ class ThreatGovernor:
         action_id: str,
         operations: list[Any],
         engine_plan: Any,
+        recommendation: Any = None,
     ) -> None:
         """Mirror an orchestrator-staged recommendation into the canonical
         action/dashboard surface. Presentation only: the durable row and its
@@ -571,6 +573,12 @@ class ThreatGovernor:
                 "score": assessment.score,
                 "operations": [dict(op) for op in operations],
                 "engine_plan": dict(engine_plan) if engine_plan else None,
+                # What each recommended action means, and whether a human can
+                # approve this recommendation at all (and if not, exactly why).
+                "recommendation": dict(recommendation) if recommendation else None,
+                "approval": (
+                    dict(recommendation["approval"]) if recommendation else None
+                ),
                 "indicators": dict(assessment.indicators),
                 "supporting_tags": list(assessment.supporting_tags),
             },

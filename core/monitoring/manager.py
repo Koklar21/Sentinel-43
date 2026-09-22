@@ -213,6 +213,7 @@ class MonitoringManager:
             "skipped_source": 0,
             "skipped_replay": 0,
             "skipped_rate_limited": 0,
+            "skipped_invalid_subject": 0,
             "failed": 0,
         }
 
@@ -264,6 +265,19 @@ class MonitoringManager:
         ).strip()
 
         expected_label = self._ingest_producers.get(trusted_producer or "")
+        if expected_label is not None and ip and identity:
+            # The (identity, source address) pair becomes the subject every
+            # downstream operation targets: it must be a server-assigned
+            # identity type and a real IP address, never free text.
+            from core.governance.sentinel43_engine import validated_subject_key
+
+            try:
+                validated_subject_key(identity, ip)
+            except ValueError:
+                with self._lock:
+                    counts["skipped_invalid_subject"] += 1
+                return
+
         if (
             expected_label is None
             or normalized.source != expected_label
