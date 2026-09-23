@@ -264,6 +264,19 @@ class MonitoringManager:
             normalized.source_identity or source_identity or ""
         ).strip()
 
+        # Only ever read from a producer registered in-process (checked
+        # immediately below): an account identifier decides what an approved
+        # account action acts on, so it must not come from a payload label.
+        from core.governance.sentinel43_engine import MAX_PRINCIPAL_LENGTH
+
+        principal_id = ""
+        if isinstance(raw, dict):
+            principal_id = str(raw.get("source_principal") or "").strip()[
+                :MAX_PRINCIPAL_LENGTH
+            ]
+            if not principal_id.isprintable():
+                principal_id = ""
+
         expected_label = self._ingest_producers.get(trusted_producer or "")
         if expected_label is not None and ip and identity:
             # The (identity, source address) pair becomes the subject every
@@ -344,6 +357,12 @@ class MonitoringManager:
                     metadata={
                         "event_id": event_id,
                         "trusted_producer": trusted_producer,
+                        # In-process provenance from the request pipeline
+                        # (SecurityContext.principal_id), carried only for a
+                        # producer already proven trusted above. It is the
+                        # account an account-scoped response would act on, so
+                        # it is never taken from an untrusted payload.
+                        "principal_id": principal_id,
                     },
                 )
             )

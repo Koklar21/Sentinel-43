@@ -511,6 +511,7 @@ class SentinelThreatDetector:
         failure_count = 0
         payload_max = 0
         producers: set[str] = set()
+        principals: set[str] = set()
 
         status_counter: Counter[int] = Counter()
         type_counter: Counter[str] = Counter()
@@ -526,6 +527,13 @@ class SentinelThreatDetector:
             trusted = (event.metadata or {}).get("trusted_producer")
             if isinstance(trusted, str) and trusted:
                 producers.add(trusted)
+
+            # Same rule: the account the request pipeline authenticated, set
+            # only by the trusted manager. Collected as a set, so a window
+            # that saw more than one account names none of them.
+            principal = (event.metadata or {}).get("principal_id")
+            if isinstance(principal, str) and principal.strip():
+                principals.add(principal.strip())
 
             if event.status_code is not None:
                 status_counter[
@@ -593,6 +601,7 @@ class SentinelThreatDetector:
                 )
             ),
             "evidence_sources": sorted(producers),
+            "subject_principals": sorted(principals),
             "event_count": event_count,
             "failure_count": failure_count,
             "max_payload_bytes": payload_max,

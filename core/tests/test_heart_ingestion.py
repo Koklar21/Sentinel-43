@@ -708,3 +708,121 @@ def test_ingestion_refuses_a_malformed_subject(identity, source_ip):
     assert counts["ingested"] == 0
     assert counts["skipped_invalid_subject"] == 1
     assert ingestor.contexts == []
+
+
+# ---------------------------------------------------------------------------
+# The account an account-scoped response acts on, from the request pipeline
+# ---------------------------------------------------------------------------
+def test_a_trusted_producer_can_report_the_authenticated_account():
+    """An account-scoped response needs the account the request pipeline
+    authenticated. It travels as in-process provenance from a REGISTERED
+    producer -- registration is the trust boundary -- and reaches the
+    assessment the orchestration authority decides on."""
+    detector = SentinelThreatDetector()
+    manager = _manager(detector, producers={"firewall": "sentinel-firewall"})
+
+    for index in range(6):
+        manager.analyze_event(
+            _event(
+                id=f"e-{index}",
+                source="sentinel-firewall",
+                source_identity="operator",
+                source_principal="user-7f3a",
+            ),
+            source_ip="198.51.100.2",
+            source_identity="operator",
+            trusted_producer="firewall",
+        )
+
+    assert _counts(manager)["ingested"] == 6
+    assessment = detector.assess_all()[0]
+    assert list(assessment.indicators["subject_principals"]) == ["user-7f3a"]
+
+    from core.governance.sentinel43_engine import principal_of_assessment
+
+    assert principal_of_assessment(assessment) == "user-7f3a"
+
+
+def test_evidence_from_two_accounts_names_neither():
+    """Two accounts behind one (identity type, address) subject: the window
+    names no account, so no account action can be approved for it."""
+    detector = SentinelThreatDetector()
+    manager = _manager(detector, producers={"firewall": "sentinel-firewall"})
+
+    for index, principal in enumerate(("user-7f3a", "user-0b12")):
+        manager.analyze_event(
+            _event(
+                id=f"m-{index}",
+                source="sentinel-firewall",
+                source_identity="operator",
+                source_principal=principal,
+            ),
+            source_ip="198.51.100.3",
+            source_identity="operator",
+            trusted_producer="firewall",
+        )
+
+    from core.governance.sentinel43_engine import principal_of_assessment
+
+    assessment = detector.assess_all()[0]
+    assert list(assessment.indicators["subject_principals"]) == [
+        "user-0b12",
+        "user-7f3a",
+    ]
+    assert principal_of_assessment(assessment) == ""
+
+
+def test_the_firewall_block_path_reports_no_account_today():
+    """Recorded, deliberately: the only registered producer emits its event
+    while REJECTING a request, which happens before anything authenticates
+    it. So a real firewall block names no account, and account-scoped
+    responses stay unapprovable until an authenticated-stage producer is
+    authorized. Nothing invents one to close that gap."""
+    detector = SentinelThreatDetector()
+    manager = MonitoringManager(_Scanner())
+    manager.start()
+    manager.attach_threat_ingestor(detector, producers={"firewall": "sentinel-firewall"})
+
+    _drive_firewall(manager, "sentinel-firewall", requests=6)
+
+    assessment = detector.assess_all()[0]
+    assert list(assessment.indicators["subject_principals"]) == []
+
+
+def test_an_anonymous_request_carries_no_account():
+    detector = SentinelThreatDetector()
+    manager = MonitoringManager(_Scanner())
+    manager.start()
+    manager.attach_threat_ingestor(detector, producers={"firewall": "sentinel-firewall"})
+
+    _drive_firewall(manager, "sentinel-firewall", requests=6)
+
+    assessment = detector.assess_all()[0]
+    assert list(assessment.indicators["subject_principals"]) == []
+
+
+def test_an_account_is_never_taken_from_an_untrusted_payload():
+    """The principal is in-process provenance. An event whose producer is not
+    registered is not ingested at all, so a payload cannot name an account."""
+    detector = SentinelThreatDetector()
+    manager = _manager(detector, producers={"firewall": "sentinel-firewall"})
+    # A payload that names an account, from a producer nothing registered.
+    manager.analyze_event(
+        _event(source="impostor-source", source_principal="admin-account"),
+        source_ip="198.51.100.2",
+        trusted_producer=None,
+    )
+    assert _counts(manager)["ingested"] == 0
+    assert detector.assess_all() == []
+
+    # ...and one from the trusted producer: the account comes from in-process
+    # provenance, so the payload's claim is what is carried ONLY because the
+    # firewall itself set it. A different producer label cannot reach here.
+    manager.analyze_event(
+        _event(source="sentinel-firewall"),
+        source_ip="198.51.100.2",
+        source_identity="anonymous",
+        trusted_producer="firewall",
+    )
+    assert _counts(manager)["ingested"] == 1
+    assert list(detector.assess_all()[0].indicators["subject_principals"]) == []
