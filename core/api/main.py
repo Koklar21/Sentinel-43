@@ -508,6 +508,22 @@ def _validate_security_config() -> None:
             "S43_ALLOW_PROCESS_LOCAL_STATE_WITH_MULTIPLE_WORKERS=true."
         )
 
+    # The Heart reports evidence; the governance orchestrator is the only
+    # authority that may stage or resolve a recommendation from it. Enabling
+    # one without the other is a configuration error, not a degraded mode, so
+    # it is refused here -- explicitly, in every environment, and whatever
+    # S43_HEART_REQUIRED says. Governance is NOT auto-enabled behind the
+    # operator: turning on an authority is their decision to make.
+    if _env_bool("S43_HEART_ENABLED", False) and not _env_bool(
+        "S43_GOVERNANCE_ENABLED", False
+    ):
+        raise RuntimeError(
+            "S43_HEART_ENABLED=true requires S43_GOVERNANCE_ENABLED=true: the "
+            "Heart has no decision authority of its own and cannot stage or "
+            "resolve a recommendation without the governance orchestrator. "
+            "Set S43_GOVERNANCE_ENABLED=true, or set S43_HEART_ENABLED=false."
+        )
+
     if not IS_LOCAL_ENV:
         if not JWT_SECRET:
             raise RuntimeError(
