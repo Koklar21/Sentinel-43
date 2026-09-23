@@ -550,6 +550,11 @@ def test_failed_recovery_blocks_readiness_but_not_liveness(monkeypatch):
     _sql(directory, "UPDATE pending_actions SET target_value='no-separator' WHERE action_id='HEART-BADROW000003'")
     monkeypatch.setenv("S43_HEART_ENABLED", "true")
     monkeypatch.setenv("S43_HEART_REQUIRED", "true")
+    # Valid configuration: an enabled Heart always declares its authority
+    # (see test_heart_governance_invariant.py), and governance requires the
+    # keyed authoritative audit ledger. What fails here is at RUNTIME.
+    monkeypatch.setenv("S43_GOVERNANCE_ENABLED", "true")
+    monkeypatch.setenv("S43_AUDIT_HMAC_KEY", "a" * 64)
     monkeypatch.setenv("S43_HEART_SQLITE_PATH", str(directory / "heart.sqlite3"))
 
     with TestClient(main_module.app) as test_client:
@@ -575,8 +580,8 @@ def test_failed_recovery_blocks_readiness_but_not_liveness(monkeypatch):
 # ---------------------------------------------------------------------------
 def test_fenrir_is_wired_to_heart_only_after_recovery_completes(monkeypatch):
     directory, audit, _, _ = _stack()
-    monkeypatch.setenv("S43_HEART_ENABLED", "true")
     monkeypatch.setenv("S43_HEART_REQUIRED", "true")
+    monkeypatch.setenv("S43_AUDIT_HMAC_KEY", "a" * 64)
     monkeypatch.setenv("S43_HEART_SQLITE_PATH", str(directory / "heart.sqlite3"))
 
     fenrir = SimpleNamespace(heart=None)
@@ -589,6 +594,9 @@ def test_fenrir_is_wired_to_heart_only_after_recovery_completes(monkeypatch):
     monkeypatch.setattr(main_module, "_rehydrate_heart_pending", _recording_recovery)
 
     with TestClient(main_module.app) as test_client:
+        # The Heart is enabled only now, so THIS test drives the single
+        # _start_heart() whose recovery race it is measuring.
+        monkeypatch.setenv("S43_HEART_ENABLED", "true")
         _start_production_governance(test_client, monkeypatch, audit)
         main_module.runtime.fenrir_instance = fenrir
         fenrir.heart = None
@@ -873,6 +881,8 @@ def _start_production_heart(client, monkeypatch, directory: Path, audit):
     import core.detection.feniri_hunter as fenrir_module
 
     monkeypatch.setenv("S43_HEART_ENABLED", "true")
+    monkeypatch.setenv("S43_GOVERNANCE_ENABLED", "true")
+    monkeypatch.setenv("S43_AUDIT_HMAC_KEY", "a" * 64)
     monkeypatch.setenv("S43_HEART_SQLITE_PATH", str(directory / "heart.sqlite3"))
     fenrir = fenrir_module.FenrirHunter()
     _start_production_governance(client, monkeypatch, audit)
@@ -1338,13 +1348,22 @@ def test_an_enabled_heart_without_its_authority_blocks_readiness(monkeypatch):
     directory, audit, _, _ = _stack()
     monkeypatch.setenv("S43_HEART_ENABLED", "true")
     monkeypatch.setenv("S43_HEART_REQUIRED", "true")
+    # The configuration is valid -- an enabled Heart declares its authority.
+    # What fails is at RUNTIME: governance never comes up, so the Heart meets
+    # an absent authority on the real startup path.
+    monkeypatch.setenv("S43_GOVERNANCE_ENABLED", "true")
+    monkeypatch.setenv("S43_AUDIT_HMAC_KEY", "a" * 64)
     monkeypatch.setenv("S43_HEART_SQLITE_PATH", str(directory / "heart.sqlite3"))
+
+    async def _governance_never_starts() -> None:
+        main_module.runtime.orchestrator = None
+
+    monkeypatch.setattr(main_module, "_start_governance", _governance_never_starts)
 
     with TestClient(main_module.app) as test_client:
         main_module.runtime.audit_store = audit
-        main_module.runtime.orchestrator = None
-        test_client.portal.call(main_module._start_heart)
 
+        assert main_module.runtime.orchestrator is None
         assert main_module.runtime.heart is None
         status = main_module.runtime.subsystems.get(main_module.SUBSYS_HEART)
         assert "governance orchestrator" in status.detail, status.detail
@@ -1488,14 +1507,19 @@ def test_the_remote_gateway_cannot_decide_a_heart_recommendation(client):
 # The owner-designated engine is the running decider, and it is contained
 # ---------------------------------------------------------------------------
 def test_the_running_engine_is_the_unmodified_owner_file():
-    import hashlib
-
-    from core.governance.sentinel43_engine import engine_source_path
+    from core.governance.sentinel43_engine import (
+        EXPECTED_ENGINE_SHA256,
+        engine_digest,
+        engine_source_path,
+    )
 
     _, _, _, heart = _stack()
     identity = heart._authority.engine_identity
-    on_disk = hashlib.sha256(engine_source_path().read_bytes()).hexdigest()
+    on_disk = engine_digest(engine_source_path().read_bytes())
     assert identity["sha256"] == on_disk
+    # ...and the file on disk is the one that was reviewed, whatever line
+    # endings this checkout materialised it with.
+    assert identity["sha256"] == EXPECTED_ENGINE_SHA256
     assert identity["class"] == "Sentinel43ResponseEngine"
 
 

@@ -66,12 +66,32 @@ ENGINE_CLASS_NAME = "Sentinel43ResponseEngine"
 _ENGINE_MODULE_NAME = "sentinel43_owner_shadow_mode"
 
 #: sha256 of the owner-designated Shadow_mode.py this adapter was reviewed
-#: against. A different file (edited, replaced, or a stale image) is refused,
-#: so nothing decides with an engine nobody reviewed. Changing the owner file
-#: is a deliberate act that must update this pin in the same change.
+#: against, over its CANONICAL content (see engine_digest). A different file
+#: -- edited, replaced, or a stale image -- is refused, so nothing decides
+#: with an engine nobody reviewed. Changing the owner file is a deliberate act
+#: that must update this pin in the same change, and
+#: test_owner_engine_integrity.py fails until it does.
 EXPECTED_ENGINE_SHA256 = (
-    "6dcad6db464a134ea80e2950bfc8f3f3c0c547bbf7b254d00dfb2d9b76877301"
+    "a8e63c44eb98b1b89a7c5da73807a3bb9818812d5fa77edc02bcd9c6e9d067a6"
 )
+
+
+def engine_digest(source: bytes) -> str:
+    """The engine file's identity, independent of how a checkout wrote it.
+
+    Line endings are a property of the checkout, not of the engine: git
+    stores this file with LF, and a Windows checkout can materialise it with
+    CRLF (``core.autocrlf``). Hashing the raw bytes therefore produced a
+    different digest on different machines for the SAME reviewed file, which
+    fails the runtime closed for a reason that has nothing to do with the
+    code. Normalising newlines first makes the pin reproducible everywhere.
+
+    It does not weaken the check: CRLF, LF and CR renderings of a file are
+    the same Python program, and any change to a token, a statement or a byte
+    of code still changes this digest.
+    """
+    normalized = source.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(normalized).hexdigest()
 
 
 def validated_subject_key(identity: Any, source_ip: Any) -> str:
@@ -171,7 +191,7 @@ def load_engine_module(root: Path | None = None) -> tuple[ModuleType, EngineIden
                 "ship Sentinel-43/Shadow_mode.py"
             )
         source = path.read_bytes()
-        digest = hashlib.sha256(source).hexdigest()
+        digest = engine_digest(source)
         if digest != EXPECTED_ENGINE_SHA256:
             raise EngineUnavailable(
                 f"engine file {path} has sha256 {digest}, not the reviewed "
@@ -787,6 +807,7 @@ __all__ = [
     "EngineUnavailable",
     "ACTION_CATALOG",
     "BLOCKING_STATUSES",
+    "engine_digest",
     "EXPECTED_ENGINE_SHA256",
     "GovernedEngine",
     "MAX_PRINCIPAL_LENGTH",

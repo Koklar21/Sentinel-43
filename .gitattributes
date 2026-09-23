@@ -1,0 +1,4 @@
+# The owner-designated orchestration engine is hashed by the runtime
+# (core/governance/sentinel43_engine.py). Keep it byte-stable across
+# checkouts so its recorded identity does not depend on the platform.
+Sentinel-43/Shadow_mode.py -text
