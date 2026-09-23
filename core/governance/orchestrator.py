@@ -1475,11 +1475,15 @@ class SystemOrchestrator:
     def recommendation_store_attached(self) -> bool:
         return self._recommendation_store is not None and self._engine is not None
 
-    @property
-    def recommendation_store(self) -> Any | None:
-        """The durable store, for reading records only. Every decision still
-        goes through stage_recommendation/resolve_recommendation."""
-        return self._recommendation_store
+    def list_incidents(self, limit: int = 200) -> tuple[Mapping[str, Any], ...]:
+        """Incident records opened by approved decisions.
+
+        The authority exposes the READ, not the store: handing out the store
+        object would hand out its raw transition_status, which has no
+        principal check of its own -- that check lives in the engine's store
+        adapter, on the one path a decision may take.
+        """
+        return self._require_recommendation_store().list_incidents(limit=limit)
 
     @property
     def engine_identity(self) -> dict[str, str] | None:
