@@ -48,6 +48,7 @@ from core.security_context import IdentityType  # noqa: E402
 from core.sentinel43_core_db import (  # noqa: E402
     ActionStatus,
     CoreStoreConfig,
+    IncidentStatus,
     PendingAction,
     SentinelCoreStore,
 )
@@ -126,29 +127,59 @@ def _authority(audit, mode: str = "HUMAN_GATED"):
     return build_orchestrator_from_settings(GovernanceSettings(), audit_store=audit)
 
 
-def _stage(heart, ip: str):
-    """Stage a recommendation composed ONLY of policy-supported operations.
+#: The actions the engine's OWN policy produces for the assessment _stage
+#: submits -- no plan is patched anywhere in this helper.
+APPROVABLE_PLAN = ["RATE_LIMIT", "REQUIRE_HUMAN_REVIEW"]
 
-    The current engine policy never produces such a plan by itself (every
-    MEDIUM/HIGH plan includes RATE_LIMIT; see
-    test_real_engine_plans_are_not_approvable), so for this one submission the
-    engine's plan is fixed to TEMP_BLOCK_IP + REQUIRE_HUMAN_REVIEW, built from
-    the engine's own ResponseDirective type. Staging, dedupe, approval and veto
-    still run through the engine's own code. This exercises the approval path
-    that exists for recommendations a human can legitimately approve.
+
+def _stage(heart, ip: str, *, severity=ThreatSeverity.HIGH, score: float = 50.0):
+    """Stage a recommendation the REAL engine plans, approvable as a whole.
+
+    Severity HIGH below the engine's high_threshold (65), from a source that
+    is not automation-likely, for a threat kind that is neither a credential
+    attack nor a generic intrusion: the engine's own _build_mid_high then
+    plans RATE_LIMIT + REQUIRE_HUMAN_REVIEW -- throttling, which the policy
+    vocabulary states exactly, plus the review this staging already is.
+
+    Planning, staging, dedupe, approval and veto all run the engine's code.
+    """
+    decision = heart.observe(
+        ThreatAssessment(
+            identity="anonymous",
+            source_ip=ip,
+            threat_kind=ThreatKind.DATA_EXFILTRATION,
+            severity=severity,
+            source_kind=ThreatSourceKind.MIXED_OR_UNKNOWN,
+            score=score,
+            indicators={"evidence_seq": 1, "evidence_sources": ["firewall", "sparta"]},
+            supporting_tags=["t"],
+            window_size=5,
+        )
+    )
+    assert decision.status == "STAGED" and decision.action_id, decision
+    return decision.action_id
+
+
+def _stage_planned(heart, ip: str, actions: list[str]):
+    """Stage a recommendation whose plan is fixed to ``actions``.
+
+    Only for action combinations the engine's current policy cannot produce
+    on its own (see test_reachable_engine_plans). The directive is built from
+    the engine's own ResponseDirective/ResponseAction types, and staging,
+    approval and veto still run through the engine's code.
     """
     engine = heart._authority._engine
     module = engine.module
     original = engine.plan
 
-    def approvable_plan(assessment):
+    def fixed_plan(assessment):
         plan = original(assessment)
         base = plan["directive"]
         directive = module.ResponseDirective(
             identity=base.identity,
             source_ip=base.source_ip,
-            primary_action=module.ResponseAction.TEMP_BLOCK_IP,
-            additional_actions=[module.ResponseAction.REQUIRE_HUMAN_REVIEW],
+            primary_action=module.ResponseAction[actions[0]],
+            additional_actions=[module.ResponseAction[name] for name in actions[1:]],
             reason=base.reason,
             expires_at=base.expires_at,
             threat_kind=base.threat_kind,
@@ -156,23 +187,26 @@ def _stage(heart, ip: str):
             source_kind=base.source_kind,
             score=base.score,
         )
-        actions = ["TEMP_BLOCK_IP", "REQUIRE_HUMAN_REVIEW"]
         return {
             "directive": directive,
-            "actions": actions,
-            "summary": {**plan["summary"], "primary_action": actions[0], "actions": actions},
+            "actions": list(actions),
+            "summary": {
+                **plan["summary"],
+                "primary_action": actions[0],
+                "actions": list(actions),
+            },
         }
 
-    engine.plan = approvable_plan
+    engine.plan = fixed_plan
     try:
         decision = heart.observe(
             ThreatAssessment(
                 identity="anonymous",
                 source_ip=ip,
-                threat_kind=list(ThreatKind)[0],
-                severity=ThreatSeverity.HIGH,
-                source_kind=ThreatSourceKind.AI_AUTOMATION_LIKELY,
-                score=80.0,
+                threat_kind=ThreatKind.DATA_EXFILTRATION,
+                severity=ThreatSeverity.CRITICAL,
+                source_kind=ThreatSourceKind.MIXED_OR_UNKNOWN,
+                score=90.0,
                 indicators={"evidence_seq": 1, "evidence_sources": ["firewall", "sparta"]},
                 supporting_tags=["t"],
                 window_size=5,
@@ -1138,7 +1172,7 @@ def test_staging_records_the_orchestrator_the_operation_and_its_target():
     action_id = _stage(heart, "203.0.113.131")
 
     row = core.get_action(action_id)
-    assert list(row["actions"]) == ["TEMP_BLOCK_IP", "REQUIRE_HUMAN_REVIEW"]
+    assert list(row["actions"]) == APPROVABLE_PLAN
     assert row["system_id"] == "SENTINEL-43-NEXUS-01"
 
     staged = audit.get_records(component="heart", correlation_id=action_id)[0]
@@ -1146,17 +1180,17 @@ def test_staging_records_the_orchestrator_the_operation_and_its_target():
     assert staged["engine"]["class"] == "Sentinel43ResponseEngine"
     assert staged["operations"] == [
         {
-            "action": "network_block",
-            "target_type": "source_ip",
-            "target": "203.0.113.131",
-            "engine_action": "TEMP_BLOCK_IP",
+            "action": "rate_limit",
+            "target_type": "subject",
+            "target": "anonymous|203.0.113.131",
+            "engine_action": "RATE_LIMIT",
         }
     ]
     assert staged["unsupported_actions"] == []
     assert staged["recommendation"]["approval"]["available"] is True
     # The policy decision is bound to that operation AND its target.
-    assert staged["policy"][0]["action"] == "network_block"
-    assert staged["policy"][0]["resource"] == "source_ip:203.0.113.131"
+    assert staged["policy"][0]["action"] == "rate_limit"
+    assert staged["policy"][0]["resource"] == "subject:anonymous|203.0.113.131"
 
 
 def test_approval_is_bound_to_the_staged_operation_and_target(client):
@@ -1178,9 +1212,11 @@ def test_approval_is_bound_to_the_staged_operation_and_target(client):
     assert approved["decided_by"] == "Sentinel43ResponseEngine.approve_action"
     assert approved["enforcement"].startswith("not_performed")
     assert response.json()["action"]["status"] == "APPROVED"
-    assert approved["operations"][0]["target"] == "203.0.113.132"
-    assert approved["policy"][0]["resource"] == "source_ip:203.0.113.132"
+    assert approved["operations"][0]["target"] == "anonymous|203.0.113.132"
+    assert approved["policy"][0]["resource"] == "subject:anonymous|203.0.113.132"
     assert approved["policy"][0]["human_approved"] is True
+    # Nothing was enforced, and no incident was authorized by this plan.
+    assert "incident_id" not in approved
 
 
 def test_a_changed_operation_cannot_be_approved(client):
@@ -1209,18 +1245,21 @@ def test_a_changed_operation_cannot_be_approved(client):
 
 
 def test_an_unsupported_recommendation_is_staged_but_not_approvable(client):
-    """For an ordinary-source HIGH finding the engine recommends step-up auth,
-    rate limiting and an identity block -- none of which the policy
-    vocabulary can state. The engine's staging decision stands, but no human
-    can approve an operation that does not exist; it can only be vetoed."""
+    """For an ordinary-source HIGH intrusion the engine recommends step-up
+    auth, rate limiting and an account block. Throttling is authorizable, but
+    the two account actions have no account to act on, so the recommendation
+    is NOT approvable -- not even for its supported part -- and the operator
+    is told which actions block it. It can still be vetoed."""
     _, audit, core, heart = _stack()
     decision = heart.observe(
         _assessment("203.0.113.134", source_kind=ThreatSourceKind.MIXED_OR_UNKNOWN)
     )
     assert decision.status == "STAGED"
     staged = audit.get_records(component="heart", correlation_id=decision.action_id)[0]
-    assert staged["operations"] == []
-    assert set(staged["unsupported_actions"]) >= {"RATE_LIMIT", "TEMP_BLOCK_IDENTITY"}
+    # The supported part was assessed, but it is not on its own approvable.
+    assert [o["action"] for o in staged["operations"]] == ["rate_limit"]
+    assert set(staged["unsupported_actions"]) == {"STEP_UP_AUTH", "TEMP_BLOCK_IDENTITY"}
+    assert staged["recommendation"]["approval"]["available"] is False
 
     _use(heart)
     assert _recover(client) == 1
@@ -1233,12 +1272,15 @@ def test_an_unsupported_recommendation_is_staged_but_not_approvable(client):
     assert core.get_status(decision.action_id) == ActionStatus.PENDING
     last = audit.get_records(component="heart", correlation_id=decision.action_id)[-1]
     assert last["reason_code"] == "APPROVAL_UNAVAILABLE"
-    assert set(last["approval"]["blocking_actions"]) >= {"RATE_LIMIT", "TEMP_BLOCK_IDENTITY"}
+    assert set(last["approval"]["blocking_actions"]) == {
+        "STEP_UP_AUTH",
+        "TEMP_BLOCK_IDENTITY",
+    }
     # The limitation is visible through the API the dashboard reads.
     listed = client.get("/actions", headers=_headers())
     shown = next(a for a in listed.json() if a["id"] == decision.action_id)
     assert shown["payload"]["approval"]["available"] is False
-    assert any("RATE_LIMIT" in r for r in shown["payload"]["approval"]["reasons"])
+    assert any("TEMP_BLOCK_IDENTITY" in r for r in shown["payload"]["approval"]["reasons"])
 
     veto = client.post(
         f"/actions/{decision.action_id}/veto",
@@ -1521,18 +1563,54 @@ def test_each_containment_layer_refuses_active_on_its_own():
 # Operational honesty: what each engine action means and whether it is approvable
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
-    "severity,source_kind,kind",
+    "severity,source_kind,kind,score,approvable,blocking",
     [
-        ("HIGH", "MIXED_OR_UNKNOWN", "CREDENTIAL_ATTACK"),
-        ("HIGH", "AI_AUTOMATION_LIKELY", "RATE_ANOMALY"),
-        ("MEDIUM", "MIXED_OR_UNKNOWN", "PAYLOAD_ABUSE"),
-        ("CRITICAL", "MIXED_OR_UNKNOWN", "GENERIC_INTRUSION"),
+        # Throttling alone, and throttling plus the review this staging is:
+        # both are approvable, because the policy vocabulary states them.
+        ("MEDIUM", "MIXED_OR_UNKNOWN", "PAYLOAD_ABUSE", 50.0, True, set()),
+        ("HIGH", "MIXED_OR_UNKNOWN", "DATA_EXFILTRATION", 50.0, True, set()),
+        # A credential attack adds step-up authentication, which needs an
+        # account this subject does not name.
+        (
+            "HIGH",
+            "MIXED_OR_UNKNOWN",
+            "CREDENTIAL_ATTACK",
+            50.0,
+            False,
+            {"STEP_UP_AUTH"},
+        ),
+        # Above the engine's temporary-block threshold an account block is
+        # added; automation-likely adds the IP block, which IS approvable.
+        (
+            "HIGH",
+            "AI_AUTOMATION_LIKELY",
+            "RATE_ANOMALY",
+            80.0,
+            False,
+            {"TEMP_BLOCK_IDENTITY"},
+        ),
+        # Critical plans quarantine the session and block the account.
+        (
+            "CRITICAL",
+            "MIXED_OR_UNKNOWN",
+            "GENERIC_INTRUSION",
+            90.0,
+            False,
+            {"QUARANTINE_SESSION", "HARD_BLOCK_IDENTITY"},
+        ),
     ],
 )
-def test_real_engine_plans_are_not_approvable(severity, source_kind, kind):
-    """Every plan the current engine policy produces for these findings
-    contains at least one action the policy vocabulary cannot state -- so
-    approval is unavailable, with a reason per blocking action."""
+def test_reachable_engine_plans(
+    severity, source_kind, kind, score, approvable, blocking
+):
+    """What the engine's OWN policy plans for real findings, and exactly which
+    of those plans a human can approve under the policy vocabulary.
+
+    The plans that cannot be approved are blocked only by actions that name an
+    account or a session: the subject a finding carries is an identity type
+    and an address, so there is no account for them to act on. Nothing is
+    relabelled to make them approvable.
+    """
     from core.governance.sentinel43_engine import assess_actions
 
     _, _, _, heart = _stack()
@@ -1543,46 +1621,60 @@ def test_real_engine_plans_are_not_approvable(severity, source_kind, kind):
             threat_kind=ThreatKind[kind],
             severity=ThreatSeverity[severity],
             source_kind=ThreatSourceKind[source_kind],
-            score=80.0,
+            score=score,
         )
     )
     assessed = assess_actions(plan["actions"], subject_key="anonymous|203.0.113.170")
-    assert assessed["approval"]["available"] is False
-    assert assessed["approval"]["blocking_actions"]
+    assert assessed["approval"]["available"] is approvable, plan["actions"]
+    assert set(assessed["approval"]["blocking_actions"]) == blocking, plan["actions"]
     assert len(assessed["approval"]["reasons"]) == len(
         assessed["approval"]["blocking_actions"]
     )
+    # No engine action is ever recorded as a network block unless it IS one.
+    for item in assessed["items"]:
+        if item["policy_action"] == "network_block":
+            assert item["engine_action"] in ("TEMP_BLOCK_IP", "HARD_BLOCK_IP")
 
 
-def test_identity_actions_are_never_relabeled_as_network_blocks():
+def test_each_engine_action_keeps_its_own_meaning():
+    """Throttling, step-up authentication and account blocks each map to the
+    policy operation that states THEIR meaning -- never to a network block,
+    and never to each other."""
+    from core.governance.sentinel43_engine import ACTION_CATALOG
+
+    assert {
+        name: entry[2]
+        for name, entry in ACTION_CATALOG.items()
+        if entry[2] is not None
+    } == {
+        "TEMP_BLOCK_IP": "network_block",
+        "HARD_BLOCK_IP": "network_block",
+        "QUARANTINE_SESSION": "quarantine",
+        "STEP_UP_AUTH": "step_up_auth",
+        "RATE_LIMIT": "rate_limit",
+        "TEMP_BLOCK_IDENTITY": "account_block_temporary",
+        "HARD_BLOCK_IDENTITY": "account_block_extended",
+        "OPEN_INCIDENT": "incident_open",
+    }
+
+
+@pytest.mark.parametrize(
+    "action", ["STEP_UP_AUTH", "TEMP_BLOCK_IDENTITY", "HARD_BLOCK_IDENTITY", "QUARANTINE_SESSION"]
+)
+@pytest.mark.parametrize("identity", ["anonymous", "operator", "service:watchtower"])
+def test_account_actions_have_no_account_to_act_on(action, identity):
+    """The subject is an identity TYPE and an address. No account is invented
+    for these, and no address operation is substituted for one -- for an
+    anonymous source or any other."""
     from core.governance.sentinel43_engine import assess_actions
 
-    assessed = assess_actions(
-        ["STEP_UP_AUTH", "RATE_LIMIT", "TEMP_BLOCK_IDENTITY", "HARD_BLOCK_IDENTITY"],
-        subject_key="anonymous|203.0.113.171",
-    )
+    assessed = assess_actions([action], subject_key=f"{identity}|203.0.113.172")
+    item = assessed["items"][0]
+    assert item["status"] == "NO_VALID_TARGET"
+    assert item["target"] is None
     assert assessed["operations"] == []
-    assert {i["status"] for i in assessed["items"]} == {"POLICY_DECISION_REQUIRED"}
-    assert all(i["policy_action"] is None for i in assessed["items"])
-
-
-def test_session_quarantine_needs_a_session():
-    from core.governance.sentinel43_engine import assess_actions
-
-    anonymous = assess_actions(["QUARANTINE_SESSION"], subject_key="anonymous|203.0.113.172")
-    assert anonymous["items"][0]["status"] == "NO_VALID_TARGET"
-    assert anonymous["approval"]["available"] is False
-
-    operator = assess_actions(["QUARANTINE_SESSION"], subject_key="operator|203.0.113.172")
-    assert operator["items"][0]["status"] == "APPROVABLE"
-    assert operator["operations"] == [
-        {
-            "action": "quarantine",
-            "target_type": "session",
-            "target": "operator|203.0.113.172",
-            "engine_action": "QUARANTINE_SESSION",
-        }
-    ]
+    assert assessed["approval"]["available"] is False
+    assert "account" in item["reason"]
 
 
 def test_a_mixed_recommendation_is_not_partially_approved():
@@ -1591,12 +1683,13 @@ def test_a_mixed_recommendation_is_not_partially_approved():
     from core.governance.sentinel43_engine import assess_actions
 
     assessed = assess_actions(
-        ["RATE_LIMIT", "TEMP_BLOCK_IP", "REQUIRE_HUMAN_REVIEW"],
+        ["RATE_LIMIT", "TEMP_BLOCK_IP", "TEMP_BLOCK_IDENTITY", "REQUIRE_HUMAN_REVIEW"],
         subject_key="anonymous|203.0.113.173",
     )
-    assert assessed["operations"]  # the IP block IS expressible...
-    assert assessed["approval"]["available"] is False  # ...but not on its own
-    assert assessed["approval"]["blocking_actions"] == ["RATE_LIMIT"]
+    # Throttling and the IP block ARE expressible...
+    assert [o["action"] for o in assessed["operations"]] == ["rate_limit", "network_block"]
+    assert assessed["approval"]["available"] is False  # ...but not on their own
+    assert assessed["approval"]["blocking_actions"] == ["TEMP_BLOCK_IDENTITY"]
 
 
 # ---------------------------------------------------------------------------
@@ -1729,7 +1822,225 @@ def test_restored_actions_carry_their_approval_state(client):
     assert _recover(client) == 1
     payload = main_module.runtime.action_store[action_id]["payload"]
     assert payload["approval"]["available"] is True
-    assert [i["engine_action"] for i in payload["recommendation"]["items"]] == [
-        "TEMP_BLOCK_IP",
-        "REQUIRE_HUMAN_REVIEW",
-    ]
+    assert [
+        i["engine_action"] for i in payload["recommendation"]["items"]
+    ] == APPROVABLE_PLAN
+
+
+# ---------------------------------------------------------------------------
+# Incident records: the one effect an approval produces, and it is internal
+# ---------------------------------------------------------------------------
+def test_approving_an_incident_recommendation_opens_a_durable_record(client):
+    """A recommendation whose plan includes OPEN_INCIDENT opens a durable
+    incident record in this system's own store when a human approves it --
+    not an audit line, a record that can be read back."""
+    _, audit, core, heart = _stack()
+    action_id = _stage_planned(heart, "203.0.113.190", ["RATE_LIMIT", "OPEN_INCIDENT"])
+    _use(heart)
+    assert _recover(client) == 1
+
+    assert core.count_incidents() == 0
+    response = client.post(
+        f"/actions/{action_id}/approve",
+        headers=_headers(),
+        json={"reason": "opening an incident for follow-up"},
+    )
+    assert response.status_code == 200, response.text
+
+    incident_id = core.incident_id_for_action(action_id)
+    incident = core.get_incident(incident_id)
+    assert incident is not None
+    assert incident["status"] == "OPEN"
+    assert incident["action_id"] == action_id
+    assert incident["subject_value"] == "anonymous|203.0.113.190"
+    assert tuple(incident["engine_actions"]) == ("RATE_LIMIT", "OPEN_INCIDENT")
+    assert incident["opened_by"] == "heart-op"
+
+    # The decision record names the incident it opened.
+    approved = audit.get_records(component="heart", correlation_id=action_id)[-1]
+    assert approved["incident_id"] == incident_id
+    # ...and so does the action the dashboard reads.
+    assert response.json()["action"]["payload"]["incident_id"] == incident_id
+
+    listed = client.get("/incidents", headers=_headers())
+    assert listed.status_code == 200, listed.text
+    assert [i["incident_id"] for i in listed.json()["incidents"]] == [incident_id]
+
+
+def test_a_vetoed_incident_recommendation_opens_nothing(client):
+    _, _, core, heart = _stack()
+    action_id = _stage_planned(heart, "203.0.113.191", ["RATE_LIMIT", "OPEN_INCIDENT"])
+    _use(heart)
+    assert _recover(client) == 1
+
+    response = client.post(
+        f"/actions/{action_id}/veto",
+        headers=_headers(),
+        json={"reason": "not an incident"},
+    )
+    assert response.status_code == 200, response.text
+    assert core.count_incidents() == 0
+
+
+def test_an_unauditable_incident_decision_is_reverted_and_the_incident_retracted():
+    """If the decision cannot be recorded, the approval is reverted -- and the
+    incident it opened is retracted rather than left standing."""
+    _, audit, core, heart = _stack()
+    action_id = _stage_planned(heart, "203.0.113.192", ["RATE_LIMIT", "OPEN_INCIDENT"])
+    authority = heart._authority
+
+    original = authority._append_audit
+
+    def fail_on_decision(record):
+        if record.get("decision") in ("APPROVED", "VETOED"):
+            raise RuntimeError("audit ledger unavailable")
+        return original(record)
+
+    authority._append_audit = fail_on_decision
+    try:
+        with pytest.raises(RuntimeError, match="audit ledger unavailable"):
+            authority.resolve_recommendation(
+                action_id,
+                approved=True,
+                operator_id="heart-op",
+                reason="reviewed",
+                principal=_principal(),
+            )
+    finally:
+        authority._append_audit = original
+
+    assert core.get_status(action_id) == ActionStatus.PENDING
+    incident = core.get_incident(core.incident_id_for_action(action_id))
+    assert incident is not None and incident["status"] == "RETRACTED"
+    assert incident["retracted_reason"] == "reverted_unaudited_decision"
+    assert core.count_incidents(status=IncidentStatus.OPEN) == 0
+
+
+def test_opening_the_same_incident_twice_keeps_one_record():
+    _, _, core, _heart = _stack()
+    first = core.open_incident(
+        action_id="a-1",
+        severity="CRITICAL",
+        kind="GENERIC_INTRUSION",
+        subject_type="identity_source_ip",
+        subject_value="anonymous|203.0.113.193",
+        summary="s",
+        engine_actions=("OPEN_INCIDENT",),
+        opened_by="heart-op",
+    )
+    second = core.open_incident(
+        action_id="a-1",
+        severity="CRITICAL",
+        kind="GENERIC_INTRUSION",
+        subject_type="identity_source_ip",
+        subject_value="anonymous|203.0.113.193",
+        summary="s",
+        engine_actions=("OPEN_INCIDENT",),
+        opened_by="heart-op",
+    )
+    assert first == second
+    assert core.count_incidents() == 1
+
+
+def test_no_incident_is_opened_without_a_human_decision():
+    """Staging alone opens nothing: the incident is an authorized response,
+    not a side effect of observing a threat."""
+    _, _, core, heart = _stack()
+    _stage_planned(heart, "203.0.113.194", ["RATE_LIMIT", "OPEN_INCIDENT"])
+    assert core.count_incidents() == 0
+
+
+def test_incidents_are_not_reachable_from_a_real_critical_plan():
+    """Recorded limitation, deliberately asserted: every plan the engine's own
+    policy produces with OPEN_INCIDENT also quarantines a session and blocks an
+    account, and those have no account to act on -- so a human cannot approve
+    it, and no incident can be opened from a real recommendation yet. Closing
+    this needs an account identifier in the evidence, which is Justin's
+    decision, not something this code may invent."""
+    from core.governance.sentinel43_engine import assess_actions
+
+    _, _, _, heart = _stack()
+    plan = heart._authority._engine.plan(
+        ThreatAssessment(
+            identity="anonymous",
+            source_ip="203.0.113.195",
+            threat_kind=ThreatKind.GENERIC_INTRUSION,
+            severity=ThreatSeverity.CRITICAL,
+            source_kind=ThreatSourceKind.MIXED_OR_UNKNOWN,
+            score=90.0,
+        )
+    )
+    assert "OPEN_INCIDENT" in plan["actions"]
+    assessed = assess_actions(plan["actions"], subject_key="anonymous|203.0.113.195")
+    assert any(o["action"] == "incident_open" for o in assessed["operations"])
+    assert assessed["approval"]["available"] is False
+    assert set(assessed["approval"]["blocking_actions"]) == {
+        "QUARANTINE_SESSION",
+        "HARD_BLOCK_IDENTITY",
+    }
+
+
+def test_new_policy_operations_require_an_authenticated_human():
+    """Each new operation is human-required in HUMAN_GATED and observe-only in
+    SHADOW -- approval is never implicit."""
+    from core.policy_gate import (
+        STATUS_OBSERVE,
+        STATUS_REQUIRES_HUMAN,
+        STATUS_ALLOW,
+        PolicyContext,
+        evaluate,
+    )
+
+    for action in (
+        "rate_limit",
+        "step_up_auth",
+        "account_block_temporary",
+        "account_block_extended",
+        "incident_open",
+    ):
+        def _ctx(mode, approved):
+            return PolicyContext(
+                action=action,
+                actor_id="heart-op",
+                tenant_id="default",
+                resource="subject:anonymous|203.0.113.196",
+                mode=mode,
+                human_approved=approved,
+            )
+
+        assert evaluate(_ctx("SHADOW", False)).status == STATUS_OBSERVE
+        assert evaluate(_ctx("HUMAN_GATED", False)).status == STATUS_REQUIRES_HUMAN
+        assert evaluate(_ctx("HUMAN_GATED", True)).status == STATUS_ALLOW
+
+
+def test_a_forged_single_operation_row_cannot_shortcut_the_assessment(client):
+    """The policy vocabulary now contains operations that share a name with
+    engine actions (rate_limit, step_up_auth, ...). A row that claims the
+    pre-engine single-operation shape must still not be able to present an
+    engine action as one approvable operation, skipping the rest of the plan."""
+    from core.governance.orchestrator import recommendation_for_row
+
+    directory, _, core, heart = _stack()
+    action_id = _stage_planned(
+        heart, "203.0.113.196", ["RATE_LIMIT", "TEMP_BLOCK_IDENTITY"]
+    )
+    _sql(
+        directory,
+        "UPDATE pending_actions SET system_id='heart' WHERE action_id=?",
+        (action_id,),
+    )
+    row = core.get_action(action_id)
+    assessed = recommendation_for_row(row)
+    # Still assessed as the engine plan it is: the account block blocks it.
+    assert assessed["approval"]["available"] is False
+    assert assessed["approval"]["blocking_actions"] == ["TEMP_BLOCK_IDENTITY"]
+
+    _use(heart)
+    assert _recover(client) == 1
+    approve = client.post(
+        f"/actions/{action_id}/approve",
+        headers=_headers(),
+        json={"reason": "reviewed by operator"},
+    )
+    assert approve.status_code == 409, approve.text
+    assert core.get_status(action_id) == ActionStatus.PENDING

@@ -18,6 +18,22 @@ and, later the same day:
 > beneath it. Preserve human authorization, fail-closed behavior, existing
 > durable state, and the prohibition on autonomous execution."
 
+and, on the approval lifecycle:
+
+> "Extend the existing policy vocabulary to represent the engine's rate
+> limiting, step-up authentication, temporary/hard account blocks, and
+> incident creation accurately. Require authenticated, authorized human
+> approval. This does not authorize external enforcement or autonomous
+> execution."
+>
+> "Account/session actions remain inapplicable to anonymous sources. Do not
+> invent accounts, substitute IP operations, silently drop actions, or
+> approve only part of the reviewed recommendation."
+>
+> "Use a durable internal incident record, reusing an existing facility if
+> available. An audit entry alone does not count as an incident. No external
+> incident integration is authorized."
+
 This README records that instruction. It is not itself an approval, and it
 does not replace the owner's review of the change that implements it.
 
@@ -42,13 +58,42 @@ does not replace the owner's review of the change that implements it.
     human principal of the decision in progress.
   - **Principal:** pre-authentication evidence is presented to it as
     `anonymous|<source_ip>`, so distinct sources are not collapsed into one.
-- Only engine actions the policy vocabulary states exactly are approvable
-  (`TEMP_BLOCK_IP`/`HARD_BLOCK_IP` → `network_block`; `QUARANTINE_SESSION` →
-  `quarantine`, for an authenticated principal only). A recommendation is
-  approved as a whole or not at all: if any of its actions has no policy
-  operation (step-up authentication, rate limiting, identity blocks), no valid
-  target, or no integration (incidents), approval is unavailable -- the reasons
-  are shown in the API and dashboard -- and the recommendation can be vetoed.
+- Every engine action is mapped to the policy operation that states ITS
+  meaning, never to a different one:
+
+  | engine action | policy operation |
+  | --- | --- |
+  | `TEMP_BLOCK_IP` / `HARD_BLOCK_IP` | `network_block` |
+  | `RATE_LIMIT` | `rate_limit` |
+  | `STEP_UP_AUTH` | `step_up_auth` |
+  | `TEMP_BLOCK_IDENTITY` | `account_block_temporary` |
+  | `HARD_BLOCK_IDENTITY` | `account_block_extended` |
+  | `QUARANTINE_SESSION` | `quarantine` |
+  | `OPEN_INCIDENT` | `incident_open` |
+
+  Each of these requires an authenticated, authorized human decision in
+  `HUMAN_GATED` and is observe-only in `SHADOW`. None of them authorizes
+  enforcement outside Sentinel-43.
+- **An action that names an account or a session has nothing to act on yet.**
+  The subject a finding carries is `<identity type>|<source address>`: the
+  only trusted producer (the request firewall) reports an `IdentityType`, so
+  the subject names a *class* of caller and an address, never an account. So
+  `STEP_UP_AUTH`, `TEMP_BLOCK_IDENTITY`, `HARD_BLOCK_IDENTITY` and
+  `QUARANTINE_SESSION` are recorded as having no valid target. No account is
+  invented for them and no address operation is substituted.
+- A recommendation is approved as a whole or not at all. If any of its actions
+  has no valid target or no policy operation, approval is unavailable -- the
+  reasons are shown in the API and the dashboard -- and it can still be
+  vetoed. Approving only the supported part would authorize a different set
+  than the reviewer saw.
+- **Incidents.** `OPEN_INCIDENT` opens a durable record in the existing
+  `SentinelCoreStore` (`incidents` table), readable at `GET /incidents` and
+  named on the decision's audit record. It is opened only by an approved
+  decision, it is retracted if that decision cannot be recorded, and it
+  reaches nothing outside this system. Today every engine plan that contains
+  `OPEN_INCIDENT` also quarantines a session and blocks an account, so no real
+  recommendation can reach it until the evidence carries an account
+  identifier -- which is the owner's decision to make, not this code's.
 
 ## What does not run, and why
 

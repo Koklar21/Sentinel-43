@@ -761,6 +761,7 @@ async def _commit_action_status(
     new_status: str,
     reason: str,
     operator: str,
+    incident_id: str | None = None,
 ) -> dict[str, Any]:
     cleaned_id = _validate_action_id(action_id)
 
@@ -783,6 +784,12 @@ async def _commit_action_status(
         action["decision_reason"] = reason
         action["operator"] = operator
         action["decision_at"] = utc_now()
+        if incident_id:
+            # The durable incident this approval opened, so the reviewer can
+            # find the record their decision created.
+            payload = action.get("payload")
+            if isinstance(payload, dict):
+                payload["incident_id"] = incident_id
         return copy.deepcopy(action)
 
 
@@ -838,7 +845,7 @@ async def _resolve_governance_and_commit_action(
         from core.governance import UnauthorizedDecision
 
         try:
-            await asyncio.to_thread(
+            resolution = await asyncio.to_thread(
                 functools.partial(
                     authority.resolve_recommendation,
                     action_id,
@@ -848,6 +855,7 @@ async def _resolve_governance_and_commit_action(
                     principal=principal,
                 )
             )
+            incident_id = str(resolution.get("incident_id") or "") or None
         except KeyError as exc:
             raise HTTPException(
                 status_code=404,
@@ -878,6 +886,7 @@ async def _resolve_governance_and_commit_action(
             ) from exc
 
     else:
+        incident_id = None
         resolved_decision_id = (
             (decision_id or "").strip()
             or str(action.get("payload", {}).get("decision_id") or "").strip()
@@ -969,6 +978,7 @@ async def _resolve_governance_and_commit_action(
         new_status=new_status,
         reason=reason,
         operator=operator,
+        incident_id=incident_id,
     )
 
 
@@ -3017,6 +3027,39 @@ async def dashboard_actions(
 ) -> list[dict[str, Any]]:
     await _require_operator(request)
     return await _list_actions(limit)
+
+
+@root_router.get("/incidents")
+async def dashboard_incidents(
+    request: Request,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Incident records opened by approved recommendations.
+
+    These are internal follow-up records in this system's own durable store.
+    Opening one is the only effect an approval produces, and it produces no
+    effect outside Sentinel-43.
+    """
+    await _require_operator(request)
+
+    authority = runtime.orchestrator
+    store = getattr(authority, "recommendation_store", None) if authority else None
+    if store is None:
+        raise HTTPException(
+            status_code=409,
+            detail="The governance orchestration store is not attached",
+        )
+
+    if not 1 <= int(limit) <= 1000:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 1000")
+
+    incidents = await asyncio.to_thread(
+        functools.partial(store.list_incidents, limit=int(limit))
+    )
+    return {
+        "incidents": [dict(incident) for incident in incidents],
+        "timestamp": utc_now(),
+    }
 
 
 @root_router.get("/vault/stats")

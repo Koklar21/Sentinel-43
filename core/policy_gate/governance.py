@@ -49,6 +49,16 @@ class GovernanceAction(StrEnum):
     SHUTDOWN = "shutdown"
     NETWORK_BLOCK = "network_block"
     PRIVILEGE_ESCALATION = "privilege_escalation"
+    # Each of the following names one distinct response meaning the
+    # orchestration engine produces. They are deliberately separate values:
+    # throttling a subject, demanding a stronger authentication factor and
+    # suspending an account are not network blocks, and recording any of them
+    # as one would misstate what a human approved.
+    RATE_LIMIT = "rate_limit"
+    STEP_UP_AUTH = "step_up_auth"
+    ACCOUNT_BLOCK_TEMPORARY = "account_block_temporary"
+    ACCOUNT_BLOCK_EXTENDED = "account_block_extended"
+    INCIDENT_OPEN = "incident_open"
 
 
 class GovernanceDecisionKind(StrEnum):
@@ -139,6 +149,11 @@ DEFAULT_GOVERNANCE: Final[
             GovernanceAction.ISOLATE,
             GovernanceAction.SHUTDOWN,
             GovernanceAction.NETWORK_BLOCK,
+            GovernanceAction.RATE_LIMIT,
+            GovernanceAction.STEP_UP_AUTH,
+            GovernanceAction.ACCOUNT_BLOCK_TEMPORARY,
+            GovernanceAction.ACCOUNT_BLOCK_EXTENDED,
+            GovernanceAction.INCIDENT_OPEN,
         }
     ),
     allowed_by_mode={
