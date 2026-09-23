@@ -270,3 +270,20 @@ def test_the_shipped_engine_is_the_reviewed_engine():
     )
 
     assert engine_digest(engine_source_path().read_bytes()) == EXPECTED_ENGINE_SHA256
+
+
+def test_the_authority_does_not_hand_out_its_durable_store():
+    """The store's own transition_status has no principal check -- that check
+    lives in the engine's adapter, on the one path a decision may take. So
+    the authority exposes reads, not the store object."""
+    from core.governance.orchestrator import SystemOrchestrator
+
+    assert not hasattr(SystemOrchestrator, "recommendation_store")
+    assert hasattr(SystemOrchestrator, "list_incidents")
+
+    # No module reads the store off the authority as an attribute.
+    tree = ast.parse((CORE / "api" / "main.py").read_text(encoding="utf-8"))
+    attributes = {
+        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+    }
+    assert "recommendation_store" not in attributes

@@ -3062,8 +3062,7 @@ async def dashboard_incidents(
     await _require_operator(request)
 
     authority = runtime.orchestrator
-    store = getattr(authority, "recommendation_store", None) if authority else None
-    if store is None:
+    if authority is None or not authority.recommendation_store_attached:
         raise HTTPException(
             status_code=409,
             detail="The governance orchestration store is not attached",
@@ -3072,8 +3071,9 @@ async def dashboard_incidents(
     if not 1 <= int(limit) <= 1000:
         raise HTTPException(status_code=422, detail="limit must be between 1 and 1000")
 
+    # Through the authority's read accessor, never the store object itself.
     incidents = await asyncio.to_thread(
-        functools.partial(store.list_incidents, limit=int(limit))
+        functools.partial(authority.list_incidents, limit=int(limit))
     )
     return {
         "incidents": [dict(incident) for incident in incidents],
