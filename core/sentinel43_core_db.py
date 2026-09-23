@@ -251,6 +251,117 @@ class SentinelCoreStore:
 
                 CREATE INDEX IF NOT EXISTS idx_incident_opened
                     ON incidents(opened_at_ms);
+
+                -- Evidence: what a producer reported, with the provenance it
+                -- arrived with. Storing a record says nothing about whether
+                -- it may COUNT: that is `state`, and only ELIGIBLE and
+                -- HUMAN_RELEASED count (see core/evidence/model.py).
+                CREATE TABLE IF NOT EXISTS evidence (
+                    evidence_id TEXT PRIMARY KEY,
+                    producer TEXT NOT NULL,
+                    producer_trust TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    observed_at_ms INTEGER NOT NULL,
+                    ingested_at_ms INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    subject_type TEXT NOT NULL DEFAULT '',
+                    subject_value TEXT NOT NULL DEFAULT '',
+                    account_id TEXT NOT NULL DEFAULT '',
+                    session_id TEXT NOT NULL DEFAULT '',
+                    device_id TEXT NOT NULL DEFAULT '',
+                    source_ip TEXT NOT NULL DEFAULT '',
+                    correlation_id TEXT NOT NULL DEFAULT '',
+                    source_event_id TEXT NOT NULL DEFAULT '',
+                    expires_at_ms INTEGER NOT NULL DEFAULT 0,
+                    state TEXT NOT NULL,
+                    lock_reason TEXT NOT NULL DEFAULT '',
+                    version INTEGER NOT NULL DEFAULT 1,
+                    CHECK (state IN (
+                        'OBSERVED', 'VERIFIED', 'ELIGIBLE', 'LOCKED',
+                        'HUMAN_RELEASED', 'REJECTED', 'EXPIRED', 'INVALIDATED'
+                    )),
+                    CHECK (version >= 1),
+                    CHECK (observed_at_ms >= 0 AND ingested_at_ms >= 0)
+                );
+
+                -- One producer reporting the same underlying fact twice is
+                -- ONE piece of evidence: the unique constraint is what stops
+                -- a replay from multiplying confidence.
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_evidence_dedupe
+                    ON evidence(producer, content_hash);
+
+                CREATE INDEX IF NOT EXISTS idx_evidence_state
+                    ON evidence(state);
+
+                CREATE INDEX IF NOT EXISTS idx_evidence_subject
+                    ON evidence(subject_value, observed_at_ms);
+
+                CREATE INDEX IF NOT EXISTS idx_evidence_correlation
+                    ON evidence(correlation_id);
+
+                -- Relationships. The child cannot be eligible while a
+                -- relationship marked required is unverified, so this table
+                -- is what keeps "B supports A" from being an assumption.
+                CREATE TABLE IF NOT EXISTS evidence_relationships (
+                    relationship_id TEXT PRIMARY KEY,
+                    parent_evidence_id TEXT NOT NULL
+                        REFERENCES evidence(evidence_id) ON DELETE CASCADE,
+                    child_evidence_id TEXT NOT NULL
+                        REFERENCES evidence(evidence_id) ON DELETE CASCADE,
+                    relationship_type TEXT NOT NULL,
+                    required_for_eligibility INTEGER NOT NULL DEFAULT 0,
+                    state TEXT NOT NULL,
+                    verification_method TEXT NOT NULL DEFAULT '',
+                    created_at_ms INTEGER NOT NULL,
+                    verified_at_ms INTEGER NOT NULL DEFAULT 0,
+                    invalidated_reason TEXT NOT NULL DEFAULT '',
+                    CHECK (parent_evidence_id <> child_evidence_id),
+                    CHECK (state IN (
+                        'PROPOSED', 'VERIFIED', 'REFUTED', 'INVALIDATED'
+                    ))
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_relationship_unique
+                    ON evidence_relationships(
+                        parent_evidence_id, child_evidence_id, relationship_type
+                    );
+
+                CREATE INDEX IF NOT EXISTS idx_relationship_child
+                    ON evidence_relationships(child_evidence_id);
+
+                CREATE INDEX IF NOT EXISTS idx_relationship_parent
+                    ON evidence_relationships(parent_evidence_id);
+
+                -- Human decisions ABOUT EVIDENCE. Deliberately separate from
+                -- pending_actions, which holds human decisions about
+                -- RESPONSE ACTIONS: releasing evidence is not approving a
+                -- response, and the two must never be read as one another.
+                CREATE TABLE IF NOT EXISTS evidence_reviews (
+                    review_id TEXT PRIMARY KEY,
+                    evidence_id TEXT NOT NULL
+                        REFERENCES evidence(evidence_id) ON DELETE CASCADE,
+                    -- The exact version the human saw. A later change bumps
+                    -- the version, so a stale decision cannot be replayed
+                    -- onto a record that has since changed.
+                    evidence_version INTEGER NOT NULL,
+                    disposition TEXT NOT NULL,
+                    operator_id TEXT NOT NULL,
+                    identity_type TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    decided_at_ms INTEGER NOT NULL,
+                    -- The lock the record carried WHEN it was reviewed. A
+                    -- release does not rewrite history.
+                    prior_state TEXT NOT NULL,
+                    prior_lock_reason TEXT NOT NULL DEFAULT '',
+                    CHECK (disposition IN ('RELEASED', 'REJECTED', 'HELD')),
+                    CHECK (evidence_version >= 1)
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_review_version
+                    ON evidence_reviews(evidence_id, evidence_version, disposition);
+
+                CREATE INDEX IF NOT EXISTS idx_review_evidence
+                    ON evidence_reviews(evidence_id, decided_at_ms);
                 """
             )
 
@@ -784,6 +895,394 @@ class SentinelCoreStore:
             ) from exc
 
         return MappingProxyType(item)
+
+    # -- evidence -----------------------------------------------------------
+    #
+    # Storage only. These methods record what was observed, what it is
+    # related to, and the eligibility the RULES (core/evidence/model.py)
+    # computed -- they never decide a response action, and nothing here is
+    # consulted about what should be done.
+    @staticmethod
+    def _evidence_row(row: sqlite3.Row) -> Mapping[str, Any]:
+        return MappingProxyType(dict(row))
+
+    def record_evidence(
+        self,
+        *,
+        evidence_id: str,
+        producer: str,
+        producer_trust: str,
+        event_type: str,
+        observed_at_ms: int,
+        ingested_at_ms: int,
+        content_hash: str,
+        state: str,
+        lock_reason: str = "",
+        subject_type: str = "",
+        subject_value: str = "",
+        account_id: str = "",
+        session_id: str = "",
+        device_id: str = "",
+        source_ip: str = "",
+        correlation_id: str = "",
+        source_event_id: str = "",
+        expires_at_ms: int = 0,
+        connection: sqlite3.Connection | None = None,
+    ) -> str | None:
+        """Store one evidence record, or return the id of the record that
+        already holds this producer's report of this fact.
+
+        The unique index on (producer, content_hash) is what makes a replay
+        a no-op instead of a second, confidence-multiplying record.
+        """
+        owns_connection = connection is None
+        connection = connection or self._connect()
+
+        try:
+            connection.execute(
+                """
+                INSERT INTO evidence (
+                    evidence_id, producer, producer_trust, event_type,
+                    observed_at_ms, ingested_at_ms, content_hash,
+                    subject_type, subject_value, account_id, session_id,
+                    device_id, source_ip, correlation_id, source_event_id,
+                    expires_at_ms, state, lock_reason, version
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    str(evidence_id), str(producer), str(producer_trust),
+                    str(event_type), int(observed_at_ms), int(ingested_at_ms),
+                    str(content_hash), str(subject_type), str(subject_value),
+                    str(account_id), str(session_id), str(device_id),
+                    str(source_ip), str(correlation_id), str(source_event_id),
+                    int(expires_at_ms), str(state), str(lock_reason),
+                ),
+            )
+            if owns_connection:
+                connection.commit()
+            return str(evidence_id)
+
+        except sqlite3.IntegrityError:
+            if owns_connection:
+                connection.rollback()
+            existing = (connection if not owns_connection else connection).execute(
+                "SELECT evidence_id FROM evidence "
+                "WHERE producer = ? AND content_hash = ?",
+                (str(producer), str(content_hash)),
+            ).fetchone()
+            return str(existing["evidence_id"]) if existing else None
+
+        finally:
+            if owns_connection:
+                connection.close()
+
+    def record_relationship(
+        self,
+        *,
+        relationship_id: str,
+        parent_evidence_id: str,
+        child_evidence_id: str,
+        relationship_type: str,
+        required_for_eligibility: bool,
+        state: str,
+        verification_method: str = "",
+        created_at_ms: int,
+        verified_at_ms: int = 0,
+        connection: sqlite3.Connection | None = None,
+    ) -> bool:
+        """Record a claimed link. False when this exact link already exists."""
+        owns_connection = connection is None
+        connection = connection or self._connect()
+
+        try:
+            connection.execute(
+                """
+                INSERT INTO evidence_relationships (
+                    relationship_id, parent_evidence_id, child_evidence_id,
+                    relationship_type, required_for_eligibility, state,
+                    verification_method, created_at_ms, verified_at_ms
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(relationship_id), str(parent_evidence_id),
+                    str(child_evidence_id), str(relationship_type),
+                    1 if required_for_eligibility else 0, str(state),
+                    str(verification_method), int(created_at_ms),
+                    int(verified_at_ms),
+                ),
+            )
+            if owns_connection:
+                connection.commit()
+            return True
+
+        except sqlite3.IntegrityError:
+            if owns_connection:
+                connection.rollback()
+            return False
+
+        finally:
+            if owns_connection:
+                connection.close()
+
+    def get_evidence(self, evidence_id: str) -> Mapping[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM evidence WHERE evidence_id = ?",
+                (str(evidence_id).strip(),),
+            ).fetchone()
+        return self._evidence_row(row) if row is not None else None
+
+    def relationships_of(
+        self, child_evidence_id: str
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Every link where this record is the DEPENDENT one."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM evidence_relationships WHERE child_evidence_id = ?",
+                (str(child_evidence_id).strip(),),
+            ).fetchall()
+        return tuple(MappingProxyType(dict(row)) for row in rows)
+
+    def corroborations_of(
+        self, evidence_id: str
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Verified CORROBORATES links touching this record, in EITHER
+        direction.
+
+        "A corroborates B" and "B corroborates A" are the same fact; the row
+        has to be stored one way round, so the read looks both ways rather
+        than requiring two rows that could drift apart.
+        """
+        identifier = str(evidence_id).strip()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM evidence_relationships
+                WHERE relationship_type = 'CORROBORATES'
+                  AND state = 'VERIFIED'
+                  AND (parent_evidence_id = ? OR child_evidence_id = ?)
+                """,
+                (identifier, identifier),
+            ).fetchall()
+        return tuple(MappingProxyType(dict(row)) for row in rows)
+
+    def dependents_of(self, parent_evidence_id: str) -> tuple[str, ...]:
+        """Ids that depend on this record, for propagation."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT child_evidence_id FROM evidence_relationships "
+                "WHERE parent_evidence_id = ?",
+                (str(parent_evidence_id).strip(),),
+            ).fetchall()
+        return tuple(str(row["child_evidence_id"]) for row in rows)
+
+    def dependency_edges(self) -> dict[str, tuple[str, ...]]:
+        """parent -> children, for a bounded traversal of the whole graph."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT parent_evidence_id, child_evidence_id "
+                "FROM evidence_relationships"
+            ).fetchall()
+
+        edges: dict[str, list[str]] = {}
+        for row in rows:
+            edges.setdefault(str(row["parent_evidence_id"]), []).append(
+                str(row["child_evidence_id"])
+            )
+        return {parent: tuple(children) for parent, children in edges.items()}
+
+    def set_evidence_state(
+        self,
+        evidence_id: str,
+        *,
+        expected_version: int,
+        state: str,
+        lock_reason: str = "",
+        connection: sqlite3.Connection | None = None,
+    ) -> bool:
+        """Compare-and-set one record's eligibility, bumping its version.
+
+        Version-guarded, so two concurrent ingestion passes cannot leave
+        contradictory eligibility: the loser sees False and re-reads.
+        """
+        owns_connection = connection is None
+        connection = connection or self._connect()
+
+        try:
+            cursor = connection.execute(
+                """
+                UPDATE evidence
+                SET state = ?, lock_reason = ?, version = version + 1
+                WHERE evidence_id = ? AND version = ?
+                """,
+                (
+                    str(state), str(lock_reason), str(evidence_id).strip(),
+                    int(expected_version),
+                ),
+            )
+            if owns_connection:
+                connection.commit()
+            return int(cursor.rowcount or 0) == 1
+
+        except Exception:
+            if owns_connection:
+                connection.rollback()
+            raise
+
+        finally:
+            if owns_connection:
+                connection.close()
+
+    def invalidate_relationship(
+        self, relationship_id: str, *, reason: str
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE evidence_relationships
+                SET state = 'INVALIDATED', invalidated_reason = ?
+                WHERE relationship_id = ? AND state <> 'INVALIDATED'
+                """,
+                (str(reason), str(relationship_id).strip()),
+            )
+            return int(cursor.rowcount or 0) == 1
+
+    def record_evidence_review(
+        self,
+        *,
+        review_id: str,
+        evidence_id: str,
+        evidence_version: int,
+        disposition: str,
+        operator_id: str,
+        identity_type: str,
+        reason: str,
+        decided_at_ms: int,
+        new_state: str,
+        new_lock_reason: str = "",
+    ) -> bool:
+        """Record one human decision about evidence AND apply it, atomically.
+
+        Both happen in one transaction: a disposition that cannot be durably
+        recorded must not change what the system will count. The review row
+        keeps the state and lock the record carried when the human saw it, so
+        a release never rewrites the history it was granted against.
+
+        Returns False when the record changed since the human reviewed it --
+        the decision is refused rather than applied to something else.
+        """
+        connection = self._connect()
+
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT state, lock_reason, version FROM evidence "
+                "WHERE evidence_id = ?",
+                (str(evidence_id).strip(),),
+            ).fetchone()
+
+            if row is None or int(row["version"]) != int(evidence_version):
+                connection.rollback()
+                return False
+
+            connection.execute(
+                """
+                INSERT INTO evidence_reviews (
+                    review_id, evidence_id, evidence_version, disposition,
+                    operator_id, identity_type, reason, decided_at_ms,
+                    prior_state, prior_lock_reason
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(review_id), str(evidence_id).strip(),
+                    int(evidence_version), str(disposition), str(operator_id),
+                    str(identity_type), str(reason), int(decided_at_ms),
+                    str(row["state"]), str(row["lock_reason"]),
+                ),
+            )
+
+            cursor = connection.execute(
+                """
+                UPDATE evidence
+                SET state = ?, lock_reason = ?, version = version + 1
+                WHERE evidence_id = ? AND version = ?
+                """,
+                (
+                    str(new_state), str(new_lock_reason),
+                    str(evidence_id).strip(), int(evidence_version),
+                ),
+            )
+            if int(cursor.rowcount or 0) != 1:
+                connection.rollback()
+                return False
+
+            connection.commit()
+            return True
+
+        except Exception:
+            connection.rollback()
+            raise
+
+        finally:
+            connection.close()
+
+    def reviews_of(self, evidence_id: str) -> tuple[Mapping[str, Any], ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM evidence_reviews WHERE evidence_id = ? "
+                "ORDER BY decided_at_ms ASC",
+                (str(evidence_id).strip(),),
+            ).fetchall()
+        return tuple(MappingProxyType(dict(row)) for row in rows)
+
+    def list_evidence(
+        self,
+        *,
+        state: str | None = None,
+        subject_value: str | None = None,
+        limit: int = 200,
+    ) -> tuple[Mapping[str, Any], ...]:
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise TypeError("limit must be an integer")
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if state is not None:
+            clauses.append("state = ?")
+            params.append(str(state))
+        if subject_value is not None:
+            clauses.append("subject_value = ?")
+            params.append(str(subject_value))
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM evidence {where} "
+                "ORDER BY observed_at_ms DESC LIMIT ?",
+                tuple(params),
+            ).fetchall()
+
+        return tuple(self._evidence_row(row) for row in rows)
+
+    def count_evidence(self, *, state: str | None = None) -> int:
+        with self._connect() as connection:
+            if state is None:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS n FROM evidence"
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS n FROM evidence WHERE state = ?",
+                    (str(state),),
+                ).fetchone()
+        return int(row["n"]) if row is not None else 0
 
     def cleanup_terminal_actions(
         self,
