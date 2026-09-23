@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import hashlib
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -52,14 +51,15 @@ def test_the_pin_matches_the_engine_as_git_stores_it():
     The digest must be a property of the repository's content, so every
     checkout -- CI's LF, a Windows CRLF working copy, the container image --
     agrees on which engine is authorised.
+
+    Computed, not shelled out to git: git stores this file with LF (it is
+    marked ``-text`` in .gitattributes), so normalising the working copy to
+    LF reproduces the stored bytes exactly. That keeps the check available
+    everywhere the suite runs -- including inside the built image, which has
+    no git binary and no work tree.
     """
-    stored = subprocess.run(
-        ["git", "show", "HEAD:Sentinel-43/Shadow_mode.py"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        check=True,
-    ).stdout
-    assert engine_digest(stored) == EXPECTED_ENGINE_SHA256
+    as_git_stores_it = _engine_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    assert hashlib.sha256(as_git_stores_it).hexdigest() == EXPECTED_ENGINE_SHA256
 
 
 @pytest.mark.parametrize("newline", [b"\n", b"\r\n", b"\r"])
