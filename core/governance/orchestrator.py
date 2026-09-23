@@ -552,6 +552,10 @@ class SystemOrchestrator:
         self._budget_window_seconds = OVERSIGHT_BUDGET_WINDOW_SECONDS
         self._budget_max_per_target = OVERSIGHT_BUDGET_MAX_PER_TARGET
         self._engine: Any | None = None
+        #: Optional evidence ledger. When attached, the authority checks for
+        #: itself that a recommendation rests on evidence that is allowed to
+        #: count, instead of trusting the reporter's own claim.
+        self._evidence_ledger: Any | None = None
 
     @staticmethod
     def _normalize_mode(
@@ -1462,6 +1466,64 @@ class SystemOrchestrator:
             }
         )
 
+    def attach_evidence_ledger(self, ledger: Any) -> None:
+        """Let the authority check evidence eligibility for itself.
+
+        The ledger decides what may COUNT; the authority still decides what
+        is DONE. Attaching one narrows what the authority will act on -- it
+        never widens it, and it never moves a decision into the ledger.
+        """
+        with self._recommendation_lock:
+            self._evidence_ledger = ledger
+
+    def detach_evidence_ledger(self) -> None:
+        with self._recommendation_lock:
+            self._evidence_ledger = None
+
+    @property
+    def evidence_ledger_attached(self) -> bool:
+        return self._evidence_ledger is not None
+
+    def _evidence_gate(
+        self, subject_key: str
+    ) -> tuple[bool, dict[str, Any]]:
+        """May a recommendation about this subject be staged, and on what?
+
+        Returns (permitted, context). The context always keeps countable and
+        held evidence in SEPARATE keys: an operator, and this code, can tell
+        which is which, and held records can never be mistaken for support.
+        """
+        ledger = self._evidence_ledger
+        if ledger is None:
+            # No ledger attached: eligibility is not being enforced here, and
+            # the context says so rather than implying evidence was checked.
+            return True, {"evidence_gate": "not_enforced"}
+
+        bundle = ledger.bundle_for_subject(subject_key)
+        context: dict[str, Any] = {
+            "evidence_gate": "enforced",
+            "eligible_evidence": [
+                {
+                    "evidence_id": record.evidence_id,
+                    "producer": record.producer,
+                    "event_type": record.event_type,
+                    "state": str(record.state),
+                    # Kept visible: an operator must be able to see when
+                    # something counts because a person said so.
+                    "released_by_a_human": record.released_by_a_human,
+                }
+                for record in bundle.eligible
+            ],
+            "eligible_producers": sorted(bundle.independent_producers),
+            # Context only. Never merged into the list above, and never
+            # counted toward anything.
+            "locked_evidence": bundle.context_for_operator(),
+        }
+
+        if not bundle.eligible:
+            return False, context
+        return True, context
+
     def detach_recommendation_store(self) -> None:
         with self._recommendation_lock:
             engine = self._engine
@@ -1590,6 +1652,33 @@ class SystemOrchestrator:
             )
             return RecommendationOutcome(status="OBSERVED", reason="INVALID_SUBJECT")
 
+        # Evidence eligibility, checked here rather than taken on trust from
+        # the reporter. A recommendation that rests only on evidence the
+        # ledger is holding is observed, not staged: locked evidence must
+        # not create a recommendation, and a reporter that miscounts its own
+        # support cannot make one appear.
+        evidence_permitted, evidence_context = self._evidence_gate(
+            recommendation.subject_key
+        )
+        if not evidence_permitted:
+            self._append_audit(
+                self._recommendation_record(
+                    recommendation,
+                    decision="OBSERVED",
+                    reason_code="EVIDENCE_NOT_ELIGIBLE",
+                    extra=evidence_context,
+                )
+            )
+            logger.warning(
+                "Recommendation for %s not staged: no evidence about this "
+                "subject is eligible to influence a decision (%d record(s) held)",
+                recommendation.subject_key,
+                len(evidence_context.get("locked_evidence", ())),
+            )
+            return RecommendationOutcome(
+                status="OBSERVED", reason="EVIDENCE_NOT_ELIGIBLE"
+            )
+
         principal = principal_of_assessment(assessment)
         plan = engine.plan(assessment)
         assessed = assess_actions(
@@ -1607,6 +1696,9 @@ class SystemOrchestrator:
             "engine_plan": plan["summary"],
             "operations": operations,
             "unsupported_actions": unsupported,
+            # What this recommendation was allowed to rest on, and -- in its
+            # own key -- what is being held back and why.
+            **evidence_context,
             "principal": principal,
             "recommendation": {
                 "items": assessed["items"],

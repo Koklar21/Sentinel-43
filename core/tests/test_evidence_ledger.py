@@ -579,3 +579,259 @@ def test_the_bundle_keeps_countable_and_held_evidence_apart():
 def test_content_hash_is_stable_across_key_order():
     assert content_hash({"a": 1, "b": 2}) == content_hash({"b": 2, "a": 1})
     assert content_hash({"a": 1}) != content_hash({"a": 2})
+
+
+# ---------------------------------------------------------------------------
+# What the decision authority is allowed to act on
+#
+# The authority stays the sole decision-maker. Attaching a ledger narrows
+# what it will act on; it never moves a decision into the ledger.
+# ---------------------------------------------------------------------------
+def _authority_stack():
+    """The production governance composition, plus an evidence ledger."""
+    from core.audit import AuditConfig, AuditStore
+    from core.governance import (
+        build_heart_from_settings,
+        build_orchestrator_from_settings,
+    )
+
+    directory = Path(tempfile.mkdtemp(prefix="s43-evidence-auth-"))
+    audit = AuditStore(
+        AuditConfig(sqlite_path=directory / "audit.sqlite3", signing_key="k" * 48)
+    )
+    audit.initialize()
+    store = SentinelCoreStore(CoreStoreConfig(db_path=directory / "heart.sqlite3"))
+    store.initialize()
+
+    class GovernanceSettings:
+        default_mode = "HUMAN_GATED"
+
+    authority = build_orchestrator_from_settings(
+        GovernanceSettings(), audit_store=audit
+    )
+
+    class Settings:
+        default_mode = "HUMAN_GATED"
+        velocity_window_seconds = 60
+        velocity_limit = 100_000
+        dedupe_ttl_seconds = 300
+        corroboration_window_seconds = 300
+        corroboration_min_signals_for_high = 2
+
+    heart = build_heart_from_settings(
+        Settings(),
+        audit_store=audit,
+        core_store=store,
+        authority=authority,
+        operator_authenticator=lambda principal: bool(
+            getattr(principal, "is_human", False)
+        ),
+    )
+    ledger = EvidenceLedger(
+        store,
+        operator_authenticator=lambda principal: bool(
+            getattr(principal, "is_human", False)
+        ),
+        audit_sink=authority._append_audit,  # noqa: SLF001
+    )
+    return directory, audit, store, heart, authority, ledger
+
+
+def _assessment(subject_ip: str = "203.0.113.50"):
+    from core.detection.sentinel_threat_types import (
+        ThreatAssessment,
+        ThreatKind,
+        ThreatSeverity,
+        ThreatSourceKind,
+    )
+
+    return ThreatAssessment(
+        identity="anonymous",
+        source_ip=subject_ip,
+        threat_kind=ThreatKind.DATA_EXFILTRATION,
+        severity=ThreatSeverity.HIGH,
+        source_kind=ThreatSourceKind.MIXED_OR_UNKNOWN,
+        score=50.0,
+        indicators={"evidence_seq": 1, "evidence_sources": ["firewall", "sparta"]},
+        supporting_tags=["t"],
+        window_size=5,
+    )
+
+
+def _ingest_for(ledger, subject, **overrides):
+    params = {
+        "producer": "firewall",
+        "producer_trust": ProducerTrust.TRUSTED,
+        "event_type": "auth_failure",
+        "payload": {"n": overrides.pop("n", 1)},
+        "subject_value": subject,
+    }
+    params.update(overrides)
+    return ledger.ingest(**params)
+
+
+def test_locked_evidence_cannot_create_a_recommendation():
+    """The subject has evidence, but all of it is held. Nothing is staged,
+    and the recorded reason says exactly that."""
+    _, audit, store, heart, authority, ledger = _authority_stack()
+    subject = "anonymous|203.0.113.50"
+
+    parent, _ = _ingest_for(ledger, subject, account_id="acct-1")
+    _ingest_for(
+        ledger, subject, producer="sparta", event_type="token_use", n=2,
+        account_id="acct-OTHER", depends_on=(parent,),
+    )
+    ledger.invalidate(parent, reason="producer compromised")
+
+    authority.attach_evidence_ledger(ledger)
+    decision = heart.observe(_assessment())
+
+    assert decision.status == "OBSERVED"
+    assert decision.reason == "EVIDENCE_NOT_ELIGIBLE"
+    assert store.count_actions() == 0
+
+    record = [
+        r
+        for r in audit.get_records(component="heart", limit=200)
+        if r.get("reason_code") == "EVIDENCE_NOT_ELIGIBLE"
+    ][-1]
+    assert record["evidence_gate"] == "enforced"
+    assert record["eligible_evidence"] == []
+    # Held evidence is still SHOWN -- it simply cannot be acted on.
+    assert record["locked_evidence"]
+    assert record["locked_evidence"][0]["lock_reason"]
+
+
+def test_eligible_evidence_reaches_the_orchestration_authority():
+    _, audit, store, heart, authority, ledger = _authority_stack()
+    subject = "anonymous|203.0.113.51"
+
+    _ingest_for(ledger, subject)
+    authority.attach_evidence_ledger(ledger)
+
+    decision = heart.observe(_assessment("203.0.113.51"))
+    assert decision.status == "STAGED", decision
+    assert store.count_actions() == 1
+
+    staged = audit.get_records(component="heart", correlation_id=decision.action_id)[0]
+    assert staged["evidence_gate"] == "enforced"
+    assert staged["eligible_producers"] == ["firewall"]
+    assert staged["locked_evidence"] == []
+
+
+def test_eligible_and_locked_evidence_are_never_flattened_together():
+    _, audit, store, heart, authority, ledger = _authority_stack()
+    subject = "anonymous|203.0.113.52"
+
+    _ingest_for(ledger, subject)
+    parent, _ = _ingest_for(ledger, subject, n=9, account_id="acct-1")
+    _ingest_for(
+        ledger, subject, producer="sparta", event_type="token_use", n=2,
+        account_id="acct-OTHER", depends_on=(parent,),
+    )
+    authority.attach_evidence_ledger(ledger)
+
+    decision = heart.observe(_assessment("203.0.113.52"))
+    assert decision.status == "STAGED", decision
+
+    staged = audit.get_records(component="heart", correlation_id=decision.action_id)[0]
+    eligible_ids = {row["evidence_id"] for row in staged["eligible_evidence"]}
+    locked_ids = {row["evidence_id"] for row in staged["locked_evidence"]}
+
+    assert eligible_ids and locked_ids
+    assert eligible_ids & locked_ids == set()
+    # The held record contributed nothing to what may count.
+    assert "sparta" not in staged["eligible_producers"]
+
+
+def test_a_human_released_record_is_marked_as_such_for_the_operator():
+    """The authority can tell an operator that something counts because a
+    person decided it, not because provenance proved it."""
+    _, audit, store, heart, authority, ledger = _authority_stack()
+    subject = "anonymous|203.0.113.53"
+
+    parent, _ = _ingest_for(ledger, subject, account_id="acct-1")
+    held, _ = _ingest_for(
+        ledger, subject, producer="sparta", event_type="token_use", n=2,
+        account_id="acct-OTHER", depends_on=(parent,),
+    )
+    ledger.review(
+        held,
+        disposition="RELEASED",
+        operator_id="evidence-op",
+        principal=_principal(),
+        reason="confirmed out of band",
+        expected_version=ledger.get(held).version,
+    )
+
+    authority.attach_evidence_ledger(ledger)
+    decision = heart.observe(_assessment("203.0.113.53"))
+    assert decision.status == "STAGED", decision
+
+    staged = audit.get_records(component="heart", correlation_id=decision.action_id)[0]
+    released = [
+        row for row in staged["eligible_evidence"] if row["released_by_a_human"]
+    ]
+    assert len(released) == 1
+    assert released[0]["evidence_id"] == held
+
+
+def test_releasing_evidence_is_not_approving_a_response():
+    """An evidence decision never authorizes an action: it is stored in its
+    own table, audited as not authorizing, and leaves the recommendation
+    awaiting a separate human decision."""
+    from core.sentinel43_core_db import ActionStatus
+
+    _, audit, store, heart, authority, ledger = _authority_stack()
+    subject = "anonymous|203.0.113.54"
+
+    # Untrusted producer: retained, not countable, until a human says so.
+    evidence_id, _ = _ingest_for(
+        ledger, subject, producer_trust=ProducerTrust.OBSERVED_ONLY
+    )
+    assert ledger.get(evidence_id).counts_toward_decisions is False
+
+    result = ledger.review(
+        evidence_id,
+        disposition="RELEASED",
+        operator_id="evidence-op",
+        principal=_principal(),
+        reason="trusted this one report",
+        expected_version=ledger.get(evidence_id).version,
+    )
+    assert result["authorizes_response_action"] is False
+
+    authority.attach_evidence_ledger(ledger)
+    decision = heart.observe(_assessment("203.0.113.54"))
+    assert decision.status == "STAGED", decision
+
+    # The recommendation still needs its OWN human decision.
+    assert store.get_status(decision.action_id) == ActionStatus.PENDING
+    reviews = store.reviews_of(evidence_id)
+    assert len(reviews) == 1
+    assert reviews[0]["disposition"] == "RELEASED"
+
+
+def test_the_ledger_never_stages_or_resolves_anything():
+    """Structural: the evidence layer holds no decision verb."""
+    import ast
+
+    source = (
+        Path(__file__).resolve().parents[1] / "evidence" / "ledger.py"
+    ).read_text(encoding="utf-8")
+    called = {
+        node.func.attr
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    forbidden = {
+        "stage_recommendation",
+        "resolve_recommendation",
+        "insert_pending",
+        "transition_status",
+        "approve_action",
+        "veto_action",
+        "plan_response",
+        "stage_directive",
+    }
+    assert called & forbidden == set()
