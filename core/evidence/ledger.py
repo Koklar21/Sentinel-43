@@ -186,18 +186,23 @@ class EvidenceLedger:
                 self._propagate_from(str(row["evidence_id"]))
             return len(rows)
 
-    def _current_trust(self, record: EvidenceRecord) -> ProducerTrust:
-        """The producer's standing NOW, not what was believed at ingestion.
+    def _current_trust(self, record: EvidenceRecord) -> ProducerTrust | None:
+        """The producer's standing NOW, per the durable registry -- never
+        the ingestion-time snapshot, which is retained on the record for
+        historical/forensic purposes only and has no say in eligibility.
 
-        The registry, when it has an entry, always wins: that is what makes
-        revocation take effect on already-stored evidence without rewriting
-        it. A producer never registered keeps its ingestion-time snapshot --
-        unchanged behaviour for callers that do not use the registry.
+        The registry is the SOLE current-trust authority: a producer that
+        is not in it is not trusted, whatever a caller claimed at ingestion
+        (a caller that could grant trust merely by asserting it would be
+        exactly the self-declared trust this system exists to refuse).
+        ``None`` means unregistered, which ``evaluate_eligibility`` reads as
+        LEGACY_UNVERIFIED -- distinct from a producer that WAS registered
+        and found wanting (PRODUCER_TRUST_INSUFFICIENT).
         """
         registered = self._store.get_producer_trust(record.producer)
-        if registered is not None:
-            return ProducerTrust(str(registered["trust"]))
-        return record.producer_trust
+        if registered is None:
+            return None
+        return ProducerTrust(str(registered["trust"]))
 
     def _relationship(self, row: Mapping[str, Any]) -> EvidenceRelationship:
         return EvidenceRelationship(

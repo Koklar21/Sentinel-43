@@ -42,6 +42,21 @@ from core.evidence.model import (
 from core.sentinel43_core_db import CoreStoreConfig, SentinelCoreStore
 
 
+#: Registered TRUSTED in every fixture below, matching what most tests here
+#: actually exercise (eligibility RULES, not registry plumbing). Tests that
+#: specifically need an unregistered/demoted/revoked producer register or
+#: deregister explicitly, in the test body, against a DIFFERENT producer
+#: name -- never against these two.
+_DEFAULT_TRUSTED_PRODUCERS = ("firewall", "sparta", "identity-provider", "root-detector")
+
+
+def _trust_default_producers(ledger: EvidenceLedger) -> None:
+    for name in _DEFAULT_TRUSTED_PRODUCERS:
+        ledger.register_producer(
+            name, trust=ProducerTrust.TRUSTED, updated_by="test-fixture"
+        )
+
+
 def _stack(required_producers: int = 1):
     directory = Path(tempfile.mkdtemp(prefix="s43-evidence-"))
     store = SentinelCoreStore(CoreStoreConfig(db_path=directory / "heart.sqlite3"))
@@ -55,6 +70,7 @@ def _stack(required_producers: int = 1):
         audit_sink=audit.append,
         required_producers=required_producers,
     )
+    _trust_default_producers(ledger)
     return directory, store, ledger, audit
 
 
@@ -293,10 +309,13 @@ def test_a_stale_parent_holds_its_dependent():
 # ---------------------------------------------------------------------------
 # Producer trust
 # ---------------------------------------------------------------------------
-def test_an_untrusted_producer_reports_but_does_not_count():
+def test_a_registered_but_downgraded_producer_reports_but_does_not_count():
     _, store, ledger, _ = _stack()
+    ledger.register_producer(
+        "limited-source", trust=ProducerTrust.OBSERVED_ONLY, updated_by="ops"
+    )
     evidence_id, outcome = _ingest(
-        ledger, producer="unregistered", producer_trust=ProducerTrust.OBSERVED_ONLY
+        ledger, producer="limited-source", producer_trust=ProducerTrust.OBSERVED_ONLY
     )
     assert outcome.state is EvidenceState.LOCKED
     assert outcome.lock_reason == LockReason.PRODUCER_TRUST_INSUFFICIENT
@@ -304,9 +323,36 @@ def test_an_untrusted_producer_reports_but_does_not_count():
     assert store.get_evidence(evidence_id) is not None
 
 
-def test_a_demoted_producer_loses_its_standing_on_recompute():
-    """A producer proven compromised later must not leave its evidence
-    counting."""
+def test_an_unregistered_producer_cannot_grant_itself_trust_by_claiming_it():
+    """The exact bypass this registry exists to refuse: a caller-supplied
+    producer_trust=TRUSTED must not make an unregistered producer count.
+    Only the durable registry may say a producer is trusted."""
+    _, store, ledger, _ = _stack()
+    evidence_id, outcome = _ingest(
+        ledger, producer="self-declared-trusted", producer_trust=ProducerTrust.TRUSTED
+    )
+    assert outcome.state is EvidenceState.LOCKED
+    assert outcome.lock_reason == LockReason.LEGACY_UNVERIFIED
+    assert ledger.get(evidence_id).counts_toward_decisions is False
+    # Retained and auditable, not discarded.
+    assert store.get_evidence(evidence_id) is not None
+    # The snapshot the caller supplied is kept for forensics...
+    assert store.get_evidence(evidence_id)["producer_trust"] == "TRUSTED"
+    # ...but it has no say: registering the SAME producer as trusted, after
+    # the fact, is what actually unlocks it -- nothing about the claim the
+    # caller made at ingestion does.
+    ledger.register_producer(
+        "self-declared-trusted", trust=ProducerTrust.TRUSTED, updated_by="ops"
+    )
+    ledger.recompute(evidence_id)
+    assert ledger.get(evidence_id).state is EvidenceState.ELIGIBLE
+
+
+def test_mutating_the_ingestion_snapshot_alone_has_no_effect():
+    """The snapshot is historical metadata, not a second trust authority.
+    Directly editing it (as opposed to registering/revoking through the
+    ledger) changes nothing about what the record is allowed to count as,
+    because eligibility never reads it."""
     _, store, ledger, _ = _stack()
     evidence_id, outcome = _ingest(ledger)
     assert outcome.state is EvidenceState.ELIGIBLE
@@ -317,6 +363,15 @@ def test_a_demoted_producer_loses_its_standing_on_recompute():
             (str(ProducerTrust.REVOKED), evidence_id),
         )
 
+    ledger.recompute(evidence_id)
+    # Still ELIGIBLE: "firewall" is still TRUSTED in the REGISTRY, which is
+    # the only thing that was ever consulted.
+    assert ledger.get(evidence_id).state is EvidenceState.ELIGIBLE
+
+    # The durable registry, not the snapshot, is what actually demotes it.
+    ledger.register_producer(
+        "firewall", trust=ProducerTrust.REVOKED, updated_by="ops"
+    )
     ledger.recompute(evidence_id)
     assert ledger.get(evidence_id).counts_toward_decisions is False
     assert ledger.get(evidence_id).lock_reason == LockReason.PRODUCER_TRUST_INSUFFICIENT
@@ -753,6 +808,7 @@ def _authority_stack():
         ),
         audit_sink=authority._append_audit,  # noqa: SLF001
     )
+    _trust_default_producers(ledger)
     return directory, audit, store, heart, authority, ledger
 
 
@@ -904,11 +960,13 @@ def test_releasing_evidence_is_not_approving_a_response():
     _, audit, store, heart, authority, ledger = _authority_stack()
     subject = "anonymous|203.0.113.54"
 
-    # Untrusted producer: retained, not countable, until a human says so.
+    # Unregistered producer: retained, not countable, until a human says so.
     evidence_id, _ = _ingest_for(
-        ledger, subject, producer_trust=ProducerTrust.OBSERVED_ONLY
+        ledger, subject, producer="not-yet-vetted",
+        producer_trust=ProducerTrust.TRUSTED,
     )
     assert ledger.get(evidence_id).counts_toward_decisions is False
+    assert ledger.get(evidence_id).lock_reason == LockReason.LEGACY_UNVERIFIED
 
     result = ledger.review(
         evidence_id,
@@ -1107,11 +1165,14 @@ def test_a_producer_can_be_registered_and_looked_up():
 
 
 def test_registry_trust_overrides_the_ingestion_time_snapshot():
-    """Once a producer is registered, the registry -- not the frozen
-    snapshot -- is what eligibility consults."""
+    """The registry -- never the frozen ingestion-time snapshot -- is what
+    eligibility consults, in both directions: it grants standing a caller's
+    own claim cannot, and it can take standing away that the snapshot still
+    claims. "firewall" is registered TRUSTED by the fixture, which is why
+    ingesting under that name counts at all."""
     _, store, ledger, _ = _stack()
     evidence_id, outcome = _ingest(ledger, producer="firewall")
-    assert outcome.state is EvidenceState.ELIGIBLE  # no registry yet: snapshot wins
+    assert outcome.state is EvidenceState.ELIGIBLE  # per the REGISTRY, not the snapshot
 
     ledger.register_producer(
         "firewall", trust=ProducerTrust.OBSERVED_ONLY, updated_by="ops",
@@ -1121,6 +1182,8 @@ def test_registry_trust_overrides_the_ingestion_time_snapshot():
     held = ledger.get(evidence_id)
     assert held.state is EvidenceState.LOCKED
     assert held.lock_reason == LockReason.PRODUCER_TRUST_INSUFFICIENT
+    # The snapshot never changed and still says TRUSTED -- it has no vote.
+    assert store.get_evidence(evidence_id)["producer_trust"] == "TRUSTED"
 
 
 def test_revoking_a_producer_re_locks_its_evidence_and_dependents():
@@ -1221,6 +1284,7 @@ def test_a_release_records_the_audit_ledgers_own_reference():
         operator_authenticator=lambda p: bool(getattr(p, "is_human", False)),
         audit_sink=audit_store.append,
     )
+    _trust_default_producers(ledger)
 
     evidence_id, _ = ledger.ingest(
         producer="firewall", producer_trust=ProducerTrust.TRUSTED,
@@ -1394,6 +1458,7 @@ def test_shadow_mode_never_counts_locked_evidence_in_its_recommendation():
         operator_authenticator=lambda p: bool(getattr(p, "is_human", False)),
     )
     ledger = EvidenceLedger(store, audit_sink=authority._append_audit)  # noqa: SLF001
+    _trust_default_producers(ledger)
     subject = "anonymous|203.0.113.63"
     parent, _ = _ingest_for(ledger, subject, account_id="acct-1")
     _ingest_for(
@@ -1464,8 +1529,13 @@ def test_a_database_from_the_first_evidence_schema_migrates_safely():
     assert row["updated_at_ms"] == 0
     assert migrated.list_producers() == ()
 
-    # The new evidence path works on the migrated database too.
+    # The new evidence path works on the migrated database too -- once the
+    # producer is registered, which the registry's own emptiness above
+    # proves nothing does automatically.
     ledger = EvidenceLedger(migrated)
+    ledger.register_producer(
+        "firewall", trust=ProducerTrust.TRUSTED, updated_by="test"
+    )
     evidence_id, outcome = ledger.ingest(
         producer="firewall", producer_trust=ProducerTrust.TRUSTED,
         event_type="auth_failure", payload={"post_migration": True},
