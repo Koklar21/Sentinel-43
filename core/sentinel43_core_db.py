@@ -1056,12 +1056,22 @@ class SentinelCoreStore:
         except sqlite3.IntegrityError:
             if owns_connection:
                 connection.rollback()
+            # Only the dedupe index's own collision is benign: it means a
+            # producer replayed a report this store already has, and the
+            # existing row's id is a legitimate answer. Any OTHER integrity
+            # violation (a CHECK on producer_trust/state, a bad foreign key)
+            # is a real defect in what the caller supplied and must not be
+            # swallowed into a silent None -- so it is re-raised UNLESS the
+            # lookup finds the specific row the dedupe index would collide
+            # on, which is the only case this handler exists for.
             existing = connection.execute(
                 "SELECT evidence_id FROM evidence "
                 "WHERE producer = ? AND content_hash = ?",
                 (str(producer), str(content_hash)),
             ).fetchone()
-            return str(existing["evidence_id"]) if existing else None
+            if existing is None:
+                raise
+            return str(existing["evidence_id"])
 
         finally:
             if owns_connection:

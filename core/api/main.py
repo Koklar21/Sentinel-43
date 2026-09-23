@@ -3144,12 +3144,18 @@ def _evidence_view(record: Mapping[str, Any]) -> dict[str, Any]:
         "subject_type": str(record["subject_type"]),
         "subject_value": str(record["subject_value"]),
         "correlation_id": str(record["correlation_id"]),
+        "incident_id": str(record.get("incident_id") or ""),
         "state": state,
         "lock_reason": lock_reason,
-        "lock_detail": LOCK_REASON_DETAIL.get(lock_reason, ""),
+        # The reason's own recorded detail (what was dynamic about it, e.g.
+        # which producers corroborate) takes precedence over the generic
+        # explanation for that reason.
+        "lock_detail": str(record.get("lock_detail") or "")
+        or LOCK_REASON_DETAIL.get(lock_reason, ""),
         "counts_toward_decisions": state in {str(s) for s in DECISION_ELIGIBLE_STATES},
         "released_by_a_human": state == "HUMAN_RELEASED",
         "version": int(record["version"]),
+        "updated_at_ms": int(record.get("updated_at_ms") or 0),
         # Present or absent, never the value itself: whether an account or
         # session is KNOWN is what decides eligibility, and the identifier
         # is not needed to explain a lock.
@@ -3259,6 +3265,10 @@ async def dashboard_evidence_detail(
                 "evidence_version": int(row["evidence_version"]),
                 "prior_state": str(row["prior_state"]),
                 "prior_lock_reason": str(row["prior_lock_reason"]),
+                # The audit ledger's own reference for this exact decision,
+                # so it can be cross-checked against the tamper-evident
+                # chain rather than trusted as a bare database row.
+                "audit_reference": str(row.get("audit_reference") or ""),
                 # Stated on every row so it can never be read as approval of
                 # a response action.
                 "authorizes_response_action": False,
@@ -3284,7 +3294,7 @@ async def dashboard_review_evidence(
     operator = await _require_operator(request)
     ledger = _require_evidence_ledger()
 
-    from core.evidence.ledger import UnauthorizedEvidenceReview
+    from core.evidence.ledger import InvalidEvidenceTransition, UnauthorizedEvidenceReview
 
     try:
         result = await asyncio.to_thread(
@@ -3305,12 +3315,39 @@ async def dashboard_review_evidence(
         ) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="evidence does not exist") from exc
-    except PermissionError as exc:
+    except (PermissionError, InvalidEvidenceTransition) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     return {"ok": True, **result, "timestamp": utc_now()}
+
+
+@root_router.get("/evidence-producers")
+async def dashboard_evidence_producers(request: Request) -> dict[str, Any]:
+    """The durable trust registry: which producers are trusted, and by whom.
+
+    A producer never grants itself trust; this is how an operator can see
+    what actually did.
+    """
+    await _require_operator(request)
+    ledger = _require_evidence_ledger()
+
+    rows = await asyncio.to_thread(ledger._store.list_producers)  # noqa: SLF001
+    return {
+        "producers": [
+            {
+                "producer": str(row["producer"]),
+                "trust": str(row["trust"]),
+                "registered_at_ms": int(row["registered_at_ms"]),
+                "updated_at_ms": int(row["updated_at_ms"]),
+                "updated_by": str(row["updated_by"]),
+                "reason": str(row["reason"]),
+            }
+            for row in rows
+        ],
+        "timestamp": utc_now(),
+    }
 
 
 @root_router.get("/vault/stats")

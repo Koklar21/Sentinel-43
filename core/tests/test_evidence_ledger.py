@@ -14,6 +14,7 @@
 # =============================================================================
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import time
 from pathlib import Path
@@ -23,10 +24,13 @@ import pytest
 
 from core.evidence.ledger import (
     EvidenceLedger,
+    InvalidEvidenceTransition,
     UnauthorizedEvidenceReview,
 )
 from core.evidence.model import (
     DECISION_ELIGIBLE_STATES,
+    EligibilityOutcome,
+    EvidenceRecord,
     EvidenceState,
     LockReason,
     ProducerTrust,
@@ -876,3 +880,479 @@ def test_holding_every_record_blocks_but_holding_none_does_not():
     assert permitted is False
     assert context["evidence_gate"] == "enforced"
     assert len(context["locked_evidence"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Second architectural pass: transitions, producer registry, root-traced
+# corroboration, migration, and the remaining Step-24 required cases.
+# ---------------------------------------------------------------------------
+def test_a_second_producer_alone_does_not_corroborate_with_itself():
+    """Two DIFFERENT (non-replay) records from the SAME producer are not two
+    independent producers, however they are linked."""
+    _, store, ledger, _ = _stack(required_producers=2)
+    first, _ = _ingest(ledger, payload={"a": 1})
+    second, _ = _ingest(ledger, payload={"a": 2})
+    store.record_relationship(
+        relationship_id="rel-same-producer",
+        parent_evidence_id=first,
+        child_evidence_id=second,
+        relationship_type=str(RelationshipType.CORROBORATES),
+        required_for_eligibility=False,
+        state=str(RelationshipState.VERIFIED),
+        created_at_ms=int(time.time() * 1000),
+    )
+    ledger.recompute(second)
+    held = ledger.get(second)
+    assert held.state is EvidenceState.LOCKED
+    assert held.lock_reason == LockReason.INSUFFICIENT_CORROBORATION
+
+
+def test_two_records_from_the_same_root_do_not_corroborate():
+    """A and B both descend (DERIVED_FROM) from the same source, under
+    different producer names. They are not two producers -- they are one
+    source told twice."""
+    _, store, ledger, _ = _stack(required_producers=2)
+    root, _ = _ingest(ledger, producer="root-detector", payload={"root": 1})
+
+    a, _ = _ingest(ledger, producer="firewall", payload={"a": 1})
+    b, _ = _ingest(ledger, producer="sparta", payload={"b": 1})
+    now = int(time.time() * 1000)
+    for child in (a, b):
+        rel_id = f"rel-derived-{child}"
+        store.record_relationship(
+            relationship_id=rel_id,
+            parent_evidence_id=root,
+            child_evidence_id=child,
+            relationship_type=str(RelationshipType.DERIVED_FROM),
+            required_for_eligibility=False,
+            state=str(RelationshipState.PROPOSED),
+            created_at_ms=now,
+        )
+        assert ledger.verify_relationship(rel_id) is True
+
+    store.record_relationship(
+        relationship_id="rel-ab-corroborates",
+        parent_evidence_id=a,
+        child_evidence_id=b,
+        relationship_type=str(RelationshipType.CORROBORATES),
+        required_for_eligibility=False,
+        state=str(RelationshipState.VERIFIED),
+        created_at_ms=now,
+    )
+    ledger.recompute(a)
+    ledger.recompute(b)
+
+    # Both share root's producer set: {firewall} u {root-detector} still < 2
+    # independent producers once the shared root is excluded.
+    held = ledger.get(b)
+    assert held.state is EvidenceState.LOCKED
+    assert held.lock_reason == LockReason.INSUFFICIENT_CORROBORATION
+
+
+def test_an_unverified_derived_from_claim_does_not_exclude_a_root():
+    """Only a VERIFIED DERIVED_FROM link removes a candidate from
+    corroboration -- an unproved claim of shared ancestry proves nothing."""
+    _, store, ledger, _ = _stack(required_producers=2)
+    root, _ = _ingest(ledger, producer="root-detector", payload={"root": 1})
+    a, _ = _ingest(ledger, producer="firewall", payload={"a": 1})
+    b, _ = _ingest(ledger, producer="sparta", payload={"b": 1})
+    now = int(time.time() * 1000)
+
+    # a IS derived from root (verified); b's claim is left unverified.
+    rel_a = "rel-derived-a2"
+    store.record_relationship(
+        relationship_id=rel_a, parent_evidence_id=root, child_evidence_id=a,
+        relationship_type=str(RelationshipType.DERIVED_FROM),
+        required_for_eligibility=False, state=str(RelationshipState.PROPOSED),
+        created_at_ms=now,
+    )
+    assert ledger.verify_relationship(rel_a) is True
+
+    store.record_relationship(
+        relationship_id="rel-ab-corroborates2", parent_evidence_id=a,
+        child_evidence_id=b, relationship_type=str(RelationshipType.CORROBORATES),
+        required_for_eligibility=False, state=str(RelationshipState.VERIFIED),
+        created_at_ms=now,
+    )
+    ledger.recompute(a)
+    ledger.recompute(b)
+    # a's root is {root, a}; b is not derived from anything, so b's own root
+    # is {b}. No shared root -- a IS an independent second producer for b.
+    assert ledger.get(b).state is EvidenceState.ELIGIBLE
+
+
+def test_a_producer_can_be_registered_and_looked_up():
+    _, store, ledger, _ = _stack()
+    ledger.register_producer(
+        "firewall", trust=ProducerTrust.TRUSTED, updated_by="ops", reason="onboarded"
+    )
+    registered = store.get_producer_trust("firewall")
+    assert registered["trust"] == "TRUSTED"
+    assert registered["updated_by"] == "ops"
+
+
+def test_registry_trust_overrides_the_ingestion_time_snapshot():
+    """Once a producer is registered, the registry -- not the frozen
+    snapshot -- is what eligibility consults."""
+    _, store, ledger, _ = _stack()
+    evidence_id, outcome = _ingest(ledger, producer="firewall")
+    assert outcome.state is EvidenceState.ELIGIBLE  # no registry yet: snapshot wins
+
+    ledger.register_producer(
+        "firewall", trust=ProducerTrust.OBSERVED_ONLY, updated_by="ops",
+        reason="downgraded pending review",
+    )
+    ledger.recompute(evidence_id)
+    held = ledger.get(evidence_id)
+    assert held.state is EvidenceState.LOCKED
+    assert held.lock_reason == LockReason.PRODUCER_TRUST_INSUFFICIENT
+
+
+def test_revoking_a_producer_re_locks_its_evidence_and_dependents():
+    """Step 22.5: a trusted producer, later revoked. Nothing is deleted;
+    everything it reported, and everything that leaned on it, is
+    re-evaluated -- not just the one record a caller happens to touch."""
+    _, store, ledger, _ = _stack()
+    ledger.register_producer(
+        "firewall", trust=ProducerTrust.TRUSTED, updated_by="ops"
+    )
+    root, _ = _ingest(ledger, producer="firewall", account_id="acct-1")
+    dependent, _ = _ingest(
+        ledger, producer="sparta", seq=2, account_id="acct-1", depends_on=(root,)
+    )
+    ledger.verify_relationship(store.relationships_of(dependent)[0]["relationship_id"])
+    assert ledger.get(root).counts_toward_decisions is True
+    assert ledger.get(dependent).counts_toward_decisions is True
+
+    affected = ledger.revoke_producer(
+        "firewall", reason="compromised host", updated_by="ops"
+    )
+    assert affected == 1  # one record was firewall's own
+
+    revoked_root = ledger.get(root)
+    assert revoked_root.counts_toward_decisions is False
+    assert revoked_root.lock_reason == LockReason.PRODUCER_TRUST_INSUFFICIENT
+    # The dependent, from a DIFFERENT (still-trusted) producer, is also
+    # re-evaluated because its support just disappeared.
+    assert ledger.get(dependent).counts_toward_decisions is False
+
+
+def test_revocation_is_durable_and_audited():
+    _, store, ledger, audit = _stack()
+    _ingest(ledger, producer="firewall")
+    ledger.revoke_producer("firewall", reason="compromised", updated_by="ops")
+
+    assert store.get_producer_trust("firewall")["trust"] == "REVOKED"
+    assert any(e["decision"] == "PRODUCER_TRUST_SET" for e in audit)
+
+
+def test_an_invalid_transition_is_refused_defensively():
+    """Defense in depth: even a hand-built EligibilityOutcome that names a
+    transition ALLOWED_TRANSITIONS does not list is refused, not written."""
+    _, store, ledger, _ = _stack()
+    evidence_id, _ = _ingest(ledger)
+    record = ledger.get(evidence_id)
+    assert record.state is EvidenceState.ELIGIBLE
+
+    with pytest.raises(InvalidEvidenceTransition):
+        ledger._write_state(  # noqa: SLF001 - exercising the guard directly
+            record,
+            EligibilityOutcome(state=EvidenceState.OBSERVED),
+            decided_by="test",
+        )
+    # Refused, not silently applied.
+    assert ledger.get(evidence_id).state is EvidenceState.ELIGIBLE
+
+
+def test_review_refuses_a_transition_human_review_may_not_make():
+    """A record a human already REJECTED is terminal for the automatic
+    rules AND for a later human review: REJECTED has no allowed target in
+    ALLOWED_TRANSITIONS, so a second review trying to RELEASE it is refused
+    rather than applied. (HELD is always a same-state no-op and so can
+    never violate the table -- this exercises a review that actually would.)
+    """
+    _, store, ledger, _ = _stack()
+    evidence_id, _ = _ingest(ledger)
+    record = ledger.get(evidence_id)
+    ledger.review(
+        evidence_id, disposition="REJECTED", operator_id="evidence-op",
+        principal=_principal(), reason="misreported", expected_version=record.version,
+    )
+    rejected = ledger.get(evidence_id)
+    with pytest.raises(InvalidEvidenceTransition):
+        ledger.review(
+            evidence_id, disposition="RELEASED", operator_id="evidence-op",
+            principal=_principal(), reason="reconsidering",
+            expected_version=rejected.version,
+        )
+    # Refused, not applied: still REJECTED.
+    assert ledger.get(evidence_id).state is EvidenceState.REJECTED
+
+
+def test_a_release_records_the_audit_ledgers_own_reference():
+    """The review row is cross-linked to the exact audit entry it produced,
+    not merely to a bare, unverifiable database value."""
+    from core.audit import AuditConfig, AuditStore
+
+    directory = Path(tempfile.mkdtemp(prefix="s43-evidence-auditref-"))
+    audit_store = AuditStore(
+        AuditConfig(sqlite_path=directory / "audit.sqlite3", signing_key="k" * 48)
+    )
+    audit_store.initialize()
+    store = SentinelCoreStore(CoreStoreConfig(db_path=directory / "heart.sqlite3"))
+    store.initialize()
+    ledger = EvidenceLedger(
+        store,
+        operator_authenticator=lambda p: bool(getattr(p, "is_human", False)),
+        audit_sink=audit_store.append,
+    )
+
+    evidence_id, _ = ledger.ingest(
+        producer="firewall", producer_trust=ProducerTrust.TRUSTED,
+        event_type="auth_failure", payload={"n": 1},
+    )
+    record = ledger.get(evidence_id)
+    result = ledger.review(
+        evidence_id, disposition="RELEASED", operator_id="evidence-op",
+        principal=_principal(), reason="confirmed", expected_version=record.version,
+    )
+    assert result["audit_reference"]
+
+    stored_review = store.reviews_of(evidence_id)[0]
+    assert stored_review["audit_reference"] == result["audit_reference"]
+
+    ledger_records = audit_store.get_records(component="evidence_ledger", limit=50)
+    assert any(
+        r.get("evidence_id") == evidence_id and r.get("decision") == "EVIDENCE_RELEASED"
+        for r in ledger_records
+    )
+
+
+def test_direct_sql_tampering_does_not_survive_the_next_recompute():
+    """A direct write to the state column is not something SQLite itself can
+    prevent -- but eligibility is recomputed fresh from provenance every
+    time, never trusted from the stored value, so the very next recompute
+    corrects it back. It does not silently persist."""
+    _, store, ledger, _ = _stack()
+    parent, _ = _ingest(ledger, account_id="acct-1")
+    dependent, _ = _ingest(
+        ledger, producer="sparta", seq=2, account_id="acct-OTHER", depends_on=(parent,)
+    )
+    assert ledger.get(dependent).state is EvidenceState.LOCKED
+
+    with store._connect() as connection:  # noqa: SLF001
+        connection.execute(
+            "UPDATE evidence SET state = 'ELIGIBLE', lock_reason = '' "
+            "WHERE evidence_id = ?",
+            (dependent,),
+        )
+    assert ledger.get(dependent).state is EvidenceState.ELIGIBLE  # tampered
+
+    ledger.recompute(dependent)
+    healed = ledger.get(dependent)
+    assert healed.state is EvidenceState.LOCKED
+    assert healed.lock_reason == LockReason.UNVERIFIED_RELATIONSHIP
+
+
+def test_the_producer_trust_column_rejects_an_unknown_value():
+    """The CHECK constraint, not only application code, refuses a value
+    outside the vocabulary."""
+    _, store, ledger, _ = _stack()
+    with pytest.raises(sqlite3.IntegrityError):
+        store.record_evidence(
+            evidence_id="ev-bad-trust", producer="x", producer_trust="ALL_POWERFUL",
+            event_type="t", observed_at_ms=1, ingested_at_ms=1, content_hash="h",
+            state=str(EvidenceState.OBSERVED),
+        )
+
+
+def test_the_canonical_and_payload_hashes_differ_on_key_order():
+    ordered = {"a": 1, "b": 2}
+    reordered = {"b": 2, "a": 1}
+    assert content_hash(ordered) == content_hash(reordered)  # canonical
+    assert content_hash(ordered, canonical=False) != content_hash(
+        reordered, canonical=False
+    )
+
+
+def test_evaluate_eligibility_locks_an_unregistered_producer_as_legacy():
+    """The pure rule, exercised directly: no trust information at all (the
+    ``None`` sentinel) is LEGACY_UNVERIFIED, distinct from a producer that
+    WAS checked and found untrustworthy."""
+    from core.evidence.model import evaluate_eligibility
+
+    record = EvidenceRecord(
+        evidence_id="e1", producer="ancient-source", producer_trust=ProducerTrust.TRUSTED,
+        event_type="t", observed_at_ms=1, ingested_at_ms=1, content_hash="h",
+        state=EvidenceState.OBSERVED,
+    )
+    outcome = evaluate_eligibility(
+        record, (), parents={}, now_ms=2, producer_trust=None,
+    )
+    assert outcome.state is EvidenceState.LOCKED
+    assert outcome.lock_reason == LockReason.LEGACY_UNVERIFIED
+
+
+def test_incident_id_is_a_first_class_field_distinct_from_correlation_id():
+    _, store, ledger, _ = _stack()
+    evidence_id, _ = _ingest(
+        ledger, correlation_id="corr-1", incident_id="INC-42"
+    )
+    record = ledger.get(evidence_id)
+    assert record.correlation_id == "corr-1"
+    assert record.incident_id == "INC-42"
+    assert len(store.list_evidence(incident_id="INC-42")) == 1
+
+
+def test_same_incident_verifies_against_incident_id_not_correlation_id():
+    _, store, ledger, _ = _stack()
+    a, _ = _ingest(ledger, incident_id="INC-1", correlation_id="corr-a")
+    b, _ = _ingest(
+        ledger, producer="sparta", seq=2, incident_id="INC-1", correlation_id="corr-b",
+        depends_on=(a,), dependency_type=RelationshipType.SAME_INCIDENT,
+    )
+    relationship = store.relationships_of(b)[0]
+    assert ledger.verify_relationship(relationship["relationship_id"]) is True
+    assert ledger.get(b).state is EvidenceState.ELIGIBLE
+
+
+# ---------------------------------------------------------------------------
+# Approving a response does not release evidence; releasing evidence does
+# not approve a response (the converse of an existing test -- Step 10).
+# ---------------------------------------------------------------------------
+def test_approving_a_recommendation_does_not_release_any_evidence():
+    _, audit, store, heart, authority, ledger = _authority_stack()
+    subject = "anonymous|203.0.113.62"
+    ledger._authenticator = lambda p: bool(getattr(p, "is_human", False))  # noqa: SLF001
+
+    evidence_id, _ = _ingest_for(ledger, subject)
+    authority.attach_evidence_ledger(ledger)
+    before_version = ledger.get(evidence_id).version
+    before_state = ledger.get(evidence_id).state
+
+    decision = heart.observe(_assessment("203.0.113.62"))
+    assert decision.status == "STAGED", decision
+
+    result = authority.resolve_recommendation(
+        decision.action_id, approved=True, operator_id="heart-op",
+        reason="reviewed", principal=_principal(subject="heart-op"),
+    )
+    assert result["outcome"] == "APPROVED"
+
+    after = ledger.get(evidence_id)
+    assert after.version == before_version
+    assert after.state is before_state
+    assert store.reviews_of(evidence_id) == ()
+
+
+# ---------------------------------------------------------------------------
+# Shadow Mode uses the SAME evidence eligibility path as HUMAN_GATED --
+# locked evidence never enters its actual assessment (Step 13).
+# ---------------------------------------------------------------------------
+def test_shadow_mode_never_counts_locked_evidence_in_its_recommendation():
+    from core.audit import AuditConfig, AuditStore
+    from core.governance import build_heart_from_settings, build_orchestrator_from_settings
+
+    directory = Path(tempfile.mkdtemp(prefix="s43-evidence-shadow-"))
+    audit = AuditStore(
+        AuditConfig(sqlite_path=directory / "audit.sqlite3", signing_key="k" * 48)
+    )
+    audit.initialize()
+    store = SentinelCoreStore(CoreStoreConfig(db_path=directory / "heart.sqlite3"))
+    store.initialize()
+
+    class GovernanceSettings:
+        default_mode = "SHADOW"
+
+    authority = build_orchestrator_from_settings(GovernanceSettings(), audit_store=audit)
+
+    class Settings:
+        default_mode = "SHADOW"
+        velocity_window_seconds = 60
+        velocity_limit = 100_000
+        dedupe_ttl_seconds = 300
+        corroboration_window_seconds = 300
+        corroboration_min_signals_for_high = 2
+
+    heart = build_heart_from_settings(
+        Settings(), audit_store=audit, core_store=store, authority=authority,
+        operator_authenticator=lambda p: bool(getattr(p, "is_human", False)),
+    )
+    ledger = EvidenceLedger(store, audit_sink=authority._append_audit)  # noqa: SLF001
+    subject = "anonymous|203.0.113.63"
+    parent, _ = _ingest_for(ledger, subject, account_id="acct-1")
+    _ingest_for(
+        ledger, subject, producer="sparta", n=2, account_id="acct-OTHER",
+        depends_on=(parent,),
+    )
+    ledger.invalidate(parent, reason="forged")
+    authority.attach_evidence_ledger(ledger)
+
+    decision = heart.observe(_assessment("203.0.113.63"))
+    # SHADOW is advisory-only, so this is always OBSERVED -- the assertion
+    # that matters is what the RECORDED reason is: evidence, not a stage.
+    assert decision.status == "OBSERVED"
+
+    records = audit.get_records(component="heart", limit=200)
+    evidence_records = [
+        r for r in records if r.get("reason_code") == "EVIDENCE_NOT_ELIGIBLE"
+    ]
+    assert evidence_records, "shadow mode must run through the same evidence gate"
+    assert evidence_records[-1]["evidence_gate"] == "enforced"
+    assert evidence_records[-1]["eligible_evidence"] == []
+
+
+# ---------------------------------------------------------------------------
+# Migration: a database built with the FIRST evidence schema keeps its data
+# and gains the new columns safely (formalises the manual check this pass's
+# work found a real ordering bug with).
+# ---------------------------------------------------------------------------
+def test_a_database_from_the_first_evidence_schema_migrates_safely():
+    import importlib.util
+    import subprocess
+    import sys as _sys
+
+    repo_root = Path(__file__).resolve().parents[2]
+    old_source = subprocess.run(
+        ["git", "show", "32e04dd~1:core/sentinel43_core_db.py"],
+        cwd=repo_root, capture_output=True, check=True,
+    ).stdout
+
+    old_module_path = Path(tempfile.mkdtemp(prefix="s43-legacy-schema-")) / "old_db.py"
+    old_module_path.write_bytes(old_source)
+
+    spec = importlib.util.spec_from_file_location("s43_legacy_db", old_module_path)
+    old = importlib.util.module_from_spec(spec)
+    _sys.modules["s43_legacy_db"] = old
+    spec.loader.exec_module(old)
+
+    directory = Path(tempfile.mkdtemp(prefix="s43-legacy-db-"))
+    legacy_path = directory / "legacy.sqlite3"
+    legacy_store = old.SentinelCoreStore(old.CoreStoreConfig(db_path=legacy_path))
+    legacy_store.initialize()
+    legacy_store.record_evidence(
+        evidence_id="LEGACY-1", producer="old-producer", producer_trust="TRUSTED",
+        event_type="auth_failure", observed_at_ms=1000, ingested_at_ms=1000,
+        content_hash="oldhash", state="ELIGIBLE",
+    )
+    del _sys.modules["s43_legacy_db"]
+
+    migrated = SentinelCoreStore(CoreStoreConfig(db_path=legacy_path))
+    migrated.initialize()  # must not raise -- this is the bug this test pins
+    migrated.initialize()  # idempotent
+
+    row = migrated.get_evidence("LEGACY-1")
+    assert row is not None, "the legacy row must survive the migration"
+    assert row["payload_hash"] == ""
+    assert row["incident_id"] == ""
+    assert row["lock_detail"] == ""
+    assert row["updated_at_ms"] == 0
+    assert migrated.list_producers() == ()
+
+    # The new evidence path works on the migrated database too.
+    ledger = EvidenceLedger(migrated)
+    evidence_id, outcome = ledger.ingest(
+        producer="firewall", producer_trust=ProducerTrust.TRUSTED,
+        event_type="auth_failure", payload={"post_migration": True},
+    )
+    assert outcome.state is EvidenceState.ELIGIBLE
