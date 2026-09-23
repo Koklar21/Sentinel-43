@@ -526,6 +526,41 @@ def test_a_contradiction_recomputed_from_its_other_side_also_locks_both():
     assert ledger.get(b).state is EvidenceState.LOCKED
 
 
+def test_a_changed_lock_reason_is_audited_even_when_the_state_does_not_change():
+    """Still LOCKED, still not countable -- but WHY changed, and an operator
+    reconstructing this record's history must be able to see that."""
+    _, store, ledger, audit = _stack()
+    a, _ = _ingest(ledger, account_id="acct-1")
+    b, outcome = _ingest(
+        ledger, producer="sparta", seq=2, account_id="acct-1", depends_on=(a,)
+    )
+    assert outcome.state is EvidenceState.LOCKED
+    assert outcome.lock_reason == LockReason.UNVERIFIED_RELATIONSHIP
+
+    other, _ = _ingest(ledger, payload={"other": 1})
+    store.record_relationship(
+        relationship_id="rel-reason-change",
+        parent_evidence_id=other,
+        child_evidence_id=b,
+        relationship_type=str(RelationshipType.CONTRADICTS),
+        required_for_eligibility=False,
+        state=str(RelationshipState.VERIFIED),
+        created_at_ms=int(time.time() * 1000),
+    )
+    ledger.recompute(b)
+    held = ledger.get(b)
+    assert held.state is EvidenceState.LOCKED  # unchanged
+    assert held.lock_reason == LockReason.CONTRADICTED  # but WHY changed
+
+    reasons = [
+        e["reason_code"]
+        for e in audit
+        if e["decision"] == "EVIDENCE_ELIGIBILITY_CHANGED" and e["evidence_id"] == b
+    ]
+    assert LockReason.UNVERIFIED_RELATIONSHIP in reasons
+    assert LockReason.CONTRADICTED in reasons
+
+
 def test_a_long_chain_propagates_in_full_not_only_the_first_two_hops():
     """A regression this pass's own rewrite of propagation introduced and
     caught: mixing dependency and contradiction edges into an unordered set

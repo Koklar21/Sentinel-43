@@ -884,11 +884,20 @@ class EvidenceLedger:
         """Material eligibility changes are auditable.
 
         A record becoming countable, or stopping, is exactly the kind of
-        change an operator must be able to reconstruct later.
+        change an operator must be able to reconstruct later -- and so is
+        WHY a record that is still held changed the reason it is held: a
+        record moving from "missing a dependency" to "contradicted" is a
+        different fact even though neither state nor countability changed,
+        and an operator asking "why was this refused" deserves the current
+        reason, not a stale one the audit trail never mentioned.
         """
         became_countable = outcome.state in DECISION_ELIGIBLE_STATES
         was_countable = record.state in DECISION_ELIGIBLE_STATES
-        if became_countable == was_countable and outcome.state is record.state:
+        if (
+            became_countable == was_countable
+            and outcome.state is record.state
+            and outcome.lock_reason == record.lock_reason
+        ):
             return
 
         self._append_audit(
