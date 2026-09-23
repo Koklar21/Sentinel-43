@@ -182,14 +182,19 @@ APPROVABLE = "APPROVABLE"
 FULFILLED = "FULFILLED_BY_REVIEW_RECORD"
 POLICY_DECISION_REQUIRED = "POLICY_DECISION_REQUIRED"
 NO_VALID_TARGET = "NO_VALID_TARGET"
-NOT_INTEGRATED = "NOT_INTEGRATED"
 UNKNOWN_ACTION = "UNKNOWN_ACTION"
-_BLOCKING = frozenset({POLICY_DECISION_REQUIRED, NO_VALID_TARGET, NOT_INTEGRATED, UNKNOWN_ACTION})
+#: Any item in one of these states blocks approval of the whole
+#: recommendation. One definition, used by the assessment and by the
+#: orchestrator, so the two can never disagree about what blocks approval.
+BLOCKING_STATUSES = frozenset(
+    {POLICY_DECISION_REQUIRED, NO_VALID_TARGET, UNKNOWN_ACTION}
+)
+_BLOCKING = BLOCKING_STATUSES
 
 #: engine action -> (meaning, target type, existing policy action or None).
-#: A policy action is listed ONLY where core.policy_gate already names that
-#: exact meaning. Rate limiting, step-up authentication and identity blocks
-#: are not network blocks and are not mapped to one.
+#: Every action is mapped to the policy operation that states ITS meaning --
+#: throttling, a stronger authentication factor and an account suspension are
+#: each their own operation, never relabelled as a network block.
 ACTION_CATALOG: Mapping[str, tuple[str, str | None, str | None]] = {
     "TEMP_BLOCK_IP": (
         "Block traffic from the source address for the engine's temporary "
@@ -210,29 +215,30 @@ ACTION_CATALOG: Mapping[str, tuple[str, str | None, str | None]] = {
     ),
     "STEP_UP_AUTH": (
         "Require the principal to re-authenticate with a stronger factor.",
-        "identity",
-        None,
+        "account",
+        "step_up_auth",
     ),
     "RATE_LIMIT": (
-        "Throttle requests from the principal (for an unauthenticated source, "
-        "its address).",
-        "identity",
-        None,
+        "Throttle the request rate of this subject: the caller class and "
+        "source address the evidence was observed from.",
+        "subject",
+        "rate_limit",
     ),
     "TEMP_BLOCK_IDENTITY": (
         "Block the principal's account for the temporary block period.",
-        "identity",
-        None,
+        "account",
+        "account_block_temporary",
     ),
     "HARD_BLOCK_IDENTITY": (
         "Block the principal's account for the extended block period.",
-        "identity",
-        None,
+        "account",
+        "account_block_extended",
     ),
     "OPEN_INCIDENT": (
-        "Open an incident record for follow-up.",
-        "incident",
-        None,
+        "Open a durable internal incident record for follow-up on this "
+        "subject.",
+        "subject",
+        "incident_open",
     ),
     "REQUIRE_HUMAN_REVIEW": (
         "A human must review this recommendation.",
@@ -244,8 +250,16 @@ ACTION_CATALOG: Mapping[str, tuple[str, str | None, str | None]] = {
 }
 
 _FULFILLED_ACTIONS = frozenset({"REQUIRE_HUMAN_REVIEW", "LOG_ONLY", "FLAG_SUSPICIOUS"})
-_IDENTITY_ACTIONS = frozenset(
-    {"STEP_UP_AUTH", "RATE_LIMIT", "TEMP_BLOCK_IDENTITY", "HARD_BLOCK_IDENTITY"}
+
+#: Actions that act on one named account or session. The subject a finding
+#: carries is ``<identity type>|<source address>`` -- a CLASS of caller and an
+#: address, never an account identifier: the only trusted producer (the
+#: request firewall) reports ``IdentityType``, and validated_subject_key admits
+#: nothing else. So there is no account for these to act on. Approving one
+#: would either authorize nothing or, read as its identity type, authorize an
+#: action against every caller of that class; neither is what a reviewer saw.
+_ACCOUNT_ACTIONS = frozenset(
+    {"STEP_UP_AUTH", "TEMP_BLOCK_IDENTITY", "HARD_BLOCK_IDENTITY", "QUARANTINE_SESSION"}
 )
 _ANONYMOUS = "anonymous"
 
@@ -298,16 +312,19 @@ def assess_actions(
             item["reason"] = (
                 "Satisfied by the staged human review and its audit record."
             )
-        elif name == "OPEN_INCIDENT":
-            item["status"] = NOT_INTEGRATED
-            item["reason"] = (
-                "No incident-management integration exists; approving could "
-                "not open one."
-            )
-        elif name == "QUARANTINE_SESSION" and unauthenticated:
+        elif name in _ACCOUNT_ACTIONS:
+            # No account is invented, and no address operation is substituted
+            # for one: the action simply has nothing to act on here.
             item["status"] = NO_VALID_TARGET
+            item["target"] = None
             item["reason"] = (
-                "An unauthenticated source has no session to quarantine."
+                "An unauthenticated source has no account or session to act on."
+                if unauthenticated
+                else (
+                    f"The subject identifies a caller class ({identity}) and an "
+                    "address, not an account or session; there is no account "
+                    "for this to act on."
+                )
             )
         elif policy_action is not None:
             item["status"] = APPROVABLE
@@ -325,12 +342,6 @@ def assess_actions(
             item["reason"] = (
                 "The policy vocabulary (core.policy_gate) has no operation with "
                 "this meaning."
-                + (
-                    " An unauthenticated source also has no account for it to "
-                    "act on."
-                    if unauthenticated and name in _IDENTITY_ACTIONS
-                    else ""
-                )
             )
         items.append(item)
 
@@ -688,6 +699,7 @@ __all__ = [
     "EngineIdentity",
     "EngineUnavailable",
     "ACTION_CATALOG",
+    "BLOCKING_STATUSES",
     "EXPECTED_ENGINE_SHA256",
     "GovernedEngine",
     "validated_subject_key",

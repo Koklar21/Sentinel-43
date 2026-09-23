@@ -49,6 +49,15 @@ class ActionStatus(StrEnum):
     EXPIRED = "EXPIRED"
 
 
+class IncidentStatus(StrEnum):
+    """An incident record is internal follow-up work, not an enforcement
+    effect: OPEN means a human approved opening it; RETRACTED means the
+    decision that opened it was reverted before it could be recorded."""
+
+    OPEN = "OPEN"
+    RETRACTED = "RETRACTED"
+
+
 _TERMINAL_ACTION_STATUSES = frozenset(
     {
         ActionStatus.VETOED,
@@ -210,6 +219,28 @@ class SentinelCoreStore:
 
                 CREATE INDEX IF NOT EXISTS idx_dedupe_exp
                     ON action_dedupe(expires_at_ms);
+
+                CREATE TABLE IF NOT EXISTS incidents (
+                    incident_id TEXT PRIMARY KEY,
+                    action_id TEXT NOT NULL,
+                    opened_at_ms INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    subject_type TEXT NOT NULL,
+                    subject_value TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    engine_actions_json TEXT NOT NULL,
+                    opened_by TEXT NOT NULL,
+                    operator_reason TEXT NOT NULL,
+                    retracted_reason TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_incident_action
+                    ON incidents(action_id);
+
+                CREATE INDEX IF NOT EXISTS idx_incident_opened
+                    ON incidents(opened_at_ms);
                 """
             )
 
@@ -517,6 +548,188 @@ class SentinelCoreStore:
 
         return tuple(results)
 
+    # -- incidents ----------------------------------------------------------
+    @staticmethod
+    def incident_id_for_action(action_id: str) -> str:
+        """One incident per resolved recommendation, named after it: a repeated
+        open for the same decision updates that record instead of multiplying
+        incidents for one approval."""
+        return f"incident:{SentinelCoreStore._normalize_action_id(action_id)}"
+
+    def open_incident(
+        self,
+        *,
+        action_id: str,
+        severity: str,
+        kind: str,
+        subject_type: str,
+        subject_value: str,
+        summary: str,
+        engine_actions: tuple[str, ...],
+        opened_by: str,
+        operator_reason: str = "",
+        now_ms: int | None = None,
+    ) -> str:
+        """Open (or re-open) the incident for one approved recommendation and
+        return its id. Durable and idempotent; opens nothing outside this
+        system."""
+        incident_id = self.incident_id_for_action(action_id)
+        opened_at_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        opened_by = str(opened_by).strip()
+
+        if not opened_by:
+            raise ValueError("opened_by must not be empty")
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO incidents (
+                    incident_id,
+                    action_id,
+                    opened_at_ms,
+                    status,
+                    severity,
+                    kind,
+                    subject_type,
+                    subject_value,
+                    summary,
+                    engine_actions_json,
+                    opened_by,
+                    operator_reason,
+                    retracted_reason
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                ON CONFLICT(incident_id) DO UPDATE SET
+                    opened_at_ms = excluded.opened_at_ms,
+                    status = excluded.status,
+                    opened_by = excluded.opened_by,
+                    operator_reason = excluded.operator_reason,
+                    retracted_reason = NULL
+                """,
+                (
+                    incident_id,
+                    self._normalize_action_id(action_id),
+                    opened_at_ms,
+                    IncidentStatus.OPEN.value,
+                    str(severity),
+                    str(kind),
+                    str(subject_type),
+                    str(subject_value),
+                    str(summary),
+                    json.dumps(
+                        [str(name) for name in engine_actions],
+                        separators=(",", ":"),
+                    ),
+                    opened_by,
+                    str(operator_reason),
+                ),
+            )
+
+        return incident_id
+
+    def retract_incident(self, incident_id: str, *, reason: str) -> bool:
+        """Mark an incident retracted because the decision that opened it was
+        reverted. The record is kept: it is evidence that it once existed."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE incidents
+                SET status = ?, retracted_reason = ?
+                WHERE incident_id = ? AND status = ?
+                """,
+                (
+                    IncidentStatus.RETRACTED.value,
+                    str(reason),
+                    str(incident_id).strip(),
+                    IncidentStatus.OPEN.value,
+                ),
+            )
+            return int(cursor.rowcount or 0) == 1
+
+    def get_incident(self, incident_id: str) -> Mapping[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM incidents WHERE incident_id = ?",
+                (str(incident_id).strip(),),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return self._incident_item(row)
+
+    def list_incidents(
+        self,
+        *,
+        status: IncidentStatus | None = None,
+        limit: int = 200,
+    ) -> tuple[Mapping[str, Any], ...]:
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise TypeError("limit must be an integer")
+
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+
+        with self._connect() as connection:
+            if status is None:
+                rows = connection.execute(
+                    """
+                    SELECT *
+                    FROM incidents
+                    ORDER BY opened_at_ms DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            else:
+                if not isinstance(status, IncidentStatus):
+                    raise TypeError("status must be IncidentStatus")
+
+                rows = connection.execute(
+                    """
+                    SELECT *
+                    FROM incidents
+                    WHERE status = ?
+                    ORDER BY opened_at_ms DESC
+                    LIMIT ?
+                    """,
+                    (status.value, limit),
+                ).fetchall()
+
+        return tuple(self._incident_item(row) for row in rows)
+
+    def count_incidents(self, *, status: IncidentStatus | None = None) -> int:
+        with self._connect() as connection:
+            if status is None:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS n FROM incidents"
+                ).fetchone()
+            else:
+                if not isinstance(status, IncidentStatus):
+                    raise TypeError("status must be IncidentStatus")
+                row = connection.execute(
+                    "SELECT COUNT(*) AS n FROM incidents WHERE status = ?",
+                    (status.value,),
+                ).fetchone()
+
+        return int(row["n"]) if row is not None else 0
+
+    @staticmethod
+    def _incident_item(row: sqlite3.Row) -> Mapping[str, Any]:
+        item = dict(row)
+
+        try:
+            item["engine_actions"] = tuple(
+                json.loads(item.pop("engine_actions_json"))
+            )
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"stored incident {item.get('incident_id')!r} "
+                "contains invalid engine_actions_json"
+            ) from exc
+
+        return MappingProxyType(item)
+
     def cleanup_terminal_actions(
         self,
         *,
@@ -570,6 +783,7 @@ class SentinelCoreStore:
 __all__ = [
     "ActionStatus",
     "CoreStoreConfig",
+    "IncidentStatus",
     "PendingAction",
     "SentinelCoreStore",
 ]

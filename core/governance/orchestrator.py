@@ -48,6 +48,7 @@ from core.policy_gate import (
     STATUS_ALLOW,
     STATUS_OBSERVE,
     STATUS_REQUIRES_HUMAN,
+    GovernanceAction,
     PolicyContext,
     evaluate,
     is_action_known,
@@ -293,11 +294,17 @@ class RecommendationOutcome:
     recommendation: Mapping[str, Any] | None = None
 
 
-#: Recorded on every approval: a human decision was made and audited; no
-#: enforcement is performed, because no executor exists.
+#: Recorded on every approval: a human decision was made and audited, and any
+#: incident record it authorized was opened in this system's own store. No
+#: effect outside Sentinel-43 is produced, because no executor exists.
 APPROVAL_ENFORCEMENT_NOTE: Final[str] = (
-    "not_performed: approval records an audited human decision; no executor exists"
+    "not_performed: approval records an audited human decision and opens any "
+    "internal incident record it authorized; no external enforcement exists"
 )
+
+#: The one approvable operation that writes something beyond the decision
+#: record itself -- and it writes only inside this system.
+INCIDENT_OPEN_ACTION: Final[str] = GovernanceAction.INCIDENT_OPEN.value
 
 
 def _operation_key(operation: Mapping[str, Any]) -> tuple[str, str, str, str]:
@@ -311,10 +318,19 @@ def _operation_key(operation: Mapping[str, Any]) -> tuple[str, str, str, str]:
 
 def _is_single_operation_row(row: Mapping[str, Any]) -> bool:
     """Rows written by the pre-engine orchestrator: system_id "heart" and a
-    single policy action. Engine rows carry the engine's system_id, so editing
-    an engine row's primary_action cannot switch it onto this path."""
-    return str(row.get("system_id") or "") == RECOMMENDATION_COMPONENT and is_action_known(
-        str(row["primary_action"] or "")
+    single policy action, recorded in the policy vocabulary's own spelling.
+
+    Engine rows carry the engine's system_id AND name their actions in the
+    engine's upper-case spelling, so an engine action can never take this
+    path -- not by editing primary_action, and not because the policy
+    vocabulary has since grown an operation of the same name (rate_limit,
+    step_up_auth, ...), which is_action_known matches case-insensitively.
+    """
+    primary = str(row["primary_action"] or "")
+    return (
+        str(row.get("system_id") or "") == RECOMMENDATION_COMPONENT
+        and primary == primary.lower()
+        and is_action_known(primary)
     )
 
 
@@ -1417,6 +1433,12 @@ class SystemOrchestrator:
         return self._recommendation_store is not None and self._engine is not None
 
     @property
+    def recommendation_store(self) -> Any | None:
+        """The durable store, for reading records only. Every decision still
+        goes through stage_recommendation/resolve_recommendation."""
+        return self._recommendation_store
+
+    @property
     def engine_identity(self) -> dict[str, str] | None:
         engine = self._engine
         return engine.identity.to_dict() if engine is not None else None
@@ -1495,7 +1517,11 @@ class SystemOrchestrator:
         mode = self._effective_recommendation_mode(recommendation.requested_mode)
         assessment = recommendation.assessment
 
-        from .sentinel43_engine import assess_actions, validated_subject_key
+        from .sentinel43_engine import (
+            BLOCKING_STATUSES,
+            assess_actions,
+            validated_subject_key,
+        )
 
         try:
             subject_ok = (
@@ -1522,8 +1548,7 @@ class SystemOrchestrator:
         unsupported = [
             item["engine_action"]
             for item in assessed["items"]
-            if item["status"] in ("POLICY_DECISION_REQUIRED", "NO_VALID_TARGET",
-                                  "NOT_INTEGRATED", "UNKNOWN_ACTION")
+            if item["status"] in BLOCKING_STATUSES
         ]
         decision_context = {
             "engine_plan": plan["summary"],
@@ -1865,7 +1890,28 @@ class SystemOrchestrator:
             raise UnauthorizedDecision("the orchestration engine refused this decision")
 
         new_status = ActionStatus.APPROVED if approved else ActionStatus.VETOED
+        incident_id: str | None = None
         try:
+            if approved and any(
+                str(operation.get("action")) == INCIDENT_OPEN_ACTION
+                for operation in operations
+            ):
+                # The one authorized operation with an effect, and it is
+                # internal: a durable follow-up record in this system's own
+                # store. Nothing outside Sentinel-43 is touched.
+                incident_id = store.open_incident(
+                    action_id=action_id,
+                    severity=str(row.get("severity") or ""),
+                    kind=str(row.get("kind") or ""),
+                    subject_type=str(row.get("target_type") or ""),
+                    subject_value=str(row.get("target_value") or ""),
+                    summary=str(row.get("reason") or ""),
+                    engine_actions=tuple(
+                        str(name) for name in (row.get("actions") or ())
+                    ),
+                    opened_by=operator_id,
+                    operator_reason=reason,
+                )
             self._append_audit(
                 {
                     "subsystem": RECOMMENDATION_COMPONENT,
@@ -1886,11 +1932,23 @@ class SystemOrchestrator:
                     "operations": operations,
                     "actions": list(row.get("actions") or ()),
                     "enforcement": APPROVAL_ENFORCEMENT_NOTE if approved else None,
+                    **({"incident_id": incident_id} if incident_id else {}),
                     **({"policy": policies} if policies else {}),
                 }
             )
         except Exception:
             # A decision that cannot be recorded must not be reported as made.
+            if incident_id is not None:
+                try:
+                    store.retract_incident(
+                        incident_id, reason="reverted_unaudited_decision"
+                    )
+                except Exception:
+                    logger.error(
+                        "Failed to retract incident %s for a reverted decision",
+                        incident_id,
+                        exc_info=True,
+                    )
             try:
                 store.transition_status(
                     action_id,
@@ -1914,6 +1972,7 @@ class SystemOrchestrator:
             "operator_id": operator_id,
             "operations": operations,
             "enforcement": APPROVAL_ENFORCEMENT_NOTE if approved else None,
+            "incident_id": incident_id,
             "resolved_at": _utc_now().isoformat(),
         }
 
