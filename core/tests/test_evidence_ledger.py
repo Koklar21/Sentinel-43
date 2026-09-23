@@ -474,6 +474,86 @@ def test_contradicting_evidence_overrides_a_human_release():
     assert held.lock_reason == LockReason.CONTRADICTED
 
 
+def test_a_contradiction_locks_both_sides_not_only_its_stored_child():
+    """The relationship row names one side "parent" and one "child" only
+    because the table needs two columns -- CONTRADICTS is symmetric in
+    MEANING. A verified contradiction must lock the record stored as the
+    parent too, not only the one that happens to be the child, or half of
+    a genuine dispute would keep counting."""
+    _, store, ledger, _ = _stack()
+    a, _ = _ingest(ledger, producer="identity-provider", payload={"device": "Y"})
+    b, _ = _ingest(ledger, producer="firewall", payload={"device": "Z"})
+    assert ledger.get(a).state is EvidenceState.ELIGIBLE
+    assert ledger.get(b).state is EvidenceState.ELIGIBLE
+
+    store.record_relationship(
+        relationship_id="rel-symmetric-contradiction",
+        parent_evidence_id=a,
+        child_evidence_id=b,
+        relationship_type=str(RelationshipType.CONTRADICTS),
+        required_for_eligibility=False,
+        state=str(RelationshipState.VERIFIED),
+        created_at_ms=int(time.time() * 1000),
+    )
+    ledger.recompute(b)
+
+    # b is the row's stored child: recomputing it directly always saw this.
+    assert ledger.get(b).state is EvidenceState.LOCKED
+    assert ledger.get(b).lock_reason == LockReason.CONTRADICTED
+    # a is the row's stored PARENT -- this is what recompute(b) must now
+    # also propagate to, since a was never "b's dependent".
+    assert ledger.get(a).state is EvidenceState.LOCKED
+    assert ledger.get(a).lock_reason == LockReason.CONTRADICTED
+
+
+def test_a_contradiction_recomputed_from_its_other_side_also_locks_both():
+    """The same fact, entered from the opposite direction: recomputing the
+    row's PARENT must propagate to lock its stored child too."""
+    _, store, ledger, _ = _stack()
+    a, _ = _ingest(ledger, producer="identity-provider", payload={"device": "Y2"})
+    b, _ = _ingest(ledger, producer="firewall", payload={"device": "Z2"})
+    store.record_relationship(
+        relationship_id="rel-symmetric-contradiction-2",
+        parent_evidence_id=a,
+        child_evidence_id=b,
+        relationship_type=str(RelationshipType.CONTRADICTS),
+        required_for_eligibility=False,
+        state=str(RelationshipState.VERIFIED),
+        created_at_ms=int(time.time() * 1000),
+    )
+    ledger.recompute(a)
+    assert ledger.get(a).state is EvidenceState.LOCKED
+    assert ledger.get(b).state is EvidenceState.LOCKED
+
+
+def test_a_long_chain_propagates_in_full_not_only_the_first_two_hops():
+    """A regression this pass's own rewrite of propagation introduced and
+    caught: mixing dependency and contradiction edges into an unordered set
+    let a child be evaluated before its parent's new state was actually
+    written, so a five-deep chain silently stopped propagating after two
+    hops. Propagation must reach every dependent, however long the chain."""
+    _, store, ledger, _ = _stack()
+    previous, _ = _ingest(ledger, account_id="acct-1")
+    chain = [previous]
+    for index in range(6):
+        current, _ = _ingest(
+            ledger, producer="sparta", seq=index + 2, account_id="acct-1",
+            depends_on=(previous,),
+        )
+        ledger.verify_relationship(
+            store.relationships_of(current)[0]["relationship_id"]
+        )
+        chain.append(current)
+        previous = current
+
+    assert all(ledger.get(item).counts_toward_decisions for item in chain)
+    ledger.invalidate(chain[0], reason="forged")
+    for depth, item in enumerate(chain):
+        assert not ledger.get(item).counts_toward_decisions, (
+            f"chain[{depth}] still counts after invalidating chain[0]"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Durability and concurrency
 # ---------------------------------------------------------------------------

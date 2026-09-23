@@ -1145,6 +1145,30 @@ class SentinelCoreStore:
             ).fetchall()
         return tuple(MappingProxyType(dict(row)) for row in rows)
 
+    def contradictions_of(
+        self, evidence_id: str
+    ) -> tuple[Mapping[str, Any], ...]:
+        """CONTRADICTS links touching this record, in EITHER direction.
+
+        A contradiction is symmetric in meaning ("A contradicts B" IS "B
+        contradicts A") even though it is stored once, in one direction. Both
+        sides must see it: unlike a dependency, where only the child cares
+        whether its parent holds up, a contradiction has to lock BOTH
+        records, or one of them would keep counting on the strength of a
+        fact its own contradiction already disputes.
+        """
+        identifier = str(evidence_id).strip()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM evidence_relationships
+                WHERE relationship_type = 'CONTRADICTS'
+                  AND (parent_evidence_id = ? OR child_evidence_id = ?)
+                """,
+                (identifier, identifier),
+            ).fetchall()
+        return tuple(MappingProxyType(dict(row)) for row in rows)
+
     def corroborations_of(
         self, evidence_id: str
     ) -> tuple[Mapping[str, Any], ...]:

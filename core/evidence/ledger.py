@@ -183,15 +183,7 @@ class EvidenceLedger:
             rows = self._store.list_evidence_by_producer(str(producer))
             for row in rows:
                 self._recompute_one(str(row["evidence_id"]))
-            edges = self._store.dependency_edges()
-            seen: set[str] = set()
-            for row in rows:
-                for dependent in dependency_closure(
-                    str(row["evidence_id"]), edges, max_nodes=MAX_PROPAGATION_NODES
-                ):
-                    if dependent not in seen:
-                        seen.add(dependent)
-                        self._recompute_one(dependent)
+                self._propagate_from(str(row["evidence_id"]))
             return len(rows)
 
     def _current_trust(self, record: EvidenceRecord) -> ProducerTrust:
@@ -408,8 +400,57 @@ class EvidenceLedger:
         return self._relationship(row) if row is not None else None
 
     # -- eligibility --------------------------------------------------------
+    def _relationships_for_evaluation(
+        self, evidence_id: str
+    ) -> tuple[EvidenceRelationship, ...]:
+        """Everything evaluate_eligibility needs to see about this record,
+        each oriented so ``parent_evidence_id`` names the OTHER party.
+
+        Dependency relationships (required_for_eligibility) are already
+        stored with the dependent as the child, which is what
+        ``relationships_of`` (child-indexed) returns as-is. CONTRADICTS is
+        different: it is symmetric in MEANING but stored once, in one
+        direction, so a record on the "parent" side of that one row would
+        otherwise never see the contradiction pointed at it. Those rows are
+        added here with parent/child swapped for presentation, so both sides
+        of a dispute lock, not only the one recorded as its child.
+        """
+        own_side = tuple(
+            self._relationship(item)
+            for item in self._store.relationships_of(evidence_id)
+        )
+        seen_relationship_ids = {rel.relationship_id for rel in own_side}
+
+        other_side: list[EvidenceRelationship] = []
+        for row in self._store.contradictions_of(evidence_id):
+            if str(row["relationship_id"]) in seen_relationship_ids:
+                continue
+            # evidence_id is this row's PARENT (the child side is already
+            # covered by relationships_of above): present it with the
+            # roles swapped, so parent_evidence_id names the OTHER record
+            # regardless of which side of the stored row evidence_id is on.
+            other_side.append(
+                EvidenceRelationship(
+                    relationship_id=str(row["relationship_id"]),
+                    parent_evidence_id=str(row["child_evidence_id"]),
+                    child_evidence_id=str(row["parent_evidence_id"]),
+                    relationship_type=RelationshipType(str(row["relationship_type"])),
+                    required_for_eligibility=bool(row["required_for_eligibility"]),
+                    state=RelationshipState(str(row["state"])),
+                    verification_method=str(row["verification_method"]),
+                    created_at_ms=int(row["created_at_ms"]),
+                    verified_at_ms=int(row["verified_at_ms"]),
+                    invalidated_reason=str(row["invalidated_reason"]),
+                )
+            )
+
+        return own_side + tuple(other_side)
+
     def recompute(self, evidence_id: str) -> EligibilityOutcome:
-        """Re-evaluate one record, then everything that depends on it.
+        """Re-evaluate one record, then everything affected by that change:
+        everything that DEPENDS on it, and -- because a contradiction locks
+        both sides, not only the one recorded as its child -- everything it
+        CONTRADICTS, and in turn whatever depends on THOSE.
 
         Propagation is iterative over a visited set, so a relationship cycle
         terminates. If a transition cannot be written durably, this raises:
@@ -417,14 +458,74 @@ class EvidenceLedger:
         """
         with self._lock:
             outcome = self._recompute_one(evidence_id)
-
-            edges = self._store.dependency_edges()
-            for dependent in dependency_closure(
-                evidence_id, edges, max_nodes=MAX_PROPAGATION_NODES
-            ):
-                self._recompute_one(dependent)
-
+            self._propagate_from(evidence_id)
             return outcome
+
+    def _propagate_from(self, evidence_id: str) -> None:
+        """Re-evaluate everything a change to ``evidence_id`` could affect:
+        its dependents, and the other side of any contradiction it touches,
+        and in turn everything affected by THOSE.
+
+        Two passes, deliberately not one:
+
+        1. Find the full closure over BOTH edge types (dependency AND
+           contradiction), bounded, breadth by breadth.
+        2. Recompute every member in a FIXED, deterministic order, and
+           repeat that full pass until one changes nothing.
+
+        The second pass is what a single ordered walk cannot guarantee once
+        contradiction edges are mixed in with dependency edges: a set has no
+        stable order, and evaluating a child before its parent's own new
+        state was actually written would read the parent's STALE value. A
+        chain of five once silently stopped propagating after two hops this
+        way -- caught by this pass's own migration test suite, not assumed
+        correct. Repeating until stable is correct for any graph shape, at
+        the cost of a few redundant passes on the rare graphs that need
+        them; the length of the closure itself bounds how many passes a
+        correct implementation could ever need.
+        """
+        edges = self._store.dependency_edges()
+        affected: set[str] = {evidence_id}
+        frontier: set[str] = {evidence_id}
+
+        while frontier and len(affected) < MAX_PROPAGATION_NODES:
+            next_frontier: set[str] = set()
+            for node in frontier:
+                for dependent in dependency_closure(
+                    node, edges, max_nodes=MAX_PROPAGATION_NODES
+                ):
+                    if dependent not in affected:
+                        next_frontier.add(dependent)
+                for row in self._store.contradictions_of(node):
+                    other = (
+                        str(row["parent_evidence_id"])
+                        if str(row["child_evidence_id"]) == node
+                        else str(row["child_evidence_id"])
+                    )
+                    if other not in affected:
+                        next_frontier.add(other)
+            affected |= next_frontier
+            frontier = next_frontier
+
+        affected.discard(evidence_id)
+        if not affected:
+            return
+
+        ordered = sorted(affected)
+        for _ in range(len(ordered) + 1):
+            changed = False
+            for node in ordered:
+                prior = self.get(node)
+                if prior is None:
+                    continue
+                outcome = self._recompute_one(node)
+                if (
+                    outcome.state is not prior.state
+                    or outcome.lock_reason != prior.lock_reason
+                ):
+                    changed = True
+            if not changed:
+                return
 
     def _recompute_one(self, evidence_id: str) -> EligibilityOutcome:
         row = self._store.get_evidence(evidence_id)
@@ -436,10 +537,7 @@ class EvidenceLedger:
             )
 
         record = self._record(row)
-        relationships = tuple(
-            self._relationship(item)
-            for item in self._store.relationships_of(evidence_id)
-        )
+        relationships = self._relationships_for_evaluation(evidence_id)
 
         parents: dict[str, EvidenceRecord] = {}
         for relationship in relationships:
@@ -602,11 +700,7 @@ class EvidenceLedger:
                 # an invalidation that did not actually happen.
                 return False
 
-            edges = self._store.dependency_edges()
-            for dependent in dependency_closure(
-                evidence_id, edges, max_nodes=MAX_PROPAGATION_NODES
-            ):
-                self._recompute_one(dependent)
+            self._propagate_from(evidence_id)
             return True
 
     # -- human review -------------------------------------------------------
@@ -716,11 +810,7 @@ class EvidenceLedger:
 
         if disposition == "RELEASED":
             # A release changes what dependents may rely on.
-            edges = self._store.dependency_edges()
-            for dependent in dependency_closure(
-                evidence_id, edges, max_nodes=MAX_PROPAGATION_NODES
-            ):
-                self._recompute_one(dependent)
+            self._propagate_from(evidence_id)
 
         return {
             "evidence_id": evidence_id,
