@@ -193,6 +193,22 @@ def build_heart_from_settings(
             audit_sink=authority._append_audit,  # noqa: SLF001 - same package
             required_producers=heart_config.corroboration_min_signals_for_high,
         )
+
+        # Trust is granted here, from configuration the composition root was
+        # handed -- never read from the environment directly (this module
+        # reads none), and never from a producer's own report. A name a
+        # caller did not supply is simply not registered; the ledger treats
+        # an unregistered producer by its ingestion-time snapshot, unchanged.
+        from core.evidence.model import ProducerTrust
+
+        for producer_name in _get(settings, "trusted_evidence_producers", ()):
+            ledger.register_producer(
+                str(producer_name),
+                trust=ProducerTrust.TRUSTED,
+                updated_by="composition_root",
+                reason="configured trusted producer",
+            )
+
         authority.attach_evidence_ledger(ledger)
 
     return ThreatGovernor(

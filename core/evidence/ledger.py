@@ -38,6 +38,7 @@ from core.sentinel43_core_db import SentinelCoreStore
 
 from .model import (
     DECISION_ELIGIBLE_STATES,
+    LOCK_REASON_DETAIL,
     EligibilityOutcome,
     EvidenceBundle,
     EvidenceRecord,
@@ -47,9 +48,11 @@ from .model import (
     ProducerTrust,
     RelationshipState,
     RelationshipType,
+    ancestor_closure,
     content_hash,
     dependency_closure,
     evaluate_eligibility,
+    is_valid_transition,
 )
 
 logger = logging.getLogger("sentinel43.evidence")
@@ -71,6 +74,15 @@ class UnauthorizedEvidenceReview(PermissionError):
     """A review was attempted without a verified human principal."""
 
 
+class InvalidEvidenceTransition(RuntimeError):
+    """A write attempted a state change ALLOWED_TRANSITIONS does not list.
+
+    Defense in depth: evaluate_eligibility should never produce one of
+    these, so reaching this exception means that guarantee broke -- and the
+    write is refused rather than silently persisted anyway.
+    """
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -88,7 +100,7 @@ class EvidenceLedger:
         store: SentinelCoreStore,
         *,
         operator_authenticator: Callable[[Any], bool] | None = None,
-        audit_sink: Callable[[Mapping[str, Any]], None] | None = None,
+        audit_sink: Callable[[Mapping[str, Any]], str | None] | None = None,
         required_producers: int = 1,
     ) -> None:
         self._store = store
@@ -117,12 +129,83 @@ class EvidenceLedger:
             device_id=str(row["device_id"]),
             source_ip=str(row["source_ip"]),
             correlation_id=str(row["correlation_id"]),
+            incident_id=str(row.get("incident_id") or ""),
             source_event_id=str(row["source_event_id"]),
+            payload_hash=str(row.get("payload_hash") or ""),
             expires_at_ms=int(row["expires_at_ms"]),
             state=EvidenceState(str(row["state"])),
             lock_reason=str(row["lock_reason"]),
+            lock_detail=str(row.get("lock_detail") or ""),
             version=int(row["version"]),
+            updated_at_ms=int(row.get("updated_at_ms") or 0),
         )
+
+    # -- producer trust registry ---------------------------------------------
+    def register_producer(
+        self, producer: str, *, trust: ProducerTrust, updated_by: str, reason: str = ""
+    ) -> None:
+        """Grant or change a producer's durable trust classification.
+
+        Never called from a producer's own payload: the caller is always
+        in-process configuration or an authenticated operator action, and
+        that identity is what ``updated_by`` records.
+        """
+        self._store.set_producer_trust(
+            str(producer), trust=str(trust), updated_by=str(updated_by),
+            reason=str(reason), now_ms=_now_ms(),
+        )
+        self._append_audit(
+            {
+                "subsystem": EVIDENCE_COMPONENT,
+                "component": EVIDENCE_COMPONENT,
+                "decision": "PRODUCER_TRUST_SET",
+                "reason_code": str(trust),
+                "producer": str(producer),
+                "correlation_id": f"producer:{producer}",
+                "updated_by": str(updated_by),
+                "resolution_reason": str(reason),
+                "authorizes_response_action": False,
+            }
+        )
+
+    def revoke_producer(self, producer: str, *, reason: str, updated_by: str) -> int:
+        """Revoke a producer's trust and re-evaluate everything it reported.
+
+        Nothing is deleted: revoked evidence is retained and re-locked, and
+        everything that depended on it is re-evaluated in turn (Step 14).
+        Returns how many of the producer's own records were re-evaluated.
+        """
+        with self._lock:
+            self.register_producer(
+                producer, trust=ProducerTrust.REVOKED, updated_by=updated_by,
+                reason=reason,
+            )
+            rows = self._store.list_evidence_by_producer(str(producer))
+            for row in rows:
+                self._recompute_one(str(row["evidence_id"]))
+            edges = self._store.dependency_edges()
+            seen: set[str] = set()
+            for row in rows:
+                for dependent in dependency_closure(
+                    str(row["evidence_id"]), edges, max_nodes=MAX_PROPAGATION_NODES
+                ):
+                    if dependent not in seen:
+                        seen.add(dependent)
+                        self._recompute_one(dependent)
+            return len(rows)
+
+    def _current_trust(self, record: EvidenceRecord) -> ProducerTrust:
+        """The producer's standing NOW, not what was believed at ingestion.
+
+        The registry, when it has an entry, always wins: that is what makes
+        revocation take effect on already-stored evidence without rewriting
+        it. A producer never registered keeps its ingestion-time snapshot --
+        unchanged behaviour for callers that do not use the registry.
+        """
+        registered = self._store.get_producer_trust(record.producer)
+        if registered is not None:
+            return ProducerTrust(str(registered["trust"]))
+        return record.producer_trust
 
     def _relationship(self, row: Mapping[str, Any]) -> EvidenceRelationship:
         return EvidenceRelationship(
@@ -158,6 +241,7 @@ class EvidenceLedger:
         device_id: str = "",
         source_ip: str = "",
         correlation_id: str = "",
+        incident_id: str = "",
         source_event_id: str = "",
         expires_at_ms: int = 0,
         depends_on: tuple[str, ...] = (),
@@ -169,13 +253,23 @@ class EvidenceLedger:
         out-of-band -- ``producer``, ``producer_trust`` and the identity
         fields are never read from ``payload``, because a producer that can
         describe its own trust or choose an account identifier could
-        manufacture correlation.
+        manufacture correlation. ``producer_trust`` is only ever the
+        INGESTION-TIME snapshot: the durable registry (register_producer /
+        revoke_producer), when it holds an entry for this producer, is what
+        eligibility actually consults from then on.
 
         A record that is incomplete is stored LOCKED, never discarded, and
         the reason is recorded with it.
+
+        ``payload`` is hashed twice: the canonical (key-order-independent)
+        hash is the dedupe key -- two reports of the same underlying fact
+        from the same producer are ONE piece of evidence, never two -- and a
+        second, order-sensitive hash of the exact bytes is kept purely for
+        forensic integrity, unused by any constraint.
         """
         now = _now_ms()
         digest = content_hash(payload)
+        raw_digest = content_hash(payload, canonical=False)
 
         evidence_id = self._store.record_evidence(
             evidence_id=f"ev-{uuid.uuid4().hex}",
@@ -185,6 +279,7 @@ class EvidenceLedger:
             observed_at_ms=int(observed_at_ms if observed_at_ms is not None else now),
             ingested_at_ms=now,
             content_hash=digest,
+            payload_hash=raw_digest,
             # Stored OBSERVED, then evaluated below: a record is never
             # eligible because of the value it was written with.
             state=str(EvidenceState.OBSERVED),
@@ -195,6 +290,7 @@ class EvidenceLedger:
             device_id=device_id,
             source_ip=source_ip,
             correlation_id=correlation_id,
+            incident_id=incident_id,
             source_event_id=source_event_id,
             expires_at_ms=int(expires_at_ms),
         )
@@ -203,12 +299,6 @@ class EvidenceLedger:
             raise EvidenceLedgerUnavailable(
                 "evidence could not be stored and no existing record was found"
             )
-
-        existing = self._store.get_evidence(evidence_id)
-        if existing is not None and str(existing["content_hash"]) == digest:
-            # A replay of the same producer's same report. It is ONE piece of
-            # evidence: re-evaluate it, but never add a second record.
-            pass
 
         for parent_id in depends_on:
             if not parent_id or parent_id == evidence_id:
@@ -237,9 +327,6 @@ class EvidenceLedger:
         in time proves nothing and verifies nothing.
         """
         with self._lock:
-            child_rows = self._store.dependency_edges()  # cheap; bounded
-            del child_rows
-
             relationship = self._find_relationship(relationship_id)
             if relationship is None:
                 return False
@@ -254,7 +341,7 @@ class EvidenceLedger:
                 RelationshipType.SAME_SESSION: "session_id",
                 RelationshipType.SAME_DEVICE: "device_id",
                 RelationshipType.SAME_REQUEST_LINEAGE: "correlation_id",
-                RelationshipType.SAME_INCIDENT: "correlation_id",
+                RelationshipType.SAME_INCIDENT: "incident_id",
                 RelationshipType.SAME_NETWORK_SUBJECT: "subject_value",
             }.get(relationship.relationship_type)
 
@@ -360,7 +447,7 @@ class EvidenceLedger:
             if parent_row is not None:
                 parents[relationship.parent_evidence_id] = self._record(parent_row)
 
-        independent = self._independent_producers(record, relationships)
+        independent = self._independent_producers(record)
 
         outcome = evaluate_eligibility(
             record,
@@ -369,6 +456,7 @@ class EvidenceLedger:
             now_ms=_now_ms(),
             independent_producers=independent,
             required_producers=self._required_producers,
+            producer_trust=self._current_trust(record),
         )
 
         if (
@@ -377,55 +465,85 @@ class EvidenceLedger:
         ):
             return outcome
 
+        self._write_state(record, outcome, decided_by="provenance_rules")
+        return outcome
+
+    def _write_state(
+        self,
+        record: EvidenceRecord,
+        outcome: EligibilityOutcome,
+        *,
+        decided_by: str,
+    ) -> EligibilityOutcome:
+        """The one place a state transition is written, so the transition
+        table is enforced in exactly one place too."""
+        if not is_valid_transition(record.state, outcome.state):
+            raise InvalidEvidenceTransition(
+                f"{record.evidence_id}: {record.state} -> {outcome.state} is "
+                "not a transition the system recognises"
+            )
+
+        detail = outcome.detail or LOCK_REASON_DETAIL.get(outcome.lock_reason, "")
+
         if not self._store.set_evidence_state(
-            evidence_id,
+            record.evidence_id,
             expected_version=record.version,
             state=str(outcome.state),
             lock_reason=str(outcome.lock_reason),
+            lock_detail=detail,
         ):
             # Someone else changed it first. Their write is authoritative;
             # this pass reports what is now stored rather than overwriting.
-            current = self._store.get_evidence(evidence_id)
+            current = self._store.get_evidence(record.evidence_id)
             if current is None:
                 raise EvidenceLedgerUnavailable(
-                    f"evidence {evidence_id} vanished during recomputation"
+                    f"evidence {record.evidence_id} vanished during recomputation"
                 )
             return EligibilityOutcome(
                 state=EvidenceState(str(current["state"])),
                 lock_reason=str(current["lock_reason"]),
+                detail=str(current["lock_detail"]),
             )
 
-        self._audit_transition(record, outcome, decided_by="provenance_rules")
+        self._audit_transition(record, outcome, decided_by=decided_by)
         return outcome
 
-    def _independent_producers(
-        self,
-        record: EvidenceRecord,
-        relationships: tuple[EvidenceRelationship, ...],
-    ) -> int:
-        """How many DISTINCT producers corroborate this record.
+    def _independent_producers(self, record: EvidenceRecord) -> int:
+        """How many DISTINCT producers corroborate this record, tracing
+        every candidate to its provenance ROOT first (Step 8).
 
         The record's own producer counts once, however many times it
-        reported: repetition by one source is not independence.
+        reported: repetition by one source is not independence. Two records
+        that both ultimately derive from the same evidence -- however many
+        DERIVED_FROM hops apart -- are not two producers either: they share
+        a root, and a shared root is the same source wearing two producer
+        names.
 
         A corroborating record contributes its producer only when nothing
-        disqualifies it -- its producer is trusted, and it has not been
-        rejected, invalidated, expired or contradicted. Waiting for its OWN
-        corroboration is deliberately not disqualifying: two records that
-        corroborate each other are each the other's second producer, and
-        excluding them both would mean no pair could ever satisfy the
+        disqualifies it -- its CURRENT registry trust is TRUSTED, and it has
+        not been rejected, invalidated, expired or contradicted. Waiting for
+        its OWN corroboration is deliberately not disqualifying: two records
+        that corroborate each other are each the other's second producer,
+        and excluding them both would mean no pair could ever satisfy the
         threshold. Every other lock reason keeps a record out of this count,
         so evidence held for missing provenance never props up a threshold.
         """
-        del relationships  # corroboration is read symmetrically, below
-
         producers = {record.producer}
+        derived_edges = self._store.derived_from_edges()
+        own_roots = self._provenance_roots(record.evidence_id, derived_edges)
+
         for row in self._store.corroborations_of(record.evidence_id):
             other_id = (
                 str(row["child_evidence_id"])
                 if str(row["parent_evidence_id"]) == record.evidence_id
                 else str(row["parent_evidence_id"])
             )
+            if other_id in own_roots or self._provenance_roots(
+                other_id, derived_edges
+            ) & (own_roots | {record.evidence_id}):
+                # Shares a root with the record itself: the same source,
+                # under a different producer name, is not independent.
+                continue
             other_row = self._store.get_evidence(other_id)
             if other_row is None:
                 continue
@@ -434,9 +552,19 @@ class EvidenceLedger:
                 producers.add(other.producer)
         return len(producers)
 
-    @staticmethod
-    def _may_corroborate(record: EvidenceRecord) -> bool:
-        if record.producer_trust is not ProducerTrust.TRUSTED:
+    def _provenance_roots(
+        self, evidence_id: str, derived_edges: Mapping[str, tuple[str, ...]]
+    ) -> frozenset[str]:
+        """Every record ``evidence_id`` derives from, transitively, over
+        VERIFIED DERIVED_FROM links -- plus itself, since a record with no
+        parent IS its own root."""
+        ancestors = ancestor_closure(
+            evidence_id, derived_edges, max_nodes=MAX_PROPAGATION_NODES
+        )
+        return frozenset(ancestors) | {evidence_id}
+
+    def _may_corroborate(self, record: EvidenceRecord) -> bool:
+        if self._current_trust(record) is not ProducerTrust.TRUSTED:
             return False
         if record.state in (
             EvidenceState.REJECTED,
@@ -460,24 +588,19 @@ class EvidenceLedger:
                 return False
             record = self._record(row)
 
-            changed = self._store.set_evidence_state(
-                evidence_id,
-                expected_version=record.version,
-                state=str(EvidenceState.INVALIDATED),
-                lock_reason=str(LockReason.DEPENDENCY_INVALIDATED),
+            outcome = EligibilityOutcome(
+                state=EvidenceState.INVALIDATED,
+                lock_reason=LockReason.DEPENDENCY_INVALIDATED,
+                detail=reason,
             )
-            if not changed:
+            try:
+                written = self._write_state(record, outcome, decided_by="invalidation")
+            except EvidenceLedgerUnavailable:
                 return False
-
-            self._audit_transition(
-                record,
-                EligibilityOutcome(
-                    state=EvidenceState.INVALIDATED,
-                    lock_reason=LockReason.DEPENDENCY_INVALIDATED,
-                    detail=reason,
-                ),
-                decided_by="invalidation",
-            )
+            if written.state is not EvidenceState.INVALIDATED:
+                # Lost the race to another write; nothing to propagate from
+                # an invalidation that did not actually happen.
+                return False
 
             edges = self._store.dependency_edges()
             for dependent in dependency_closure(
@@ -532,8 +655,18 @@ class EvidenceLedger:
             "HELD": (record.state, record.lock_reason),
         }[disposition]
 
+        if not is_valid_transition(record.state, new_state):
+            raise InvalidEvidenceTransition(
+                f"{evidence_id}: {record.state} -> {new_state} is not a "
+                "transition human review may make"
+            )
+        new_lock_detail = (
+            LOCK_REASON_DETAIL.get(new_lock, "") if new_lock else ""
+        )
+
+        review_id = f"rev-{uuid.uuid4().hex}"
         applied = self._store.record_evidence_review(
-            review_id=f"rev-{uuid.uuid4().hex}",
+            review_id=review_id,
             evidence_id=evidence_id,
             evidence_version=int(expected_version),
             disposition=disposition,
@@ -543,6 +676,7 @@ class EvidenceLedger:
             decided_at_ms=_now_ms(),
             new_state=str(new_state),
             new_lock_reason=str(new_lock),
+            new_lock_detail=new_lock_detail,
         )
 
         if not applied:
@@ -551,7 +685,7 @@ class EvidenceLedger:
                 "refused rather than applied to a different version"
             )
 
-        self._append_audit(
+        audit_reference = self._append_audit(
             {
                 "subsystem": EVIDENCE_COMPONENT,
                 "component": EVIDENCE_COMPONENT,
@@ -571,6 +705,14 @@ class EvidenceLedger:
                 "authorizes_response_action": False,
             }
         )
+        if audit_reference:
+            # The audit ledger's own reference can only be known once the
+            # append above returns, so the review row is stamped with it in
+            # a second, best-effort write -- the review itself already
+            # committed and does not depend on this succeeding.
+            self._store.set_review_audit_reference(
+                review_id, audit_reference=str(audit_reference)
+            )
 
         if disposition == "RELEASED":
             # A release changes what dependents may rely on.
@@ -585,6 +727,7 @@ class EvidenceLedger:
             "disposition": disposition,
             "state": str(new_state),
             "operator_id": operator_id,
+            "audit_reference": audit_reference,
             "authorizes_response_action": False,
         }
 
@@ -612,6 +755,7 @@ class EvidenceLedger:
             outcomes[record.evidence_id] = EligibilityOutcome(
                 state=record.state,
                 lock_reason=record.lock_reason,
+                detail=record.lock_detail,
                 missing_dependencies=tuple(
                     relationship.parent_evidence_id
                     for relationship in relationships
@@ -630,11 +774,15 @@ class EvidenceLedger:
         )
 
     # -- audit --------------------------------------------------------------
-    def _append_audit(self, record: Mapping[str, Any]) -> None:
+    def _append_audit(self, record: Mapping[str, Any]) -> str | None:
+        """Appends and returns the ledger's own reference for the record
+        (e.g. its HMAC), when the sink provides one -- used to cross-link a
+        review row to the exact audit entry it produced."""
         sink = self._audit
         if sink is None:
-            return
-        sink(record)
+            return None
+        result = sink(record)
+        return str(result) if result else None
 
     def _audit_transition(
         self,
@@ -699,5 +847,6 @@ __all__ = [
     "MAX_PROPAGATION_NODES",
     "EvidenceLedger",
     "EvidenceLedgerUnavailable",
+    "InvalidEvidenceTransition",
     "UnauthorizedEvidenceReview",
 ]

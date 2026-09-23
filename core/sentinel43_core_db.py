@@ -264,6 +264,7 @@ class SentinelCoreStore:
                     observed_at_ms INTEGER NOT NULL,
                     ingested_at_ms INTEGER NOT NULL,
                     content_hash TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL DEFAULT '',
                     subject_type TEXT NOT NULL DEFAULT '',
                     subject_value TEXT NOT NULL DEFAULT '',
                     account_id TEXT NOT NULL DEFAULT '',
@@ -271,14 +272,20 @@ class SentinelCoreStore:
                     device_id TEXT NOT NULL DEFAULT '',
                     source_ip TEXT NOT NULL DEFAULT '',
                     correlation_id TEXT NOT NULL DEFAULT '',
+                    incident_id TEXT NOT NULL DEFAULT '',
                     source_event_id TEXT NOT NULL DEFAULT '',
                     expires_at_ms INTEGER NOT NULL DEFAULT 0,
                     state TEXT NOT NULL,
                     lock_reason TEXT NOT NULL DEFAULT '',
+                    lock_detail TEXT NOT NULL DEFAULT '',
                     version INTEGER NOT NULL DEFAULT 1,
+                    updated_at_ms INTEGER NOT NULL DEFAULT 0,
                     CHECK (state IN (
                         'OBSERVED', 'VERIFIED', 'ELIGIBLE', 'LOCKED',
                         'HUMAN_RELEASED', 'REJECTED', 'EXPIRED', 'INVALIDATED'
+                    )),
+                    CHECK (producer_trust IN (
+                        'TRUSTED', 'OBSERVED_ONLY', 'REVOKED'
                     )),
                     CHECK (version >= 1),
                     CHECK (observed_at_ms >= 0 AND ingested_at_ms >= 0)
@@ -298,6 +305,31 @@ class SentinelCoreStore:
 
                 CREATE INDEX IF NOT EXISTS idx_evidence_correlation
                     ON evidence(correlation_id);
+
+                -- idx_evidence_incident and idx_evidence_producer are NOT
+                -- here: they cover columns (incident_id, and producer's own
+                -- lookup index) that a database from an earlier revision may
+                -- not have yet. They are created below, after the ALTER
+                -- TABLE migration that guarantees the columns exist -- this
+                -- script runs unconditionally on every startup, including
+                -- against an existing database where CREATE TABLE IF NOT
+                -- EXISTS is a no-op and an index on a not-yet-added column
+                -- would fail closed on every subsequent restart.
+
+                -- The durable trust registry. A producer does not grant
+                -- itself trust: this table is the ONLY source eligibility
+                -- reads current trust from (core/evidence/ledger.py), and it
+                -- is written only by an explicit, audited registration or
+                -- revocation call -- never from a producer's own payload.
+                CREATE TABLE IF NOT EXISTS evidence_producers (
+                    producer TEXT PRIMARY KEY,
+                    trust TEXT NOT NULL,
+                    registered_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    updated_by TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    CHECK (trust IN ('TRUSTED', 'OBSERVED_ONLY', 'REVOKED'))
+                );
 
                 -- Relationships. The child cannot be eligible while a
                 -- relationship marked required is unverified, so this table
@@ -353,6 +385,11 @@ class SentinelCoreStore:
                     -- release does not rewrite history.
                     prior_state TEXT NOT NULL,
                     prior_lock_reason TEXT NOT NULL DEFAULT '',
+                    -- The authoritative audit ledger's own reference (its
+                    -- HMAC) for the record of THIS decision, so a review row
+                    -- can be cross-checked against the tamper-evident audit
+                    -- chain rather than trusted as a bare database row.
+                    audit_reference TEXT NOT NULL DEFAULT '',
                     CHECK (disposition IN ('RELEASED', 'REJECTED', 'HELD')),
                     CHECK (evidence_version >= 1)
                 );
@@ -380,6 +417,53 @@ class SentinelCoreStore:
                     "ALTER TABLE pending_actions "
                     "ADD COLUMN principal_id TEXT NOT NULL DEFAULT ''"
                 )
+
+            # A database created by the FIRST evidence schema (before
+            # producers/incident_id/lock_detail/payload_hash/updated_at_ms
+            # existed) keeps its rows; new columns arrive empty/zero, which
+            # is exactly what those rows mean: this information was never
+            # captured for them. Nothing is fabricated to fill the gap.
+            evidence_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(evidence)"
+                ).fetchall()
+            }
+
+            for column, ddl in (
+                ("payload_hash", "TEXT NOT NULL DEFAULT ''"),
+                ("incident_id", "TEXT NOT NULL DEFAULT ''"),
+                ("lock_detail", "TEXT NOT NULL DEFAULT ''"),
+                ("updated_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column not in evidence_columns:
+                    connection.execute(
+                        f"ALTER TABLE evidence ADD COLUMN {column} {ddl}"
+                    )
+
+            review_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(evidence_reviews)"
+                ).fetchall()
+            }
+
+            if "audit_reference" not in review_columns:
+                connection.execute(
+                    "ALTER TABLE evidence_reviews "
+                    "ADD COLUMN audit_reference TEXT NOT NULL DEFAULT ''"
+                )
+
+            # Only safe to create now: the columns above are guaranteed to
+            # exist, on a fresh database and a migrated one alike.
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_evidence_incident "
+                "ON evidence(incident_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_evidence_producer "
+                "ON evidence(producer)"
+            )
 
     @staticmethod
     def _normalize_action_id(action_id: str) -> str:
@@ -917,7 +1001,9 @@ class SentinelCoreStore:
         ingested_at_ms: int,
         content_hash: str,
         state: str,
+        payload_hash: str = "",
         lock_reason: str = "",
+        lock_detail: str = "",
         subject_type: str = "",
         subject_value: str = "",
         account_id: str = "",
@@ -925,6 +1011,7 @@ class SentinelCoreStore:
         device_id: str = "",
         source_ip: str = "",
         correlation_id: str = "",
+        incident_id: str = "",
         source_event_id: str = "",
         expires_at_ms: int = 0,
         connection: sqlite3.Connection | None = None,
@@ -937,26 +1024,29 @@ class SentinelCoreStore:
         """
         owns_connection = connection is None
         connection = connection or self._connect()
+        now_ms = int(ingested_at_ms)
 
         try:
             connection.execute(
                 """
                 INSERT INTO evidence (
                     evidence_id, producer, producer_trust, event_type,
-                    observed_at_ms, ingested_at_ms, content_hash,
+                    observed_at_ms, ingested_at_ms, content_hash, payload_hash,
                     subject_type, subject_value, account_id, session_id,
-                    device_id, source_ip, correlation_id, source_event_id,
-                    expires_at_ms, state, lock_reason, version
+                    device_id, source_ip, correlation_id, incident_id,
+                    source_event_id, expires_at_ms, state, lock_reason,
+                    lock_detail, version, updated_at_ms
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
                 """,
                 (
                     str(evidence_id), str(producer), str(producer_trust),
-                    str(event_type), int(observed_at_ms), int(ingested_at_ms),
-                    str(content_hash), str(subject_type), str(subject_value),
-                    str(account_id), str(session_id), str(device_id),
-                    str(source_ip), str(correlation_id), str(source_event_id),
-                    int(expires_at_ms), str(state), str(lock_reason),
+                    str(event_type), int(observed_at_ms), now_ms,
+                    str(content_hash), str(payload_hash), str(subject_type),
+                    str(subject_value), str(account_id), str(session_id),
+                    str(device_id), str(source_ip), str(correlation_id),
+                    str(incident_id), str(source_event_id), int(expires_at_ms),
+                    str(state), str(lock_reason), str(lock_detail), now_ms,
                 ),
             )
             if owns_connection:
@@ -966,7 +1056,7 @@ class SentinelCoreStore:
         except sqlite3.IntegrityError:
             if owns_connection:
                 connection.rollback()
-            existing = (connection if not owns_connection else connection).execute(
+            existing = connection.execute(
                 "SELECT evidence_id FROM evidence "
                 "WHERE producer = ? AND content_hash = ?",
                 (str(producer), str(content_hash)),
@@ -1093,6 +1183,28 @@ class SentinelCoreStore:
             )
         return {parent: tuple(children) for parent, children in edges.items()}
 
+    def derived_from_edges(self) -> dict[str, tuple[str, ...]]:
+        """child -> its DERIVED_FROM parents, over VERIFIED links only.
+
+        For tracing corroboration to its roots (Step 8): two records that
+        both ultimately derive from the same source are not two producers,
+        however many hops apart -- and an unverified DERIVED_FROM claim has
+        proved nothing yet, so it does not shrink anyone's independence.
+        """
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT parent_evidence_id, child_evidence_id "
+                "FROM evidence_relationships "
+                "WHERE relationship_type = 'DERIVED_FROM' AND state = 'VERIFIED'"
+            ).fetchall()
+
+        edges: dict[str, list[str]] = {}
+        for row in rows:
+            edges.setdefault(str(row["child_evidence_id"]), []).append(
+                str(row["parent_evidence_id"])
+            )
+        return {child: tuple(parents) for child, parents in edges.items()}
+
     def set_evidence_state(
         self,
         evidence_id: str,
@@ -1100,6 +1212,8 @@ class SentinelCoreStore:
         expected_version: int,
         state: str,
         lock_reason: str = "",
+        lock_detail: str = "",
+        now_ms: int | None = None,
         connection: sqlite3.Connection | None = None,
     ) -> bool:
         """Compare-and-set one record's eligibility, bumping its version.
@@ -1114,12 +1228,14 @@ class SentinelCoreStore:
             cursor = connection.execute(
                 """
                 UPDATE evidence
-                SET state = ?, lock_reason = ?, version = version + 1
+                SET state = ?, lock_reason = ?, lock_detail = ?,
+                    version = version + 1, updated_at_ms = ?
                 WHERE evidence_id = ? AND version = ?
                 """,
                 (
-                    str(state), str(lock_reason), str(evidence_id).strip(),
-                    int(expected_version),
+                    str(state), str(lock_reason), str(lock_detail),
+                    int(now_ms if now_ms is not None else time.time() * 1000),
+                    str(evidence_id).strip(), int(expected_version),
                 ),
             )
             if owns_connection:
@@ -1162,6 +1278,8 @@ class SentinelCoreStore:
         decided_at_ms: int,
         new_state: str,
         new_lock_reason: str = "",
+        new_lock_detail: str = "",
+        audit_reference: str = "",
     ) -> bool:
         """Record one human decision about evidence AND apply it, atomically.
 
@@ -1187,32 +1305,36 @@ class SentinelCoreStore:
                 connection.rollback()
                 return False
 
+            now_ms = int(decided_at_ms)
+
             connection.execute(
                 """
                 INSERT INTO evidence_reviews (
                     review_id, evidence_id, evidence_version, disposition,
                     operator_id, identity_type, reason, decided_at_ms,
-                    prior_state, prior_lock_reason
+                    prior_state, prior_lock_reason, audit_reference
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(review_id), str(evidence_id).strip(),
                     int(evidence_version), str(disposition), str(operator_id),
-                    str(identity_type), str(reason), int(decided_at_ms),
+                    str(identity_type), str(reason), now_ms,
                     str(row["state"]), str(row["lock_reason"]),
+                    str(audit_reference),
                 ),
             )
 
             cursor = connection.execute(
                 """
                 UPDATE evidence
-                SET state = ?, lock_reason = ?, version = version + 1
+                SET state = ?, lock_reason = ?, lock_detail = ?,
+                    version = version + 1, updated_at_ms = ?
                 WHERE evidence_id = ? AND version = ?
                 """,
                 (
-                    str(new_state), str(new_lock_reason),
-                    str(evidence_id).strip(), int(evidence_version),
+                    str(new_state), str(new_lock_reason), str(new_lock_detail),
+                    now_ms, str(evidence_id).strip(), int(evidence_version),
                 ),
             )
             if int(cursor.rowcount or 0) != 1:
@@ -1229,6 +1351,21 @@ class SentinelCoreStore:
         finally:
             connection.close()
 
+    def set_review_audit_reference(
+        self, review_id: str, *, audit_reference: str
+    ) -> bool:
+        """Attach the audit ledger's reference to a review row already
+        written -- used when the audit append happens (necessarily) after
+        the review transaction commits, so the reference cannot be known
+        until then. Best-effort: a failure here does not undo the review."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE evidence_reviews SET audit_reference = ? "
+                "WHERE review_id = ?",
+                (str(audit_reference), str(review_id).strip()),
+            )
+            return int(cursor.rowcount or 0) == 1
+
     def reviews_of(self, evidence_id: str) -> tuple[Mapping[str, Any], ...]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -1243,6 +1380,8 @@ class SentinelCoreStore:
         *,
         state: str | None = None,
         subject_value: str | None = None,
+        producer: str | None = None,
+        incident_id: str | None = None,
         limit: int = 200,
     ) -> tuple[Mapping[str, Any], ...]:
         if not isinstance(limit, int) or isinstance(limit, bool):
@@ -1258,6 +1397,12 @@ class SentinelCoreStore:
         if subject_value is not None:
             clauses.append("subject_value = ?")
             params.append(str(subject_value))
+        if producer is not None:
+            clauses.append("producer = ?")
+            params.append(str(producer))
+        if incident_id is not None:
+            clauses.append("incident_id = ?")
+            params.append(str(incident_id))
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
@@ -1283,6 +1428,74 @@ class SentinelCoreStore:
                     (str(state),),
                 ).fetchone()
         return int(row["n"]) if row is not None else 0
+
+    # -- producer trust registry ---------------------------------------------
+    #
+    # The ONLY durable record of what a producer is trusted to do. Written
+    # only by an explicit registration/revocation call (never from a
+    # producer's own payload); read by the ledger at eligibility-evaluation
+    # time so a revocation takes effect on re-evaluation without needing to
+    # rewrite every evidence row it touches.
+    def set_producer_trust(
+        self,
+        producer: str,
+        *,
+        trust: str,
+        updated_by: str,
+        reason: str = "",
+        now_ms: int | None = None,
+    ) -> None:
+        producer = str(producer).strip()
+        if not producer:
+            raise ValueError("producer must not be empty")
+        moment = int(now_ms if now_ms is not None else time.time() * 1000)
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO evidence_producers (
+                    producer, trust, registered_at_ms, updated_at_ms,
+                    updated_by, reason
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(producer) DO UPDATE SET
+                    trust = excluded.trust,
+                    updated_at_ms = excluded.updated_at_ms,
+                    updated_by = excluded.updated_by,
+                    reason = excluded.reason
+                """,
+                (producer, str(trust), moment, moment, str(updated_by), str(reason)),
+            )
+
+    def get_producer_trust(self, producer: str) -> Mapping[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM evidence_producers WHERE producer = ?",
+                (str(producer).strip(),),
+            ).fetchone()
+        return MappingProxyType(dict(row)) if row is not None else None
+
+    def list_producers(self) -> tuple[Mapping[str, Any], ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM evidence_producers ORDER BY producer"
+            ).fetchall()
+        return tuple(MappingProxyType(dict(row)) for row in rows)
+
+    def list_evidence_by_producer(
+        self, producer: str, *, limit: int = 1000
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Every record from one producer, for a revocation's re-evaluation
+        pass. Bounded, like every other evidence read."""
+        if not 1 <= limit <= 10_000:
+            raise ValueError("limit must be between 1 and 10000")
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM evidence WHERE producer = ? "
+                "ORDER BY observed_at_ms ASC LIMIT ?",
+                (str(producer).strip(), int(limit)),
+            ).fetchall()
+        return tuple(self._evidence_row(row) for row in rows)
 
     def cleanup_terminal_actions(
         self,

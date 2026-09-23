@@ -646,9 +646,9 @@ class SystemOrchestrator:
     def _append_audit(
         self,
         payload: dict[str, Any],
-    ) -> None:
+    ) -> str:
         try:
-            self.audit_store.append(
+            return self.audit_store.append(
                 payload
             )
         except Exception:
@@ -1489,9 +1489,15 @@ class SystemOrchestrator:
     ) -> tuple[bool, dict[str, Any]]:
         """May a recommendation about this subject be staged, and on what?
 
-        Returns (permitted, context). The context always keeps countable and
-        held evidence in SEPARATE keys: an operator, and this code, can tell
-        which is which, and held records can never be mistaken for support.
+        Returns (permitted, context). The context keeps THREE groups
+        strictly separate, so a recommendation view can show each on its own
+        (Step 21): what was actually USED (``eligible_evidence`` /
+        ``eligible_producers``), what is being HELD (``locked_evidence`` --
+        every reason included), and, named on their own because a dispute is
+        not the same kind of fact as a missing dependency, what is
+        CONTRADICTORY (``contradictory_evidence`` -- a strict subset of the
+        locked list, never additional records). None of the held groups is
+        ever merged into the used one.
         """
         ledger = self._evidence_ledger
         if ledger is None:
@@ -1518,6 +1524,7 @@ class SystemOrchestrator:
             # Context only. Never merged into the list above, and never
             # counted toward anything.
             "locked_evidence": bundle.context_for_operator(),
+            "contradictory_evidence": bundle.contradictions_for_operator(),
         }
 
         # The gate refuses when evidence about this subject EXISTS and none

@@ -2317,6 +2317,17 @@ async def _start_heart() -> None:
                 minimum=1,
                 maximum=_HEART_RECOVERY_PAGE - 1,
             )
+            # The evidence ledger's trust registry (Step 14): a producer
+            # must not grant itself trust, so this is the ONE configured
+            # name -- the same label _start_fenrir registers the firewall's
+            # events under -- that the composition root marks TRUSTED. Not
+            # read from anywhere a producer's own payload could reach.
+            trusted_evidence_producers = (
+                _env_str(
+                    "S43_FIREWALL_MONITORING_SOURCE", "sentinel-firewall"
+                ).strip()
+                or "sentinel-firewall",
+            )
 
         core_store = SentinelCoreStore(
             CoreStoreConfig(

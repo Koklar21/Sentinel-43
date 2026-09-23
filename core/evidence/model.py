@@ -86,6 +86,96 @@ TERMINAL_STATES: Final[frozenset[EvidenceState]] = frozenset(
     {EvidenceState.REJECTED, EvidenceState.INVALIDATED}
 )
 
+#: Every transition the system is allowed to make, explicitly enumerated.
+#:
+#:     OBSERVED --> VERIFIED --> ELIGIBLE
+#:        |    \        |
+#:        |     \       +------> LOCKED
+#:        |      \
+#:        +-------+--------------> LOCKED
+#:        +----------------------> INVALIDATED | EXPIRED
+#:
+#: Evaluation is synchronous and idempotent: one pass over a record's current
+#: facts and relationships computes its best current answer, so a record
+#: with nothing outstanding reaches ELIGIBLE in the very same recompute()
+#: call that first examines it -- there is no separate wall-clock "wait" at
+#: VERIFIED before that. OBSERVED --> ELIGIBLE is therefore a real, common
+#: transition, not a shortcut around VERIFIED: it means the record passed
+#: every check VERIFIED represents, in one step. VERIFIED remains available
+#: as an explicit resting point for a caller that confirms a record's own
+#: provenance (producer trust, freshness) in one step and its relationships
+#: in a later one -- e.g. an out-of-band producer-confirmation pass -- and it
+#: is what OBSERVED and LOCKED alike fall back to when neither ELIGIBLE nor a
+#: named lock reason applies yet.
+#:
+#: A record is never persisted as bare VERIFIED when a specific LockReason
+#: already explains why it is not ELIGIBLE: LOCKED with a reason is more
+#: informative than VERIFIED, and a lock without a reason is not a lock (see
+#: LOCK_REASON_DETAIL). VERIFIED is for the gap between "provenance checked"
+#: and "relationships checked" existing at all.
+#:
+#: REJECTED and INVALIDATED are terminal for the automatic rules (see
+#: TERMINAL_STATES): recomputation cannot move a record out of them. Only a
+#: verified contradiction may override a state a human already decided,
+#: which is why HUMAN_RELEASED --> LOCKED is listed once, for exactly that.
+#:
+#: This table is enforced defensively (is_valid_transition / the ledger
+#: raises on a combination not listed here); the eligibility rules below
+#: never produce one that is not.
+ALLOWED_TRANSITIONS: Final[Mapping[EvidenceState, frozenset[EvidenceState]]] = {
+    EvidenceState.OBSERVED: frozenset(
+        {
+            EvidenceState.VERIFIED,
+            EvidenceState.ELIGIBLE,
+            EvidenceState.LOCKED,
+            EvidenceState.INVALIDATED,
+            EvidenceState.EXPIRED,
+        }
+    ),
+    EvidenceState.VERIFIED: frozenset(
+        {
+            EvidenceState.ELIGIBLE,
+            EvidenceState.LOCKED,
+            EvidenceState.INVALIDATED,
+            EvidenceState.EXPIRED,
+        }
+    ),
+    EvidenceState.ELIGIBLE: frozenset(
+        {
+            EvidenceState.LOCKED,
+            EvidenceState.INVALIDATED,
+            EvidenceState.EXPIRED,
+            EvidenceState.HUMAN_RELEASED,
+            EvidenceState.REJECTED,
+        }
+    ),
+    EvidenceState.LOCKED: frozenset(
+        {
+            EvidenceState.ELIGIBLE,
+            EvidenceState.LOCKED,
+            EvidenceState.INVALIDATED,
+            EvidenceState.EXPIRED,
+            EvidenceState.HUMAN_RELEASED,
+            EvidenceState.REJECTED,
+        }
+    ),
+    # A verified contradiction against evidence a human already released
+    # overrides that release: the person had not seen the contradiction.
+    # Every other human decision is terminal for the automatic rules.
+    EvidenceState.HUMAN_RELEASED: frozenset({EvidenceState.LOCKED}),
+    EvidenceState.REJECTED: frozenset(),
+    EvidenceState.INVALIDATED: frozenset(),
+    EvidenceState.EXPIRED: frozenset(),
+}
+
+
+def is_valid_transition(current: EvidenceState, target: EvidenceState) -> bool:
+    """Whether moving from ``current`` to ``target`` is a transition the
+    system recognises. A no-op (state unchanged) is always valid."""
+    if current is target:
+        return True
+    return target in ALLOWED_TRANSITIONS.get(current, frozenset())
+
 
 class LockReason(StrEnum):
     """Why a record is not allowed to count. A lock without a reason is not
@@ -249,6 +339,10 @@ class EvidenceRecord:
     event_type: str
     observed_at_ms: int
     ingested_at_ms: int
+    #: The canonical (normalised, key-order-independent) hash: two reports
+    #: of the same underlying fact from the same producer hash the same, and
+    #: the unique dedupe index is keyed on this. Called "content_hash" in
+    #: this codebase; "canonical_hash" in the terms this record answers to.
     content_hash: str
 
     #: Server-established identity, where the pipeline knew it.
@@ -259,18 +353,36 @@ class EvidenceRecord:
     device_id: str = ""
     source_ip: str = ""
     correlation_id: str = ""
+    #: The staged/governed incident this evidence belongs to, if any. Kept
+    #: separate from correlation_id: a correlation chain can span several
+    #: incidents over time, or none yet.
+    incident_id: str = ""
 
     #: The producer's own identifier for the underlying event, used to
     #: recognise a replay of the same report.
     source_event_id: str = ""
+    #: Hash of the exact bytes reported, order-sensitive, kept purely for
+    #: forensic integrity ("prove this is what was received") -- never used
+    #: for dedup matching, which is content_hash's job.
+    payload_hash: str = ""
     #: After this, the record is stale for governed use. 0 means no expiry.
     expires_at_ms: int = 0
 
     state: EvidenceState = EvidenceState.OBSERVED
     lock_reason: str = ""
+    #: The reason's explanation AT THE TIME it was set, including whatever
+    #: was dynamic about it (e.g. which producers corroborate, how many are
+    #: required). LOCK_REASON_DETAIL is the generic fallback; this is the
+    #: specific one, persisted so it survives independently of the code that
+    #: produced it.
+    lock_detail: str = ""
     #: Bumped on every material change, so a human decision can be bound to
     #: the exact version that was reviewed.
     version: int = 1
+    #: When the state (or its version) last changed. Separate from version
+    #: so "how long has this been sitting locked" is answerable without a
+    #: join to the audit ledger.
+    updated_at_ms: int = 0
 
     def __post_init__(self) -> None:
         for name in ("evidence_id", "producer", "event_type", "content_hash"):
@@ -343,17 +455,25 @@ class EligibilityOutcome:
         }
 
 
-def content_hash(payload: Mapping[str, Any]) -> str:
-    """A canonical hash of what a producer reported.
+def content_hash(payload: Mapping[str, Any], *, canonical: bool = True) -> str:
+    """A hash of what a producer reported.
 
-    Two reports of the same underlying fact hash the same, which is how a
-    replay is recognised. Key order and whitespace are normalised so that
-    re-serialising cannot make one report look like two.
+    ``canonical=True`` (the default): key order and whitespace are
+    normalised, so two reports of the same underlying fact hash the same --
+    this is the dedupe key and the one meaning most callers want.
+
+    ``canonical=False``: the exact bytes as given, key order included. Used
+    only to keep a forensic "prove this is what was received" hash alongside
+    the canonical one; never used for dedupe matching, and never the same
+    value as the canonical hash for a payload with more than one key.
     """
-    canonical = json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), default=str
+    serialised = json.dumps(
+        payload,
+        sort_keys=canonical,
+        separators=(",", ":"),
+        default=str,
     )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return hashlib.sha256(serialised.encode("utf-8")).hexdigest()
 
 
 def evaluate_eligibility(
@@ -364,6 +484,7 @@ def evaluate_eligibility(
     now_ms: int,
     independent_producers: int = 0,
     required_producers: int = 1,
+    producer_trust: ProducerTrust | None = None,
 ) -> EligibilityOutcome:
     """Decide whether one record may count, from provenance alone.
 
@@ -382,6 +503,16 @@ def evaluate_eligibility(
     Nothing here looks at timestamp proximity, and nothing infers identity
     from a label: a relationship either was proved from provenance or it was
     not.
+
+    ``producer_trust`` is the producer's CURRENT standing, looked up by the
+    caller from the durable producer registry -- never the record's own
+    frozen ``producer_trust`` field, which is what was believed at ingestion
+    and must not be re-read as if it still applies (a producer trusted then
+    can be revoked now). ``None`` means the producer is not in the registry
+    at all: a record from a producer that was never registered, or that
+    predates the registry, is LEGACY_UNVERIFIED rather than assumed trusted
+    OR silently treated the same as a producer that WAS checked and found
+    wanting.
     """
     conflicts = tuple(
         rel.parent_evidence_id
@@ -405,11 +536,18 @@ def evaluate_eligibility(
     if record.state is EvidenceState.HUMAN_RELEASED:
         return EligibilityOutcome(state=EvidenceState.HUMAN_RELEASED)
 
-    if record.producer_trust is not ProducerTrust.TRUSTED:
+    if producer_trust is None:
+        return EligibilityOutcome(
+            state=EvidenceState.LOCKED,
+            lock_reason=LockReason.LEGACY_UNVERIFIED,
+            detail=f"producer {record.producer!r} is not in the trust registry",
+        )
+
+    if producer_trust is not ProducerTrust.TRUSTED:
         return EligibilityOutcome(
             state=EvidenceState.LOCKED,
             lock_reason=LockReason.PRODUCER_TRUST_INSUFFICIENT,
-            detail=f"producer trust is {record.producer_trust}",
+            detail=f"producer trust is {producer_trust}",
         )
 
     if record.expires_at_ms and now_ms >= record.expires_at_ms:
@@ -464,6 +602,41 @@ def evaluate_eligibility(
     return EligibilityOutcome(state=EvidenceState.ELIGIBLE)
 
 
+def _bounded_closure(
+    start: str,
+    edges_of: Mapping[str, tuple[str, ...]],
+    *,
+    max_nodes: int,
+) -> tuple[str, ...]:
+    """Shared walk for both dependency_closure and ancestor_closure.
+
+    Iterative with a visited set, so a relationship cycle -- which the schema
+    permits, because two records can each claim to continue the other --
+    terminates instead of recursing forever. ``max_nodes`` bounds the walk so
+    one pathological chain cannot stall ingestion.
+
+    Deterministic: each node's edges are visited in sorted order, so the same
+    graph always produces the same visitation order and the same truncation
+    when ``max_nodes`` is reached, run to run and process to process.
+    """
+    seen: set[str] = set()
+    order: list[str] = []
+    stack = [start]
+
+    while stack:
+        current = stack.pop()
+        for neighbour in sorted(edges_of.get(current, ())):
+            if neighbour in seen or neighbour == start:
+                continue
+            seen.add(neighbour)
+            order.append(neighbour)
+            if len(order) >= max_nodes:
+                return tuple(order)
+            stack.append(neighbour)
+
+    return tuple(order)
+
+
 def dependency_closure(
     start: str,
     children_of: Mapping[str, tuple[str, ...]],
@@ -472,27 +645,28 @@ def dependency_closure(
 ) -> tuple[str, ...]:
     """Every record that depends on ``start``, directly or transitively.
 
-    Iterative with a visited set, so a relationship cycle -- which the schema
-    permits, because two records can each claim to continue the other --
-    terminates instead of recursing forever. ``max_nodes`` bounds the walk so
-    one pathological chain cannot stall ingestion.
+    Used to propagate a change to ``start`` (invalidation, a producer
+    revocation, a new verified relationship) to everything that would need
+    re-evaluating because of it.
     """
-    seen: set[str] = set()
-    order: list[str] = []
-    stack = [start]
+    return _bounded_closure(start, children_of, max_nodes=max_nodes)
 
-    while stack:
-        current = stack.pop()
-        for child in children_of.get(current, ()):  # noqa: SIM118
-            if child in seen or child == start:
-                continue
-            seen.add(child)
-            order.append(child)
-            if len(order) >= max_nodes:
-                return tuple(order)
-            stack.append(child)
 
-    return tuple(order)
+def ancestor_closure(
+    start: str,
+    parents_of: Mapping[str, tuple[str, ...]],
+    *,
+    max_nodes: int = 10_000,
+) -> tuple[str, ...]:
+    """Every record ``start`` descends from, directly or transitively, over
+    one relationship type's edges (``parents_of`` maps a child to its
+    parents for that type alone).
+
+    Used to trace independent corroboration to its ROOTS: two records that
+    both derive from the same ultimate source are not two producers, however
+    many hops apart they are (Step 8).
+    """
+    return _bounded_closure(start, parents_of, max_nodes=max_nodes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -522,6 +696,18 @@ class EvidenceBundle:
     def has_locked_evidence(self) -> bool:
         return bool(self.locked)
 
+    @property
+    def contradictory(self) -> tuple[EvidenceRecord, ...]:
+        """Locked specifically because something contradicts it -- a strict
+        view of ``locked``, so an operator can see disputes as their own
+        labelled group rather than reading every lock reason to find them."""
+        return tuple(
+            record
+            for record in self.locked
+            if self.outcomes.get(record.evidence_id) is not None
+            and self.outcomes[record.evidence_id].conflicts
+        )
+
     def context_for_operator(self) -> list[dict[str, Any]]:
         """Why each held record is being held, for presentation only."""
         rows: list[dict[str, Any]] = []
@@ -534,7 +720,8 @@ class EvidenceBundle:
                     "event_type": record.event_type,
                     "state": str(record.state),
                     "lock_reason": record.lock_reason,
-                    "lock_detail": LOCK_REASON_DETAIL.get(record.lock_reason, ""),
+                    "lock_detail": record.lock_detail
+                    or LOCK_REASON_DETAIL.get(record.lock_reason, ""),
                     "missing_dependencies": list(
                         outcome.missing_dependencies if outcome else ()
                     ),
@@ -543,8 +730,20 @@ class EvidenceBundle:
             )
         return rows
 
+    def contradictions_for_operator(self) -> list[dict[str, Any]]:
+        """The same shape as :meth:`context_for_operator`, filtered to
+        records specifically in dispute -- the third labelled group Step 21
+        asks a recommendation view to show, separate from "used" and
+        "locked"."""
+        disputed_ids = {record.evidence_id for record in self.contradictory}
+        return [
+            row for row in self.context_for_operator()
+            if row["evidence_id"] in disputed_ids
+        ]
+
 
 __all__ = [
+    "ALLOWED_TRANSITIONS",
     "DECISION_ELIGIBLE_STATES",
     "HUMAN_DECIDED_STATES",
     "IDENTITY_RELATIONSHIPS",
@@ -560,7 +759,9 @@ __all__ = [
     "ProducerTrust",
     "RelationshipState",
     "RelationshipType",
+    "ancestor_closure",
     "content_hash",
     "dependency_closure",
     "evaluate_eligibility",
+    "is_valid_transition",
 ]
