@@ -110,6 +110,11 @@ class PendingAction:
     execute_at_ms: int | None = None
     operator_id: str | None = None
     operator_reason: str | None = None
+    #: The one account the evidence in this window belongs to, as the request
+    #: pipeline established it (SecurityContext.principal_id). Empty when the
+    #: source was unauthenticated, or when the window held more than one
+    #: account and therefore names none.
+    principal_id: str = ""
 
     def __post_init__(self) -> None:
         values = {
@@ -155,6 +160,10 @@ class PendingAction:
                 )
 
             object.__setattr__(self, "score", score)
+
+        object.__setattr__(
+            self, "principal_id", str(self.principal_id or "").strip()
+        )
 
 
 class SentinelCoreStore:
@@ -203,7 +212,8 @@ class SentinelCoreStore:
                     reason TEXT NOT NULL,
                     system_id TEXT NOT NULL,
                     operator_id TEXT,
-                    operator_reason TEXT
+                    operator_reason TEXT,
+                    principal_id TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_pending_status
@@ -243,6 +253,22 @@ class SentinelCoreStore:
                     ON incidents(opened_at_ms);
                 """
             )
+
+            # A database created before principal_id existed keeps its rows
+            # and gains the column empty, which is exactly what those rows
+            # mean: the account was never recorded for them.
+            existing = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(pending_actions)"
+                ).fetchall()
+            }
+
+            if "principal_id" not in existing:
+                connection.execute(
+                    "ALTER TABLE pending_actions "
+                    "ADD COLUMN principal_id TEXT NOT NULL DEFAULT ''"
+                )
 
     @staticmethod
     def _normalize_action_id(action_id: str) -> str:
@@ -354,9 +380,10 @@ class SentinelCoreStore:
                     reason,
                     system_id,
                     operator_id,
-                    operator_reason
+                    operator_reason,
+                    principal_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     action.action_id,
@@ -375,6 +402,7 @@ class SentinelCoreStore:
                     action.system_id,
                     action.operator_id,
                     action.operator_reason,
+                    action.principal_id,
                 ),
             )
 
@@ -488,6 +516,33 @@ class SentinelCoreStore:
                     "SELECT COUNT(*) AS n FROM pending_actions WHERE status = ?",
                     (status.value,),
                 ).fetchone()
+
+        return int(row["n"]) if row is not None else 0
+
+    def count_actions_for_target(
+        self,
+        *,
+        target_value: str,
+        since_ms: int,
+    ) -> int:
+        """How many actions were recorded against one target since
+        ``since_ms``. Counts every status: an action that was staged and then
+        vetoed still happened, and the budget is about how often this target
+        is acted on, not about how those decisions turned out."""
+        target = str(target_value).strip()
+
+        if not target:
+            raise ValueError("target_value must not be empty")
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM pending_actions
+                WHERE target_value = ? AND created_at_ms >= ?
+                """,
+                (target, int(since_ms)),
+            ).fetchone()
 
         return int(row["n"]) if row is not None else 0
 

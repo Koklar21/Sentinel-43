@@ -56,6 +56,9 @@ does not replace the owner's review of the change that implements it.
     Approval is recorded; nothing is executed.
   - **Authentication:** its authenticator is bound to the server-verified
     human principal of the decision in progress.
+  - **Its event log:** `ActionStore.log_event` for the engine's governance
+    modules is appended to the one canonical `AuditStore`, so the engine's own
+    account of what it did is durable -- in that ledger, never a second one.
   - **Principal:** pre-authentication evidence is presented to it as
     `anonymous|<source_ip>`, so distinct sources are not collapsed into one.
 - Every engine action is mapped to the policy operation that states ITS
@@ -74,13 +77,22 @@ does not replace the owner's review of the change that implements it.
   Each of these requires an authenticated, authorized human decision in
   `HUMAN_GATED` and is observe-only in `SHADOW`. None of them authorizes
   enforcement outside Sentinel-43.
-- **An action that names an account or a session has nothing to act on yet.**
-  The subject a finding carries is `<identity type>|<source address>`: the
-  only trusted producer (the request firewall) reports an `IdentityType`, so
-  the subject names a *class* of caller and an address, never an account. So
-  `STEP_UP_AUTH`, `TEMP_BLOCK_IDENTITY`, `HARD_BLOCK_IDENTITY` and
-  `QUARANTINE_SESSION` are recorded as having no valid target. No account is
-  invented for them and no address operation is substituted.
+- **An action that names an account acts on the account, and only on a real
+  one.** `STEP_UP_AUTH`, `TEMP_BLOCK_IDENTITY`, `HARD_BLOCK_IDENTITY` and
+  `QUARANTINE_SESSION` target the account the request pipeline authenticated
+  (`SecurityContext.principal_id`), carried through as in-process provenance
+  exactly like the evidence producer: a registered producer reports it, the
+  detector collects the distinct accounts a window saw, and the authority uses
+  it only when the window names exactly one. The subject key
+  (`<identity type>|<source address>`) is never read as an account, no account
+  is invented, and no address operation is substituted for one.
+
+  **Today no producer reports one.** The only registered producer is the
+  firewall, and it emits its event while *rejecting* a request -- before
+  anything authenticates it. So account-scoped responses stay unapprovable in
+  production until an authenticated-stage evidence producer is authorized.
+  That is the owner's decision; this code does not close it by inventing a
+  target. (`core/tests/test_heart_ingestion.py` asserts both halves.)
 - A recommendation is approved as a whole or not at all. If any of its actions
   has no valid target or no policy operation, approval is unavailable -- the
   reasons are shown in the API and the dashboard -- and it can still be
@@ -94,6 +106,29 @@ does not replace the owner's review of the change that implements it.
   `OPEN_INCIDENT` also quarantines a session and blocks an account, so no real
   recommendation can reach it until the evidence carries an account
   identifier -- which is the owner's decision to make, not this code's.
+
+## Which original oversight controls are active
+
+`OversightEngine` in this file holds the original design's staging controls.
+They are enforced in the production path by `SystemOrchestrator`, against the
+one durable store -- the class itself is not instantiated, because it carries
+its own in-memory pending queue and would be a second authority:
+
+| Oversight control | Where it is enforced now |
+| --- | --- |
+| back-pressure (`max_pending`) | staging ceiling, `count_actions(PENDING)` |
+| dedupe (`dedupe_ttl_seconds`) | the engine's own `stage_directive`, over `SentinelCoreStore.dedupe_allow` |
+| action budget per target | `count_actions_for_target` over the budget window, before anything is staged (`SENTINEL_OVERSIGHT_BUDGET_*`) |
+| two-signal corroboration for HIGH | the Heart's corroboration, by distinct trusted producers |
+| SHADOW = advisory only | `stage_recommendation` observes, never stages a decision |
+| HUMAN_GATED = stage for a human | the engine's own `stage_directive` |
+| ACTIVE = stage with a veto delay | refused: no autonomous execution |
+| operator authentication | `resolve_recommendation`, bound to a verified human |
+
+Its per-*source* budget is not enforced here: a durable row records the
+subject it targets, not which producer reported it, so there is nothing to
+count a source against. The ingestion rate limit bounds one producer's flow
+at the boundary instead.
 
 ## What does not run, and why
 

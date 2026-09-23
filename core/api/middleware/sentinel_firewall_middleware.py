@@ -1156,6 +1156,14 @@ class SentinelFirewall:
                 if context is not None
                 else IdentityType.ANONYMOUS.value
             ),
+            # The account this request authenticated as, as the pipeline
+            # established it -- never a credential, and empty when the caller
+            # is anonymous. It is what an account-scoped response acts on.
+            "source_principal": (
+                context.principal_id
+                if context is not None and context.authenticated
+                else ""
+            ),
             "correlation_id": (
                 context.correlation_id if context is not None else ""
             ),

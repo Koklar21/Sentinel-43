@@ -2126,6 +2126,9 @@ async def _rehydrate_heart_pending() -> int:
                     "reason": reason,
                     "operations": operations_for_row(row),
                     "actions": list(row.get("actions") or ()),
+                    # The account an account-scoped operation would act on,
+                    # so a reviewer sees it before approving one.
+                    "principal": str(row.get("principal_id") or ""),
                     "recommendation": recommendation_for_row(row),
                     "approval": recommendation_for_row(row)["approval"],
                     "legacy": str(row["primary_action"]) == LEGACY_REVIEW_ACTION,

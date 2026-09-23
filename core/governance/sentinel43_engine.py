@@ -96,6 +96,37 @@ def validated_subject_key(identity: Any, source_ip: Any) -> str:
     return f"{identity_value}|{normalized}"
 
 
+#: Recorded by the detector from in-process provenance only (see
+#: core/detection/sentinel_threat_detector.py), exactly like evidence_sources.
+SUBJECT_PRINCIPALS_INDICATOR = "subject_principals"
+
+#: An account identifier is a bounded, printable token: it becomes an
+#: operation's target and is shown to a human, so it is never free-form text.
+MAX_PRINCIPAL_LENGTH = 200
+
+
+def principal_of_assessment(assessment: Any) -> str:
+    """The ONE account this evidence belongs to, or "".
+
+    A window that saw no account, or more than one, names none: acting on
+    "the account" would then be acting on an account nobody reviewed.
+    """
+    indicators = getattr(assessment, "indicators", None) or {}
+    principals = indicators.get(SUBJECT_PRINCIPALS_INDICATOR)
+
+    if not isinstance(principals, (list, tuple, set)):
+        return ""
+
+    distinct = {str(value).strip() for value in principals if str(value).strip()}
+    if len(distinct) != 1:
+        return ""
+
+    principal = distinct.pop()
+    if len(principal) > MAX_PRINCIPAL_LENGTH or not principal.isprintable():
+        return ""
+    return principal
+
+
 class EngineUnavailable(RuntimeError):
     """The owner-designated engine could not be loaded; nothing may decide."""
 
@@ -251,13 +282,13 @@ ACTION_CATALOG: Mapping[str, tuple[str, str | None, str | None]] = {
 
 _FULFILLED_ACTIONS = frozenset({"REQUIRE_HUMAN_REVIEW", "LOG_ONLY", "FLAG_SUSPICIOUS"})
 
-#: Actions that act on one named account or session. The subject a finding
-#: carries is ``<identity type>|<source address>`` -- a CLASS of caller and an
-#: address, never an account identifier: the only trusted producer (the
-#: request firewall) reports ``IdentityType``, and validated_subject_key admits
-#: nothing else. So there is no account for these to act on. Approving one
-#: would either authorize nothing or, read as its identity type, authorize an
-#: action against every caller of that class; neither is what a reviewer saw.
+#: Actions that act on one named account or session. The subject key names a
+#: CLASS of caller and an address, so these act on the ``principal`` the
+#: request pipeline established for that evidence instead
+#: (SecurityContext.principal_id, carried through as in-process provenance).
+#: Without one there is no account to act on: approving such an action would
+#: either authorize nothing or, read as its identity type, authorize an action
+#: against every caller of that class -- neither is what a reviewer saw.
 _ACCOUNT_ACTIONS = frozenset(
     {"STEP_UP_AUTH", "TEMP_BLOCK_IDENTITY", "HARD_BLOCK_IDENTITY", "QUARANTINE_SESSION"}
 )
@@ -268,11 +299,22 @@ def assess_actions(
     engine_actions: tuple[str, ...] | list[str],
     *,
     subject_key: str,
+    principal: str | None = None,
 ) -> dict[str, Any]:
     """Classify every action of one engine recommendation, and decide whether
-    the recommendation as a whole can be approved under existing policy."""
+    the recommendation as a whole can be approved under existing policy.
+
+    ``principal`` is the single account the evidence belongs to, established
+    by the request pipeline. It is never derived from the subject key and
+    never invented: an unauthenticated source, or a window holding more than
+    one account, has none.
+    """
     identity, _sep, source_ip = str(subject_key).rpartition("|")
     unauthenticated = identity == _ANONYMOUS
+    principal = str(principal or "").strip()
+    if unauthenticated:
+        # An unauthenticated source has no account, whatever was recorded.
+        principal = ""
     items: list[dict[str, Any]] = []
     operations: list[dict[str, str]] = []
 
@@ -293,13 +335,16 @@ def assess_actions(
             )
             continue
         meaning, target_type, policy_action = entry
-        target = (
-            source_ip
-            if target_type == "source_ip"
-            else subject_key
-            if target_type is not None
-            else None
-        )
+        if target_type == "source_ip":
+            target = source_ip
+        elif target_type in ("account", "session"):
+            # The account itself, never the subject key: an account action
+            # must not be recorded as acting on a caller class.
+            target = principal or None
+        elif target_type is not None:
+            target = subject_key
+        else:
+            target = None
         item: dict[str, Any] = {
             "engine_action": name,
             "meaning": meaning,
@@ -312,7 +357,7 @@ def assess_actions(
             item["reason"] = (
                 "Satisfied by the staged human review and its audit record."
             )
-        elif name in _ACCOUNT_ACTIONS:
+        elif name in _ACCOUNT_ACTIONS and not principal:
             # No account is invented, and no address operation is substituted
             # for one: the action simply has nothing to act on here.
             item["status"] = NO_VALID_TARGET
@@ -321,9 +366,10 @@ def assess_actions(
                 "An unauthenticated source has no account or session to act on."
                 if unauthenticated
                 else (
-                    f"The subject identifies a caller class ({identity}) and an "
-                    "address, not an account or session; there is no account "
-                    "for this to act on."
+                    "The evidence does not name one account to act on: the "
+                    f"subject identifies a caller class ({identity}) and an "
+                    "address, and no single authenticated account was recorded "
+                    "for it."
                 )
             )
         elif policy_action is not None:
@@ -364,10 +410,13 @@ def engine_operations(
     engine_actions: tuple[str, ...] | list[str],
     *,
     subject_key: str,
+    principal: str | None = None,
 ) -> tuple[list[dict[str, str]], list[str]]:
     """(authorizable operations, actions that are neither authorizable nor
     satisfied by the review record) for one recommendation."""
-    assessed = assess_actions(engine_actions, subject_key=subject_key)
+    assessed = assess_actions(
+        engine_actions, subject_key=subject_key, principal=principal
+    )
     unsupported = [
         item["engine_action"]
         for item in assessed["items"]
@@ -386,6 +435,7 @@ class _StagingContext:
     severity: str
     source_kind: str
     score: float
+    principal: str = ""
 
 
 _staging: contextvars.ContextVar[_StagingContext | None] = contextvars.ContextVar(
@@ -417,8 +467,18 @@ class CoreStoreActionStore:
         "EXPIRED": CoreStatus.EXPIRED,
     }
 
-    def __init__(self, core_store: SentinelCoreStore) -> None:
+    #: Engine events that record a governance-relevant fact about a decision,
+    #: rather than operational noise. These reach the canonical audit ledger;
+    #: everything else is logged only. The engine names its own modules.
+    _AUDITED_MODULES = frozenset({"OVERSIGHT", "STAGING", "RESPONSE"})
+
+    def __init__(
+        self,
+        core_store: SentinelCoreStore,
+        audit_sink: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> None:
         self._core = core_store
+        self._audit_sink = audit_sink
 
     @property
     def core_store(self) -> SentinelCoreStore:
@@ -448,6 +508,29 @@ class CoreStoreActionStore:
             "WARNING": logger.warning,
         }.get(str(level).upper(), logger.info)
         log("[engine:%s] %s %s", module, message, json.dumps(context or {}, default=str))
+
+        # The engine's own account of what it decided belongs in the one
+        # authoritative ledger, not only in process logs -- and in that
+        # ledger, never a second one. A sink failure must not change what the
+        # engine decided, so it is logged and swallowed here; the decision
+        # records the orchestrator writes are the ones that fail closed.
+        sink = self._audit_sink
+        if sink is None or str(module).upper() not in self._AUDITED_MODULES:
+            return
+        try:
+            sink(
+                {
+                    "subsystem": "sentinel43_engine",
+                    "component": "sentinel43_engine",
+                    "decision": "ENGINE_EVENT",
+                    "reason_code": str(message)[:200],
+                    "level": str(level).upper(),
+                    "engine_module": str(module),
+                    "engine_context": dict(context or {}),
+                }
+            )
+        except Exception:
+            logger.error("engine event could not be audited", exc_info=True)
 
     def dedupe_check_and_set(self, key: str, ttl_seconds: int) -> bool:
         return self._core.dedupe_allow(f"engine:{key}", ttl_seconds=int(ttl_seconds))
@@ -480,6 +563,7 @@ class CoreStoreActionStore:
                 score=float(context.score),
                 reason=str(pa.reason),
                 system_id=str(pa.system_id),
+                principal_id=context.principal,
             )
         )
 
@@ -559,11 +643,12 @@ class GovernedEngine:
         *,
         human_authenticator: Callable[[Any], bool],
         root: Path | None = None,
+        audit_sink: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
         module, identity = load_engine_module(root)
         self.module = module
         self.identity = identity
-        self.store = CoreStoreActionStore(core_store)
+        self.store = CoreStoreActionStore(core_store, audit_sink)
 
         base = getattr(module, ENGINE_CLASS_NAME)
 
@@ -654,6 +739,7 @@ class GovernedEngine:
         severity: str,
         source_kind: str,
         score: float,
+        principal: str = "",
     ) -> Any:
         """Run the engine's own stage_directive; returns its PendingAction or
         None when the engine suppresses (LOG_ONLY or its dedupe window)."""
@@ -664,6 +750,7 @@ class GovernedEngine:
                 severity=severity,
                 source_kind=source_kind,
                 score=score,
+                principal=principal,
             )
         )
         try:
@@ -702,6 +789,9 @@ __all__ = [
     "BLOCKING_STATUSES",
     "EXPECTED_ENGINE_SHA256",
     "GovernedEngine",
+    "MAX_PRINCIPAL_LENGTH",
+    "SUBJECT_PRINCIPALS_INDICATOR",
+    "principal_of_assessment",
     "validated_subject_key",
     "assess_actions",
     "engine_operations",

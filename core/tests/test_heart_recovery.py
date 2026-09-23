@@ -238,6 +238,19 @@ def _raw_row(core, action_id: str, *, target="anonymous|198.51.100.1", kind="x")
     )
 
 
+def _sql_at(core, action_id: str, created_at_ms: int) -> None:
+    """Move one recorded action's timestamp, to test a window boundary."""
+    connection = sqlite3.connect(core._config.db_path)
+    try:
+        connection.execute(
+            "UPDATE pending_actions SET created_at_ms=? WHERE action_id=?",
+            (created_at_ms, action_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def _sql(directory: Path, statement: str, params: tuple = ()) -> None:
     connection = sqlite3.connect(directory / "heart.sqlite3")
     try:
@@ -1950,19 +1963,17 @@ def test_no_incident_is_opened_without_a_human_decision():
     assert core.count_incidents() == 0
 
 
-def test_incidents_are_not_reachable_from_a_real_critical_plan():
-    """Recorded limitation, deliberately asserted: every plan the engine's own
-    policy produces with OPEN_INCIDENT also quarantines a session and blocks an
-    account, and those have no account to act on -- so a human cannot approve
-    it, and no incident can be opened from a real recommendation yet. Closing
-    this needs an account identifier in the evidence, which is Justin's
-    decision, not something this code may invent."""
+def test_a_real_critical_plan_is_approvable_only_when_the_evidence_names_an_account():
+    """The engine's own CRITICAL plan quarantines a session and blocks an
+    account. Those act on the account the request pipeline authenticated: with
+    one, the whole plan is approvable; without one, it is not, and nothing is
+    substituted to make it so."""
     from core.governance.sentinel43_engine import assess_actions
 
     _, _, _, heart = _stack()
     plan = heart._authority._engine.plan(
         ThreatAssessment(
-            identity="anonymous",
+            identity="operator",
             source_ip="203.0.113.195",
             threat_kind=ThreatKind.GENERIC_INTRUSION,
             severity=ThreatSeverity.CRITICAL,
@@ -1971,13 +1982,63 @@ def test_incidents_are_not_reachable_from_a_real_critical_plan():
         )
     )
     assert "OPEN_INCIDENT" in plan["actions"]
-    assessed = assess_actions(plan["actions"], subject_key="anonymous|203.0.113.195")
-    assert any(o["action"] == "incident_open" for o in assessed["operations"])
-    assert assessed["approval"]["available"] is False
-    assert set(assessed["approval"]["blocking_actions"]) == {
+
+    without = assess_actions(plan["actions"], subject_key="operator|203.0.113.195")
+    assert without["approval"]["available"] is False
+    assert set(without["approval"]["blocking_actions"]) == {
         "QUARANTINE_SESSION",
         "HARD_BLOCK_IDENTITY",
     }
+
+    with_account = assess_actions(
+        plan["actions"],
+        subject_key="operator|203.0.113.195",
+        principal="user-7f3a",
+    )
+    assert with_account["approval"]["available"] is True
+    assert with_account["approval"]["blocking_actions"] == []
+    by_action = {o["engine_action"]: o for o in with_account["operations"]}
+    # Each operation acts on what it names, and the account ones on the account.
+    assert by_action["HARD_BLOCK_IDENTITY"] == {
+        "action": "account_block_extended",
+        "target_type": "account",
+        "target": "user-7f3a",
+        "engine_action": "HARD_BLOCK_IDENTITY",
+    }
+    assert by_action["QUARANTINE_SESSION"]["target"] == "user-7f3a"
+    assert by_action["HARD_BLOCK_IP"]["target"] == "203.0.113.195"
+
+
+def test_an_anonymous_source_never_gains_an_account(client):
+    """Decision 2, enforced at the boundary: even if an account were recorded
+    against an anonymous subject, no account action becomes approvable."""
+    from core.governance.sentinel43_engine import assess_actions
+
+    assessed = assess_actions(
+        ["HARD_BLOCK_IDENTITY"],
+        subject_key="anonymous|203.0.113.197",
+        principal="user-7f3a",
+    )
+    assert assessed["items"][0]["status"] == "NO_VALID_TARGET"
+    assert assessed["items"][0]["target"] is None
+    assert assessed["operations"] == []
+
+
+def test_a_window_with_two_accounts_names_neither():
+    """The account is the target of a real response, so ambiguity is refused
+    rather than resolved by picking one."""
+    from core.governance.sentinel43_engine import principal_of_assessment
+
+    def _assess(principals):
+        return SimpleNamespace(indicators={"subject_principals": principals})
+
+    assert principal_of_assessment(_assess(["user-a"])) == "user-a"
+    assert principal_of_assessment(_assess(["user-a", "user-b"])) == ""
+    assert principal_of_assessment(_assess([])) == ""
+    assert principal_of_assessment(SimpleNamespace(indicators={})) == ""
+    # Never free-form text: an unprintable or oversized value names nothing.
+    assert principal_of_assessment(_assess(["a\nb"])) == ""
+    assert principal_of_assessment(_assess(["u" * 500])) == ""
 
 
 def test_new_policy_operations_require_an_authenticated_human():
@@ -2043,4 +2104,279 @@ def test_a_forged_single_operation_row_cannot_shortcut_the_assessment(client):
         json={"reason": "reviewed by operator"},
     )
     assert approve.status_code == 409, approve.text
+    assert core.get_status(action_id) == ActionStatus.PENDING
+
+
+# ---------------------------------------------------------------------------
+# The production path for an account-scoped response, end to end
+# ---------------------------------------------------------------------------
+def _stage_critical(heart, ip: str, principal: str = "user-7f3a"):
+    """Stage the engine's own CRITICAL plan for an authenticated subject.
+
+    No plan is patched: the engine's _build_critical produces
+    QUARANTINE_SESSION + HARD_BLOCK_IDENTITY + HARD_BLOCK_IP + OPEN_INCIDENT +
+    REQUIRE_HUMAN_REVIEW, and the account those act on is the one the request
+    pipeline authenticated, carried in the evidence.
+    """
+    decision = heart.observe(
+        ThreatAssessment(
+            identity=IdentityType.OPERATOR.value,
+            source_ip=ip,
+            threat_kind=ThreatKind.GENERIC_INTRUSION,
+            severity=ThreatSeverity.CRITICAL,
+            source_kind=ThreatSourceKind.MIXED_OR_UNKNOWN,
+            score=90.0,
+            indicators={
+                "evidence_seq": 1,
+                "evidence_sources": ["firewall", "sparta"],
+                "subject_principals": [principal],
+            },
+            supporting_tags=["t"],
+            window_size=5,
+        )
+    )
+    assert decision.status == "STAGED" and decision.action_id, decision
+    return decision.action_id
+
+
+def test_a_real_critical_recommendation_is_approved_end_to_end(client):
+    """The owner's engine plans it, the orchestration authority stages and
+    resolves it, an authenticated human approves it, and the account-scoped
+    operations are recorded against the account -- not an address."""
+    _, audit, core, heart = _stack()
+    action_id = _stage_critical(heart, "203.0.113.200")
+
+    row = core.get_action(action_id)
+    assert list(row["actions"]) == [
+        "QUARANTINE_SESSION",
+        "HARD_BLOCK_IDENTITY",
+        "HARD_BLOCK_IP",
+        "OPEN_INCIDENT",
+        "REQUIRE_HUMAN_REVIEW",
+    ]
+    assert row["principal_id"] == "user-7f3a"
+
+    _use(heart)
+    assert _recover(client) == 1
+    restored = main_module.runtime.action_store[action_id]["payload"]
+    assert restored["approval"]["available"] is True
+    assert restored["principal"] == "user-7f3a"
+
+    response = client.post(
+        f"/actions/{action_id}/approve",
+        headers=_headers(),
+        json={"reason": "confirmed account compromise"},
+    )
+    assert response.status_code == 200, response.text
+    assert core.get_status(action_id) == ActionStatus.APPROVED
+
+    approved = audit.get_records(component="heart", correlation_id=action_id)[-1]
+    assert approved["decided_by"] == "Sentinel43ResponseEngine.approve_action"
+    assert approved["identity_type"] == "operator"
+    by_action = {o["engine_action"]: o for o in approved["operations"]}
+    assert by_action["HARD_BLOCK_IDENTITY"]["action"] == "account_block_extended"
+    assert by_action["HARD_BLOCK_IDENTITY"]["target"] == "user-7f3a"
+    assert by_action["QUARANTINE_SESSION"]["action"] == "quarantine"
+    assert by_action["HARD_BLOCK_IP"]["target"] == "203.0.113.200"
+    # Every authorized operation was policy-checked as itself.
+    assert {p["action"] for p in approved["policy"]} == {
+        "quarantine",
+        "account_block_extended",
+        "network_block",
+        "incident_open",
+    }
+    # ...and the plan's incident was opened, durably.
+    incident = core.get_incident(approved["incident_id"])
+    assert incident["status"] == "OPEN"
+    assert incident["subject_value"] == "operator|203.0.113.200"
+    # Still nothing was enforced.
+    assert approved["enforcement"].startswith("not_performed")
+
+
+def test_the_account_an_approval_acts_on_cannot_be_changed_after_review(client):
+    """Consent is to the account that was reviewed. A row whose principal has
+    since changed cannot be approved on the staging record."""
+    directory, audit, core, heart = _stack()
+    action_id = _stage_critical(heart, "203.0.113.201")
+    _use(heart)
+    assert _recover(client) == 1
+
+    _sql(
+        directory,
+        "UPDATE pending_actions SET principal_id='someone-else' WHERE action_id=?",
+        (action_id,),
+    )
+    response = client.post(
+        f"/actions/{action_id}/approve",
+        headers=_headers(),
+        json={"reason": "reviewed by operator"},
+    )
+    assert response.status_code == 409, response.text
+    assert core.get_status(action_id) == ActionStatus.PENDING
+    last = audit.get_records(component="heart", correlation_id=action_id)[-1]
+    assert last["reason_code"] == "OPERATION_DOES_NOT_MATCH_STAGING_RECORD"
+    assert core.count_incidents() == 0
+
+
+def test_a_critical_recommendation_without_an_account_is_veto_only(client):
+    """The same real plan, from a source the pipeline never authenticated:
+    staged, honestly unapprovable, and vetoable."""
+    _, audit, core, heart = _stack()
+    decision = heart.observe(
+        ThreatAssessment(
+            identity="anonymous",
+            source_ip="203.0.113.202",
+            threat_kind=ThreatKind.GENERIC_INTRUSION,
+            severity=ThreatSeverity.CRITICAL,
+            source_kind=ThreatSourceKind.MIXED_OR_UNKNOWN,
+            score=90.0,
+            indicators={"evidence_seq": 1, "evidence_sources": ["firewall", "sparta"]},
+            supporting_tags=["t"],
+            window_size=5,
+        )
+    )
+    assert decision.status == "STAGED"
+    _use(heart)
+    assert _recover(client) == 1
+
+    approve = client.post(
+        f"/actions/{decision.action_id}/approve",
+        headers=_headers(),
+        json={"reason": "reviewed by operator"},
+    )
+    assert approve.status_code == 409
+    assert core.count_incidents() == 0
+    veto = client.post(
+        f"/actions/{decision.action_id}/veto",
+        headers=_headers(),
+        json={"reason": "no account to act on"},
+    )
+    assert veto.status_code == 200, veto.text
+    assert core.get_status(decision.action_id) == ActionStatus.VETOED
+
+
+# ---------------------------------------------------------------------------
+# Original oversight controls, in the production orchestration path
+# ---------------------------------------------------------------------------
+def _seed_action_for_target(core, action_id: str, target: str, created_at_ms: int) -> None:
+    """An action already recorded against ``target`` -- what the budget counts."""
+    core.insert_pending(
+        PendingAction(
+            action_id=action_id,
+            created_at_ms=created_at_ms,
+            status=ActionStatus.VETOED,
+            target_type="identity_source_ip",
+            target_value=target,
+            primary_action="RATE_LIMIT",
+            actions=("RATE_LIMIT",),
+            severity="HIGH",
+            kind="DATA_EXFILTRATION",
+            source_kind="MIXED_OR_UNKNOWN",
+            score=50.0,
+            reason="earlier action for this target",
+            system_id="SENTINEL-43-NEXUS-01",
+        )
+    )
+
+
+def test_the_action_budget_holds_a_repeatedly_targeted_subject(monkeypatch):
+    """The original oversight budget: once enough actions have been recorded
+    against ONE target inside the window, a further recommendation for it is
+    observed, not staged. Other subjects are unaffected."""
+    _, audit, core, heart = _stack()
+    monkeypatch.setattr(heart._authority, "_budget_max_per_target", 2)
+    now_ms = int(time.time() * 1000)
+    _seed_action_for_target(core, "seed-1", "anonymous|203.0.113.210", now_ms)
+    _seed_action_for_target(core, "seed-2", "anonymous|203.0.113.210", now_ms)
+
+    held = heart.observe(
+        ThreatAssessment(
+            identity="anonymous",
+            source_ip="203.0.113.210",
+            threat_kind=ThreatKind.DATA_EXFILTRATION,
+            severity=ThreatSeverity.HIGH,
+            source_kind=ThreatSourceKind.MIXED_OR_UNKNOWN,
+            score=52.0,
+            indicators={"evidence_seq": 1, "evidence_sources": ["firewall", "sparta"]},
+            supporting_tags=["t"],
+            window_size=5,
+        )
+    )
+    assert held.status == "OBSERVED"
+    assert held.reason == "BUDGET_EXCEEDED"
+    assert core.count_actions() == 2  # nothing new was staged
+
+    record = audit.get_records(component="heart", limit=200)[-1]
+    assert record["reason_code"] == "BUDGET_EXCEEDED"
+    assert record["budget_target"] == "anonymous|203.0.113.210"
+    assert record["budget_limit"] == 2
+
+    # A different subject is not affected by another subject's budget.
+    other = _stage(heart, "203.0.113.211")
+    assert core.get_status(other) == ActionStatus.PENDING
+
+
+def test_the_budget_counts_only_actions_inside_its_window(monkeypatch):
+    """An action older than the window no longer holds the target."""
+    _, _, core, heart = _stack()
+    monkeypatch.setattr(heart._authority, "_budget_max_per_target", 1)
+    monkeypatch.setattr(heart._authority, "_budget_window_seconds", 300)
+    _seed_action_for_target(
+        core,
+        "seed-old",
+        "anonymous|203.0.113.212",
+        int((time.time() - 600) * 1000),
+    )
+
+    staged = _stage(heart, "203.0.113.212")
+    assert core.get_status(staged) == ActionStatus.PENDING
+
+
+def test_the_engine_events_reach_the_one_audit_ledger():
+    """The engine's own account of what it did is durable, in the same ledger
+    as the governed decision -- not a second store, and not only a log line."""
+    _, audit, _, heart = _stack()
+    action_id = _stage(heart, "203.0.113.213")
+
+    engine_records = [
+        r
+        for r in audit.get_records(component="sentinel43_engine", limit=200)
+        if r.get("decision") == "ENGINE_EVENT"
+    ]
+    assert engine_records, "the engine's own events were not audited"
+    staged_events = [
+        r
+        for r in engine_records
+        if r["reason_code"] == "Action staged"
+        and r["engine_context"].get("action_id") == action_id
+    ]
+    assert len(staged_events) == 1
+    assert staged_events[0]["engine_module"] == "OVERSIGHT"
+    assert staged_events[0]["component"] == "sentinel43_engine"
+
+    # The engine's refusal of an unauthenticated approval is recorded too.
+    with pytest.raises(UnauthorizedDecision):
+        heart._authority.resolve_recommendation(
+            action_id,
+            approved=True,
+            operator_id="not-the-operator",
+            reason="x",
+            principal=_principal(
+                subject="someone-else", identity=IdentityType.SERVICE_API
+            ),
+        )
+
+
+def test_an_unauditable_engine_event_does_not_change_the_decision():
+    """Audit continuity is best-effort for the engine's own log lines: a sink
+    failure must not stop the engine deciding, because the decision records
+    that DO fail closed are written by the orchestrator."""
+    _, _, core, heart = _stack()
+    store = heart._authority._engine.store
+
+    def explode(_record):
+        raise RuntimeError("ledger unavailable")
+
+    store._audit_sink = explode
+    action_id = _stage(heart, "203.0.113.214")
     assert core.get_status(action_id) == ActionStatus.PENDING

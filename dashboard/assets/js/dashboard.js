@@ -887,7 +887,8 @@ function renderRecommendationDetail(action) {
     const rec = action?.payload?.recommendation;
     const approval = action?.payload?.approval;
     const incidentId = action?.payload?.incident_id;
-    if (!rec && !approval && !incidentId) return "";
+    const principal = action?.payload?.principal;
+    if (!rec && !approval && !incidentId && !principal) return "";
     const blocked = approvalBlock(action);
     const approvalText = blocked
         ? "UNAVAILABLE — " + blocked.join(" | ")
@@ -897,6 +898,9 @@ function renderRecommendationDetail(action) {
         ? items.map(i => `${i.engine_action}: ${i.status}` + (i.meaning ? ` — ${i.meaning}` : "")).join("\n")
         : "—";
     return `<div class="expand-kv"><div class="k">APPROVAL</div><div class="v">${escHtml(approvalText)}</div></div>` +
+        (principal
+            ? `<div class="expand-kv"><div class="k">ACCOUNT</div><div class="v">${escHtml(principal)}</div></div>`
+            : "") +
         `<div class="expand-kv"><div class="k">RECOMMENDED</div><div class="v" style="white-space:pre-wrap">${escHtml(itemsText)}</div></div>` +
         (incidentId
             ? `<div class="expand-kv"><div class="k">INCIDENT</div><div class="v">${escHtml(incidentId)}</div></div>`

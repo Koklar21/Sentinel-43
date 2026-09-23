@@ -64,6 +64,32 @@ MAX_PENDING_REVIEWS: Final[int] = 10_000
 DEFAULT_REVIEW_TTL_SECONDS: Final[int] = 30 * 60
 
 
+def _oversight_int(name: str, default: int) -> int:
+    """One of the original oversight limits, read from the environment name
+    the original design uses, so an existing deployment's configuration keeps
+    meaning what it meant."""
+    import os
+
+    try:
+        value = int(str(os.getenv(name, "")).strip() or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+#: The original oversight action budget (Shadow_mode.py's OversightEngine):
+#: how many actions may be recorded against ONE target inside one window
+#: before further recommendations for it are held as observations. It bounds
+#: how often a single subject is acted on, which the dedupe window (seconds)
+#: and the pending ceiling (depth) do not.
+OVERSIGHT_BUDGET_WINDOW_SECONDS: Final[int] = _oversight_int(
+    "SENTINEL_OVERSIGHT_BUDGET_WINDOW_SECONDS", 300
+)
+OVERSIGHT_BUDGET_MAX_PER_TARGET: Final[int] = _oversight_int(
+    "SENTINEL_OVERSIGHT_BUDGET_MAX_PER_TARGET", 5
+)
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -354,7 +380,9 @@ def operations_for_row(row: Mapping[str, Any]) -> list[dict[str, str]] | None:
     from .sentinel43_engine import engine_operations
 
     operations, _unsupported = engine_operations(
-        tuple(row.get("actions") or ()), subject_key=subject_key
+        tuple(row.get("actions") or ()),
+        subject_key=subject_key,
+        principal=str(row.get("principal_id") or ""),
     )
     return operations
 
@@ -386,7 +414,9 @@ def recommendation_for_row(row: Mapping[str, Any]) -> dict[str, Any]:
     from .sentinel43_engine import assess_actions
 
     assessed = assess_actions(
-        tuple(row.get("actions") or ()), subject_key=str(row["target_value"])
+        tuple(row.get("actions") or ()),
+        subject_key=str(row["target_value"]),
+        principal=str(row.get("principal_id") or ""),
     )
     if not _engine_row_consistent(row):
         assessed["approval"] = {
@@ -412,6 +442,11 @@ def staging_record_matches_row(
             and str(plan.get("primary_action") or "") == str(row["primary_action"])
             and [str(a) for a in plan["actions"]]
             == [str(a) for a in (row.get("actions") or ())]
+            # The account an account action would act on is part of what was
+            # reviewed: a row whose principal_id has since changed proposes a
+            # different target and cannot be approved on this record.
+            and str(record.get("principal") or "")
+            == str(row.get("principal_id") or "")
         )
     return same_operations(staged_operations_of(record), operations_for_row(row))
 
@@ -514,6 +549,8 @@ class SystemOrchestrator:
             lambda _principal: False
         )
         self._max_pending_recommendations = 500
+        self._budget_window_seconds = OVERSIGHT_BUDGET_WINDOW_SECONDS
+        self._budget_max_per_target = OVERSIGHT_BUDGET_MAX_PER_TARGET
         self._engine: Any | None = None
 
     @staticmethod
@@ -1387,7 +1424,13 @@ class SystemOrchestrator:
             if operator_authenticator is not None
             else (lambda _principal: False)
         )
-        engine = GovernedEngine(store, human_authenticator=authenticator)
+        engine = GovernedEngine(
+            store,
+            human_authenticator=authenticator,
+            # One ledger: the engine's own events go to the same audit store
+            # every governed decision is written to.
+            audit_sink=self._append_audit,
+        )
         with self._recommendation_lock:
             previous = self._engine
             self._recommendation_store = store
@@ -1520,6 +1563,7 @@ class SystemOrchestrator:
         from .sentinel43_engine import (
             BLOCKING_STATUSES,
             assess_actions,
+            principal_of_assessment,
             validated_subject_key,
         )
 
@@ -1542,8 +1586,13 @@ class SystemOrchestrator:
             )
             return RecommendationOutcome(status="OBSERVED", reason="INVALID_SUBJECT")
 
+        principal = principal_of_assessment(assessment)
         plan = engine.plan(assessment)
-        assessed = assess_actions(plan["actions"], subject_key=recommendation.subject_key)
+        assessed = assess_actions(
+            plan["actions"],
+            subject_key=recommendation.subject_key,
+            principal=principal,
+        )
         operations = assessed["operations"]
         unsupported = [
             item["engine_action"]
@@ -1554,6 +1603,7 @@ class SystemOrchestrator:
             "engine_plan": plan["summary"],
             "operations": operations,
             "unsupported_actions": unsupported,
+            "principal": principal,
             "recommendation": {
                 "items": assessed["items"],
                 "approval": assessed["approval"],
@@ -1617,6 +1667,7 @@ class SystemOrchestrator:
             "severity": assessment.severity.value,
             "source_kind": assessment.source_kind.value,
             "score": float(assessment.score),
+            "principal": principal,
         }
 
         with self._recommendation_lock:
@@ -1643,6 +1694,43 @@ class SystemOrchestrator:
                     )
                     return RecommendationOutcome(
                         status="OBSERVED", reason="BACKPRESSURE_LIMIT"
+                    )
+
+                # The original oversight budget, in its original position:
+                # after back-pressure, before anything durable is staged. A
+                # target already acted on this often stays under observation
+                # rather than producing another decision for a human.
+                since_ms = int(
+                    (_utc_now().timestamp() - self._budget_window_seconds) * 1000
+                )
+                recent = store.count_actions_for_target(
+                    target_value=recommendation.subject_key, since_ms=since_ms
+                )
+                if recent >= self._budget_max_per_target:
+                    self._append_audit(
+                        self._recommendation_record(
+                            recommendation,
+                            decision="OBSERVED",
+                            reason_code="BUDGET_EXCEEDED",
+                            extra={
+                                **decision_context,
+                                "budget_target": recommendation.subject_key,
+                                "budget_recent_actions": recent,
+                                "budget_limit": self._budget_max_per_target,
+                                "budget_window_seconds": self._budget_window_seconds,
+                            },
+                        )
+                    )
+                    logger.warning(
+                        "Recommendation not staged: %d actions already recorded "
+                        "for %s within %ds (limit %d)",
+                        recent,
+                        recommendation.subject_key,
+                        self._budget_window_seconds,
+                        self._budget_max_per_target,
+                    )
+                    return RecommendationOutcome(
+                        status="OBSERVED", reason="BUDGET_EXCEEDED"
                     )
 
             staged = engine.stage(plan["directive"], **stage_kwargs)
