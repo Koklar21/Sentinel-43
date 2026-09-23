@@ -322,6 +322,26 @@ ALLOW_PROCESS_LOCAL_STATE = _env_bool(
 # Validation models
 # =============================================================================
 
+class EvidenceReviewBody(BaseModel):
+    """A human decision about whether evidence may be COUNTED.
+
+    ``expected_version`` binds the decision to the exact version the
+    reviewer saw: if the record changed in the meantime the decision is
+    refused rather than applied to something else.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    disposition: str = Field(pattern="^(RELEASED|REJECTED|HELD)$")
+    reason: str = Field(min_length=10, max_length=500)
+    expected_version: int = Field(ge=1)
+
+    @field_validator("reason")
+    @classmethod
+    def clean_reason(cls, value: str) -> str:
+        return value.strip()
+
+
 class DecisionBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -432,6 +452,9 @@ class RuntimeState:
     audit_store: Any | None = None
     orchestrator: Any | None = None
     heart: Any | None = None
+    #: Durable evidence, its provenance and its eligibility. An evidence
+    #: layer: it decides what may COUNT, never what is done.
+    evidence_ledger: Any | None = None
     sparta_instance: Any | None = None
     sparta_task: asyncio.Task[Any] | None = None
     fenrir_instance: Any | None = None
@@ -2318,6 +2341,13 @@ async def _start_heart() -> None:
             operator_authenticator=_heart_operator_authenticator,
         )
 
+        # The composition root attached the evidence ledger to the
+        # authority; expose the same instance for the operator-facing
+        # /evidence routes. One ledger, one durable store.
+        runtime.evidence_ledger = getattr(
+            runtime.orchestrator, "_evidence_ledger", None
+        )
+
         # Recovery finishes BEFORE Fenrir may stage live, otherwise a row
         # inserted but not yet audited would be read as unaudited and
         # quarantined while it is being legitimately staged.
@@ -2361,6 +2391,7 @@ async def _start_heart() -> None:
         logger.info("Heart (ThreatGovernor) started (mode=%s)", resolved_default_mode)
     except Exception as exc:
         runtime.heart = None
+        runtime.evidence_ledger = None
         if runtime.fenrir_instance is not None:
             runtime.fenrir_instance.heart = None
         # A Heart that failed to start must not leave its decisions reachable
@@ -3079,6 +3110,196 @@ async def dashboard_incidents(
         "incidents": [dict(incident) for incident in incidents],
         "timestamp": utc_now(),
     }
+
+
+def _evidence_view(record: Mapping[str, Any]) -> dict[str, Any]:
+    """One evidence record as an operator needs to see it.
+
+    Provenance identifiers are shown because they are what makes a
+    relationship checkable; the reported content is not, because it is the
+    part that can carry sensitive values.
+    """
+    from core.evidence.model import DECISION_ELIGIBLE_STATES, LOCK_REASON_DETAIL
+
+    state = str(record["state"])
+    lock_reason = str(record["lock_reason"])
+    return {
+        "evidence_id": str(record["evidence_id"]),
+        "producer": str(record["producer"]),
+        "producer_trust": str(record["producer_trust"]),
+        "event_type": str(record["event_type"]),
+        "observed_at_ms": int(record["observed_at_ms"]),
+        "ingested_at_ms": int(record["ingested_at_ms"]),
+        "subject_type": str(record["subject_type"]),
+        "subject_value": str(record["subject_value"]),
+        "correlation_id": str(record["correlation_id"]),
+        "state": state,
+        "lock_reason": lock_reason,
+        "lock_detail": LOCK_REASON_DETAIL.get(lock_reason, ""),
+        "counts_toward_decisions": state in {str(s) for s in DECISION_ELIGIBLE_STATES},
+        "released_by_a_human": state == "HUMAN_RELEASED",
+        "version": int(record["version"]),
+        # Present or absent, never the value itself: whether an account or
+        # session is KNOWN is what decides eligibility, and the identifier
+        # is not needed to explain a lock.
+        "has_account_identity": bool(str(record["account_id"]).strip()),
+        "has_session_identity": bool(str(record["session_id"]).strip()),
+        "has_device_identity": bool(str(record["device_id"]).strip()),
+    }
+
+
+def _require_evidence_ledger():
+    ledger = runtime.evidence_ledger
+    if ledger is None:
+        raise HTTPException(
+            status_code=409,
+            detail="The evidence ledger is not attached",
+        )
+    return ledger
+
+
+@root_router.get("/evidence")
+async def dashboard_evidence(
+    request: Request,
+    state: str | None = None,
+    subject: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Evidence and why each record may or may not be used.
+
+    Answers "why is Sentinel refusing to use this?" without reconstructing
+    it from logs.
+    """
+    await _require_operator(request)
+    ledger = _require_evidence_ledger()
+
+    if not 1 <= int(limit) <= 1000:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 1000")
+
+    rows = await asyncio.to_thread(
+        functools.partial(
+            ledger._store.list_evidence,  # noqa: SLF001 - read-only accessor
+            state=state,
+            subject_value=subject,
+            limit=int(limit),
+        )
+    )
+    return {
+        "evidence": [_evidence_view(row) for row in rows],
+        "timestamp": utc_now(),
+    }
+
+
+@root_router.get("/evidence/{evidence_id}")
+async def dashboard_evidence_detail(
+    evidence_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    """One record, its relationships, what it is waiting for, and any human
+    disposition it already carries."""
+    await _require_operator(request)
+    ledger = _require_evidence_ledger()
+
+    record = await asyncio.to_thread(
+        functools.partial(ledger._store.get_evidence, evidence_id)  # noqa: SLF001
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="evidence does not exist")
+
+    relationships = await asyncio.to_thread(
+        functools.partial(ledger._store.relationships_of, evidence_id)  # noqa: SLF001
+    )
+    reviews = await asyncio.to_thread(
+        functools.partial(ledger._store.reviews_of, evidence_id)  # noqa: SLF001
+    )
+
+    return {
+        **_evidence_view(record),
+        "relationships": [
+            {
+                "relationship_id": str(row["relationship_id"]),
+                "parent_evidence_id": str(row["parent_evidence_id"]),
+                "relationship_type": str(row["relationship_type"]),
+                "required_for_eligibility": bool(row["required_for_eligibility"]),
+                "state": str(row["state"]),
+                "verification_method": str(row["verification_method"]),
+                "invalidated_reason": str(row["invalidated_reason"]),
+            }
+            for row in relationships
+        ],
+        "missing_dependencies": [
+            str(row["parent_evidence_id"])
+            for row in relationships
+            if bool(row["required_for_eligibility"])
+            and str(row["state"]) != "VERIFIED"
+        ],
+        "conflicts": [
+            str(row["parent_evidence_id"])
+            for row in relationships
+            if str(row["relationship_type"]) == "CONTRADICTS"
+        ],
+        "human_dispositions": [
+            {
+                "disposition": str(row["disposition"]),
+                "operator_id": str(row["operator_id"]),
+                "identity_type": str(row["identity_type"]),
+                "reason": str(row["reason"]),
+                "decided_at_ms": int(row["decided_at_ms"]),
+                "evidence_version": int(row["evidence_version"]),
+                "prior_state": str(row["prior_state"]),
+                "prior_lock_reason": str(row["prior_lock_reason"]),
+                # Stated on every row so it can never be read as approval of
+                # a response action.
+                "authorizes_response_action": False,
+            }
+            for row in reviews
+        ],
+        "timestamp": utc_now(),
+    }
+
+
+@root_router.post("/evidence/{evidence_id}/review")
+async def dashboard_review_evidence(
+    evidence_id: str,
+    body: EvidenceReviewBody,
+    request: Request,
+) -> dict[str, Any]:
+    """An authenticated human decision about whether evidence may be counted.
+
+    This is NOT approval of a response action: those are resolved through
+    /actions/{id}/approve, by the governance authority. Releasing evidence
+    only makes it eligible to be considered.
+    """
+    operator = await _require_operator(request)
+    ledger = _require_evidence_ledger()
+
+    from core.evidence.ledger import UnauthorizedEvidenceReview
+
+    try:
+        result = await asyncio.to_thread(
+            functools.partial(
+                ledger.review,
+                evidence_id,
+                disposition=body.disposition,
+                operator_id=operator,
+                principal=_decision_principal(request, operator),
+                reason=body.reason,
+                expected_version=body.expected_version,
+            )
+        )
+    except UnauthorizedEvidenceReview as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="an authenticated human operator is required to review evidence",
+        ) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="evidence does not exist") from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return {"ok": True, **result, "timestamp": utc_now()}
 
 
 @root_router.get("/vault/stats")

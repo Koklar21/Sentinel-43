@@ -1520,8 +1520,21 @@ class SystemOrchestrator:
             "locked_evidence": bundle.context_for_operator(),
         }
 
-        if not bundle.eligible:
+        # The gate refuses when evidence about this subject EXISTS and none
+        # of it may count: that is evidence being withheld, and acting would
+        # mean acting on held evidence.
+        #
+        # A subject the ledger holds nothing for is a different situation --
+        # nothing is being withheld, and the reporter's own corroboration
+        # rules still apply as they always did. Refusing there would turn a
+        # ledger that is not yet the source for a given path into an outage,
+        # so the gate degrades instead: it records that it had nothing to
+        # check rather than silently implying evidence was verified.
+        if not bundle.eligible and bundle.locked:
             return False, context
+
+        if not bundle.eligible:
+            context["evidence_gate"] = "no_recorded_evidence"
         return True, context
 
     def detach_recommendation_store(self) -> None:

@@ -180,6 +180,21 @@ def build_heart_from_settings(
             max_pending_actions=heart_config.max_pending_actions,
         )
 
+        # The evidence ledger shares the one durable governance store, so
+        # evidence, the decisions it supports and their audit trail are in
+        # the same database and commit against the same transactions. It is
+        # attached to the authority as an INPUT filter -- it narrows what
+        # may be acted on, and holds no decision of its own.
+        from core.evidence.ledger import EvidenceLedger
+
+        ledger = EvidenceLedger(
+            core_store,
+            operator_authenticator=operator_authenticator,
+            audit_sink=authority._append_audit,  # noqa: SLF001 - same package
+            required_producers=heart_config.corroboration_min_signals_for_high,
+        )
+        authority.attach_evidence_ledger(ledger)
+
     return ThreatGovernor(
         audit_store=audit_store,
         velocity_guard=velocity_guard,

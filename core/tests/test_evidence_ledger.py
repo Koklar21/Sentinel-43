@@ -835,3 +835,44 @@ def test_the_ledger_never_stages_or_resolves_anything():
         "stage_directive",
     }
     assert called & forbidden == set()
+
+
+def test_a_subject_with_no_recorded_evidence_degrades_instead_of_blocking():
+    """An empty ledger for a subject is not evidence being withheld.
+
+    Refusing there would turn a ledger that is not yet the source for a
+    given path into an outage. The gate records that it had nothing to
+    check, and the reporter's own rules still apply.
+    """
+    _, audit, store, heart, authority, ledger = _authority_stack()
+    authority.attach_evidence_ledger(ledger)
+
+    decision = heart.observe(_assessment("203.0.113.60"))
+    assert decision.status == "STAGED", decision
+
+    staged = audit.get_records(component="heart", correlation_id=decision.action_id)[0]
+    assert staged["evidence_gate"] == "no_recorded_evidence"
+    assert staged["eligible_evidence"] == []
+    assert staged["locked_evidence"] == []
+
+
+def test_holding_every_record_blocks_but_holding_none_does_not():
+    """The difference the gate turns on, stated directly."""
+    _, _, _, _, authority, ledger = _authority_stack()
+    authority.attach_evidence_ledger(ledger)
+    subject = "anonymous|203.0.113.61"
+
+    permitted, context = authority._evidence_gate(subject)  # noqa: SLF001
+    assert permitted is True and context["evidence_gate"] == "no_recorded_evidence"
+
+    parent, _ = _ingest_for(ledger, subject, account_id="acct-1")
+    _ingest_for(
+        ledger, subject, producer="sparta", n=2, account_id="acct-OTHER",
+        depends_on=(parent,),
+    )
+    ledger.invalidate(parent, reason="forged")
+
+    permitted, context = authority._evidence_gate(subject)  # noqa: SLF001
+    assert permitted is False
+    assert context["evidence_gate"] == "enforced"
+    assert len(context["locked_evidence"]) == 2
