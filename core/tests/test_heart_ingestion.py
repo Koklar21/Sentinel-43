@@ -826,3 +826,41 @@ def test_an_account_is_never_taken_from_an_untrusted_payload():
     )
     assert _counts(manager)["ingested"] == 1
     assert list(detector.assess_all()[0].indicators["subject_principals"]) == []
+
+
+def test_a_reported_account_is_bounded_at_the_ingestion_boundary():
+    """Each layer refuses a malformed account on its own. The manager clamps
+    what it carries out of a payload, so an oversized or unprintable value
+    never reaches the detector -- not only the authority's later check."""
+    from core.governance.sentinel43_engine import MAX_PRINCIPAL_LENGTH
+
+    ingestor = _RecordingIngestor()
+    manager = _manager(ingestor, producers={"firewall": "sentinel-firewall"})
+
+    manager.analyze_event(
+        _event(
+            id="clamp-1",
+            source="sentinel-firewall",
+            source_identity="operator",
+            source_principal="u" * (MAX_PRINCIPAL_LENGTH + 500),
+        ),
+        source_ip="198.51.100.4",
+        source_identity="operator",
+        trusted_producer="firewall",
+    )
+    manager.analyze_event(
+        _event(
+            id="clamp-2",
+            source="sentinel-firewall",
+            source_identity="operator",
+            source_principal="bad\nvalue",
+        ),
+        source_ip="198.51.100.5",
+        source_identity="operator",
+        trusted_producer="firewall",
+    )
+
+    assert _counts(manager)["ingested"] == 2
+    carried = [c.metadata["principal_id"] for c in ingestor.contexts]
+    assert len(carried[0]) == MAX_PRINCIPAL_LENGTH
+    assert carried[1] == ""
