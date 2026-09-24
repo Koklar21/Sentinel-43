@@ -199,6 +199,12 @@ class EvidenceLedger:
                 self._propagate_from(str(row["evidence_id"]))
             return len(rows)
 
+    def list_producers(self) -> tuple[Mapping[str, Any], ...]:
+        """The durable trust registry, in full: which producers are
+        trusted, and by whom. Historical rows, not a domain type of their
+        own -- same rationale as reviews_of()."""
+        return self._store.list_producers()
+
     def _current_trust(self, record: EvidenceRecord) -> ProducerTrust | None:
         """The producer's standing NOW, per the durable registry -- never
         the ingestion-time snapshot, which is retained on the record for
@@ -234,6 +240,41 @@ class EvidenceLedger:
     def get(self, evidence_id: str) -> EvidenceRecord | None:
         row = self._store.get_evidence(evidence_id)
         return self._record(row) if row is not None else None
+
+    def list_evidence(
+        self,
+        *,
+        state: str | None = None,
+        subject_value: str | None = None,
+        limit: int = 200,
+    ) -> tuple[EvidenceRecord, ...]:
+        """Every stored record matching the filter, as domain objects.
+
+        Read-only and unfiltered by eligibility: this is what an operator
+        sees when asking "what evidence exists", not what orchestration may
+        act on -- that distinction is bundle_for_subject()'s job. Callers
+        that need eligibility must go through that, not this.
+        """
+        rows = self._store.list_evidence(
+            state=state, subject_value=subject_value, limit=limit
+        )
+        return tuple(self._record(row) for row in rows)
+
+    def relationships_of(
+        self, evidence_id: str
+    ) -> tuple[EvidenceRelationship, ...]:
+        """Every relationship where this record is the dependent child."""
+        return tuple(
+            self._relationship(row)
+            for row in self._store.relationships_of(evidence_id)
+        )
+
+    def reviews_of(self, evidence_id: str) -> tuple[Mapping[str, Any], ...]:
+        """Every human review decision recorded against this record, in
+        order. Historical audit rows, not a domain type of their own -- the
+        review itself is unevaluated, so there is nothing to compute here
+        beyond what was durably recorded."""
+        return self._store.reviews_of(evidence_id)
 
     # -- ingestion ----------------------------------------------------------
     def ingest(

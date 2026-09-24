@@ -38,6 +38,7 @@ from core.detection.sentinel_threat_types import (  # noqa: E402
     ThreatSeverity,
     ThreatSourceKind,
 )
+from core.evidence.model import ProducerTrust  # noqa: E402
 from core.governance import (  # noqa: E402
     DecisionPrincipal,
     UnauthorizedDecision,
@@ -2568,3 +2569,82 @@ def test_a_pending_actions_table_without_the_check_constraint_gets_it_added_safe
         ).fetchall()
     }
     assert {"idx_pending_status", "idx_pending_created"} <= indexes
+
+
+# ---------------------------------------------------------------------------
+# The /evidence routes read through the ledger's own public contract
+# (list_evidence / get / relationships_of / reviews_of), never through its
+# private _store -- proving the production change, not merely the ledger
+# methods it now calls (those are exercised directly in
+# test_evidence_ledger.py).
+# ---------------------------------------------------------------------------
+def test_the_evidence_routes_read_through_the_ledgers_public_contract(client):
+    _, _, core, heart = _stack()
+    ledger = heart._authority._evidence_ledger
+    assert ledger is not None
+    main_module.runtime.evidence_ledger = ledger
+    try:
+        for producer in ("sentinel-firewall", "sparta"):
+            ledger.register_producer(
+                producer, trust=ProducerTrust.TRUSTED, updated_by="test"
+            )
+        parent, _ = ledger.ingest(
+            producer="sentinel-firewall",
+            producer_trust=ProducerTrust.TRUSTED,
+            event_type="auth_failure",
+            payload={"n": 1},
+            subject_value="anonymous|203.0.113.220",
+            account_id="acct-boundary-1",
+        )
+        child, _ = ledger.ingest(
+            producer="sparta",
+            producer_trust=ProducerTrust.TRUSTED,
+            event_type="token_use",
+            payload={"n": 2},
+            subject_value="anonymous|203.0.113.220",
+            account_id="acct-OTHER",
+            depends_on=(parent,),
+        )
+
+        listed = client.get(
+            "/evidence", params={"subject": "anonymous|203.0.113.220"},
+            headers=_headers(),
+        )
+        assert listed.status_code == 200, listed.text
+        ids = {row["evidence_id"] for row in listed.json()["evidence"]}
+        assert {parent, child} <= ids
+        parent_row = next(
+            row for row in listed.json()["evidence"] if row["evidence_id"] == parent
+        )
+        assert parent_row["producer"] == "sentinel-firewall"
+        assert parent_row["version"] >= 1
+
+        detail = client.get(f"/evidence/{child}", headers=_headers())
+        assert detail.status_code == 200, detail.text
+        body = detail.json()
+        assert body["evidence_id"] == child
+        assert body["counts_toward_decisions"] is False
+        assert body["missing_dependencies"] == [parent]
+        assert body["relationships"][0]["parent_evidence_id"] == parent
+
+        ledger.review(
+            child, disposition="RELEASED", operator_id="heart-op",
+            principal=_principal(), reason="confirmed out of band",
+            expected_version=ledger.get(child).version,
+        )
+        released = client.get(f"/evidence/{child}", headers=_headers())
+        assert released.status_code == 200, released.text
+        released_body = released.json()
+        assert released_body["counts_toward_decisions"] is True
+        assert released_body["released_by_a_human"] is True
+        assert released_body["human_dispositions"][0]["disposition"] == "RELEASED"
+
+        missing = client.get("/evidence/does-not-exist", headers=_headers())
+        assert missing.status_code == 404
+
+        producers = client.get("/evidence-producers", headers=_headers())
+        assert producers.status_code == 200, producers.text
+        registered = {row["producer"] for row in producers.json()["producers"]}
+        assert {"sentinel-firewall", "sparta"} <= registered
+    finally:
+        main_module.runtime.evidence_ledger = None

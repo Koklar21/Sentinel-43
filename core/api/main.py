@@ -48,8 +48,11 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from collections.abc import Mapping
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from core.evidence.model import EvidenceRecord
 
 from fastapi import (
     APIRouter,
@@ -3190,45 +3193,48 @@ async def dashboard_incidents(
     }
 
 
-def _evidence_view(record: Mapping[str, Any]) -> dict[str, Any]:
+def _evidence_view(record: EvidenceRecord) -> dict[str, Any]:
     """One evidence record as an operator needs to see it.
+
+    Takes the domain object the evidence ledger's own read contract
+    returns -- never a raw store row -- so "is this eligible" and "was
+    this released by a human" are the record's own properties, not
+    reimplemented here from a state string.
 
     Provenance identifiers are shown because they are what makes a
     relationship checkable; the reported content is not, because it is the
     part that can carry sensitive values.
     """
-    from core.evidence.model import DECISION_ELIGIBLE_STATES, LOCK_REASON_DETAIL
+    from core.evidence.model import LOCK_REASON_DETAIL
 
-    state = str(record["state"])
-    lock_reason = str(record["lock_reason"])
     return {
-        "evidence_id": str(record["evidence_id"]),
-        "producer": str(record["producer"]),
-        "producer_trust": str(record["producer_trust"]),
-        "event_type": str(record["event_type"]),
-        "observed_at_ms": int(record["observed_at_ms"]),
-        "ingested_at_ms": int(record["ingested_at_ms"]),
-        "subject_type": str(record["subject_type"]),
-        "subject_value": str(record["subject_value"]),
-        "correlation_id": str(record["correlation_id"]),
-        "incident_id": str(record.get("incident_id") or ""),
-        "state": state,
-        "lock_reason": lock_reason,
+        "evidence_id": record.evidence_id,
+        "producer": record.producer,
+        "producer_trust": str(record.producer_trust),
+        "event_type": record.event_type,
+        "observed_at_ms": record.observed_at_ms,
+        "ingested_at_ms": record.ingested_at_ms,
+        "subject_type": record.subject_type,
+        "subject_value": record.subject_value,
+        "correlation_id": record.correlation_id,
+        "incident_id": record.incident_id,
+        "state": str(record.state),
+        "lock_reason": record.lock_reason,
         # The reason's own recorded detail (what was dynamic about it, e.g.
         # which producers corroborate) takes precedence over the generic
         # explanation for that reason.
-        "lock_detail": str(record.get("lock_detail") or "")
-        or LOCK_REASON_DETAIL.get(lock_reason, ""),
-        "counts_toward_decisions": state in {str(s) for s in DECISION_ELIGIBLE_STATES},
-        "released_by_a_human": state == "HUMAN_RELEASED",
-        "version": int(record["version"]),
-        "updated_at_ms": int(record.get("updated_at_ms") or 0),
+        "lock_detail": record.lock_detail
+        or LOCK_REASON_DETAIL.get(record.lock_reason, ""),
+        "counts_toward_decisions": record.counts_toward_decisions,
+        "released_by_a_human": record.released_by_a_human,
+        "version": record.version,
+        "updated_at_ms": record.updated_at_ms,
         # Present or absent, never the value itself: whether an account or
         # session is KNOWN is what decides eligibility, and the identifier
         # is not needed to explain a lock.
-        "has_account_identity": bool(str(record["account_id"]).strip()),
-        "has_session_identity": bool(str(record["session_id"]).strip()),
-        "has_device_identity": bool(str(record["device_id"]).strip()),
+        "has_account_identity": bool(record.account_id.strip()),
+        "has_session_identity": bool(record.session_id.strip()),
+        "has_device_identity": bool(record.device_id.strip()),
     }
 
 
@@ -3260,16 +3266,16 @@ async def dashboard_evidence(
     if not 1 <= int(limit) <= 1000:
         raise HTTPException(status_code=422, detail="limit must be between 1 and 1000")
 
-    rows = await asyncio.to_thread(
+    records = await asyncio.to_thread(
         functools.partial(
-            ledger._store.list_evidence,  # noqa: SLF001 - read-only accessor
+            ledger.list_evidence,
             state=state,
             subject_value=subject,
             limit=int(limit),
         )
     )
     return {
-        "evidence": [_evidence_view(row) for row in rows],
+        "evidence": [_evidence_view(record) for record in records],
         "timestamp": utc_now(),
     }
 
@@ -3284,43 +3290,41 @@ async def dashboard_evidence_detail(
     await _require_operator(request)
     ledger = _require_evidence_ledger()
 
-    record = await asyncio.to_thread(
-        functools.partial(ledger._store.get_evidence, evidence_id)  # noqa: SLF001
-    )
+    record = await asyncio.to_thread(functools.partial(ledger.get, evidence_id))
     if record is None:
         raise HTTPException(status_code=404, detail="evidence does not exist")
 
     relationships = await asyncio.to_thread(
-        functools.partial(ledger._store.relationships_of, evidence_id)  # noqa: SLF001
+        functools.partial(ledger.relationships_of, evidence_id)
     )
     reviews = await asyncio.to_thread(
-        functools.partial(ledger._store.reviews_of, evidence_id)  # noqa: SLF001
+        functools.partial(ledger.reviews_of, evidence_id)
     )
 
     return {
         **_evidence_view(record),
         "relationships": [
             {
-                "relationship_id": str(row["relationship_id"]),
-                "parent_evidence_id": str(row["parent_evidence_id"]),
-                "relationship_type": str(row["relationship_type"]),
-                "required_for_eligibility": bool(row["required_for_eligibility"]),
-                "state": str(row["state"]),
-                "verification_method": str(row["verification_method"]),
-                "invalidated_reason": str(row["invalidated_reason"]),
+                "relationship_id": rel.relationship_id,
+                "parent_evidence_id": rel.parent_evidence_id,
+                "relationship_type": str(rel.relationship_type),
+                "required_for_eligibility": rel.required_for_eligibility,
+                "state": str(rel.state),
+                "verification_method": rel.verification_method,
+                "invalidated_reason": rel.invalidated_reason,
             }
-            for row in relationships
+            for rel in relationships
         ],
         "missing_dependencies": [
-            str(row["parent_evidence_id"])
-            for row in relationships
-            if bool(row["required_for_eligibility"])
-            and str(row["state"]) != "VERIFIED"
+            rel.parent_evidence_id
+            for rel in relationships
+            if rel.required_for_eligibility
+            and str(rel.state) != "VERIFIED"
         ],
         "conflicts": [
-            str(row["parent_evidence_id"])
-            for row in relationships
-            if str(row["relationship_type"]) == "CONTRADICTS"
+            rel.parent_evidence_id
+            for rel in relationships
+            if str(rel.relationship_type) == "CONTRADICTS"
         ],
         "human_dispositions": [
             {
@@ -3400,7 +3404,7 @@ async def dashboard_evidence_producers(request: Request) -> dict[str, Any]:
     await _require_operator(request)
     ledger = _require_evidence_ledger()
 
-    rows = await asyncio.to_thread(ledger._store.list_producers)  # noqa: SLF001
+    rows = await asyncio.to_thread(ledger.list_producers)
     return {
         "producers": [
             {
