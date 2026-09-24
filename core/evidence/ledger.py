@@ -831,14 +831,34 @@ class EvidenceLedger:
         self, subject_value: str, *, limit: int = 200
     ) -> EvidenceBundle:
         """Evidence about one subject, with countable and held records kept
-        strictly apart."""
+        strictly apart.
+
+        Freshness is checked here, at read time, not merely trusted from
+        whatever the persisted state last settled on: nothing whose
+        effective expiry has passed may leave the evidence boundary in the
+        eligible bucket, even if nothing has recomputed it since it expired.
+        This is bounded to exactly the records this one call fetched --
+        never a background sweep or timer -- and self-heals the persisted
+        state in the process, so it does not need repeating on every read.
+        """
         rows = self._store.list_evidence(subject_value=subject_value, limit=limit)
+        now_ms = _now_ms()
         eligible: list[EvidenceRecord] = []
         locked: list[EvidenceRecord] = []
         outcomes: dict[str, EligibilityOutcome] = {}
 
         for row in rows:
             record = self._record(row)
+            if (
+                record.expires_at_ms
+                and now_ms >= record.expires_at_ms
+                and record.state in DECISION_ELIGIBLE_STATES
+            ):
+                self.recompute(record.evidence_id)
+                refreshed = self._store.get_evidence(record.evidence_id)
+                if refreshed is not None:
+                    record = self._record(refreshed)
+
             if record.state in DECISION_ELIGIBLE_STATES:
                 eligible.append(record)
                 continue

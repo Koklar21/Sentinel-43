@@ -936,6 +936,64 @@ def test_the_bundle_keeps_countable_and_held_evidence_apart():
     assert row["missing_dependencies"] == [parent]
 
 
+def test_a_bundle_never_returns_evidence_whose_expiry_has_already_passed():
+    """Nothing whose effective expiry has passed may leave the evidence
+    boundary in the eligible bucket -- even if nothing has recomputed it
+    since it expired. bundle_for_subject() must catch this itself, at read
+    time, rather than trusting a persisted ELIGIBLE that is now stale."""
+    _, store, ledger, _ = _stack()
+    subject = "operator|203.0.113.90"
+    now = int(time.time() * 1000)
+    evidence_id, outcome = _ingest(
+        ledger, subject_value=subject, account_id="acct-1", expires_at_ms=now + 50
+    )
+    assert outcome.state is EvidenceState.ELIGIBLE
+
+    time.sleep(0.08)
+    # Nothing else has touched this record since it expired -- no recompute,
+    # no revocation, nothing. The persisted row still says ELIGIBLE.
+    assert store.get_evidence(evidence_id)["state"] == "ELIGIBLE"
+
+    bundle = ledger.bundle_for_subject(subject)
+    eligible_ids = {record.evidence_id for record in bundle.eligible}
+    locked_ids = {record.evidence_id for record in bundle.locked}
+    assert evidence_id not in eligible_ids
+    assert evidence_id in locked_ids
+    assert bundle.outcomes[evidence_id].lock_reason == LockReason.EXPIRED
+    # The read also self-healed the persisted state, so this does not need
+    # re-deriving on every future read.
+    assert ledger.get(evidence_id).state is EvidenceState.EXPIRED
+
+
+def test_a_bundle_never_returns_a_human_released_record_past_its_expiry():
+    """The same guarantee for evidence a human already released: a release
+    does not extend how long a record may count past its own expiry."""
+    _, store, ledger, _ = _stack()
+    subject = "operator|203.0.113.91"
+    now = int(time.time() * 1000)
+    evidence_id, _ = _ingest(
+        ledger, subject_value=subject, producer="sparta", account_id="acct-OTHER",
+        expires_at_ms=now + 50,
+    )
+    ledger.review(
+        evidence_id, disposition="RELEASED", operator_id="evidence-op",
+        principal=_principal(), reason="trusted this once",
+        expected_version=ledger.get(evidence_id).version,
+    )
+    assert ledger.get(evidence_id).state is EvidenceState.HUMAN_RELEASED
+
+    time.sleep(0.08)
+    assert store.get_evidence(evidence_id)["state"] == "HUMAN_RELEASED"
+
+    bundle = ledger.bundle_for_subject(subject)
+    eligible_ids = {record.evidence_id for record in bundle.eligible}
+    assert evidence_id not in eligible_ids
+    assert bundle.outcomes[evidence_id].lock_reason == LockReason.EXPIRED
+    assert ledger.get(evidence_id).state is EvidenceState.EXPIRED
+    # The original release is preserved in history, not rewritten.
+    assert len(store.reviews_of(evidence_id)) == 1
+
+
 def test_content_hash_is_stable_across_key_order():
     assert content_hash({"a": 1, "b": 2}) == content_hash({"b": 2, "a": 1})
     assert content_hash({"a": 1}) != content_hash({"a": 2})

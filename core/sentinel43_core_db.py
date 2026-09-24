@@ -306,6 +306,14 @@ class SentinelCoreStore:
                 CREATE INDEX IF NOT EXISTS idx_evidence_correlation
                     ON evidence(correlation_id);
 
+                -- Backs the bounded on-read freshness check in
+                -- bundle_for_subject(): finding which of a subject's
+                -- records have an effective expiry in the past is a lookup
+                -- against this index, not a full-table scan, and never a
+                -- background sweep.
+                CREATE INDEX IF NOT EXISTS idx_evidence_expires_at
+                    ON evidence(expires_at_ms) WHERE expires_at_ms > 0;
+
                 -- idx_evidence_incident and idx_evidence_producer are NOT
                 -- here: they cover columns (incident_id, and producer's own
                 -- lookup index) that a database from an earlier revision may
