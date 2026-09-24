@@ -162,6 +162,55 @@ def test_the_durable_store_itself_holds_no_authorization_logic():
         assert term not in source
 
 
+def test_set_evidence_state_is_called_only_from_the_evidence_ledger():
+    """set_evidence_state() is a raw, unauthenticated compare-and-set: any
+    module holding a SentinelCoreStore can call it. Only
+    core/evidence/ledger.py's own automatic recompute path (_write_state)
+    may -- if anything else starts calling it, that is a second,
+    unaudited way to transition evidence eligibility."""
+    assert _modules_calling("set_evidence_state") == {"core/evidence/ledger.py"}
+
+
+def test_set_evidence_state_cannot_manufacture_a_human_release_or_rejection():
+    """A caller holding only a SentinelCoreStore -- no EvidenceLedger, no
+    authenticated principal, no reason, no audit record -- must not be
+    able to reach HUMAN_RELEASED or REJECTED. Those exist only through
+    record_evidence_review(), which requires all four."""
+    import tempfile
+    from pathlib import Path as _Path
+
+    from core.sentinel43_core_db import (
+        CoreStoreConfig,
+        EvidenceStateRequiresReview,
+        SentinelCoreStore,
+    )
+
+    directory = _Path(tempfile.mkdtemp(prefix="s43-authority-evidence-"))
+    store = SentinelCoreStore(CoreStoreConfig(db_path=directory / "heart.sqlite3"))
+    store.initialize()
+
+    evidence_id = store.record_evidence(
+        evidence_id="ev-authority-boundary-test",
+        producer="firewall",
+        producer_trust="TRUSTED",
+        event_type="auth_failure",
+        observed_at_ms=0,
+        ingested_at_ms=0,
+        content_hash="hash",
+        payload_hash="hash",
+        state="LOCKED",
+    )
+
+    for forbidden_state in ("HUMAN_RELEASED", "REJECTED"):
+        with pytest.raises(EvidenceStateRequiresReview):
+            store.set_evidence_state(
+                evidence_id, expected_version=1, state=forbidden_state
+            )
+
+    # Ordinary automatic states are untouched by the guard.
+    assert store.set_evidence_state(evidence_id, expected_version=1, state="ELIGIBLE")
+
+
 # ---------------------------------------------------------------------------
 # 5. No API route bypasses the orchestrator
 # ---------------------------------------------------------------------------

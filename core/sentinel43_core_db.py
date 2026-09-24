@@ -59,6 +59,29 @@ class IncidentStatus(StrEnum):
     RETRACTED = "RETRACTED"
 
 
+class EvidenceStateRequiresReview(PermissionError):
+    """Raised by ``set_evidence_state`` when asked to write a state that
+    the authenticated evidence-review path alone may produce.
+
+    ``set_evidence_state`` is a raw, unauthenticated compare-and-set: any
+    caller holding a ``SentinelCoreStore`` can call it. HUMAN_RELEASED and
+    REJECTED are decisions about who a human trusted and why -- they exist
+    only via ``record_evidence_review``, which requires an authenticated
+    principal, a reason, and a durable audit record. This method refuses
+    to become a second, unauthenticated way to reach either one.
+    """
+
+
+#: States that must never be written through set_evidence_state(): both are
+#: exclusively produced by record_evidence_review(), which requires an
+#: authenticated principal, a reason, and a durable audit record that this
+#: raw CAS has none of. No legitimate caller needs this method to write
+#: either -- EvidenceLedger's own automatic recompute path never targets
+#: HUMAN_RELEASED (it may only leave one, never enter one) and never
+#: targets REJECTED at all.
+_REVIEW_ONLY_EVIDENCE_STATES = frozenset({"HUMAN_RELEASED", "REJECTED"})
+
+
 _TERMINAL_ACTION_STATUSES = frozenset(
     {
         ActionStatus.VETOED,
@@ -1263,7 +1286,20 @@ class SentinelCoreStore:
 
         Version-guarded, so two concurrent ingestion passes cannot leave
         contradictory eligibility: the loser sees False and re-reads.
+
+        Refuses ``state`` values in ``_REVIEW_ONLY_EVIDENCE_STATES``: this
+        is a raw, unauthenticated write, and HUMAN_RELEASED/REJECTED must
+        never be reachable any way other than an authenticated, audited
+        evidence review (record_evidence_review).
         """
+        normalized_state = str(state).strip().upper()
+        if normalized_state in _REVIEW_ONLY_EVIDENCE_STATES:
+            raise EvidenceStateRequiresReview(
+                f"{normalized_state} may only be written by an "
+                "authenticated evidence review (record_evidence_review), "
+                "never by set_evidence_state"
+            )
+
         owns_connection = connection is None
         connection = connection or self._connect()
 
