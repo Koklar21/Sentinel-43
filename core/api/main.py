@@ -1453,6 +1453,7 @@ SUBSYS_FENRIR = "fenrir"
 SUBSYS_AUDIT = "audit_store"
 SUBSYS_GOVERNANCE = "governance"
 SUBSYS_HEART = "heart"
+SUBSYS_EVIDENCE_GOVERNANCE = "evidence_governance"
 SUBSYS_RELIABILITY = "reliability"
 
 
@@ -1485,6 +1486,16 @@ def _declare_subsystems() -> None:
         # a fail-closed /ready by default, not a silently-optional one.
         SUBSYS_HEART, required=_env_bool("S43_HEART_REQUIRED", True)
         and _env_bool("S43_HEART_ENABLED", False)
+    )
+    runtime.subsystems.declare(
+        # The explicit required/optional deployment invariant for evidence
+        # governance (Sentinel-43 Evidence Provenance Correctness Pass,
+        # Item 5): default False, an explicit opt-in, never a default a
+        # production deployment falls into unnoticed. When True, a missing
+        # or failed evidence ledger blocks /ready instead of the
+        # orchestrator's gate silently degrading to "not enforced".
+        SUBSYS_EVIDENCE_GOVERNANCE,
+        required=_env_bool("S43_EVIDENCE_GOVERNANCE_REQUIRED", False),
     )
     runtime.subsystems.declare(SUBSYS_RELIABILITY, required=False)
 
@@ -1866,6 +1877,12 @@ async def _start_governance() -> None:
                 minimum=1,
                 maximum=1_000_000,
             )
+            # Same flag SUBSYS_EVIDENCE_GOVERNANCE is declared with in
+            # _declare_subsystems(): one source of truth for whether a
+            # missing evidence ledger should block staging.
+            evidence_governance_required = _env_bool(
+                "S43_EVIDENCE_GOVERNANCE_REQUIRED", False
+            )
 
         runtime.orchestrator = build_orchestrator_from_settings(
             Settings(),
@@ -1946,6 +1963,38 @@ def _report_heart_health(healthy: bool, detail: str) -> None:
         runtime.subsystems.mark_active(SUBSYS_HEART, detail)
     else:
         runtime.subsystems.mark_failed(SUBSYS_HEART, detail)
+
+
+def _report_evidence_governance_status() -> None:
+    """Evidence governance's own readiness signal, independent of the
+    Heart's.
+
+    The Heart can be healthy while never having attached an evidence
+    ledger at all (disabled, or failed before reaching that step) -- this
+    is the deployment invariant Sentinel-43 Evidence Provenance
+    Correctness Pass Item 5 established: when required, a missing ledger
+    is a fault /ready must report, never a silent fallback to ungoverned
+    evidence. Called from every exit path of _start_heart(), the only
+    place that attaches or detaches the ledger.
+    """
+    orchestrator = runtime.orchestrator
+    if orchestrator is None:
+        runtime.subsystems.mark_disabled(SUBSYS_EVIDENCE_GOVERNANCE)
+        return
+    required = orchestrator.evidence_governance_required
+    if orchestrator.evidence_ledger_attached:
+        runtime.subsystems.mark_active(
+            SUBSYS_EVIDENCE_GOVERNANCE,
+            "Evidence eligibility is enforced for governed recommendations.",
+        )
+    elif required:
+        runtime.subsystems.mark_failed(
+            SUBSYS_EVIDENCE_GOVERNANCE,
+            "Evidence governance is required but no evidence ledger is "
+            "attached.",
+        )
+    else:
+        runtime.subsystems.mark_disabled(SUBSYS_EVIDENCE_GOVERNANCE)
 
 
 class _HeartActionSink:
@@ -2249,6 +2298,7 @@ async def _start_heart() -> None:
     """
     if not _env_bool("S43_HEART_ENABLED", False):
         runtime.subsystems.mark_disabled(SUBSYS_HEART)
+        _report_evidence_governance_status()
         return
 
     if runtime.orchestrator is None:
@@ -2261,6 +2311,7 @@ async def _start_heart() -> None:
             "The Heart is enabled but the governance orchestrator is not "
             "running; refusing to start the Heart without its authority."
         )
+        _report_evidence_governance_status()
         return
 
     if runtime.audit_store is None:
@@ -2272,6 +2323,7 @@ async def _start_heart() -> None:
             "The Heart is enabled but the authoritative audit store is "
             "not initialized; refusing to start ThreatGovernor."
         )
+        _report_evidence_governance_status()
         return
 
     try:
@@ -2400,18 +2452,22 @@ async def _start_heart() -> None:
             )
         runtime.subsystems.mark_active(SUBSYS_HEART, detail)
         logger.info("Heart (ThreatGovernor) started (mode=%s)", resolved_default_mode)
+        _report_evidence_governance_status()
     except Exception as exc:
         runtime.heart = None
         runtime.evidence_ledger = None
         if runtime.fenrir_instance is not None:
             runtime.fenrir_instance.heart = None
         # A Heart that failed to start must not leave its decisions reachable
-        # through the orchestrator either.
+        # through the orchestrator either, and must not leave a ledger
+        # dangling half-attached to an authority whose Heart never started.
         if runtime.orchestrator is not None:
             runtime.orchestrator.detach_recommendation_store()
+            runtime.orchestrator.detach_evidence_ledger()
         runtime.subsystems.mark_failed(
             SUBSYS_HEART, f"Failed to start: {type(exc).__name__}"
         )
+        _report_evidence_governance_status()
         logger.error("Heart failed to start", exc_info=True)
 
 
@@ -2684,6 +2740,17 @@ async def _shutdown_runtime() -> None:
     runtime.heart = None
     if runtime.subsystems.get(SUBSYS_HEART) is not None:
         runtime.subsystems.mark_stopped(SUBSYS_HEART)
+
+    # The evidence ledger is torn down with the Heart that attached it --
+    # a stale reference here is exactly the same repeated-lifespan hazard
+    # as runtime.heart above, and a lingering attachment on the
+    # orchestrator would let a late caller's evidence_gate check succeed
+    # against a ledger this process no longer owns.
+    runtime.evidence_ledger = None
+    if runtime.orchestrator is not None:
+        runtime.orchestrator.detach_evidence_ledger()
+    if runtime.subsystems.get(SUBSYS_EVIDENCE_GOVERNANCE) is not None:
+        runtime.subsystems.mark_stopped(SUBSYS_EVIDENCE_GOVERNANCE)
 
     # Close, then deregister, the audit store the same way, so late callers
     # (e.g. the Remote Gateway) see "no store" rather than a closed/stale

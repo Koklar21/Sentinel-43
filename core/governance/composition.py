@@ -112,6 +112,9 @@ def build_orchestrator_from_settings(
         max_pending_reviews=int(
             _get(settings, "max_pending_reviews", MAX_PENDING_REVIEWS)
         ),
+        evidence_governance_required=bool(
+            _get(settings, "evidence_governance_required", False)
+        ),
     )
 
 
@@ -197,8 +200,10 @@ def build_heart_from_settings(
         # Trust is granted here, from configuration the composition root was
         # handed -- never read from the environment directly (this module
         # reads none), and never from a producer's own report. A name a
-        # caller did not supply is simply not registered; the ledger treats
-        # an unregistered producer by its ingestion-time snapshot, unchanged.
+        # caller did not supply is simply not registered, and the registry
+        # is the sole authority eligibility consults from then on: an
+        # unregistered producer locks LEGACY_UNVERIFIED unconditionally,
+        # regardless of what producer_trust it claimed at ingestion.
         from core.evidence.model import ProducerTrust
 
         for producer_name in _get(settings, "trusted_evidence_producers", ()):

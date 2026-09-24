@@ -1273,6 +1273,79 @@ def _ingest_for(ledger, subject, **overrides):
     return ledger.ingest(**params)
 
 
+# ---------------------------------------------------------------------------
+# The explicit required/optional deployment invariant (Sentinel-43 Evidence
+# Provenance Correctness Pass, Item 5): a missing ledger is either an
+# enforced fault or an explicit, visible degrade -- never a silent one.
+# ---------------------------------------------------------------------------
+def test_evidence_governance_required_blocks_the_gate_with_no_ledger_attached():
+    from core.audit import AuditConfig, AuditStore
+    from core.governance import build_orchestrator_from_settings
+
+    directory = Path(tempfile.mkdtemp(prefix="s43-evidence-required-"))
+    audit = AuditStore(
+        AuditConfig(sqlite_path=directory / "audit.sqlite3", signing_key="k" * 48)
+    )
+    audit.initialize()
+
+    class Settings:
+        default_mode = "HUMAN_GATED"
+        evidence_governance_required = True
+
+    authority = build_orchestrator_from_settings(Settings(), audit_store=audit)
+    assert authority.evidence_governance_required is True
+    assert authority.evidence_ledger_attached is False
+
+    permitted, context = authority._evidence_gate(  # noqa: SLF001
+        "anonymous|203.0.113.60"
+    )
+    assert permitted is False
+    assert context == {"evidence_gate": "required_but_unavailable"}
+
+
+def test_evidence_governance_optional_by_default_degrades_instead_of_blocking():
+    """The transitional/dev default: unless a deployment explicitly opts
+    in, a missing ledger degrades to "not enforced" rather than blocking
+    every recommendation -- unchanged behavior for anyone who has not yet
+    wired evidence governance in."""
+    from core.audit import AuditConfig, AuditStore
+    from core.governance import build_orchestrator_from_settings
+
+    directory = Path(tempfile.mkdtemp(prefix="s43-evidence-optional-"))
+    audit = AuditStore(
+        AuditConfig(sqlite_path=directory / "audit.sqlite3", signing_key="k" * 48)
+    )
+    audit.initialize()
+
+    class Settings:
+        default_mode = "HUMAN_GATED"
+
+    authority = build_orchestrator_from_settings(Settings(), audit_store=audit)
+    assert authority.evidence_governance_required is False
+
+    permitted, context = authority._evidence_gate(  # noqa: SLF001
+        "anonymous|203.0.113.61"
+    )
+    assert permitted is True
+    assert context == {"evidence_gate": "not_enforced"}
+
+
+def test_evidence_governance_required_and_satisfied_stages_normally():
+    """Requiring governance never breaks the happy path: once a ledger IS
+    attached and has eligible evidence, staging proceeds exactly as it
+    would with governance left optional."""
+    _, audit, store, heart, authority, ledger = _authority_stack()
+    authority._evidence_governance_required = True  # noqa: SLF001
+    subject = "anonymous|203.0.113.62"
+
+    _ingest_for(ledger, subject)
+    authority.attach_evidence_ledger(ledger)
+
+    decision = heart.observe(_assessment("203.0.113.62"))
+    assert decision.status == "STAGED", decision
+    assert store.count_actions() == 1
+
+
 def test_locked_evidence_cannot_create_a_recommendation():
     """The subject has evidence, but all of it is held. Nothing is staged,
     and the recorded reason says exactly that."""

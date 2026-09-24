@@ -489,6 +489,7 @@ class SystemOrchestrator:
         monitoring_manager: MonitoringSink | None = None,
         review_ttl_seconds: int = DEFAULT_REVIEW_TTL_SECONDS,
         max_pending_reviews: int = MAX_PENDING_REVIEWS,
+        evidence_governance_required: bool = False,
     ) -> None:
         self.audit_store = audit_store
         self.velocity_guard = velocity_guard
@@ -556,6 +557,13 @@ class SystemOrchestrator:
         #: itself that a recommendation rests on evidence that is allowed to
         #: count, instead of trusting the reporter's own claim.
         self._evidence_ledger: Any | None = None
+        #: The explicit required/optional deployment invariant: when True,
+        #: a missing (or later detached) ledger is a fault the gate refuses
+        #: on, never a silent "not enforced". False preserves the
+        #: transitional/dev behavior of degrading instead of blocking, and
+        #: must be an explicit, visible choice -- never an implicit default
+        #: a production deployment falls into unnoticed.
+        self._evidence_governance_required = bool(evidence_governance_required)
 
     @staticmethod
     def _normalize_mode(
@@ -1484,6 +1492,15 @@ class SystemOrchestrator:
     def evidence_ledger_attached(self) -> bool:
         return self._evidence_ledger is not None
 
+    @property
+    def evidence_governance_required(self) -> bool:
+        """Whether this deployment has declared evidence governance
+        mandatory. When True, ``_evidence_gate`` refuses to stage a
+        recommendation rather than degrade to "not enforced" if no ledger
+        is attached -- the composition root's readiness check should
+        report a fault in exactly that situation."""
+        return self._evidence_governance_required
+
     def _evidence_gate(
         self, subject_key: str
     ) -> tuple[bool, dict[str, Any]]:
@@ -1501,8 +1518,14 @@ class SystemOrchestrator:
         """
         ledger = self._evidence_ledger
         if ledger is None:
-            # No ledger attached: eligibility is not being enforced here, and
-            # the context says so rather than implying evidence was checked.
+            if self._evidence_governance_required:
+                # This deployment declared evidence governance mandatory:
+                # a missing ledger is a fault to refuse on, never a silent
+                # fallback to ungoverned evidence.
+                return False, {"evidence_gate": "required_but_unavailable"}
+            # No ledger attached, and governance was never declared
+            # mandatory here: eligibility is not being enforced, and the
+            # context says so rather than implying evidence was checked.
             return True, {"evidence_gate": "not_enforced"}
 
         bundle = ledger.bundle_for_subject(subject_key)
