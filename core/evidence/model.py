@@ -159,13 +159,23 @@ ALLOWED_TRANSITIONS: Final[Mapping[EvidenceState, frozenset[EvidenceState]]] = {
             EvidenceState.REJECTED,
         }
     ),
-    # A verified contradiction against evidence a human already released
-    # overrides that release: the person had not seen the contradiction.
-    # Every other human decision is terminal for the automatic rules.
-    EvidenceState.HUMAN_RELEASED: frozenset({EvidenceState.LOCKED}),
+    # A release means "given what was true when reviewed", not "forever
+    # regardless of what changes": a verified contradiction, the producer's
+    # trust worsening, the record itself expiring, or a relationship it
+    # relied on being actively invalidated all override it. Rejection is
+    # still terminal for the automatic rules.
+    EvidenceState.HUMAN_RELEASED: frozenset(
+        {EvidenceState.LOCKED, EvidenceState.EXPIRED}
+    ),
     EvidenceState.REJECTED: frozenset(),
     EvidenceState.INVALIDATED: frozenset(),
-    EvidenceState.EXPIRED: frozenset(),
+    # Expiry is not terminal for HUMAN review, even though it is for the
+    # automatic rules (which never revive it on their own): a person may
+    # look at exactly why it expired and decide it should count anyway --
+    # the same option they have for anything else LOCKED.
+    EvidenceState.EXPIRED: frozenset(
+        {EvidenceState.HUMAN_RELEASED, EvidenceState.REJECTED}
+    ),
 }
 
 
@@ -476,6 +486,63 @@ def content_hash(payload: Mapping[str, Any], *, canonical: bool = True) -> str:
     return hashlib.sha256(serialised.encode("utf-8")).hexdigest()
 
 
+def _recheck_human_release(
+    relationships: tuple[EvidenceRelationship, ...],
+    *,
+    parents: Mapping[str, EvidenceRecord],
+) -> EligibilityOutcome:
+    """A human release means "given what was true when reviewed" -- not
+    "trustworthy forever regardless of what changes." (Contradiction,
+    producer trust and freshness are checked by the caller, unconditionally,
+    before this runs; this covers what is left: the dependencies the release
+    itself rested on.)
+
+    Re-lock only on an ACTIVE negative change since the review: a required
+    relationship actively disproved (REFUTED/INVALIDATED, not merely still
+    unverified), or a required parent that has since been invalidated,
+    rejected, or expired.
+
+    Deliberately NOT re-checked here: a relationship that is still merely
+    PROPOSED (never verified either way), a parent that is simply still
+    LOCKED, or independent-corroboration sufficiency. Those are exactly the
+    ambiguity the release was FOR -- unchanged since the review, not a new
+    fact -- and re-litigating them on every recompute would make releasing
+    evidence for precisely that reason pointless, since the very next
+    recompute would re-lock it for the identical, unchanged reason.
+    """
+    invalidated: list[str] = []
+
+    for rel in relationships:
+        if not rel.required_for_eligibility:
+            continue
+
+        if rel.state in (RelationshipState.REFUTED, RelationshipState.INVALIDATED):
+            invalidated.append(rel.parent_evidence_id)
+            continue
+
+        parent = parents.get(rel.parent_evidence_id)
+        if parent is not None and parent.state in (
+            EvidenceState.INVALIDATED,
+            EvidenceState.REJECTED,
+            EvidenceState.EXPIRED,
+        ):
+            invalidated.append(rel.parent_evidence_id)
+
+    if invalidated:
+        return EligibilityOutcome(
+            state=EvidenceState.LOCKED,
+            lock_reason=LockReason.DEPENDENCY_INVALIDATED,
+            missing_dependencies=tuple(dict.fromkeys(invalidated)),
+            detail=(
+                "a human released this evidence, but a relationship it "
+                "relied on has since been invalidated and it must be "
+                "reviewed again"
+            ),
+        )
+
+    return EligibilityOutcome(state=EvidenceState.HUMAN_RELEASED)
+
+
 def evaluate_eligibility(
     record: EvidenceRecord,
     relationships: tuple[EvidenceRelationship, ...],
@@ -490,14 +557,18 @@ def evaluate_eligibility(
 
     This is the whole automatic rule set, in one readable place:
 
-    1. a human decision stands until a human changes it, or until something
-       contradicts it;
-    2. a record whose producer is not trusted never counts;
-    3. an expired record never counts;
-    4. a contradicted record never counts;
-    5. every relationship marked required must be VERIFIED, and the parent it
-       points at must itself be countable;
-    6. where independent corroboration is required, it must come from
+    1. a verified contradiction locks the record, overriding even a human
+       release: the person who released it had not seen this;
+    2. REJECTED/INVALIDATED are terminal -- nothing here revives them;
+    3. a record whose producer is not currently trusted never counts, human
+       release or not: a release does not vouch for the producer forever;
+    4. an expired record never counts, human release or not, for the same
+       reason;
+    5. a record a human already released is then re-checked ONLY against
+       what actually changed since -- see ``_recheck_human_release``;
+    6. otherwise, every relationship marked required must be VERIFIED, and
+       the parent it points at must itself be countable;
+    7. where independent corroboration is required, it must come from
        genuinely different producers.
 
     Nothing here looks at timestamp proximity, and nothing infers identity
@@ -533,9 +604,11 @@ def evaluate_eligibility(
     if record.state in TERMINAL_STATES:
         return EligibilityOutcome(state=record.state, lock_reason=record.lock_reason)
 
-    if record.state is EvidenceState.HUMAN_RELEASED:
-        return EligibilityOutcome(state=EvidenceState.HUMAN_RELEASED)
-
+    # Trust and freshness are unconditional requirements, not "material
+    # changes special to a release": a record no longer trusted, or no
+    # longer fresh, never counts -- whether a human released it or not. A
+    # release means "given what was true when reviewed", never "trustworthy
+    # and fresh forever regardless of what changes."
     if producer_trust is None:
         return EligibilityOutcome(
             state=EvidenceState.LOCKED,
@@ -555,6 +628,9 @@ def evaluate_eligibility(
             state=EvidenceState.EXPIRED, lock_reason=LockReason.EXPIRED
         )
 
+    if record.state is EvidenceState.HUMAN_RELEASED:
+        return _recheck_human_release(relationships, parents=parents)
+
     required = [rel for rel in relationships if rel.required_for_eligibility]
     missing: list[str] = []
     reason = ""
@@ -565,10 +641,15 @@ def evaluate_eligibility(
             missing.append(rel.parent_evidence_id)
             reason = reason or LockReason.MISSING_PARENT
             continue
-        if rel.state is not RelationshipState.VERIFIED:
-            missing.append(rel.parent_evidence_id)
-            reason = reason or LockReason.UNVERIFIED_RELATIONSHIP
-            continue
+        # An ACTIVE negative fact about the parent -- it was invalidated,
+        # rejected, or expired -- is more specific and more actionable than
+        # "the relationship was never verified", so it is checked and
+        # reported first, whether or not the relationship itself was ever
+        # proved. This also keeps this path and _recheck_human_release
+        # agreeing on the reason once a record has moved from HUMAN_RELEASED
+        # to plain LOCKED: re-evaluating a stable LOCKED record must not
+        # keep changing what it says, or propagation would never settle on
+        # its most informative answer.
         if parent.state is EvidenceState.INVALIDATED:
             missing.append(rel.parent_evidence_id)
             reason = LockReason.DEPENDENCY_INVALIDATED
@@ -576,6 +657,10 @@ def evaluate_eligibility(
         if parent.state is EvidenceState.EXPIRED:
             missing.append(rel.parent_evidence_id)
             reason = reason or LockReason.STALE_DEPENDENCY
+            continue
+        if rel.state is not RelationshipState.VERIFIED:
+            missing.append(rel.parent_evidence_id)
+            reason = reason or LockReason.UNVERIFIED_RELATIONSHIP
             continue
         if not parent.counts_toward_decisions:
             # The parent is itself held; a dependent cannot outrank it.

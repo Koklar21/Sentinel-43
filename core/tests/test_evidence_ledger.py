@@ -430,6 +430,192 @@ def test_a_release_does_not_rewrite_the_original_lock():
     assert review["disposition"] == "RELEASED"
 
 
+# ---------------------------------------------------------------------------
+# A human release means "given what was true when reviewed" -- not
+# "trustworthy forever regardless of what changes." Each of these proves one
+# of the material changes that must re-lock a release, that the original
+# review is preserved in history (never rewritten), and that a human may
+# review the changed circumstances and release it again.
+# ---------------------------------------------------------------------------
+def test_revoking_the_producer_after_release_relocks_it():
+    _, store, ledger, _ = _stack()
+    evidence_id, _ = _ingest(ledger, producer="sparta")
+    released = ledger.get(evidence_id)
+    ledger.review(
+        evidence_id, disposition="RELEASED", operator_id="evidence-op",
+        principal=_principal(), reason="trusted this once",
+        expected_version=released.version,
+    )
+    assert ledger.get(evidence_id).state is EvidenceState.HUMAN_RELEASED
+
+    ledger.revoke_producer("sparta", reason="compromised", updated_by="ops")
+
+    relocked = ledger.get(evidence_id)
+    assert relocked.state is EvidenceState.LOCKED
+    assert relocked.lock_reason == LockReason.PRODUCER_TRUST_INSUFFICIENT
+    assert relocked.counts_toward_decisions is False
+    # The original release is preserved, not rewritten.
+    reviews = store.reviews_of(evidence_id)
+    assert len(reviews) == 1
+    assert reviews[0]["disposition"] == "RELEASED"
+    # A human may review the changed circumstances and release it again.
+    result = ledger.review(
+        evidence_id, disposition="RELEASED", operator_id="evidence-op",
+        principal=_principal(), reason="re-confirmed after producer cleared",
+        expected_version=ledger.get(evidence_id).version,
+    )
+    assert result["state"] == EvidenceState.HUMAN_RELEASED
+    assert len(store.reviews_of(evidence_id)) == 2
+
+
+def test_expiry_after_release_relocks_it_and_it_is_reviewable_again():
+    _, store, ledger, _ = _stack()
+    now = int(time.time() * 1000)
+    evidence_id, _ = _ingest(ledger, expires_at_ms=now + 50)
+    ledger.review(
+        evidence_id, disposition="RELEASED", operator_id="evidence-op",
+        principal=_principal(), reason="trusted for now",
+        expected_version=ledger.get(evidence_id).version,
+    )
+    assert ledger.get(evidence_id).state is EvidenceState.HUMAN_RELEASED
+
+    time.sleep(0.08)
+    ledger.recompute(evidence_id)
+    expired = ledger.get(evidence_id)
+    assert expired.state is EvidenceState.EXPIRED
+    assert expired.counts_toward_decisions is False
+    assert len(store.reviews_of(evidence_id)) == 1  # original review preserved
+
+    result = ledger.review(
+        evidence_id, disposition="RELEASED", operator_id="evidence-op",
+        principal=_principal(), reason="still trust it despite the age",
+        expected_version=expired.version,
+    )
+    assert result["state"] == EvidenceState.HUMAN_RELEASED
+    assert len(store.reviews_of(evidence_id)) == 2
+
+
+def test_a_required_dependency_invalidated_after_release_relocks_it():
+    _, store, ledger, _ = _stack()
+    a, _ = _ingest(ledger, account_id="acct-1")
+    b, _ = _ingest(
+        ledger, producer="sparta", seq=2, account_id="acct-OTHER", depends_on=(a,)
+    )
+    ledger.review(
+        b, disposition="RELEASED", operator_id="evidence-op",
+        principal=_principal(), reason="confirmed same account out of band",
+        expected_version=ledger.get(b).version,
+    )
+    assert ledger.get(b).state is EvidenceState.HUMAN_RELEASED
+
+    ledger.invalidate(a, reason="turned out to be forged")
+
+    relocked = ledger.get(b)
+    assert relocked.state is EvidenceState.LOCKED
+    assert relocked.lock_reason == LockReason.DEPENDENCY_INVALIDATED
+    assert relocked.counts_toward_decisions is False
+    assert len(store.reviews_of(b)) == 1
+
+
+def test_a_required_relationship_refuted_after_release_relocks_it():
+    """Distinct from a parent being invalidated: here the RELATIONSHIP
+    itself -- the claim of shared provenance -- is proved false after the
+    human already released the record on the strength of it."""
+    _, store, ledger, _ = _stack()
+    a, _ = _ingest(ledger, account_id="acct-1")
+    b, _ = _ingest(
+        ledger, producer="sparta", seq=2, account_id="acct-1", depends_on=(a,)
+    )
+    relationship_id = store.relationships_of(b)[0]["relationship_id"]
+    ledger.verify_relationship(relationship_id)
+    assert ledger.get(b).state is EvidenceState.ELIGIBLE
+
+    ledger.review(
+        b, disposition="RELEASED", operator_id="evidence-op",
+        principal=_principal(), reason="human release for good measure",
+        expected_version=ledger.get(b).version,
+    )
+    assert ledger.get(b).state is EvidenceState.HUMAN_RELEASED
+
+    store.invalidate_relationship(relationship_id, reason="account link disproved later")
+    ledger.recompute(b)
+
+    relocked = ledger.get(b)
+    assert relocked.state is EvidenceState.LOCKED
+    assert relocked.lock_reason == LockReason.DEPENDENCY_INVALIDATED
+
+
+def test_a_stale_ambiguity_the_release_was_for_does_not_relock_it():
+    """The negative control: a required relationship that was NEVER proved
+    -- unchanged since the review, not a new fact -- must NOT re-lock a
+    release on every recompute. Re-litigating the exact ambiguity a human
+    already decided to override would make the override pointless."""
+    _, store, ledger, _ = _stack()
+    a, _ = _ingest(ledger, account_id="acct-1")
+    b, _ = _ingest(
+        ledger, producer="sparta", seq=2, account_id="acct-OTHER", depends_on=(a,)
+    )
+    assert ledger.get(b).lock_reason == LockReason.UNVERIFIED_RELATIONSHIP
+
+    ledger.review(
+        b, disposition="RELEASED", operator_id="evidence-op",
+        principal=_principal(), reason="confirmed same account out of band",
+        expected_version=ledger.get(b).version,
+    )
+    assert ledger.get(b).state is EvidenceState.HUMAN_RELEASED
+
+    # Nothing changed; the relationship is still simply unverified.
+    ledger.recompute(b)
+    still_released = ledger.get(b)
+    assert still_released.state is EvidenceState.HUMAN_RELEASED
+    assert still_released.counts_toward_decisions is True
+    assert len(store.reviews_of(b)) == 1
+
+
+def test_a_released_records_producer_trust_is_reevaluated_not_the_snapshot():
+    """The registry, not the frozen snapshot, decides for a released record
+    too -- a demoted producer relocks it even though the record's own
+    producer_trust column still says TRUSTED."""
+    _, store, ledger, _ = _stack()
+    evidence_id, _ = _ingest(ledger, producer="sparta")
+    ledger.review(
+        evidence_id, disposition="RELEASED", operator_id="evidence-op",
+        principal=_principal(), reason="trusted this once",
+        expected_version=ledger.get(evidence_id).version,
+    )
+    ledger.register_producer(
+        "sparta", trust=ProducerTrust.OBSERVED_ONLY, updated_by="ops"
+    )
+    ledger.recompute(evidence_id)
+    relocked = ledger.get(evidence_id)
+    assert relocked.state is EvidenceState.LOCKED
+    assert relocked.lock_reason == LockReason.PRODUCER_TRUST_INSUFFICIENT
+    assert store.get_evidence(evidence_id)["producer_trust"] == "TRUSTED"
+
+
+def test_a_relocked_release_stays_relocked_across_repeated_recomputes():
+    """Regression guard: once a release is correctly re-locked, re-running
+    recompute must not keep changing the reported reason (a symptom of the
+    two evaluation paths disagreeing with each other)."""
+    _, store, ledger, _ = _stack()
+    a, _ = _ingest(ledger, account_id="acct-1")
+    b, _ = _ingest(
+        ledger, producer="sparta", seq=2, account_id="acct-OTHER", depends_on=(a,)
+    )
+    ledger.review(
+        b, disposition="RELEASED", operator_id="evidence-op",
+        principal=_principal(), reason="confirmed out of band",
+        expected_version=ledger.get(b).version,
+    )
+    ledger.invalidate(a, reason="forged")
+
+    first = ledger.get(b)
+    assert first.lock_reason == LockReason.DEPENDENCY_INVALIDATED
+    for _ in range(3):
+        ledger.recompute(b)
+        assert ledger.get(b).lock_reason == LockReason.DEPENDENCY_INVALIDATED
+
+
 def test_a_rejection_is_durable_and_not_lifted_by_recomputation():
     _, _, ledger, _ = _stack()
     evidence_id, _ = _ingest(ledger)
