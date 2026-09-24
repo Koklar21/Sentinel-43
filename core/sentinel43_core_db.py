@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -1321,17 +1322,26 @@ class SentinelCoreStore:
         new_state: str,
         new_lock_reason: str = "",
         new_lock_detail: str = "",
-        audit_reference: str = "",
+        audit_writer: Callable[[], str | None] | None = None,
     ) -> bool:
-        """Record one human decision about evidence AND apply it, atomically.
+        """Record one human decision about evidence AND apply it, atomically
+        with its own durable, authoritative audit record.
 
-        Both happen in one transaction: a disposition that cannot be durably
-        recorded must not change what the system will count. The review row
-        keeps the state and lock the record carried when the human saw it, so
-        a release never rewrites the history it was granted against.
+        ``audit_writer``, when given, is called at most once, after the
+        version check below has passed and while this transaction still
+        holds its exclusive write lock -- so nothing else can observe the
+        state this call would produce before its audit record durably
+        exists. If it raises, this whole review -- the state change
+        included -- is rolled back and the exception propagates: an
+        evidence decision that could not be durably audited never takes
+        effect, whatever its disposition. Its return value, when not
+        empty, is stored on the review row as ``audit_reference``.
 
         Returns False when the record changed since the human reviewed it --
-        the decision is refused rather than applied to something else.
+        the decision is refused rather than applied to something else. The
+        review row keeps the state and lock the record carried when the
+        human saw it, so a release never rewrites the history it was
+        granted against.
         """
         connection = self._connect()
 
@@ -1346,6 +1356,8 @@ class SentinelCoreStore:
             if row is None or int(row["version"]) != int(evidence_version):
                 connection.rollback()
                 return False
+
+            audit_reference = str(audit_writer() or "") if audit_writer else ""
 
             now_ms = int(decided_at_ms)
 
@@ -1392,21 +1404,6 @@ class SentinelCoreStore:
 
         finally:
             connection.close()
-
-    def set_review_audit_reference(
-        self, review_id: str, *, audit_reference: str
-    ) -> bool:
-        """Attach the audit ledger's reference to a review row already
-        written -- used when the audit append happens (necessarily) after
-        the review transaction commits, so the reference cannot be known
-        until then. Best-effort: a failure here does not undo the review."""
-        with self._connect() as connection:
-            cursor = connection.execute(
-                "UPDATE evidence_reviews SET audit_reference = ? "
-                "WHERE review_id = ?",
-                (str(audit_reference), str(review_id).strip()),
-            )
-            return int(cursor.rowcount or 0) == 1
 
     def reviews_of(self, evidence_id: str) -> tuple[Mapping[str, Any], ...]:
         with self._connect() as connection:

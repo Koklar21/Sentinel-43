@@ -23,6 +23,7 @@ from .ledger import (
     MAX_PROPAGATION_NODES,
     EvidenceLedger,
     EvidenceLedgerUnavailable,
+    EvidenceReviewAuditFailed,
     InvalidEvidenceTransition,
     UnauthorizedEvidenceReview,
 )
@@ -64,6 +65,7 @@ __all__ = [
     "EvidenceBundle",
     "EvidenceLedger",
     "EvidenceLedgerUnavailable",
+    "EvidenceReviewAuditFailed",
     "EvidenceRecord",
     "EvidenceRelationship",
     "EvidenceState",

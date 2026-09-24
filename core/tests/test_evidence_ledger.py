@@ -24,6 +24,7 @@ import pytest
 
 from core.evidence.ledger import (
     EvidenceLedger,
+    EvidenceReviewAuditFailed,
     InvalidEvidenceTransition,
     UnauthorizedEvidenceReview,
 )
@@ -72,6 +73,33 @@ def _stack(required_producers: int = 1):
     )
     _trust_default_producers(ledger)
     return directory, store, ledger, audit
+
+
+def _stack_with_audit(*, required_producers: int = 1):
+    """Like _stack(), but built with a benign no-op audit sink, so setup
+    (registering producers, ingesting evidence -- both of which audit
+    their own automatic eligibility writes) never depends on the sink a
+    test swaps in later.
+
+    Tests that need to prove a human evidence decision fails closed when
+    its audit record cannot be written set ``ledger._audit`` themselves,
+    AFTER setup, and only immediately before the ``review()`` call under
+    test -- a broken sink is what that one call is exercising, not
+    something fixture setup should have to survive too.
+    """
+    directory = Path(tempfile.mkdtemp(prefix="s43-evidence-audit-"))
+    store = SentinelCoreStore(CoreStoreConfig(db_path=directory / "heart.sqlite3"))
+    store.initialize()
+    ledger = EvidenceLedger(
+        store,
+        operator_authenticator=lambda principal: bool(
+            getattr(principal, "is_human", False)
+        ),
+        audit_sink=lambda entry: None,
+        required_producers=required_producers,
+    )
+    _trust_default_producers(ledger)
+    return directory, store, ledger
 
 
 def _principal(subject: str = "evidence-op", is_human: bool = True):
@@ -409,6 +437,162 @@ def test_a_human_can_release_locked_evidence_and_it_is_audited():
     assert entry["identity_type"] == "operator"
     assert entry["prior_lock_reason"] == LockReason.UNVERIFIED_RELATIONSHIP
     assert entry["authorizes_response_action"] is False
+
+
+# ---------------------------------------------------------------------------
+# No evidence may enter HUMAN_RELEASED unless its authenticated review has a
+# durable authoritative audit record -- that is what fail-closed means here.
+# A decision whose audit could not be written never takes effect, whatever
+# its disposition, so review history never contains one the audit trail
+# cannot corroborate.
+# ---------------------------------------------------------------------------
+def test_a_release_does_not_take_effect_when_its_audit_record_fails():
+    _, store, ledger = _stack_with_audit()
+    a, _ = _ingest(ledger, account_id="acct-1")
+    b, _ = _ingest(
+        ledger, producer="sparta", seq=2, account_id="acct-OTHER", depends_on=(a,)
+    )
+    before = ledger.get(b)
+    assert before.state is EvidenceState.LOCKED
+
+    def _broken_sink(_entry):
+        raise RuntimeError("audit store is unreachable")
+
+    ledger._audit = _broken_sink
+
+    with pytest.raises(EvidenceReviewAuditFailed):
+        ledger.review(
+            b, disposition="RELEASED", operator_id="evidence-op",
+            principal=_principal(), reason="trusted despite the gap",
+            expected_version=before.version,
+        )
+
+    after = ledger.get(b)
+    assert after.state is EvidenceState.LOCKED
+    assert after.version == before.version
+    assert after.counts_toward_decisions is False
+    # No partial or misleading record of a decision that never took effect.
+    assert store.reviews_of(b) == ()
+
+
+def test_a_release_does_not_take_effect_with_no_audit_store_attached():
+    _, store, ledger = _stack_with_audit()
+    evidence_id, _ = _ingest(ledger)
+    before = ledger.get(evidence_id)
+    ledger._audit = None
+
+    with pytest.raises(EvidenceReviewAuditFailed):
+        ledger.review(
+            evidence_id, disposition="RELEASED", operator_id="evidence-op",
+            principal=_principal(), reason="trusted this one",
+            expected_version=before.version,
+        )
+
+    after = ledger.get(evidence_id)
+    assert after.state == before.state
+    assert after.version == before.version
+    assert store.reviews_of(evidence_id) == ()
+
+
+def test_a_rejection_also_does_not_take_effect_when_its_audit_record_fails():
+    """Documented, deliberate: the same fail-closed guarantee applies to
+    REJECTED and HELD, not only RELEASED. A REJECTED/HELD decision that
+    silently failed to record would leave review history just as
+    unreconstructable as a silently-effective release would leave
+    eligibility untrustworthy, so it is refused the same way."""
+
+    _, store, ledger = _stack_with_audit()
+    a, _ = _ingest(ledger, account_id="acct-1")
+    b, _ = _ingest(
+        ledger, producer="sparta", seq=2, account_id="acct-OTHER", depends_on=(a,)
+    )
+    before = ledger.get(b)
+    assert before.state is EvidenceState.LOCKED
+
+    def _broken_sink(_entry):
+        raise RuntimeError("audit store is unreachable")
+
+    ledger._audit = _broken_sink
+
+    with pytest.raises(EvidenceReviewAuditFailed):
+        ledger.review(
+            b, disposition="REJECTED", operator_id="evidence-op",
+            principal=_principal(), reason="this is a false positive",
+            expected_version=before.version,
+        )
+
+    after = ledger.get(b)
+    assert after.state is EvidenceState.LOCKED  # not REJECTED
+    assert after.version == before.version
+    assert store.reviews_of(b) == ()
+
+
+def test_a_hold_also_does_not_take_effect_when_its_audit_record_fails():
+    _, store, ledger = _stack_with_audit()
+    a, _ = _ingest(ledger, account_id="acct-1")
+    b, _ = _ingest(
+        ledger, producer="sparta", seq=2, account_id="acct-OTHER", depends_on=(a,)
+    )
+    before = ledger.get(b)
+
+    def _broken_sink(_entry):
+        raise RuntimeError("audit store is unreachable")
+
+    ledger._audit = _broken_sink
+
+    with pytest.raises(EvidenceReviewAuditFailed):
+        ledger.review(
+            b, disposition="HELD", operator_id="evidence-op",
+            principal=_principal(), reason="still investigating",
+            expected_version=before.version,
+        )
+
+    after = ledger.get(b)
+    assert after.version == before.version
+    assert store.reviews_of(b) == ()
+
+
+def test_a_release_succeeds_and_is_cross_linked_once_the_audit_record_recovers():
+    """The refusal is not permanent: once the audit store is reachable
+    again, the same human decision -- reviewed against the still-current
+    version, since nothing was ever applied -- succeeds normally."""
+    _, store, ledger = _stack_with_audit()
+    a, _ = _ingest(ledger, account_id="acct-1")
+    b, _ = _ingest(
+        ledger, producer="sparta", seq=2, account_id="acct-OTHER", depends_on=(a,)
+    )
+    locked = ledger.get(b)
+
+    calls = {"n": 0}
+    audit: list[dict] = []
+
+    def _flaky_sink(entry):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("audit store is unreachable")
+        audit.append(entry)
+        return f"audit-ref-{calls['n']}"
+
+    ledger._audit = _flaky_sink
+
+    with pytest.raises(EvidenceReviewAuditFailed):
+        ledger.review(
+            b, disposition="RELEASED", operator_id="evidence-op",
+            principal=_principal(), reason="trusted despite the gap",
+            expected_version=locked.version,
+        )
+    assert ledger.get(b).version == locked.version  # still nothing applied
+
+    result = ledger.review(
+        b, disposition="RELEASED", operator_id="evidence-op",
+        principal=_principal(), reason="trusted despite the gap",
+        expected_version=ledger.get(b).version,
+    )
+    assert result["state"] == EvidenceState.HUMAN_RELEASED
+    assert result["audit_reference"] == "audit-ref-2"
+    reviews = store.reviews_of(b)
+    assert len(reviews) == 1
+    assert reviews[0]["audit_reference"] == "audit-ref-2"
 
 
 def test_a_release_does_not_rewrite_the_original_lock():

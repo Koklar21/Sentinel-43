@@ -83,6 +83,19 @@ class InvalidEvidenceTransition(RuntimeError):
     """
 
 
+class EvidenceReviewAuditFailed(RuntimeError):
+    """A human evidence decision could not be durably, authoritatively
+    audited, so it was refused rather than applied.
+
+    Raised for every disposition (RELEASED, REJECTED, HELD), not only a
+    release: a decision this system cannot prove was made is not one
+    anything may rely on having happened, and a REJECTED/HELD decision
+    that silently failed to record would make review history
+    unreconstructable in exactly the same way a silently-effective release
+    would make eligibility untrustworthy.
+    """
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -764,19 +777,82 @@ class EvidenceLedger:
         )
 
         review_id = f"rev-{uuid.uuid4().hex}"
-        applied = self._store.record_evidence_review(
-            review_id=review_id,
-            evidence_id=evidence_id,
-            evidence_version=int(expected_version),
-            disposition=disposition,
-            operator_id=operator_id,
-            identity_type=str(getattr(principal, "identity_type", "")),
-            reason=str(reason),
-            decided_at_ms=_now_ms(),
-            new_state=str(new_state),
-            new_lock_reason=str(new_lock),
-            new_lock_detail=new_lock_detail,
-        )
+        audit_reference_holder: list[str | None] = [None]
+
+        def _write_authoritative_audit() -> str | None:
+            # Called by the store only after it has confirmed, under its own
+            # write lock, that this review still applies to the version it
+            # was decided against -- so a durable audit record is written
+            # if and only if the state change it describes is about to take
+            # effect, and its absence or failure refuses that state change
+            # rather than merely failing to describe it. No evidence
+            # decision -- RELEASED, REJECTED, or HELD -- takes effect
+            # without one: a decision this system cannot prove was made is
+            # not one review history can reconstruct, and for RELEASED
+            # specifically, it is not one anything may ever count on.
+            if self._audit is None:
+                raise EvidenceReviewAuditFailed(
+                    "no authoritative audit store is attached to this "
+                    "ledger; a human evidence decision may not be applied "
+                    "without a durable audit record of it"
+                )
+            try:
+                reference = self._audit(
+                    {
+                        "subsystem": EVIDENCE_COMPONENT,
+                        "component": EVIDENCE_COMPONENT,
+                        "decision": f"EVIDENCE_{disposition}",
+                        "reason_code": "HUMAN_EVIDENCE_DECISION",
+                        "evidence_id": evidence_id,
+                        "evidence_version": int(expected_version),
+                        "correlation_id": record.correlation_id or evidence_id,
+                        "operator_id": operator_id,
+                        "identity_type": str(
+                            getattr(principal, "identity_type", "")
+                        ),
+                        "resolution_reason": str(reason),
+                        "prior_state": str(record.state),
+                        "prior_lock_reason": record.lock_reason,
+                        "new_state": str(new_state),
+                        # Said explicitly so an evidence decision can never be
+                        # read as authorization of a response.
+                        "authorizes_response_action": False,
+                    }
+                )
+            except Exception as exc:
+                raise EvidenceReviewAuditFailed(
+                    "the authoritative audit store raised while recording "
+                    "this human evidence decision"
+                ) from exc
+            # The sink is what durably persists the record; a reference
+            # string back is a bonus for cross-linking, not itself proof of
+            # durability -- what makes this authoritative is that the call
+            # above ran to completion without raising. A sink that persists
+            # but returns nothing (or nothing truthy) is not a failure.
+            resolved = str(reference) if reference else None
+            audit_reference_holder[0] = resolved
+            return resolved
+
+        try:
+            applied = self._store.record_evidence_review(
+                review_id=review_id,
+                evidence_id=evidence_id,
+                evidence_version=int(expected_version),
+                disposition=disposition,
+                operator_id=operator_id,
+                identity_type=str(getattr(principal, "identity_type", "")),
+                reason=str(reason),
+                decided_at_ms=_now_ms(),
+                new_state=str(new_state),
+                new_lock_reason=str(new_lock),
+                new_lock_detail=new_lock_detail,
+                audit_writer=_write_authoritative_audit,
+            )
+        except EvidenceReviewAuditFailed:
+            # The state change was never committed -- the store rolled the
+            # whole transaction back before this propagated. The record is
+            # exactly as it was before this call.
+            raise
 
         if not applied:
             raise PermissionError(
@@ -784,34 +860,7 @@ class EvidenceLedger:
                 "refused rather than applied to a different version"
             )
 
-        audit_reference = self._append_audit(
-            {
-                "subsystem": EVIDENCE_COMPONENT,
-                "component": EVIDENCE_COMPONENT,
-                "decision": f"EVIDENCE_{disposition}",
-                "reason_code": "HUMAN_EVIDENCE_DECISION",
-                "evidence_id": evidence_id,
-                "evidence_version": int(expected_version),
-                "correlation_id": record.correlation_id or evidence_id,
-                "operator_id": operator_id,
-                "identity_type": str(getattr(principal, "identity_type", "")),
-                "resolution_reason": str(reason),
-                "prior_state": str(record.state),
-                "prior_lock_reason": record.lock_reason,
-                "new_state": str(new_state),
-                # Said explicitly so an evidence decision can never be read
-                # as authorization of a response.
-                "authorizes_response_action": False,
-            }
-        )
-        if audit_reference:
-            # The audit ledger's own reference can only be known once the
-            # append above returns, so the review row is stamped with it in
-            # a second, best-effort write -- the review itself already
-            # committed and does not depend on this succeeding.
-            self._store.set_review_audit_reference(
-                review_id, audit_reference=str(audit_reference)
-            )
+        audit_reference = audit_reference_holder[0]
 
         if disposition == "RELEASED":
             # A release changes what dependents may rely on.
@@ -971,6 +1020,7 @@ __all__ = [
     "MAX_PROPAGATION_NODES",
     "EvidenceLedger",
     "EvidenceLedgerUnavailable",
+    "EvidenceReviewAuditFailed",
     "InvalidEvidenceTransition",
     "UnauthorizedEvidenceReview",
 ]
