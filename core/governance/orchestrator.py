@@ -293,6 +293,21 @@ class RecommendationAuthorityUnavailable(RuntimeError):
     """No durable recommendation store is attached to the orchestrator."""
 
 
+class RecommendationDecisionUnreconciled(RuntimeError):
+    """A recommendation is stuck in a terminal status with no matching
+    authoritative audit record, and the automatic revert to PENDING could
+    not be applied either.
+
+    Distinguished from the plain audit-failure case (still raised as-is
+    when the revert succeeds, so the row is safely back at PENDING and the
+    decision can be retried): here the row is APPROVED/VETOED -- terminal,
+    never retried automatically -- with nothing durable saying why. This
+    is a forensic-integrity emergency, not a routine failure, and needs a
+    distinct type so it can be alerted on and reconciled manually rather
+    than logged and forgotten.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class ThreatRecommendation:
     """A detection-layer finding reported to the orchestration core.
@@ -2163,7 +2178,7 @@ class SystemOrchestrator:
                     **({"policy": policies} if policies else {}),
                 }
             )
-        except Exception:
+        except Exception as audit_exc:
             # A decision that cannot be recorded must not be reported as made.
             if incident_id is not None:
                 try:
@@ -2176,8 +2191,15 @@ class SystemOrchestrator:
                         incident_id,
                         exc_info=True,
                     )
+
+            # transition_status() communicates a failed CAS by returning
+            # False, not by raising -- catching only exceptions here would
+            # treat a silently-unapplied revert exactly like a successful
+            # one, leaving a terminal (APPROVED/VETOED, unretryable) row
+            # with no audit record and nothing to ever notice it again.
+            reverted = False
             try:
-                store.transition_status(
+                reverted = store.transition_status(
                     action_id,
                     expected=new_status,
                     new_status=ActionStatus.PENDING,
@@ -2191,6 +2213,23 @@ class SystemOrchestrator:
                     new_status.value,
                     exc_info=True,
                 )
+
+            if not reverted:
+                logger.error(
+                    "Recommendation %s remains %s with no authoritative "
+                    "audit record of the decision, and the automatic "
+                    "revert to PENDING did not apply -- this requires "
+                    "manual reconciliation",
+                    action_id,
+                    new_status.value,
+                )
+                raise RecommendationDecisionUnreconciled(
+                    f"recommendation {action_id!r} is {new_status.value} "
+                    "with no durable audit record, and the automatic "
+                    "revert to PENDING did not apply; this requires "
+                    "manual reconciliation"
+                ) from audit_exc
+
             raise
 
         return {
@@ -2238,6 +2277,7 @@ __all__ = [
     "RECOMMENDATION_AUTHORITY",
     "RECOMMENDATION_COMPONENT",
     "RecommendationAuthorityUnavailable",
+    "RecommendationDecisionUnreconciled",
     "RecommendationOutcome",
     "ThreatRecommendation",
     "UnauthorizedDecision",

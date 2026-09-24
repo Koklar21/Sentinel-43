@@ -237,7 +237,11 @@ class SentinelCoreStore:
                     system_id TEXT NOT NULL,
                     operator_id TEXT,
                     operator_reason TEXT,
-                    principal_id TEXT NOT NULL DEFAULT ''
+                    principal_id TEXT NOT NULL DEFAULT '',
+                    CHECK (status IN (
+                        'SHADOWED', 'STAGED', 'PENDING', 'VETOED',
+                        'APPROVED', 'EXECUTED', 'EXPIRED'
+                    ))
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_pending_status
@@ -267,7 +271,8 @@ class SentinelCoreStore:
                     engine_actions_json TEXT NOT NULL,
                     opened_by TEXT NOT NULL,
                     operator_reason TEXT NOT NULL,
-                    retracted_reason TEXT
+                    retracted_reason TEXT,
+                    CHECK (status IN ('OPEN', 'RETRACTED'))
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_incident_action
@@ -450,6 +455,81 @@ class SentinelCoreStore:
                     "ADD COLUMN principal_id TEXT NOT NULL DEFAULT ''"
                 )
 
+            # A database from before the CHECK constraints below existed
+            # keeps its rows exactly as they are -- application code has
+            # always restricted these columns to their enum's values
+            # (ActionStatus / IncidentStatus), so nothing here can fail;
+            # this only closes the gap for a caller that bypasses the
+            # application layer entirely. SQLite cannot ALTER a CHECK onto
+            # an existing table, so this rebuilds it: a new table with the
+            # constraint, the old rows copied across, then the swap.
+            self._add_check_constraint_if_missing(
+                connection,
+                table="pending_actions",
+                check_signature="CHECK (status IN (\n                        'SHADOWED'",
+                create_sql="""
+                    CREATE TABLE pending_actions (
+                        action_id TEXT PRIMARY KEY,
+                        created_at_ms INTEGER NOT NULL,
+                        execute_at_ms INTEGER,
+                        status TEXT NOT NULL,
+                        target_type TEXT NOT NULL,
+                        target_value TEXT NOT NULL,
+                        primary_action TEXT NOT NULL,
+                        actions_json TEXT NOT NULL,
+                        severity TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        source_kind TEXT NOT NULL,
+                        score REAL,
+                        reason TEXT NOT NULL,
+                        system_id TEXT NOT NULL,
+                        operator_id TEXT,
+                        operator_reason TEXT,
+                        principal_id TEXT NOT NULL DEFAULT '',
+                        CHECK (status IN (
+                            'SHADOWED', 'STAGED', 'PENDING', 'VETOED',
+                            'APPROVED', 'EXECUTED', 'EXPIRED'
+                        ))
+                    )
+                """,
+                index_sqls=(
+                    "CREATE INDEX IF NOT EXISTS idx_pending_status "
+                    "ON pending_actions(status)",
+                    "CREATE INDEX IF NOT EXISTS idx_pending_created "
+                    "ON pending_actions(created_at_ms)",
+                ),
+            )
+
+            self._add_check_constraint_if_missing(
+                connection,
+                table="incidents",
+                check_signature="CHECK (status IN ('OPEN'",
+                create_sql="""
+                    CREATE TABLE incidents (
+                        incident_id TEXT PRIMARY KEY,
+                        action_id TEXT NOT NULL,
+                        opened_at_ms INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        severity TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        subject_type TEXT NOT NULL,
+                        subject_value TEXT NOT NULL,
+                        summary TEXT NOT NULL,
+                        engine_actions_json TEXT NOT NULL,
+                        opened_by TEXT NOT NULL,
+                        operator_reason TEXT NOT NULL,
+                        retracted_reason TEXT,
+                        CHECK (status IN ('OPEN', 'RETRACTED'))
+                    )
+                """,
+                index_sqls=(
+                    "CREATE INDEX IF NOT EXISTS idx_incident_action "
+                    "ON incidents(action_id)",
+                    "CREATE INDEX IF NOT EXISTS idx_incident_opened "
+                    "ON incidents(opened_at_ms)",
+                ),
+            )
+
             # A database created by the FIRST evidence schema (before
             # producers/incident_id/lock_detail/payload_hash/updated_at_ms
             # existed) keeps its rows; new columns arrive empty/zero, which
@@ -496,6 +576,42 @@ class SentinelCoreStore:
                 "CREATE INDEX IF NOT EXISTS idx_evidence_producer "
                 "ON evidence(producer)"
             )
+
+    @staticmethod
+    def _add_check_constraint_if_missing(
+        connection: sqlite3.Connection,
+        *,
+        table: str,
+        check_signature: str,
+        create_sql: str,
+        index_sqls: tuple[str, ...],
+    ) -> None:
+        """Add a CHECK constraint to an existing table, idempotently.
+
+        SQLite has no ``ALTER TABLE ... ADD CONSTRAINT``: the only way to
+        add a CHECK to a table that already exists is the standard
+        rebuild-and-swap (new table with the constraint, copy every row
+        across unchanged, drop the old table, rename the new one into its
+        place). ``check_signature`` is a distinctive substring of the
+        constraint's own SQL, used to detect whether a previous run of
+        this already applied it -- this runs on every startup, so it must
+        be a no-op the second time.
+        """
+        current_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        if current_sql is None or check_signature in str(current_sql[0]):
+            return
+
+        rebuilt = f"{table}__check_rebuild"
+        connection.execute(f"DROP TABLE IF EXISTS {rebuilt}")
+        connection.execute(create_sql.replace(f"TABLE {table}", f"TABLE {rebuilt}", 1))
+        connection.execute(f"INSERT INTO {rebuilt} SELECT * FROM {table}")
+        connection.execute(f"DROP TABLE {table}")
+        connection.execute(f"ALTER TABLE {rebuilt} RENAME TO {table}")
+        for index_sql in index_sqls:
+            connection.execute(index_sql)
 
     @staticmethod
     def _normalize_action_id(action_id: str) -> str:

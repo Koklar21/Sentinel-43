@@ -1953,6 +1953,56 @@ def test_an_unauditable_incident_decision_is_reverted_and_the_incident_retracted
     assert core.count_incidents(status=IncidentStatus.OPEN) == 0
 
 
+def test_an_unauditable_decision_whose_revert_also_fails_is_distinguishable():
+    """transition_status() reports a failed CAS by returning False, not by
+    raising. Catching only exceptions on the compensating revert would
+    treat that silent failure exactly like a successful one, leaving a
+    terminal (APPROVED, unretryable) row with no audit record and no way
+    for anything to ever notice. The double failure must raise a distinct
+    type so it cannot be mistaken for the safely-reverted case, and the
+    row's terminal, unaudited state must be real and observable."""
+    from core.governance.orchestrator import RecommendationDecisionUnreconciled
+
+    _, _, core, heart = _stack()
+    action_id = _stage_planned(heart, "203.0.113.193", ["RATE_LIMIT"])
+    authority = heart._authority
+
+    def fail_on_decision(record):
+        if record.get("decision") in ("APPROVED", "VETOED"):
+            raise RuntimeError("audit ledger unavailable")
+        raise AssertionError("unexpected audit call")
+
+    real_transition_status = core.transition_status
+
+    def revert_never_applies(action_id, *, expected, new_status, **kwargs):
+        # Let the real APPROVE transition through; only the compensating
+        # revert-to-PENDING attempt is the one that must not apply.
+        if new_status is ActionStatus.PENDING:
+            return False
+        return real_transition_status(
+            action_id, expected=expected, new_status=new_status, **kwargs
+        )
+
+    authority._append_audit = fail_on_decision
+    core.transition_status = revert_never_applies
+    try:
+        with pytest.raises(RecommendationDecisionUnreconciled):
+            authority.resolve_recommendation(
+                action_id,
+                approved=True,
+                operator_id="heart-op",
+                reason="reviewed",
+                principal=_principal(),
+            )
+    finally:
+        del authority._append_audit
+        del core.transition_status
+
+    # The row is truthfully stuck: terminal, and nothing pretends the
+    # decision was ever recorded.
+    assert core.get_status(action_id) == ActionStatus.APPROVED
+
+
 def test_opening_the_same_incident_twice_keeps_one_record():
     _, _, core, _heart = _stack()
     first = core.open_incident(
@@ -2404,3 +2454,117 @@ def test_an_unauditable_engine_event_does_not_change_the_decision():
     store._audit_sink = explode
     action_id = _stage(heart, "203.0.113.214")
     assert core.get_status(action_id) == ActionStatus.PENDING
+
+
+# ---------------------------------------------------------------------------
+# Database-level invariants: pending_actions.status and incidents.status
+# must be structurally restricted to their enum's values regardless of
+# caller, mirroring the CHECK already enforced on evidence.state -- a
+# direct SQL write that bypasses ActionStatus/IncidentStatus entirely must
+# still be refused by the database itself, not merely by application code.
+# ---------------------------------------------------------------------------
+def test_pending_actions_rejects_an_invalid_status_at_the_database_layer():
+    directory = Path(tempfile.mkdtemp(prefix="s43-pending-check-"))
+    store = SentinelCoreStore(CoreStoreConfig(db_path=directory / "heart.sqlite3"))
+    store.initialize()
+
+    with store._connect() as connection, pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """
+            INSERT INTO pending_actions (
+                action_id, created_at_ms, status, target_type, target_value,
+                primary_action, actions_json, severity, kind, source_kind,
+                reason, system_id
+            ) VALUES ('a-1', 0, 'NOT_A_REAL_STATUS', 't', 'v', 'p', '[]',
+                      's', 'k', 'sk', 'r', 'sys')
+            """
+        )
+
+
+def test_incidents_rejects_an_invalid_status_at_the_database_layer():
+    directory = Path(tempfile.mkdtemp(prefix="s43-incident-check-"))
+    store = SentinelCoreStore(CoreStoreConfig(db_path=directory / "heart.sqlite3"))
+    store.initialize()
+
+    with store._connect() as connection, pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            """
+            INSERT INTO incidents (
+                incident_id, action_id, opened_at_ms, status, severity, kind,
+                subject_type, subject_value, summary, engine_actions_json,
+                opened_by, operator_reason
+            ) VALUES ('i-1', 'a-1', 0, 'NOT_A_REAL_STATUS', 's', 'k', 'st',
+                      'sv', 'sum', '[]', 'op', 'r')
+            """
+        )
+
+
+def test_a_pending_actions_table_without_the_check_constraint_gets_it_added_safely():
+    """A database from before this CHECK existed keeps its rows, gains the
+    constraint on the next initialize(), and a second initialize() is a
+    no-op rather than re-attempting (and failing) the rebuild."""
+    directory = Path(tempfile.mkdtemp(prefix="s43-pending-legacy-"))
+    db_path = directory / "heart.sqlite3"
+
+    with sqlite3.connect(str(db_path)) as connection:
+        connection.execute(
+            """
+            CREATE TABLE pending_actions (
+                action_id TEXT PRIMARY KEY,
+                created_at_ms INTEGER NOT NULL,
+                execute_at_ms INTEGER,
+                status TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_value TEXT NOT NULL,
+                primary_action TEXT NOT NULL,
+                actions_json TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                score REAL,
+                reason TEXT NOT NULL,
+                system_id TEXT NOT NULL,
+                operator_id TEXT,
+                operator_reason TEXT,
+                principal_id TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO pending_actions (
+                action_id, created_at_ms, status, target_type, target_value,
+                primary_action, actions_json, severity, kind, source_kind,
+                reason, system_id
+            ) VALUES ('legacy-1', 1000, 'PENDING', 't', 'v', 'p', '[]',
+                      's', 'k', 'sk', 'r', 'sys')
+            """
+        )
+        connection.commit()
+
+    store = SentinelCoreStore(CoreStoreConfig(db_path=db_path))
+    store.initialize()  # must not raise -- adds the CHECK, keeps the row
+    store.initialize()  # idempotent -- must not attempt the rebuild again
+
+    row = store.get_action("legacy-1")
+    assert row is not None
+    assert row["status"] == "PENDING"
+
+    with store._connect() as connection, pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "INSERT INTO pending_actions ("
+            "action_id, created_at_ms, status, target_type, target_value, "
+            "primary_action, actions_json, severity, kind, source_kind, "
+            "reason, system_id) VALUES ('legacy-2', 1000, 'BOGUS', 't', 'v', "
+            "'p', '[]', 's', 'k', 'sk', 'r', 'sys')"
+        )
+
+    # The index the rebuild is responsible for recreating still exists.
+    indexes = {
+        str(r["name"])
+        for r in store._connect().execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' "
+            "AND tbl_name = 'pending_actions'"
+        ).fetchall()
+    }
+    assert {"idx_pending_status", "idx_pending_created"} <= indexes
