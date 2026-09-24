@@ -336,3 +336,98 @@ def test_the_authority_does_not_hand_out_its_durable_store():
         node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
     }
     assert "recommendation_store" not in attributes
+
+
+# ---------------------------------------------------------------------------
+# 11. Every remaining privileged-mutation surface has exactly one caller.
+# insert_pending and transition_status are covered above; these close the
+# same gap for evidence review, producer trust, and incidents.
+# ---------------------------------------------------------------------------
+def test_only_the_evidence_ledger_records_a_human_review():
+    assert _modules_calling("record_evidence_review") == {"core/evidence/ledger.py"}
+
+
+def test_only_the_evidence_ledger_writes_producer_trust():
+    assert _modules_calling("set_producer_trust") == {"core/evidence/ledger.py"}
+
+
+def test_only_the_authority_opens_or_retracts_an_incident():
+    assert _modules_calling("open_incident") == {"core/governance/orchestrator.py"}
+    assert _modules_calling("retract_incident") == {"core/governance/orchestrator.py"}
+
+
+def test_the_durable_store_and_ledger_are_constructed_in_exactly_one_place():
+    """A second construction site is a second, independently-connected
+    handle to the same governance database -- an unaudited path around
+    every check the canonical instance enforces, not merely a style issue."""
+    assert _modules_calling("SentinelCoreStore") == {"core/api/main.py"}
+    assert _modules_calling("EvidenceLedger") == {"core/governance/composition.py"}
+
+
+# ---------------------------------------------------------------------------
+# 12. The dashboard is a client, not a second control plane. It must reach
+# Sentinel-43 only through the HTTP API -- never by importing governance,
+# evidence, audit, or persistence internals directly, however same-repo or
+# same-deployment that might be.
+# ---------------------------------------------------------------------------
+DASHBOARD = REPO_ROOT / "dashboard"
+
+DASHBOARD_SOURCES = sorted(
+    path
+    for path in DASHBOARD.rglob("*.py")
+    if "tests" not in path.parts and "__pycache__" not in path.parts
+)
+
+RESTRICTED_INTERNAL_MODULES = (
+    "core.sentinel43_core_db",
+    "core.governance",
+    "core.evidence",
+    "core.audit",
+)
+
+
+def _imported_modules(path: Path) -> set[str]:
+    """Every module named in an import statement in one file."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            modules.add(node.module)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                modules.add(alias.name)
+    return modules
+
+
+def test_the_dashboard_never_imports_sentinel43_internals():
+    offenders: dict[str, set[str]] = {}
+    for path in DASHBOARD_SOURCES:
+        hits = {
+            module
+            for module in _imported_modules(path)
+            if any(
+                module == restricted or module.startswith(restricted + ".")
+                for restricted in RESTRICTED_INTERNAL_MODULES
+            )
+        }
+        if hits:
+            offenders[str(path.relative_to(REPO_ROOT))] = hits
+
+    assert offenders == {}, (
+        "the dashboard must reach Sentinel-43 only through the HTTP API "
+        "(dashboard/services/api_client.py), never by importing internals "
+        f"directly: {offenders}"
+    )
+
+
+def test_the_dashboard_has_no_direct_database_handle():
+    """No sqlite/sqlalchemy/db-driver import anywhere in the dashboard --
+    confirms there is no filesystem-level side channel to the same database
+    the API/orchestration boundary owns."""
+    forbidden = ("sqlite3", "sqlalchemy", "psycopg", "psycopg2")
+    offenders = {
+        str(path.relative_to(REPO_ROOT)): (_imported_modules(path) & set(forbidden))
+        for path in DASHBOARD_SOURCES
+        if _imported_modules(path) & set(forbidden)
+    }
+    assert offenders == {}
