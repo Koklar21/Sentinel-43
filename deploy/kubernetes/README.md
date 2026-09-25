@@ -188,6 +188,10 @@ curl http://localhost:8000/health
 curl http://localhost:8000/bootstrap/status
 ```
 
+`"initialized": false` means no administrator has been claimed yet. Claim
+one at once with `docs/BETA_RUNBOOK.md` §16a. Never put the password on a
+command line.
+
 ## Logs and diagnostics
 
 ```bash
