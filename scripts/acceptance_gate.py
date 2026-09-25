@@ -12,7 +12,10 @@ recorded before execution.
 Sub-commands (all read ``acceptance/suites.json``):
 
   inventory  --out DIR [--job J ...]   record collected test IDs (collect-only)
-  inventory-all --out DIR              independent whole-tree collection (omission check)
+  inventory-all --out DIR [--profile P ...]
+                                       independent whole-tree collection (omission check),
+                                       one per interpreter profile; each profile MUST be
+                                       collected by that profile's own interpreter
   run-job    JOB --out DIR             collect (if needed) + run one pytest job
   run-check  JOB --out DIR -- CMD...   run a non-pytest required check
   mark-unmet JOB --out DIR --reason R  record a required job that cannot run
@@ -92,6 +95,13 @@ def python_for(job: dict) -> str:
                      ROOT / ".venv-browser" / "bin" / "python"):
             if cand.exists():
                 return str(cand)
+        if ROOT == REPO_ROOT:
+            # The browser venv's pytest-playwright parametrizes node IDs (e.g. "[chromium]");
+            # the main interpreter reports the same tests WITHOUT that suffix. Silently
+            # collecting or running the browser profile under it yields IDs that can never
+            # reconcile, so for this repository the interpreter must be named explicitly.
+            raise SystemExit("browser profile needs its own interpreter: set S43_BROWSER_PYTHON or create "
+                             ".venv-browser (refusing to fall back to the main interpreter)")
     return sys.executable
 
 
@@ -171,14 +181,20 @@ def profile_paths(manifest: dict, profile: str) -> list[str]:
                   if j["kind"] == "pytest" and j.get("python", "main") == profile for p in j["paths"]})
 
 
-def collect_all(out: Path, manifest: dict) -> dict[str, int]:
+def collect_all(out: Path, manifest: dict, only: list[str] | None = None) -> dict[str, int]:
     """Independent, IGNORE-FREE collection of every path used by each interpreter
     profile (one recollection per profile, since plugins differ per venv -- see
     python_profiles()). This is deliberately NOT the same command as any job's own
     collection: no per-job --ignore is applied, so a job that narrowed its own
-    collection cannot go unnoticed. Returns {profile: returncode}."""
+    collection cannot go unnoticed. ``only`` limits the run to those profiles (a CI job
+    that has just one interpreter collects just its own profile; verify still requires
+    every profile's recollection). Returns {profile: returncode}."""
     rcs = {}
-    for profile in python_profiles(manifest):
+    known = python_profiles(manifest)
+    unknown = sorted(set(only or []) - set(known))
+    if unknown:
+        raise SystemExit(f"unknown interpreter profile(s) {unknown}; known: {known}")
+    for profile in (only or known):
         inv = out / "inventory" / f"_all-{profile}.json"
         env = job_env({"python": profile})
         paths = profile_paths(manifest, profile)
@@ -198,7 +214,7 @@ def cmd_inventory_all(args: argparse.Namespace) -> int:
     out = Path(args.out)
     (out / "inventory").mkdir(parents=True, exist_ok=True)
     manifest = load_manifest()
-    rcs = collect_all(out, manifest)
+    rcs = collect_all(out, manifest, args.profile)
     ok = True
     union: set[str] = set()
     for profile, rc in rcs.items():
@@ -661,7 +677,8 @@ def main() -> int:
     p.set_defaults(fn=cmd_inventory)
     p = sub.add_parser("run-job"); p.add_argument("job"); p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_run_job)
-    p = sub.add_parser("inventory-all"); p.add_argument("--out", required=True); p.set_defaults(fn=cmd_inventory_all)
+    p = sub.add_parser("inventory-all"); p.add_argument("--out", required=True)
+    p.add_argument("--profile", action="append"); p.set_defaults(fn=cmd_inventory_all)
     p = sub.add_parser("run-check"); p.add_argument("job"); p.add_argument("--out", required=True)
     p.add_argument("command", nargs=argparse.REMAINDER); p.set_defaults(fn=cmd_run_check)
     p = sub.add_parser("mark-unmet"); p.add_argument("job"); p.add_argument("--out", required=True)
