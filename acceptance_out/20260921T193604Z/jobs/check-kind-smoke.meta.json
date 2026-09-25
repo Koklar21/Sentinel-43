@@ -1,0 +1,34 @@
+{
+ "classification": "env_unmet",
+ "finished": 1790019545.2819102,
+ "job": "check-kind-smoke",
+ "kind": "check",
+ "missing_env": [
+  "kind + Calico smoke deploy needs a hosted CI runner / kind binary; none available locally"
+ ],
+ "rc": null,
+ "revision": {
+  "branch": "feat/heart-detection-ingestion-20260921",
+  "dirty_files": [
+   ".env.example",
+   ".github/workflows/k8s.yml",
+   ".gitignore",
+   "S43_FEATURE_INVENTORY.md",
+   "acceptance/suites.json",
+   "browser_tests/run.sh",
+   "core/cli/generate_secrets.py",
+   "core/tests/test_bootstrap.py",
+   "deploy/kubernetes/base/configmap.yaml",
+   "docker-compose.beta.yml",
+   "docker-compose.yml",
+   "scripts/acceptance_campaign.py",
+   "scripts/acceptance_gate.py",
+   "scripts/acceptance_recorder.py",
+   "scripts/ci_live_tests.py",
+   "scripts/deploy_preflight.py"
+  ],
+  "head": "f3e15bb13bde77c5f539112f72f0d46e9e1cb79c",
+  "tree_fingerprint": "fc1b19a2a51946edb0daeddd70d0afaca6c753f1889ff39fe4dc266b04e0f9c4"
+ },
+ "started": 1790019545.28191
+}

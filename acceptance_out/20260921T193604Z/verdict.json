@@ -1,0 +1,136 @@
+{
+ "env_unmet": [
+  "browser-target: prerequisite unmet: ['no explicitly authorized isolated target/credentials supplied (S43_TARGET_* unset)']",
+  "check-kind-smoke: prerequisite unmet: ['kind + Calico smoke deploy needs a hosted CI runner / kind binary; none available locally']"
+ ],
+ "failures": [
+  "browser-disposable: required job has no result (never ran / artifact missing)",
+  "check-compose-config: required job has no result (never ran / artifact missing)",
+  "check-k8s-policy: required job has no result (never ran / artifact missing)",
+  "check-kubeconform: required job has no result (never ran / artifact missing)",
+  "check-image-scan: required job has no result (never ran / artifact missing)",
+  "evidence spans 3 different revisions/tree states",
+  "evidence does not match the current HEAD/working tree"
+ ],
+ "jobs": [
+  {
+   "counts": {
+    "passed": 980
+   },
+   "job": "core-isolated",
+   "kind": "pytest",
+   "status": "PASS",
+   "why": []
+  },
+  {
+   "counts": {
+    "passed": 114
+   },
+   "job": "core-postgres",
+   "kind": "pytest",
+   "status": "PASS",
+   "why": []
+  },
+  {
+   "counts": {
+    "passed": 14
+   },
+   "job": "core-live",
+   "kind": "pytest",
+   "status": "PASS",
+   "why": []
+  },
+  {
+   "counts": {},
+   "job": "browser-disposable",
+   "kind": "pytest",
+   "status": "FAIL",
+   "why": [
+    "required job has no result (never ran / artifact missing)"
+   ]
+  },
+  {
+   "counts": {},
+   "job": "browser-target",
+   "kind": "pytest",
+   "status": "ENV-UNMET",
+   "why": [
+    "prerequisite unmet: ['no explicitly authorized isolated target/credentials supplied (S43_TARGET_* unset)']"
+   ]
+  },
+  {
+   "counts": {},
+   "job": "check-compose-config",
+   "kind": "check",
+   "status": "FAIL",
+   "why": [
+    "required job has no result (never ran / artifact missing)"
+   ]
+  },
+  {
+   "counts": {},
+   "job": "check-k8s-policy",
+   "kind": "check",
+   "status": "FAIL",
+   "why": [
+    "required job has no result (never ran / artifact missing)"
+   ]
+  },
+  {
+   "counts": {},
+   "job": "check-kubeconform",
+   "kind": "check",
+   "status": "FAIL",
+   "why": [
+    "required job has no result (never ran / artifact missing)"
+   ]
+  },
+  {
+   "counts": {},
+   "job": "check-image-scan",
+   "kind": "check",
+   "status": "FAIL",
+   "why": [
+    "required job has no result (never ran / artifact missing)"
+   ]
+  },
+  {
+   "counts": {},
+   "job": "check-kind-smoke",
+   "kind": "check",
+   "status": "ENV-UNMET",
+   "why": [
+    "prerequisite unmet: ['kind + Calico smoke deploy needs a hosted CI runner / kind binary; none available locally']"
+   ]
+  }
+ ],
+ "revision": {
+  "branch": "feat/heart-detection-ingestion-20260921",
+  "dirty_files": [
+   ".env.example",
+   ".github/workflows/k8s.yml",
+   ".gitignore",
+   "S43_FEATURE_INVENTORY.md",
+   "acceptance/suites.json",
+   "browser_tests/run.sh",
+   "core/cli/generate_secrets.py",
+   "core/tests/test_bootstrap.py",
+   "deploy/kubernetes/base/configmap.yaml",
+   "docker-compose.beta.yml",
+   "docker-compose.yml",
+   "scripts/acceptance_campaign.py",
+   "scripts/acceptance_gate.py",
+   "scripts/acceptance_recorder.py",
+   "scripts/ci_live_tests.py",
+   "scripts/deploy_preflight.py"
+  ],
+  "head": "f3e15bb13bde77c5f539112f72f0d46e9e1cb79c",
+  "tree_fingerprint": "fc1b19a2a51946edb0daeddd70d0afaca6c753f1889ff39fe4dc266b04e0f9c4"
+ },
+ "test_ids_reconciled": 1108,
+ "totals": {
+  "passed": 1108
+ },
+ "uncovered_test_files": [],
+ "verdict": "ACCEPTANCE FAIL"
+}

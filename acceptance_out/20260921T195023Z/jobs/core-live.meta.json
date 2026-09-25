@@ -1,0 +1,39 @@
+{
+ "classification": "executed",
+ "cmd": [
+  "C:\\Users\\heero\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
+  "-m",
+  "pytest",
+  "-p",
+  "acceptance_recorder",
+  "-p",
+  "no:cacheprovider",
+  "--acc-report",
+  "C:\\Users\\heero\\OneDrive\\Documents\\GitHub\\Olympus_Complete_Dropin\\Sentinel-43\\acceptance_out\\20260921T195023Z\\jobs\\core-live.results.json",
+  "--acc-job",
+  "core-live",
+  "-q",
+  "-rA",
+  "core/tests/test_bootstrap.py",
+  "core/tests/test_system_smoke.py"
+ ],
+ "finished": 1790020344.2240665,
+ "job": "core-live",
+ "kind": "pytest",
+ "rc": 0,
+ "revision": {
+  "branch": "feat/heart-detection-ingestion-20260921",
+  "dirty_files": [
+   ".env.example",
+   "S43_FEATURE_INVENTORY.md",
+   "core/cli/generate_secrets.py",
+   "deploy/kubernetes/base/configmap.yaml",
+   "docker-compose.beta.yml",
+   "docker-compose.yml",
+   "scripts/deploy_preflight.py"
+  ],
+  "head": "aa370698415eb101addc9cf3dfe492616954850f",
+  "tree_fingerprint": "2a5052aba0cff77e03d0aae2c9dd57a498942a917ad28eb93f789f6080e9abd4"
+ },
+ "started": 1790020342.021118
+}

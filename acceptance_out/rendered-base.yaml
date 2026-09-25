@@ -1,0 +1,806 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    app.kubernetes.io/part-of: sentinel43
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+  name: sentinel43
+---
+apiVersion: v1
+automountServiceAccountToken: false
+kind: ServiceAccount
+metadata:
+  name: s43-api
+  namespace: sentinel43
+---
+apiVersion: v1
+automountServiceAccountToken: false
+kind: ServiceAccount
+metadata:
+  name: s43-core
+  namespace: sentinel43
+---
+apiVersion: v1
+automountServiceAccountToken: false
+kind: ServiceAccount
+metadata:
+  name: s43-db
+  namespace: sentinel43
+---
+apiVersion: v1
+automountServiceAccountToken: false
+kind: ServiceAccount
+metadata:
+  name: s43-migration
+  namespace: sentinel43
+---
+apiVersion: v1
+data:
+  POSTGRES_DB: s43
+  POSTGRES_USER: s43
+  S43_ALLOW_INSECURE_ORIGINS: "false"
+  S43_ALLOWED_ORIGINS: ""
+  S43_AUDIT_SQLITE_PATH: /app/sentinel43_state/audit.sqlite3
+  S43_DB_PATH: /app/sentinel43_state/sentinel43.sqlite3
+  S43_DEAD_LETTER_MAX_ROWS: "10000"
+  S43_DEAD_LETTER_PATH: /app/sentinel43_state/dead_letter.sqlite3
+  S43_DEFAULT_MODE: HUMAN_GATED
+  S43_DELIVERY_BASE_DELAY: "0.2"
+  S43_DELIVERY_DEADLINE: "10.0"
+  S43_DELIVERY_MAX_ATTEMPTS: "3"
+  S43_DELIVERY_MAX_DELAY: "5.0"
+  S43_ENABLE_TEST_INJECTION: "false"
+  S43_ENV: production
+  S43_FENRIR_ANOMALY_DECAY: "0.002"
+  S43_FENRIR_ANOMALY_ZSCORE: "2.5"
+  S43_FENRIR_BROADCAST_URL: http://s43-api:8000/internal/events/broadcast
+  S43_FENRIR_ENABLED: "true"
+  S43_FENRIR_MAX_HONEYPOT_EVENTS: "500"
+  S43_FENRIR_MIN_SEVERITY: MEDIUM
+  S43_FENRIR_NODE_ID: sentinel-43-primary
+  S43_FENRIR_REPORT_TIMEOUT: "2.0"
+  S43_FENRIR_WATCHTOWER_URL: http://s43-api:8000/watchtower/events
+  S43_GOVERNANCE_ENABLED: "false"
+  S43_HEART_SQLITE_PATH: /app/sentinel43_state/heart.sqlite3
+  S43_IDEMPOTENCY_MAX_ENTRIES: "10000"
+  S43_IDEMPOTENCY_TTL_SECONDS: "900"
+  S43_JORM_ENABLED: "false"
+  S43_JWT_ALGORITHM: HS256
+  S43_JWT_AUDIENCE: sentinel-43-dashboard
+  S43_JWT_ISSUER: sentinel-43
+  S43_JWT_TTL_SECONDS: "28800"
+  S43_LOG_LEVEL: INFO
+  S43_OPERATOR_USERNAME: operator
+  S43_SESSION_ACCESS_TTL_SECONDS: "900"
+  S43_SESSION_REFRESH_TTL_SECONDS: "604800"
+  S43_SPARTA_CHECK_INTERVAL: "30.0"
+  S43_SPARTA_ENABLED: "false"
+  S43_SPARTA_NODE_SIGNATURE: sparta-core
+  S43_SPARTA_PUBLIC_HEALTH_DETAIL: "false"
+  S43_TLS_TERMINATED_AT_TRUSTED_EDGE: "false"
+  S43_TRUSTED_HOSTS: s43-api
+  S43_TRUSTED_PROXIES: ""
+  S43_WATCHTOWER_HOST: 0.0.0.0
+  S43_WATCHTOWER_PORT: "9100"
+  S43_WATCHTOWER_TIMEOUT: "2.0"
+  S43_WATCHTOWER_URL: http://s43-core:9100
+  S43_WS_REQUIRE_AUTH: "true"
+  S43_WS_SESSION_RECHECK_SECONDS: "60"
+  SENTINEL_ENV: production
+kind: ConfigMap
+metadata:
+  name: sentinel43-config
+  namespace: sentinel43
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: s43-api
+  name: s43-api
+  namespace: sentinel43
+spec:
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+  selector:
+    app: s43-api
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: s43-core
+  name: s43-core
+  namespace: sentinel43
+spec:
+  ports:
+  - name: http
+    port: 9100
+    targetPort: 9100
+  selector:
+    app: s43-core
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: s43-db
+  name: s43-db
+  namespace: sentinel43
+spec:
+  clusterIP: None
+  ports:
+  - name: postgres
+    port: 5432
+    targetPort: 5432
+  selector:
+    app: s43-db
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: s43-api-state
+  namespace: sentinel43
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: s43-api
+  name: s43-api
+  namespace: sentinel43
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: s43-api
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: s43-api
+        network/s43-core-client: "true"
+        network/s43-db-client: "true"
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - command:
+        - uvicorn
+        - core.api.main:app
+        - --host
+        - 0.0.0.0
+        - --port
+        - "8000"
+        - --forwarded-allow-ips
+        - 127.0.0.1
+        envFrom:
+        - configMapRef:
+            name: sentinel43-config
+        - secretRef:
+            name: sentinel43-secrets
+        image: sentinel43-api:base-placeholder
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /health
+            port: 8000
+          periodSeconds: 15
+        name: s43-api
+        ports:
+        - containerPort: 8000
+          name: http
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /ready
+            port: 8000
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 192Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          privileged: false
+          readOnlyRootFilesystem: true
+          seccompProfile:
+            type: RuntimeDefault
+        startupProbe:
+          failureThreshold: 24
+          httpGet:
+            path: /health
+            port: 8000
+          periodSeconds: 5
+        volumeMounts:
+        - mountPath: /tmp
+          name: tmp
+        - mountPath: /app/sentinel43_state
+          name: state
+        - mountPath: /app/logs
+          name: logs
+      initContainers:
+      - command:
+        - python
+        - -c
+        - |
+          import os, socket, sys, time
+          from urllib.parse import urlsplit
+
+          url = urlsplit(os.environ.get("S43_WATCHTOWER_URL", ""))
+          host, port = url.hostname or "s43-core", url.port or 9100
+          deadline = time.monotonic() + 120
+
+          while time.monotonic() < deadline:
+              try:
+                  with socket.create_connection((host, port), timeout=5):
+                      print(f"{host}:{port} is accepting connections")
+                      sys.exit(0)
+              except OSError as exc:
+                  print(f"waiting for {host}:{port}: {exc}", flush=True)
+                  time.sleep(2)
+
+          print(
+              f"{host}:{port} did not answer; starting anyway -- "
+              f"Watchtower is optional and will be reported degraded",
+              flush=True,
+          )
+          sys.exit(0)
+        env:
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        envFrom:
+        - configMapRef:
+            name: sentinel43-config
+        image: sentinel43-api:base-placeholder
+        imagePullPolicy: IfNotPresent
+        name: wait-for-core
+        resources:
+          limits:
+            cpu: 200m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          privileged: false
+          readOnlyRootFilesystem: true
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - mountPath: /tmp
+          name: tmp
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: s43-api
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - emptyDir: {}
+        name: tmp
+      - emptyDir: {}
+        name: logs
+      - name: state
+        persistentVolumeClaim:
+          claimName: s43-api-state
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: s43-core
+  name: s43-core
+  namespace: sentinel43
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: s43-core
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: s43-core
+        network/s43-db-client: "true"
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - command:
+        - uvicorn
+        - core.monitoring.watchtower:app
+        - --host
+        - 0.0.0.0
+        - --port
+        - "9100"
+        envFrom:
+        - configMapRef:
+            name: sentinel43-config
+        - secretRef:
+            name: sentinel43-secrets
+        image: sentinel43-api:base-placeholder
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /watchtower/health
+            port: 9100
+          periodSeconds: 15
+        name: s43-core
+        ports:
+        - containerPort: 9100
+          name: http
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /watchtower/health
+            port: 9100
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: 500m
+            memory: 384Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          privileged: false
+          readOnlyRootFilesystem: true
+          seccompProfile:
+            type: RuntimeDefault
+        startupProbe:
+          failureThreshold: 24
+          httpGet:
+            path: /watchtower/health
+            port: 9100
+          periodSeconds: 5
+        volumeMounts:
+        - mountPath: /tmp
+          name: tmp
+        - mountPath: /app/logs
+          name: logs
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: s43-core
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - emptyDir: {}
+        name: tmp
+      - emptyDir: {}
+        name: logs
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: s43-db
+  name: s43-db
+  namespace: sentinel43
+spec:
+  podManagementPolicy: OrderedReady
+  replicas: 1
+  selector:
+    matchLabels:
+      app: s43-db
+  serviceName: s43-db
+  template:
+    metadata:
+      labels:
+        app: s43-db
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - env:
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        - name: POSTGRES_DB
+          valueFrom:
+            configMapKeyRef:
+              key: POSTGRES_DB
+              name: sentinel43-config
+        - name: POSTGRES_USER
+          valueFrom:
+            configMapKeyRef:
+              key: POSTGRES_USER
+              name: sentinel43-config
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: POSTGRES_PASSWORD
+              name: sentinel43-secrets
+        image: postgres:16.3
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - s43
+            - -d
+            - s43
+            - -h
+            - 127.0.0.1
+          failureThreshold: 6
+          initialDelaySeconds: 30
+          periodSeconds: 20
+        name: postgres
+        ports:
+        - containerPort: 5432
+          name: postgres
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - s43
+            - -d
+            - s43
+            - -h
+            - 127.0.0.1
+          failureThreshold: 6
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          privileged: false
+          readOnlyRootFilesystem: true
+          seccompProfile:
+            type: RuntimeDefault
+        startupProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - s43
+            - -d
+            - s43
+            - -h
+            - 127.0.0.1
+          failureThreshold: 30
+          periodSeconds: 5
+        volumeMounts:
+        - mountPath: /var/lib/postgresql/data
+          name: pgdata
+        - mountPath: /tmp
+          name: tmp
+        - mountPath: /run/postgresql
+          name: run
+      securityContext:
+        fsGroup: 999
+        runAsGroup: 999
+        runAsNonRoot: true
+        runAsUser: 999
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: s43-db
+      terminationGracePeriodSeconds: 60
+      volumes:
+      - emptyDir: {}
+        name: tmp
+      - emptyDir: {}
+        name: run
+  updateStrategy:
+    type: RollingUpdate
+  volumeClaimTemplates:
+  - metadata:
+      labels:
+        app: s43-db
+      name: pgdata
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 5Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  labels:
+    app: s43-migration
+  name: s43-migration
+  namespace: sentinel43
+spec:
+  activeDeadlineSeconds: 900
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: s43-migration
+        network/s43-db-client: "true"
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - command:
+        - alembic
+        - upgrade
+        - head
+        env:
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        envFrom:
+        - configMapRef:
+            name: sentinel43-config
+        - secretRef:
+            name: sentinel43-secrets
+        image: sentinel43-api:base-placeholder
+        imagePullPolicy: IfNotPresent
+        name: migrate
+        resources:
+          limits:
+            cpu: 500m
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          privileged: false
+          readOnlyRootFilesystem: true
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - mountPath: /tmp
+          name: tmp
+      initContainers:
+      - command:
+        - python
+        - -c
+        - |
+          import os, socket, sys, time
+          from urllib.parse import urlsplit
+
+          url = urlsplit(os.environ.get("DATABASE_URL", ""))
+          host, port = url.hostname or "s43-db", url.port or 5432
+          deadline = time.monotonic() + 600
+
+          while time.monotonic() < deadline:
+              try:
+                  with socket.create_connection((host, port), timeout=5):
+                      print(f"{host}:{port} is accepting connections")
+                      sys.exit(0)
+              except OSError as exc:
+                  print(f"waiting for {host}:{port}: {exc}", flush=True)
+                  time.sleep(3)
+
+          print(f"timed out waiting for {host}:{port}", file=sys.stderr)
+          sys.exit(1)
+        env:
+        - name: PYTHONDONTWRITEBYTECODE
+          value: "1"
+        envFrom:
+        - configMapRef:
+            name: sentinel43-config
+        - secretRef:
+            name: sentinel43-secrets
+        image: sentinel43-api:base-placeholder
+        imagePullPolicy: IfNotPresent
+        name: wait-for-db
+        resources:
+          limits:
+            cpu: 200m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          privileged: false
+          readOnlyRootFilesystem: true
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - mountPath: /tmp
+          name: tmp
+      restartPolicy: Never
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: s43-migration
+      terminationGracePeriodSeconds: 10
+      volumes:
+      - emptyDir: {}
+        name: tmp
+  ttlSecondsAfterFinished: 3600
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: sentinel43
+spec:
+  egress:
+  - ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+    to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+  podSelector: {}
+  policyTypes:
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: sentinel43
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: s43-api-egress
+  namespace: sentinel43
+spec:
+  egress:
+  - ports:
+    - port: 5432
+      protocol: TCP
+    to:
+    - podSelector:
+        matchLabels:
+          app: s43-db
+  - ports:
+    - port: 9100
+      protocol: TCP
+    to:
+    - podSelector:
+        matchLabels:
+          app: s43-core
+  - ports:
+    - port: 8000
+      protocol: TCP
+    to:
+    - podSelector:
+        matchLabels:
+          app: s43-api
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: s43-api
+    ports:
+    - port: 8000
+      protocol: TCP
+  podSelector:
+    matchLabels:
+      app: s43-api
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: s43-core-allow-clients
+  namespace: sentinel43
+spec:
+  egress:
+  - ports:
+    - port: 5432
+      protocol: TCP
+    to:
+    - podSelector:
+        matchLabels:
+          app: s43-db
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          network/s43-core-client: "true"
+    ports:
+    - port: 9100
+      protocol: TCP
+  podSelector:
+    matchLabels:
+      app: s43-core
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: s43-db-allow-clients
+  namespace: sentinel43
+spec:
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          network/s43-db-client: "true"
+    ports:
+    - port: 5432
+      protocol: TCP
+  podSelector:
+    matchLabels:
+      app: s43-db
+  policyTypes:
+  - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: s43-migration-egress
+  namespace: sentinel43
+spec:
+  egress:
+  - ports:
+    - port: 5432
+      protocol: TCP
+    to:
+    - podSelector:
+        matchLabels:
+          app: s43-db
+  podSelector:
+    matchLabels:
+      app: s43-migration
+  policyTypes:
+  - Egress
