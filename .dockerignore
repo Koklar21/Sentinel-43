@@ -140,3 +140,12 @@ Sentinel-43/*
 # their own outdated Go toolchain, entirely unrelated to the application.
 # -----------------------------------------------------------------------------
 .tools/
+
+# -----------------------------------------------------------------------------
+# Generated acceptance evidence (scripts/acceptance_*.py write here). It is build
+# OUTPUT, never an input to the image -- but a checkout that contains it (main
+# currently tracks a copy, including a Windows kubeconform.exe with an outdated Go
+# toolchain) would otherwise COPY it in, and Trivy then fails the image on that
+# binary's stdlib CVEs, none of which are in the application.
+# -----------------------------------------------------------------------------
+acceptance_out/
