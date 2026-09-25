@@ -114,7 +114,21 @@ echo "== building + starting the s43browser stack =="
 "${COMPOSE[@]}" up -d --build
 
 echo "== running browser tests =="
-# target/ is the real-target acceptance suite -- never part of the disposable run.
-S43_BROWSER_BASE_URL="https://s43.beta.test:8443" \
-  "$PY" -m pytest browser_tests/ --ignore=browser_tests/target_acceptance \
-  -q -p no:cacheprovider "$@"
+if [ -n "${S43_ACCEPTANCE_OUT:-}" ]; then
+    # Acceptance run: the ONE canonical execution path is the gate's run-job, which
+    # builds the pytest command from acceptance/suites.json (recorder plugin, report
+    # path, job identity) and writes <out>/jobs/browser-disposable.{results,meta}.json
+    # from the real execution. Extra pytest args would change what is being accepted.
+    if [ "$#" -ne 0 ]; then
+        echo "S43_ACCEPTANCE_OUT is set: extra pytest arguments are not allowed (they would narrow the accepted run)." >&2
+        exit 2
+    fi
+    S43_BROWSER_PYTHON="$PY" S43_BROWSER_BASE_URL="https://s43.beta.test:8443" \
+      "$PY" scripts/acceptance_gate.py run-job browser-disposable --out "$S43_ACCEPTANCE_OUT"
+else
+    # Developer run (no evidence recorded).
+    # target/ is the real-target acceptance suite -- never part of the disposable run.
+    S43_BROWSER_BASE_URL="https://s43.beta.test:8443" \
+      "$PY" -m pytest browser_tests/ --ignore=browser_tests/target_acceptance \
+      -q -p no:cacheprovider "$@"
+fi

@@ -548,3 +548,93 @@ def test_pr_ci_rejects_missing_tampered_stale_and_mismatched_evidence(pr_ci_good
         edit_json(root / "acceptance" / "suites.json", lambda m: m.update(_note="edited after the run"))
     ok, text = verify(root, out, "pr-ci")
     assert not ok and "PR-CI FAIL" in text and needle.lower() in text.lower(), (tamper, text[-1200:])
+
+
+# ============================================ browser-disposable evidence wiring
+# browser_tests/run.sh used to run plain pytest, so the workflow/campaign's
+# S43_ACCEPTANCE_OUT produced no browser-disposable.{results,meta}.json at all.
+BROWSER_FILES = dict(GOOD, **{
+    "browser_tests/test_flow.py": "def test_flow():\n    assert True\n",
+    "target_tests/test_t.py": "def test_target():\n    assert True\n",
+})
+BROWSER_MANIFEST = json.loads(json.dumps(TARGET_MANIFEST))
+BROWSER_MANIFEST["jobs"]["browser-disposable"] = {
+    "kind": "pytest", "python": "browser", "paths": ["browser_tests"], "ignore": [], "env": {},
+    "requires_env": ["S43_BROWSER_BASE_URL"],
+}
+
+
+def _browser_stack(tmp: Path, flow_body: str | None = None, run_browser: bool = True) -> tuple[Path, Path]:
+    files = dict(BROWSER_FILES)
+    if flow_body is not None:
+        files["browser_tests/test_flow.py"] = flow_body
+    root, out, _ = build(tmp, files, manifest=BROWSER_MANIFEST, ini="[pytest]"+chr(10))  # like the real repo: a fixed rootdir
+    if run_browser:
+        env = {k: v for k, v in os.environ.items() if not k.startswith("S43_")}
+        env.update(S43_ACC_ROOT=str(root), S43_BROWSER_BASE_URL="https://disposable.invalid")
+        subprocess.run([sys.executable, str(GATE), "inventory", "--out", str(out), "--job", "browser-disposable"],
+                       cwd=root, env=env, capture_output=True, text=True)
+        subprocess.run([sys.executable, str(GATE), "run-job", "browser-disposable", "--out", str(out)],
+                       cwd=root, env=env, capture_output=True, text=True)
+    return root, out
+
+
+def test_browser_disposable_run_writes_results_and_metadata_from_the_real_execution(tmp_path):
+    root, out = _browser_stack(tmp_path)
+    meta = json.loads((out / "jobs" / "browser-disposable.meta.json").read_text(encoding="utf-8"))
+    res = json.loads((out / "jobs" / "browser-disposable.results.json").read_text(encoding="utf-8"))
+    assert meta["job"] == "browser-disposable" and meta["classification"] == "executed" and meta["rc"] == 0
+    assert meta["results_sha256"] == hashlib.sha256(
+        (out / "jobs" / "browser-disposable.results.json").read_bytes()).hexdigest()
+    assert res["results"] == {"browser_tests/test_flow.py::test_flow": "passed"}
+    assert "acceptance_recorder" in meta["cmd"] and "browser-disposable" in meta["cmd"]
+
+
+def test_pr_ci_and_final_beta_consume_valid_browser_disposable_evidence(tmp_path):
+    root, out = _browser_stack(tmp_path)
+    ok, text = verify(root, out, "pr-ci")
+    assert ok, text
+    row = next(r for r in verdict_of(out)["jobs"] if r["job"] == "browser-disposable")
+    assert row["status"] == "PASS"
+    ok, text = verify(root, out, "final-beta")  # fails only because browser-target is unmet
+    assert not ok
+    row = next(r for r in verdict_of(out)["jobs"] if r["job"] == "browser-disposable")
+    assert row["status"] == "PASS"
+    assert not any(f.startswith("browser-disposable:") for f in verdict_of(out)["failures"] + verdict_of(out)["env_unmet"])
+
+
+@pytest.mark.parametrize("mode", ["pr-ci", "final-beta"])
+def test_a_skipped_browser_test_is_rejected(tmp_path, mode):
+    body = "import pytest\n@pytest.mark.skip(reason='x')\ndef test_flow(): pass\n"
+    root, out = _browser_stack(tmp_path, flow_body=body)
+    ok, text = verify(root, out, mode)
+    assert not ok and "skipped" in text.lower()
+
+
+@pytest.mark.parametrize("mode", ["pr-ci", "final-beta"])
+def test_missing_browser_disposable_evidence_is_rejected(tmp_path, mode):
+    root, out = _browser_stack(tmp_path, run_browser=False)
+    ok, text = verify(root, out, mode)
+    assert not ok and "browser-disposable" in text and "never ran" in text
+
+
+def test_run_sh_routes_acceptance_runs_through_the_gate_and_refuses_extra_pytest_args():
+    src = (REPO / "browser_tests" / "run.sh").read_text(encoding="utf-8")
+    assert 'S43_ACCEPTANCE_OUT' in src
+    assert 'scripts/acceptance_gate.py run-job browser-disposable --out "$S43_ACCEPTANCE_OUT"' in src
+    assert "extra pytest arguments are not allowed" in src
+    # the developer path is unchanged and still excludes the real-target suite
+    assert "--ignore=browser_tests/target_acceptance" in src
+
+
+# ------------------------------------------- subprocess hardening (PR #294 review)
+@pytest.mark.parametrize("field", ["paths", "ignore"])
+def test_manifest_entries_that_look_like_pytest_options_are_refused(tmp_path, field):
+    manifest = json.loads(json.dumps(MANIFEST))
+    manifest["jobs"]["unit"][field] = ["tests", "--rootdir=/elsewhere"] if field == "paths" else ["-p", "evil"]
+    root, out, result = build(tmp_path, GOOD, manifest=manifest)
+    assert result.returncode != 0
+    assert "not options" in result.stdout + result.stderr or "not pytest options" in result.stdout + result.stderr
+    # the run itself must be refused, not merely reported afterwards
+    run = _run(root, out, "run-job", "unit", "--out", str(out))
+    assert run.returncode != 0 and "not options" in run.stderr + run.stdout
