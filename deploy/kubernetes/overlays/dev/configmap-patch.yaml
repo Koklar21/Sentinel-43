@@ -22,6 +22,20 @@
 # value; kubelet's own /health and /ready probes are exempt from the host
 # check regardless (core/api/middleware/security_headers.py's
 # _HOST_CHECK_EXEMPT_PATHS), so this does not affect liveness/readiness.
+#
+# S43_WATCHTOWER_REQUIRED: "true" here (code-level default is "false").
+# Beta Closure #2: with S43_WATCHTOWER_SERVICE_TOKEN missing from the
+# Secret, s43-api's Watchtower registration/heartbeat calls to s43-core
+# were rejected unauthenticated (401/503), the watchtower subsystem sat
+# DEGRADED, and /ready still reported 200 -- an apparently healthy pod
+# silently missing telemetry, discoverable only by reading logs. The
+# token is provisioned now (from the same local secret source
+# docker-compose already uses; see
+# deploy/kubernetes/base/secret.example.yaml), but a future Secret
+# rotation that drops it again must not repeat that silent failure. This
+# flag is watchtower-specific and does not touch S43_GOVERNANCE_ENABLED/
+# S43_HEART_ENABLED or their required-ness -- governance stays "false"
+# here exactly as before.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -32,3 +46,4 @@ data:
   S43_ENV: "development"
   S43_TRUSTED_HOSTS: "s43-api,192.168.1.233"
   S43_ALLOWED_ORIGINS: "http://localhost:8000,http://127.0.0.1:8000,http://192.168.1.233:8000"
+  S43_WATCHTOWER_REQUIRED: "true"
