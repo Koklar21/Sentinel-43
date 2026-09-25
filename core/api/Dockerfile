@@ -50,8 +50,11 @@ RUN python -m pip install --upgrade pip \
 # =============================================================================
 FROM dependencies AS test
 
-# Test-only tooling is absent from the release image.
-RUN python -m pip install --no-cache-dir pytest requests
+# Test-only tooling is absent from the release image. The acceptance-gate
+# adversarial tests create disposable Git repositories, so git is required in
+# this stage only; the runtime image remains unchanged and does not gain git.
+RUN apk add --no-cache git \
+    && python -m pip install --no-cache-dir pytest requests
 
 COPY . /app
 
