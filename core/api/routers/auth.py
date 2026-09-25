@@ -1146,11 +1146,64 @@ def note_legacy_auth(
 
 
 def legacy_auth_is_rejected() -> bool:
-    return _env_bool(
+    """Whether per-request password ("legacy") authentication is refused.
+
+    Outside local/dev/test this fails closed: an absent, blank or malformed
+    S43_REJECT_LEGACY_AUTH REJECTS legacy authentication, and the only way to
+    accept it is an explicit false value (announced at CRITICAL on every
+    start by validate_legacy_auth_config). Local/dev/test keeps its
+    compatibility default of accepting it.
+
+    Never raises: this runs per request, including mid-WebSocket-handshake,
+    where an exception is a crash rather than a clean rejection.
+    """
+    if _is_local():
+        return _env_bool(
+            "S43_REJECT_LEGACY_AUTH",
+            False,
+            strict=False,
+        )
+
+    try:
+        return _env_bool(
+            "S43_REJECT_LEGACY_AUTH",
+            True,
+            strict=True,
+        )
+
+    except RuntimeError:
+        logger.error(
+            "Auth: S43_REJECT_LEGACY_AUTH is malformed; "
+            "legacy authentication is REJECTED (fail closed)"
+        )
+        return True
+
+
+def validate_legacy_auth_config() -> None:
+    """Startup gate for non-local environments.
+
+    A malformed S43_REJECT_LEGACY_AUTH refuses to start rather than being
+    silently reinterpreted, and an explicit override is made conspicuous.
+    """
+    if _is_local():
+        return
+
+    # Raises RuntimeError naming the variable when it is not boolean.
+    _env_bool(
         "S43_REJECT_LEGACY_AUTH",
-        False,
-        strict=not _is_local(),
+        True,
+        strict=True,
     )
+
+    if not legacy_auth_is_rejected():
+        logger.critical(
+            "SECURITY OVERRIDE ACTIVE: S43_REJECT_LEGACY_AUTH is explicitly "
+            "false in a non-local environment (%s). Per-request password "
+            "authentication (X-S43-Password header, WebSocket auth-frame "
+            "password) is ACCEPTED. Remove the override; deploy_preflight "
+            "fails this configuration.",
+            _environment(),
+        )
 
 
 def _cookie_secure() -> bool:
@@ -1962,6 +2015,7 @@ __all__ = [
     "resolve_session_subject",
     "router",
     "token_is_session_bound",
+    "validate_legacy_auth_config",
     "verify_jwt_token",
     "reverify_password",
 ]

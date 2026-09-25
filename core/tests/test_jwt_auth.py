@@ -103,6 +103,10 @@ def prod_env(monkeypatch):
     monkeypatch.setenv("S43_JWT_AUDIENCE",  TEST_AUDIENCE)
     monkeypatch.setenv("S43_WS_REQUIRE_AUTH", "true")
     monkeypatch.setenv("S43_ENABLE_TEST_INJECTION", "false")
+    # These tests exercise the token+password contract in a production
+    # environment, where legacy authentication is rejected unless it is
+    # explicitly overridden.
+    monkeypatch.setenv("S43_REJECT_LEGACY_AUTH", "false")
 
     import core.api.main as main_module
     importlib.reload(main_module)

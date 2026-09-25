@@ -539,6 +539,13 @@ def _validate_security_config() -> None:
                 "development/local/test environments"
             )
 
+        # Per-request password authentication is refused by default here: a
+        # malformed S43_REJECT_LEGACY_AUTH refuses startup, and an explicit
+        # false (the only override) is logged at CRITICAL.
+        from .routers.auth import validate_legacy_auth_config
+
+        validate_legacy_auth_config()
+
         if not _TRUSTED_HOSTS and not _env_bool(
             "S43_TRUST_PROXY_HOST_VALIDATION",
             False,

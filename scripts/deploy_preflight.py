@@ -70,12 +70,13 @@ EXIT_OK, EXIT_FAIL, EXIT_INCOMPLETE = 0, 1, 2
 # deliberately stdlib-only so it runs without installing the application's
 # dependencies. Anything not in this set -- missing, blank, a recognized
 # false value ("disabled" included), or a malformed/unknown string -- must
-# NOT be approved as "legacy auth is rejected": the application either still
-# treats it as false (legacy auth stays accepted) or, in a real non-local
-# target where S43_REJECT_LEGACY_AUTH is read with strict=True, raises at
-# startup instead of serving at all. One canonical set, one canonical
-# predicate, used by both the Compose and Kubernetes paths below -- not two
-# independently drifting ones.
+# NOT be approved as "legacy auth is rejected". A current image already
+# rejects legacy auth outside local when the value is absent or malformed
+# (and refuses to start on a malformed one), and an explicit false is its
+# logged CRITICAL override -- but this gate cannot know which image is
+# running, so it demands the explicit true rather than infer safety from
+# silence. One canonical set, one canonical predicate, used by both the
+# Compose and Kubernetes paths below -- not two independently drifting ones.
 _APP_TRUE_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
 
 

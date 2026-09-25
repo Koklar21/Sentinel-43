@@ -135,13 +135,16 @@ S43_REJECT_LEGACY_AUTH: "true"
 ```
 
 For a Compose-based beta, set `S43_REJECT_LEGACY_AUTH=true` in your beta
-`.env` file. The code-level default remains `false` (accept legacy auth) —
-this is a deliberate, clearly-labeled local-development compatibility
-option, so `docker-compose up` for local dev and the existing test suite
-keep working unmodified. It is only for a target you consider "beta or
-beyond" that this must be turned on explicitly, and `deploy_preflight.py`
-(§15) now **fails** (not merely notes) a beta/non-local target where it
-is left off.
+`.env` file. Outside local/dev/test the application already fails closed:
+an absent or malformed value **rejects** legacy authentication (a malformed
+value additionally refuses startup), and only an explicit
+`S43_REJECT_LEGACY_AUTH=false` accepts it — that override is logged at
+`CRITICAL` on every start and is never appropriate for a beta target. The
+compatibility default of *accepting* legacy auth applies only when
+`SENTINEL_ENV` is `development`/`dev`/`local`/`test`. State the value
+explicitly anyway: `deploy_preflight.py` (§15) **fails** (not merely notes)
+a beta/non-local target unless it is an explicit `true`, whatever the
+running image's default.
 
 This does not disable break-glass entirely — it disables the *password
 fallback for already-issued legacy tokens*. Recovery access when locked out
