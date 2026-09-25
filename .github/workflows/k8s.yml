@@ -453,14 +453,20 @@ jobs:
         run: kind delete cluster --name $(kind get clusters | head -1) || true
 
   acceptance-gate:
-    # Zero-skip acceptance verdict. A green status on the jobs above is NOT
+    # Zero-skip PR-CI verdict. A green status on the jobs above is NOT
     # sufficient: this job re-derives the verdict from the per-test-ID result
     # artifacts and fails on any skip/xfail/xpass/error/deselection, any missing
-    # or incomplete artifact, and any required job that was skipped, cancelled
-    # or unsuccessful. browser-target (real deployed target acceptance) has no
-    # CI-provisioned target, so it is reported as an unmet prerequisite and the
-    # overall result is ACCEPTANCE FAIL until an authorized target is supplied.
-    name: Acceptance gate (zero-skip)
+    # or incomplete artifact, and any PR-CI-owned job that was skipped, cancelled
+    # or unsuccessful.
+    #
+    # This is `verify --mode pr-ci`, NOT final beta acceptance. Ordinary PR CI
+    # provisions no authorized deployed target or credentials, so browser-target
+    # is recorded as "NOT PERFORMED IN PR CI" (never as passed) and a PR-CI PASS
+    # means only that everything PR CI owns executed with valid evidence. Final
+    # beta acceptance (`verify --mode final-beta`) still requires browser-target
+    # and every other required job; the mode is always explicit, never inferred
+    # from which credentials happen to be present.
+    name: Acceptance gate (zero-skip, PR-CI scope)
     if: always()
     needs: [validate-manifests, test, pg-tests, browser-smoke, build-and-scan, kind-smoke-deploy]
     runs-on: ubuntu-latest
@@ -487,9 +493,8 @@ jobs:
           done
           python scripts/acceptance_gate.py record-ci check-image-scan --out acceptance_out --result "$(res build-and-scan)"
           python scripts/acceptance_gate.py record-ci check-kind-smoke --out acceptance_out --result "$(res kind-smoke-deploy)"
-          python scripts/acceptance_gate.py mark-unmet browser-target --out acceptance_out             --reason "no explicitly authorized isolated deployed target/credentials provisioned in CI"
-      - name: Verify (fails the workflow unless ACCEPTANCE PASS)
-        run: python scripts/acceptance_gate.py verify --out acceptance_out
+      - name: Verify PR-CI-owned work (fails the workflow unless PR-CI PASS; not final beta acceptance)
+        run: python scripts/acceptance_gate.py verify --out acceptance_out --mode pr-ci
       - name: Upload verdict
         if: always()
         uses: actions/upload-artifact@v4
