@@ -78,6 +78,9 @@ jobs:
       - name: Install PyYAML
         run: pip install pyyaml
 
+      - name: Validate Compose files
+        run: python scripts/acceptance_campaign.py check compose
+
       - name: Render and validate every overlay
         run: |
           set -euo pipefail
@@ -117,19 +120,28 @@ jobs:
       # Install from the runtime manifest present in the merged checkout.
       # pytest and requests are the additional dependencies used by core/tests.
       - run: python -m pip install -r requirements.txt pytest requests
+      # Zero-skip acceptance: jobs are defined in acceptance/suites.json and
+      # run through scripts/acceptance_gate.py, which records every test ID's
+      # outcome and fails on any skip/xfail/xpass/error/deselection.
+      - name: Record the test inventory before execution
+        run: |
+          python scripts/acceptance_gate.py inventory --out acceptance_out --job core-isolated --job core-live
+          python scripts/acceptance_gate.py inventory-all --out acceptance_out
       - name: Isolated application and security tests
-        env:
-          S43_WATCHTOWER_URL: http://127.0.0.1:19100
-          S43_WATCHTOWER_TIMEOUT: "0.1"
         # Live tests run in the next required step against real processes.
-        run: >-
-          python -m pytest core/tests/ -q
-          --ignore=core/tests/test_bootstrap.py
-          --ignore=core/tests/test_system_smoke.py
+        run: python scripts/acceptance_gate.py run-job core-isolated --out acceptance_out
       - name: Live API, PostgreSQL, and Watchtower tests
         env:
           S43_CI_DATABASE_URL: postgresql+asyncpg://s43_ci:disposable-ci-database-only@127.0.0.1:5432/s43_ci
+          S43_ACCEPTANCE_OUT: acceptance_out
         run: python scripts/ci_live_tests.py
+      - name: Upload acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-test
+          path: acceptance_out/
+          if-no-files-found: error
 
   pg-tests:
     # Beta's disposable-PostgreSQL suites (schema-version gate, migration
@@ -189,35 +201,17 @@ jobs:
           # makes the outcome independent of import order.
           SENTINEL_ENV: test
           S43_ENV: test
-        run: >-
-          python -m pytest -q -rs --junit-xml=/tmp/pg-junit.xml
-          core/tests/test_schema_version_pg.py
-          core/tests/test_schema_authority.py
-          core/tests/test_deploy_migration_wiring.py
-          core/tests/test_migrations_pg.py
-          core/tests/test_backup_restore_pg.py
-          core/tests/test_auth_session_pg.py
-          core/tests/test_session_layer_pg.py
-          core/tests/test_ws_session_pg.py
-          core/tests/test_break_glass_pg.py
-          core/tests/test_account_transactions_pg.py
-      - name: Fail if any PostgreSQL suite was skipped
-        # These suites must actually execute here -- a silent skip (missing
-        # S43_TEST_PG_DSN / S43_TEST_PG_CONTAINER) would hide a regression.
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import xml.etree.ElementTree as ET
-          ts = ET.parse("/tmp/pg-junit.xml").getroot()
-          suites = ts.iter("testsuite")
-          skipped = sum(int(s.get("skipped", "0")) for s in suites)
-          tests = sum(int(s.get("tests", "0")) for s in ET.parse("/tmp/pg-junit.xml").getroot().iter("testsuite"))
-          print(f"pg suites: {tests} tests, {skipped} skipped")
-          if skipped:
-              raise SystemExit(f"{skipped} PostgreSQL-backed test(s) were skipped in CI")
-          if tests == 0:
-              raise SystemExit("no PostgreSQL-backed tests ran")
-          PY
+          python scripts/acceptance_gate.py inventory --out acceptance_out --job core-postgres
+          python scripts/acceptance_gate.py run-job core-postgres --out acceptance_out
+      - name: Upload acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-pg-tests
+          path: acceptance_out/
+          if-no-files-found: error
 
   browser-smoke:
     name: browser SPA smoke (Playwright)
@@ -244,10 +238,22 @@ jobs:
           bash -n browser_tests/run_target.sh
           .venv-browser/bin/python -m pytest browser_tests/target_acceptance/ \
             --collect-only -q -p no:cacheprovider
+      - name: Record the browser test inventory before execution
+        env:
+          S43_BROWSER_PYTHON: .venv-browser/bin/python
+        run: python scripts/acceptance_gate.py inventory --out acceptance_out --job browser-disposable --job browser-target
       - name: Run the browser SPA smoke against a disposable HTTPS stack
         env:
           S43_BROWSER_PYTHON: .venv-browser/bin/python
+          S43_ACCEPTANCE_OUT: acceptance_out
         run: bash browser_tests/run.sh
+      - name: Upload acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-browser-smoke
+          path: acceptance_out/
+          if-no-files-found: error
       - name: Upload failure diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
@@ -266,10 +272,21 @@ jobs:
 
       - name: Test application on the container runtime
         run: |
+          set -euo pipefail
           docker build --target test -t sentinel43-api:test -f core/api/Dockerfile .
-          docker run --rm sentinel43-api:test python -m pytest core/tests/ -q \
-            --ignore=core/tests/test_bootstrap.py \
-            --ignore=core/tests/test_system_smoke.py
+          mkdir -p acceptance_out
+          python3 scripts/acceptance_gate.py revision --out acceptance_out
+          mount="-v $PWD/acceptance_out:/out -e S43_ACC_REVISION_FILE=/out/revision.json"
+          docker run --rm $mount sentinel43-api:test python scripts/acceptance_gate.py inventory --out /out --job core-isolated-container
+          docker run --rm $mount sentinel43-api:test python scripts/acceptance_gate.py run-job core-isolated-container --out /out
+
+      - name: Upload acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-container-tests
+          path: acceptance_out/
+          if-no-files-found: error
 
       - name: Build image
         run: docker build -t sentinel43-api:ci -f core/api/Dockerfile .
@@ -434,3 +451,49 @@ jobs:
       - name: Teardown
         if: always()
         run: kind delete cluster --name $(kind get clusters | head -1) || true
+
+  acceptance-gate:
+    # Zero-skip acceptance verdict. A green status on the jobs above is NOT
+    # sufficient: this job re-derives the verdict from the per-test-ID result
+    # artifacts and fails on any skip/xfail/xpass/error/deselection, any missing
+    # or incomplete artifact, and any required job that was skipped, cancelled
+    # or unsuccessful. browser-target (real deployed target acceptance) has no
+    # CI-provisioned target, so it is reported as an unmet prerequisite and the
+    # overall result is ACCEPTANCE FAIL until an authorized target is supplied.
+    name: Acceptance gate (zero-skip)
+    if: always()
+    needs: [validate-manifests, test, pg-tests, browser-smoke, build-and-scan, kind-smoke-deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: acceptance-*
+          path: acceptance_out
+          merge-multiple: true
+      - name: Record required-check conclusions and unmet prerequisites
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          mkdir -p acceptance_out
+          res() { python -c "import json,os;print(json.loads(os.environ['NEEDS'])['$1']['result'])"; }
+          for job in check-compose-config check-k8s-policy check-kubeconform; do
+            python scripts/acceptance_gate.py record-ci "$job" --out acceptance_out --result "$(res validate-manifests)"
+          done
+          python scripts/acceptance_gate.py record-ci check-image-scan --out acceptance_out --result "$(res build-and-scan)"
+          python scripts/acceptance_gate.py record-ci check-kind-smoke --out acceptance_out --result "$(res kind-smoke-deploy)"
+          python scripts/acceptance_gate.py mark-unmet browser-target --out acceptance_out             --reason "no explicitly authorized isolated deployed target/credentials provisioned in CI"
+      - name: Verify (fails the workflow unless ACCEPTANCE PASS)
+        run: python scripts/acceptance_gate.py verify --out acceptance_out
+      - name: Upload verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-verdict
+          path: acceptance_out/verdict.*
+          if-no-files-found: warn

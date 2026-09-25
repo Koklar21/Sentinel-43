@@ -191,3 +191,82 @@ def test_real_wss_connects_and_authenticates_then_logout_drops_it(stack, page):
         "!(window.SentinelWS && window.SentinelWS.authenticated)",
         timeout=30_000,
     )
+
+
+def test_reconnect_backoff_survives_repeated_pre_auth_closes(stack, page):
+    """Regression for 6a0f96f (fix(ws): preserve backoff until authentication
+    succeeds).
+
+    Before that fix, websocket.js reset _reconnectAttempts to 0 in the raw
+    transport's 'open' handler -- before authentication. A backend outage
+    that accepts the transport and then closes with 1011 (e.g.
+    service_unavailable) therefore reset the counter on every single cycle,
+    so every retry waited only the initial ~1s instead of the growing
+    bounded exponential backoff, letting every dashboard hammer the failing
+    dependency. The real shipped websocket.js (not a rewritten copy) is
+    exercised here through the actual SPA, with only the browser's WebSocket
+    CONSTRUCTOR stubbed to simulate the outage -- the reconnect logic under
+    test is untouched.
+    """
+    do_login(page, stack["base_url"], *stack["admin"])
+    page.wait_for_function(
+        "window.SentinelWS && window.SentinelWS.connected && window.SentinelWS.authenticated",
+        timeout=20_000,
+    )
+
+    # Simulate an auth-backend outage: every new transport opens, then the
+    # server immediately closes it with 1011/service_unavailable, before any
+    # auth frame could ever be accepted. Real WebSocket close/open event
+    # semantics (order, async dispatch) are preserved; only the connection
+    # outcome is forced.
+    page.evaluate(
+        """() => {
+            window.SentinelWS.disconnect();
+            const RealWebSocket = window.WebSocket;
+            class OutageSocket extends EventTarget {
+                constructor(url) {
+                    super();
+                    this.url = url;
+                    this.readyState = RealWebSocket.CONNECTING;
+                    setTimeout(() => {
+                        this.readyState = RealWebSocket.OPEN;
+                        this.dispatchEvent(new Event('open'));
+                        setTimeout(() => {
+                            this.readyState = RealWebSocket.CLOSED;
+                            this.dispatchEvent(new CloseEvent('close', {
+                                code: 1011, reason: 'service_unavailable', wasClean: false,
+                            }));
+                        }, 0);
+                    }, 0);
+                }
+                send() {}
+                close() { this.readyState = RealWebSocket.CLOSED; }
+            }
+            OutageSocket.CONNECTING = RealWebSocket.CONNECTING;
+            OutageSocket.OPEN = RealWebSocket.OPEN;
+            OutageSocket.CLOSING = RealWebSocket.CLOSING;
+            OutageSocket.CLOSED = RealWebSocket.CLOSED;
+            window.WebSocket = OutageSocket;
+            window.__s43RealWebSocket = RealWebSocket;
+            window.SentinelWS.connect();
+        }"""
+    )
+
+    # A reset-on-open bug plateaus at reconnectAttempts <= 1 forever (each
+    # cycle's spurious reset undoes the previous cycle's single increment).
+    # The fix lets it climb past that on every full outage cycle.
+    page.wait_for_function("window.SentinelWS.reconnectAttempts >= 3", timeout=15_000)
+    attempts_at_three = page.evaluate("window.SentinelWS.reconnectAttempts")
+    assert attempts_at_three >= 3, (
+        "reconnectAttempts did not grow past a pre-auth close reset -- "
+        f"backoff was not preserved (stuck around {attempts_at_three})"
+    )
+
+    # Restore the real WebSocket so later tests/teardown are unaffected.
+    page.evaluate(
+        """() => {
+            window.SentinelWS.disconnect();
+            window.WebSocket = window.__s43RealWebSocket;
+            delete window.__s43RealWebSocket;
+        }"""
+    )

@@ -32,20 +32,15 @@
 # that entirely, the same way test_system_smoke.py does for other live
 # checks.
 #
-# Because /bootstrap/admin can only ever succeed once per deployment (it
-# refuses with 409 the instant an active admin exists), the "actually
-# create an admin" test only runs when the live target reports
-# initialized=false. On a deployment that already completed setup, that one
-# test is skipped, but status/validation coverage still runs — this mirrors
-# how test_system_smoke.py's live-auth tests skip without live credentials
-# rather than failing the whole run.
+# /bootstrap/admin can only ever succeed once per deployment (it refuses with
+# 409 the instant an active admin exists), so the two state-dependent tests
+# below establish their own state through the ``fresh_deployment`` and
+# ``initialized_deployment`` fixtures, which reset the users table of a
+# DISPOSABLE loopback database (S43_LIVE_TEST_DB_DSN). Neither test depends on
+# source order and neither skips.
 #
-# See also test_bootstrap_isolated.py: once a deployment is initialized,
-# the "creates the first admin" test below skips permanently on that
-# deployment (there's nothing left to bootstrap). test_bootstrap_isolated.py
-# covers the same create-admin -> login -> protected-route flow against an
-# in-memory fake user store instead of the live DB, so that path keeps
-# getting exercised on every test run regardless of this deployment's state.
+# See also test_bootstrap_isolated.py, which covers the same create-admin ->
+# login -> protected-route flow against an in-memory fake user store.
 # =============================================================================
 
 from __future__ import annotations
@@ -89,6 +84,77 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+# --------------------------------------------------------------------------
+# Explicit deployment-state fixtures (A: fresh, B: already initialized).
+#
+# Both states used to be inferred from whatever the live deployment happened to
+# contain, so one of the two tests below skipped on every run (a fresh
+# deployment skipped the rejection test; an initialized one skipped the
+# create-admin test) and their outcome depended on source order. Each test now
+# ESTABLISHES the state it needs. That requires resetting the users table of
+# the deployment under test, which is destructive, so it is only permitted
+# against a loopback disposable database named by S43_LIVE_TEST_DB_DSN
+# (scripts/ci_live_tests.py and scripts/acceptance_campaign.py set it). A missing
+# or non-disposable DSN FAILS the test -- it never skips and never touches a
+# real deployment.
+# --------------------------------------------------------------------------
+_DISPOSABLE_DB_PREFIXES = ("s43_ci", "s43_accept")
+
+
+def _reset_users_on_disposable_db() -> None:
+    from urllib.parse import urlsplit
+
+    from sqlalchemy import create_engine, text
+
+    dsn = os.getenv("S43_LIVE_TEST_DB_DSN", "")
+    if not dsn:
+        pytest.fail(
+            "S43_LIVE_TEST_DB_DSN is not set: these tests must establish their own "
+            "deployment state and need the disposable database's DSN to do so.",
+            pytrace=False,
+        )
+    parts = urlsplit(dsn)
+    api_host = urlsplit(API_URL).hostname
+    if (
+        parts.hostname not in ("127.0.0.1", "localhost")
+        or api_host not in ("127.0.0.1", "localhost")
+        or not (parts.path.lstrip("/")).startswith(_DISPOSABLE_DB_PREFIXES)
+    ):
+        pytest.fail(
+            "refusing to reset users: the database and API must both be loopback and the "
+            f"database name must start with one of {_DISPOSABLE_DB_PREFIXES}",
+            pytrace=False,
+        )
+    engine = create_engine(dsn.replace("+asyncpg", "+psycopg"))
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("TRUNCATE users CASCADE"))
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture
+def fresh_deployment() -> None:
+    """State A: no admin exists."""
+    _reset_users_on_disposable_db()
+    assert _get_status()["initialized"] is False
+
+
+@pytest.fixture
+def initialized_deployment() -> None:
+    """State B: exactly one admin exists, created through the real endpoint."""
+    _reset_users_on_disposable_db()
+    response = requests.post(
+        f"{API_URL}/bootstrap/admin",
+        json={"username": f"seed-{uuid.uuid4().hex[:8]}", "password": "a-perfectly-long-enough-password-123"},
+        timeout=5,
+    )
+    assert response.status_code == 201, (
+        f"could not establish the initialized state: {response.status_code} {response.text[:300]}"
+    )
+    assert _get_status()["initialized"] is True
+
+
 def _get_status() -> dict:
     response = requests.get(f"{API_URL}/bootstrap/status", timeout=5)
     assert response.status_code == 200, (
@@ -130,14 +196,7 @@ def test_bootstrap_admin_rejects_missing_username() -> None:
     assert response.status_code == 422
 
 
-def test_bootstrap_admin_rejects_when_already_initialized() -> None:
-    if not _get_status()["initialized"]:
-        pytest.skip(
-            "Deployment is not initialized yet — the "
-            "test_first_run_bootstrap_flow_creates_admin test below covers "
-            "this deployment instead."
-        )
-
+def test_bootstrap_admin_rejects_when_already_initialized(initialized_deployment) -> None:
     response = requests.post(
         f"{API_URL}/bootstrap/admin",
         json={
@@ -152,20 +211,16 @@ def test_bootstrap_admin_rejects_when_already_initialized() -> None:
     )
 
 
-def test_first_run_bootstrap_flow_creates_admin() -> None:
+def test_first_run_bootstrap_flow_creates_admin(fresh_deployment) -> None:
     """
     Full first-run flow: status reports uninitialized, POST /bootstrap/admin
     succeeds, status flips to initialized, a second POST is refused, and the
     new admin can log in and use the resulting token against a protected
     route.
 
-    Only runs against a fresh (uninitialized) deployment — it is the only
-    test in this file that mutates state, and it can only ever do so once
-    per deployment by design.
+    The ``fresh_deployment`` fixture establishes the uninitialized state on the
+    disposable database first, so this runs regardless of test order.
     """
-    if _get_status()["initialized"]:
-        pytest.skip("Deployment already has an active admin — nothing left to bootstrap.")
-
     username = f"bootstrap-test-{uuid.uuid4().hex[:8]}"
     password = "a-perfectly-long-enough-password-123"
 

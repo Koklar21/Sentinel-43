@@ -49,7 +49,16 @@ def main() -> int:
         or parsed.path != "/s43_ci"
     ):
         raise RuntimeError("Live CI tests require the disposable local s43_ci database")
+    return run_live_suite(database_url)
 
+
+def run_live_suite(database_url: str, *, api_port: int = 18000, watchtower_port: int = 19100) -> int:
+    """Provision the disposable services on ``database_url`` and run the live suite.
+
+    The CI guard above stays in ``main()``. scripts/acceptance_campaign.py calls
+    this directly, with its own guard that only accepts a loopback database it
+    created itself.
+    """
     password = secrets.token_urlsafe(32)
     jwt_secret = secrets.token_urlsafe(32)
     pepper = secrets.token_urlsafe(32)
@@ -93,7 +102,7 @@ def main() -> int:
         # database so test_system_smoke.py's live-login (which uses this
         # env-operator) still works.
         "S43_BREAK_GLASS_ARMED": "true",
-        "S43_WATCHTOWER_URL": "http://127.0.0.1:19100",
+        "S43_WATCHTOWER_URL": f"http://127.0.0.1:{watchtower_port}",
         "S43_WATCHTOWER_SERVICE_TOKEN": service_token,
         # Mandatory outside development/local/test (core/api/main.py's
         # _start_audit_store()) -- the authoritative audit store cannot be
@@ -127,7 +136,7 @@ def main() -> int:
         # _check_state_change_origin), and test_bootstrap.py /
         # test_system_smoke.py now send an Origin header identifying
         # themselves as this exact address -- allow-list it.
-        "S43_ALLOWED_ORIGINS": "http://127.0.0.1:18000",
+        "S43_ALLOWED_ORIGINS": f"http://127.0.0.1:{api_port}",
     })
     # SENTINEL_ENV=production above, so core.auth.users.init_models() is a
     # deliberate no-op (Alembic owns the schema in a non-local environment).
@@ -151,8 +160,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="s43-ci-") as tmp:
         try:
             for module, port, probe in (
-                ("core.monitoring.watchtower:app", 19100, "/watchtower/health"),
-                ("core.api.main:app", 18000, "/bootstrap/status"),
+                ("core.monitoring.watchtower:app", watchtower_port, "/watchtower/health"),
+                ("core.api.main:app", api_port, "/bootstrap/status"),
             ):
                 output = open(Path(tmp) / f"service-{port}.log", "w+")
                 handles.append(output)
@@ -166,15 +175,23 @@ def main() -> int:
 
             test_env = os.environ.copy()
             test_env.update({
-                "S43_TEST_API_URL": "http://127.0.0.1:18000",
+                "S43_TEST_API_URL": f"http://127.0.0.1:{api_port}",
+                # Lets test_bootstrap.py establish its own fresh/initialized
+                # state on THIS disposable database (it refuses anything else).
+                "S43_LIVE_TEST_DB_DSN": database_url,
                 "S43_LIVE_TEST_USERNAME": "ci-live-operator",
                 "S43_LIVE_TEST_PASSWORD": password,
             })
-            result = subprocess.run(
-                [sys.executable, "-m", "pytest", "-q",
-                 "core/tests/test_bootstrap.py", "core/tests/test_system_smoke.py"],
-                cwd=ROOT, env=test_env, timeout=300,
-            ).returncode
+            accept_out = os.environ.get("S43_ACCEPTANCE_OUT")
+            if accept_out:
+                # Zero-skip acceptance: same tests, run through the gate's
+                # recorder so every test ID gets a machine-readable result.
+                live_cmd = [sys.executable, "scripts/acceptance_gate.py", "run-job",
+                            "core-live", "--out", accept_out]
+            else:
+                live_cmd = [sys.executable, "-m", "pytest", "-q",
+                            "core/tests/test_bootstrap.py", "core/tests/test_system_smoke.py"]
+            result = subprocess.run(live_cmd, cwd=ROOT, env=test_env, timeout=300).returncode
             return result
         finally:
             for process in reversed(processes):
