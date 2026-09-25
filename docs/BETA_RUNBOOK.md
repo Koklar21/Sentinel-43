@@ -134,23 +134,28 @@ overlay now sets this:
 S43_REJECT_LEGACY_AUTH: "true"
 ```
 
-For a Compose-based beta, set `S43_REJECT_LEGACY_AUTH=true` in your beta
-`.env` file. Outside local/dev/test the application already fails closed:
-an absent or malformed value **rejects** legacy authentication (a malformed
-value additionally refuses startup), and only an explicit
-`S43_REJECT_LEGACY_AUTH=false` accepts it — that override is logged at
-`CRITICAL` on every start and is never appropriate for a beta target. The
-compatibility default of *accepting* legacy auth applies only when
-`SENTINEL_ENV` is `development`/`dev`/`local`/`test`. State the value
-explicitly anyway: `deploy_preflight.py` (§15) **fails** (not merely notes)
-a beta/non-local target unless it is an explicit `true`, whatever the
-running image's default.
+For Compose, set `S43_REJECT_LEGACY_AUTH=true` in your `.env` file — the
+base `docker-compose.yml` forwards it, and the beta override requires it.
+Outside local/dev/test the API **refuses to start** unless the value is
+explicitly true: unset, blank, `false` and malformed values all refuse, and
+there is no override that accepts legacy authentication. With `true` it is
+refused on every request. Only when `SENTINEL_ENV` is
+`development`/`dev`/`local`/`test` can legacy authentication be accepted
+(the default there). `deploy_preflight.py` (§15) also **fails** a
+beta/non-local target unless the value is an explicit `true`.
+
+If a deployment that worked before now stops at startup with a
+`S43_REJECT_LEGACY_AUTH` error, add `S43_REJECT_LEGACY_AUTH=true` to its
+`.env` (or ConfigMap). Any client that relied on `X-S43-Password` outside
+local has to log in for a session instead.
 
 Rejecting legacy authentication also makes the break-glass env operator
-unusable outside local: it has no server-side session, so its token is
-refused on every protected route. It was never an administrator recovery
-path either — it always gets role `operator` and cannot reach `/users`.
-Bootstrap does not reopen when administrators are lost; see §16a.
+unusable outside local. Its login can still succeed there (when armed, or
+while no admin is active) and return a token, but that token has no
+server-side session, so every protected route refuses it. It was never an
+administrator recovery path either — it always gets role `operator` and
+cannot reach `/users`. Bootstrap does not reopen when administrators are
+lost; see §16a.
 
 ## 7. Service-token separation
 

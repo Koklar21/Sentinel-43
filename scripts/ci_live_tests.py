@@ -100,8 +100,13 @@ def run_live_suite(database_url: str, *, api_port: int = 18000, watchtower_port:
         # -- inert once a DB admin exists. test_bootstrap.py creates one in
         # this same run, so arm break-glass explicitly for the disposable CI
         # database so test_system_smoke.py's live-login (which uses this
-        # env-operator) still works.
+        # env-operator) still works. Its token has no server-side session,
+        # so outside local every protected route refuses it (see below).
         "S43_BREAK_GLASS_ARMED": "true",
+        # SENTINEL_ENV=production: the API refuses to start unless this is
+        # explicitly true, and per-request password authentication is
+        # refused whatever it is set to.
+        "S43_REJECT_LEGACY_AUTH": "true",
         "S43_WATCHTOWER_URL": f"http://127.0.0.1:{watchtower_port}",
         "S43_WATCHTOWER_SERVICE_TOKEN": service_token,
         # Mandatory outside development/local/test (core/api/main.py's

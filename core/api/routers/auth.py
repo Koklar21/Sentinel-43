@@ -1148,61 +1148,64 @@ def note_legacy_auth(
 def legacy_auth_is_rejected() -> bool:
     """Whether per-request password ("legacy") authentication is refused.
 
-    Outside local/dev/test this fails closed: an absent, blank or malformed
-    S43_REJECT_LEGACY_AUTH REJECTS legacy authentication, and the only way to
-    accept it is an explicit false value (announced at CRITICAL on every
-    start by validate_legacy_auth_config). Local/dev/test keeps its
+    Outside local/dev/test it is ALWAYS refused. Startup
+    (validate_legacy_auth_config) will not run there unless
+    S43_REJECT_LEGACY_AUTH is explicitly true, and no value read here can
+    turn legacy authentication back on -- a value that is missing, false or
+    malformed after startup still refuses it. Local/dev/test keeps its
     compatibility default of accepting it.
 
     Never raises: this runs per request, including mid-WebSocket-handshake,
     where an exception is a crash rather than a clean rejection.
     """
-    if _is_local():
-        return _env_bool(
-            "S43_REJECT_LEGACY_AUTH",
-            False,
-            strict=False,
-        )
-
-    try:
-        return _env_bool(
-            "S43_REJECT_LEGACY_AUTH",
-            True,
-            strict=True,
-        )
-
-    except RuntimeError:
-        logger.error(
-            "Auth: S43_REJECT_LEGACY_AUTH is malformed; "
-            "legacy authentication is REJECTED (fail closed)"
-        )
+    if not _is_local():
         return True
+
+    return _env_bool(
+        "S43_REJECT_LEGACY_AUTH",
+        False,
+        strict=False,
+    )
 
 
 def validate_legacy_auth_config() -> None:
     """Startup gate for non-local environments.
 
-    A malformed S43_REJECT_LEGACY_AUTH refuses to start rather than being
-    silently reinterpreted, and an explicit override is made conspicuous.
+    Outside local/dev/test S43_REJECT_LEGACY_AUTH must be explicitly true.
+    Unset, blank, malformed and false all refuse startup: there is no
+    non-local override that accepts per-request password authentication.
     """
     if _is_local():
         return
 
-    # Raises RuntimeError naming the variable when it is not boolean.
-    _env_bool(
-        "S43_REJECT_LEGACY_AUTH",
-        True,
-        strict=True,
-    )
+    raw = os.getenv("S43_REJECT_LEGACY_AUTH")
 
-    if not legacy_auth_is_rejected():
-        logger.critical(
-            "SECURITY OVERRIDE ACTIVE: S43_REJECT_LEGACY_AUTH is explicitly "
-            "false in a non-local environment (%s). Per-request password "
-            "authentication (X-S43-Password header, WebSocket auth-frame "
-            "password) is ACCEPTED. Remove the override; deploy_preflight "
-            "fails this configuration.",
-            _environment(),
+    if raw is None or not raw.strip():
+        raise RuntimeError(
+            "S43_REJECT_LEGACY_AUTH must be set to true outside "
+            f"development/local/test (environment {_environment()!r}); it is "
+            "unset. Per-request password authentication cannot be enabled here."
+        )
+
+    try:
+        rejected = _env_bool(
+            "S43_REJECT_LEGACY_AUTH",
+            True,
+            strict=True,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"S43_REJECT_LEGACY_AUTH={raw.strip()!r} is not a boolean; it must "
+            f"be true outside development/local/test (environment "
+            f"{_environment()!r})."
+        ) from exc
+
+    if not rejected:
+        raise RuntimeError(
+            f"S43_REJECT_LEGACY_AUTH={raw.strip()!r} is not permitted outside "
+            f"development/local/test (environment {_environment()!r}): "
+            "per-request password authentication cannot be enabled there. "
+            "Set it to true."
         )
 
 

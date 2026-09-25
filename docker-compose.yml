@@ -166,6 +166,12 @@ services:
       # container, leaving an operator with a startup error they cannot fix
       # from configuration.
       S43_TLS_TERMINATED_AT_TRUSTED_EDGE: ${S43_TLS_TERMINATED_AT_TRUSTED_EDGE:-}
+      # Per-request password ("legacy") authentication. Outside
+      # development/local/test the API refuses to start unless this is
+      # explicitly true -- unset, blank, false and malformed all refuse --
+      # and it is declared here, empty by default, so that .env can supply
+      # it and a missing value fails at startup instead of being filled in.
+      S43_REJECT_LEGACY_AUTH: ${S43_REJECT_LEGACY_AUTH:-}
 
       # Internal services
       S43_WATCHTOWER_URL: http://s43-core:9100

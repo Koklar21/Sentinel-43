@@ -103,10 +103,10 @@ def prod_env(monkeypatch):
     monkeypatch.setenv("S43_JWT_AUDIENCE",  TEST_AUDIENCE)
     monkeypatch.setenv("S43_WS_REQUIRE_AUTH", "true")
     monkeypatch.setenv("S43_ENABLE_TEST_INJECTION", "false")
-    # These tests exercise the token+password contract in a production
-    # environment, where legacy authentication is rejected unless it is
-    # explicitly overridden.
-    monkeypatch.setenv("S43_REJECT_LEGACY_AUTH", "false")
+    # Outside local/dev/test this is the only value startup accepts, and
+    # legacy (token + per-request password) authentication is refused
+    # whatever it is set to.
+    monkeypatch.setenv("S43_REJECT_LEGACY_AUTH", "true")
 
     import core.api.main as main_module
     importlib.reload(main_module)
@@ -517,11 +517,18 @@ class TestGetOperatorProductionEnvironment:
         assert exc_info.value.status_code == 401
         assert "authentication required" in exc_info.value.detail.lower()
 
-    def test_valid_token_returns_subject_in_production(self, prod_env):
+    def test_legacy_token_with_password_is_refused_in_production(self, prod_env):
+        # A non-session token plus X-S43-Password (which the fixture's
+        # reverify_password would accept) is refused outside local: there is
+        # no configuration that re-enables per-request password auth there.
         token = _make_token(subject="prod-operator")
         request = _bearer_request(token)
 
-        assert _run(prod_env._get_operator(request)) == "prod-operator"
+        with pytest.raises(HTTPException) as exc_info:
+            _run(prod_env._get_operator(request))
+
+        assert exc_info.value.status_code == 401
+        assert "legacy authentication" in exc_info.value.detail.lower()
 
     def test_empty_bearer_returns_401_in_production(self, prod_env):
         request = _bearer_request("")

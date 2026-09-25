@@ -43,12 +43,11 @@
 # break-glass/env-operator) is a compatibility path the real shipped
 # consumers (browser dashboard's normal account path, dashboard Python
 # clients, browser_tests/) never depend on for a real operator/admin
-# account; only the break-glass path does. Outside local/dev/test the code
-# already rejects it when this is absent or malformed
-# (core/api/routers/auth.py::legacy_auth_is_rejected); an explicit "false"
-# is the only override and is logged at CRITICAL on every start. This value
-# is still stated here because scripts/deploy_preflight.py requires an
-# explicit "true" for a beta/non-local target, whatever the image's default.
+# account; only the break-glass path does. Outside local/dev/test the API
+# refuses to start unless this is explicitly "true" -- unset, blank, "false"
+# and malformed values all refuse (core/api/routers/auth.py::
+# validate_legacy_auth_config) -- and refuses the fallback whatever the
+# value. scripts/deploy_preflight.py also requires the explicit "true".
 #
 # S43_HEART_ENABLED: "true" here, and only here. The Heart
 # (core/governance/heart.py::ThreatGovernor) is the human-governed

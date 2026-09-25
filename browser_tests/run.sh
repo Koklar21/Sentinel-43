@@ -101,6 +101,10 @@ S43_WS_REQUIRE_AUTH=true
 # that added the browser stack's own S43_TRUSTED_PROXIES pin to the proxy's
 # address, without this stack ever picking it up.
 S43_TLS_TERMINATED_AT_TRUSTED_EDGE=true
+# SENTINEL_ENV=beta is non-local: the API refuses to start unless this is
+# explicitly true. The browser flows are session-based and never use the
+# per-request password.
+S43_REJECT_LEGACY_AUTH=true
 S43_ALLOWED_ORIGINS=https://s43.beta.test:8443
 S43_TRUSTED_HOSTS=s43.beta.test
 S43_ENABLE_TEST_INJECTION=false
