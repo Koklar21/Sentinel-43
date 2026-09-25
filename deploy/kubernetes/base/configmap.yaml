@@ -34,6 +34,8 @@ data:
   # from the container's working directory.
   S43_AUDIT_SQLITE_PATH: "/app/sentinel43_state/audit.sqlite3"
   S43_DEAD_LETTER_PATH: "/app/sentinel43_state/dead_letter.sqlite3"
+  # The Heart's durable state (used only when S43_HEART_ENABLED is true).
+  S43_HEART_SQLITE_PATH: "/app/sentinel43_state/heart.sqlite3"
   S43_DEAD_LETTER_MAX_ROWS: "10000"
 
   # Watchtower / internal service routing

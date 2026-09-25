@@ -314,11 +314,11 @@ def _atomic_write_text(
     )
 
     try:
-        temp.write_text(
-            content,
-            encoding="utf-8",
-            newline="\n",
-        )
+        # Owner-only from creation: the file holds live secrets, so it must
+        # never exist under the default umask, even briefly.
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
         os.replace(
             temp,
             path,

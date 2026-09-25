@@ -1,0 +1,210 @@
+{
+  "_comment": "Declared acceptance inventory: every job below is REQUIRED. scripts/acceptance_gate.py builds each job's pytest command from this file, so CI and local runs cannot drift. A job that cannot run (missing env, missing dependency) is an ACCEPTANCE FAIL classified env_unmet, never a skip.",
+  "test_globs": [
+    "test_*.py",
+    "*_test.py"
+  ],
+  "ignored_dirs": [
+    ".claude",
+    ".venv-browser",
+    ".git",
+    "node_modules",
+    "acceptance_out",
+    "__pycache__"
+  ],
+  "jobs": {
+    "core-isolated": {
+      "kind": "pytest",
+      "python": "main",
+      "description": "core + dashboard unit/in-process suites (no live service, no PostgreSQL)",
+      "paths": [
+        "core/tests",
+        "dashboard/tests"
+      ],
+      "ignore": [
+        "core/tests/test_bootstrap.py",
+        "core/tests/test_system_smoke.py",
+        "core/tests/test_schema_version_pg.py",
+        "core/tests/test_schema_authority.py",
+        "core/tests/test_deploy_migration_wiring.py",
+        "core/tests/test_migrations_pg.py",
+        "core/tests/test_backup_restore_pg.py",
+        "core/tests/test_auth_session_pg.py",
+        "core/tests/test_session_layer_pg.py",
+        "core/tests/test_ws_session_pg.py",
+        "core/tests/test_break_glass_pg.py",
+        "core/tests/test_account_transactions_pg.py"
+      ],
+      "env": {
+        "S43_WATCHTOWER_URL": "http://127.0.0.1:19100",
+        "S43_WATCHTOWER_TIMEOUT": "0.1"
+      },
+      "forbid_env": [
+        "S43_TEST_API_URL"
+      ],
+      "requires_env": []
+    },
+    "core-isolated-container": {
+      "kind": "pytest",
+      "python": "main",
+      "description": "the same core-isolated suites executed inside the runtime container's test stage (python:3.13-alpine)",
+      "paths": [
+        "core/tests",
+        "dashboard/tests"
+      ],
+      "ignore": [
+        "core/tests/test_bootstrap.py",
+        "core/tests/test_system_smoke.py",
+        "core/tests/test_schema_version_pg.py",
+        "core/tests/test_schema_authority.py",
+        "core/tests/test_deploy_migration_wiring.py",
+        "core/tests/test_migrations_pg.py",
+        "core/tests/test_backup_restore_pg.py",
+        "core/tests/test_auth_session_pg.py",
+        "core/tests/test_session_layer_pg.py",
+        "core/tests/test_ws_session_pg.py",
+        "core/tests/test_break_glass_pg.py",
+        "core/tests/test_account_transactions_pg.py"
+      ],
+      "env": {
+        "S43_WATCHTOWER_URL": "http://127.0.0.1:19100",
+        "S43_WATCHTOWER_TIMEOUT": "0.1"
+      },
+      "forbid_env": [
+        "S43_TEST_API_URL"
+      ],
+      "requires_env": []
+    },
+    "core-postgres": {
+      "kind": "pytest",
+      "python": "main",
+      "description": "disposable-PostgreSQL suites (schema gate, migrations, sessions, break-glass, WS, backup/restore)",
+      "paths": [
+        "core/tests/test_schema_version_pg.py",
+        "core/tests/test_schema_authority.py",
+        "core/tests/test_deploy_migration_wiring.py",
+        "core/tests/test_migrations_pg.py",
+        "core/tests/test_backup_restore_pg.py",
+        "core/tests/test_auth_session_pg.py",
+        "core/tests/test_session_layer_pg.py",
+        "core/tests/test_ws_session_pg.py",
+        "core/tests/test_break_glass_pg.py",
+        "core/tests/test_account_transactions_pg.py"
+      ],
+      "ignore": [],
+      "env": {
+        "S43_WATCHTOWER_URL": "http://127.0.0.1:19100",
+        "S43_WATCHTOWER_TIMEOUT": "0.1",
+        "SENTINEL_ENV": "test",
+        "S43_ENV": "test"
+      },
+      "requires_env": [
+        "S43_TEST_PG_DSN",
+        "S43_TEST_PG_CONTAINER"
+      ]
+    },
+    "core-live": {
+      "kind": "pytest",
+      "python": "main",
+      "description": "live API + Watchtower tests against a disposable, freshly-migrated stack",
+      "paths": [
+        "core/tests/test_bootstrap.py",
+        "core/tests/test_system_smoke.py"
+      ],
+      "ignore": [],
+      "env": {},
+      "requires_env": [
+        "S43_TEST_API_URL",
+        "S43_LIVE_TEST_USERNAME",
+        "S43_LIVE_TEST_PASSWORD",
+        "S43_LIVE_TEST_DB_DSN"
+      ]
+    },
+    "browser-disposable": {
+      "kind": "pytest",
+      "python": "browser",
+      "description": "Playwright SPA suite against the disposable HTTPS Compose stack (browser_tests/run.sh)",
+      "paths": [
+        "browser_tests/test_session_flow.py"
+      ],
+      "ignore": [],
+      "env": {},
+      "requires_env": [
+        "S43_BROWSER_BASE_URL"
+      ]
+    },
+    "browser-target": {
+      "kind": "pytest",
+      "python": "browser",
+      "description": "Target acceptance against an explicitly authorized, isolated deployed target",
+      "paths": [
+        "browser_tests/target_acceptance"
+      ],
+      "ignore": [],
+      "env": {},
+      "requires_env": [
+        "S43_TARGET_BASE_URL",
+        "S43_TARGET_OPERATOR_CRED_FILE",
+        "S43_TARGET_ADMIN_SCOPE",
+        "S43_TARGET_ADMIN_CRED_FILE",
+        "S43_TARGET_MUTATION_OPERATOR_CRED_FILE"
+      ]
+    },
+    "check-compose-config": {
+      "kind": "check",
+      "description": "docker compose config renders for docker-compose.yml and the beta/browser overlays",
+      "evidence": {
+        "cmd_contains": [
+          "acceptance_campaign.py",
+          "check",
+          "compose"
+        ],
+        "ci_job": "validate-manifests"
+      }
+    },
+    "check-k8s-policy": {
+      "kind": "check",
+      "description": "kubectl kustomize + scripts/k8s_policy_check.py for base, dev and beta overlays",
+      "evidence": {
+        "cmd_contains": [
+          "acceptance_campaign.py",
+          "check",
+          "k8s-policy"
+        ],
+        "ci_job": "validate-manifests"
+      }
+    },
+    "check-kubeconform": {
+      "kind": "check",
+      "description": "kubeconform -strict on every rendered overlay",
+      "evidence": {
+        "cmd_contains": [
+          "acceptance_campaign.py",
+          "check",
+          "kubeconform"
+        ],
+        "ci_job": "validate-manifests"
+      }
+    },
+    "check-image-scan": {
+      "kind": "check",
+      "description": "image build + Trivy HIGH/CRITICAL vulnerability scan",
+      "evidence": {
+        "cmd_contains": [
+          "acceptance_campaign.py",
+          "check",
+          "image-scan"
+        ],
+        "ci_job": "build-and-scan"
+      }
+    },
+    "check-kind-smoke": {
+      "kind": "check",
+      "description": "ephemeral kind + Calico smoke deploy (CI workflow job kind-smoke-deploy)",
+      "evidence": {
+        "cmd_contains": [],
+        "ci_job": "kind-smoke-deploy"
+      }
+    }
+  }
+}
