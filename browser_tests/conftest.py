@@ -158,6 +158,13 @@ def page(page):
     page.on("pageerror", lambda e: errors.append(str(e)))
     page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
     page._s43_console_errors = errors  # type: ignore[attr-defined]
+    # Diagnostics only (never asserted on): WHICH url a console error / failed request
+    # came from, so an environmental "Failed to load resource" can be attributed.
+    sources: list[dict] = []
+    page.on("console", lambda m: sources.append({"console": m.text, "url": (m.location or {}).get("url")})
+            if m.type == "error" else None)
+    page.on("requestfailed", lambda r: sources.append({"requestfailed": r.url, "failure": r.failure}))
+    page._s43_error_sources = sources  # type: ignore[attr-defined]
     return page
 
 
