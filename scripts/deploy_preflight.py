@@ -53,6 +53,7 @@ import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 # --- statuses -----------------------------------------------------------------
@@ -86,6 +87,9 @@ _APP_FALSE_VALUES = frozenset({"0", "false", "no", "off", "disabled"})
 
 
 def _is_explicitly_false(value: str) -> bool:
+    """Only an explicit falsy value. Unset or malformed is NOT false here:
+    the flags this guards default to true in the app, so silence means the
+    safe setting, and only a deliberate opt-out should fail a gate."""
     return value.strip().lower() in _APP_FALSE_VALUES
 
 # A value that looks like a stand-in rather than a real hostname / secret.
@@ -603,6 +607,46 @@ def check_image(rep: Report, image: str, image_id: str, source_revision: str) ->
     rep.record(status, "image reference is an immutable identity", detail)
 
 
+def check_app_flag_invariants(rep: Report, env: Mapping[str, str]) -> None:
+    """The application flags a non-local target must have, and the one
+    relationship BETWEEN them, checked from whatever source states them --
+    a Compose .env file or a Kubernetes ConfigMap.
+
+    Kept in one place because the invariant is a property of the
+    application, not of how it happens to be packaged.
+    """
+    legacy = str(env.get("S43_REJECT_LEGACY_AUTH", ""))
+    rep.record(PASS if _is_explicitly_true(legacy) else FAIL,
+               "S43_REJECT_LEGACY_AUTH is true for this non-local target",
+               "the per-request X-S43-Password fallback (break-glass/"
+               "env-operator only; real dashboard/API consumers never need "
+               "it) must be rejected outside local/dev")
+
+    heart = str(env.get("S43_HEART_ENABLED", ""))
+    rep.record(PASS if _is_explicitly_true(heart) else FAIL,
+               "S43_HEART_ENABLED is true for this non-local target",
+               "the Heart (human-governed threat-assessment staging, "
+               "core/governance/heart.py) must be explicitly enabled for a "
+               "controlled-beta target -- missing, malformed, false, or "
+               "ambiguous values all fail this gate")
+
+    governance = str(env.get("S43_GOVERNANCE_ENABLED", ""))
+    rep.record(PASS if _is_explicitly_true(governance) else FAIL,
+               _GOVERNANCE_CHECK_NAME_PREPARE, _GOVERNANCE_CHECK_DETAIL)
+
+    rep.record(PASS if not _is_explicitly_false(
+                   str(env.get("S43_GOVERNANCE_REQUIRED", "true"))) else FAIL,
+               "S43_GOVERNANCE_REQUIRED is not disabled for this non-local target",
+               "a governance failure must keep /ready false, not serve ungoverned")
+
+    # The invariant itself: the API refuses to start on this combination, so
+    # catching it here is the difference between a failed gate and a failed
+    # deployment.
+    rep.record(PASS if not (_is_explicitly_true(heart)
+                            and not _is_explicitly_true(governance)) else FAIL,
+               _HEART_NEEDS_GOVERNANCE_NAME, _HEART_NEEDS_GOVERNANCE_DETAIL)
+
+
 def check_compose_config(rep: Report, env_file: str, hostname: str,
                          https_port: int) -> None:
     print("\n== compose configuration ==")
@@ -651,28 +695,7 @@ def check_compose_config(rep: Report, env_file: str, hostname: str,
     rep.record(PASS if not insecure else FAIL,
                "S43_ALLOW_INSECURE_ORIGINS is not set", insecure or "unset")
 
-    legacy = env.get("S43_REJECT_LEGACY_AUTH", "")
-    rep.record(PASS if _is_explicitly_true(legacy) else FAIL,
-               "S43_REJECT_LEGACY_AUTH is true for this non-local target",
-               "the per-request X-S43-Password fallback (break-glass/"
-               "env-operator only; real dashboard/API consumers never need "
-               "it) must be rejected outside local/dev")
-
-    heart = env.get("S43_HEART_ENABLED", "")
-    rep.record(PASS if _is_explicitly_true(heart) else FAIL,
-               "S43_HEART_ENABLED is true for this non-local target",
-               "the Heart (human-governed threat-assessment staging, "
-               "core/governance/heart.py) must be explicitly enabled for a "
-               "controlled-beta target -- missing, malformed, false, or "
-               "ambiguous values all fail this gate")
-
-    governance = env.get("S43_GOVERNANCE_ENABLED", "")
-    rep.record(PASS if _is_explicitly_true(governance) else FAIL,
-               _GOVERNANCE_CHECK_NAME_PREPARE, _GOVERNANCE_CHECK_DETAIL)
-    required = env.get("S43_GOVERNANCE_REQUIRED", "")
-    rep.record(FAIL if _is_explicitly_false(required) else PASS,
-               "S43_GOVERNANCE_REQUIRED is not disabled",
-               "a governance failure must keep /ready false")
+    check_app_flag_invariants(rep, env)
 
 
 def check_kube_prereqs(rep: Report, context: str, namespace: str) -> None:
@@ -720,28 +743,7 @@ def check_kube_prereqs(rep: Report, context: str, namespace: str) -> None:
             data = json.loads(out).get("data", {})
         except ValueError:
             data = {}
-        legacy = str(data.get("S43_REJECT_LEGACY_AUTH", ""))
-        rep.record(PASS if _is_explicitly_true(legacy) else FAIL,
-                   "S43_REJECT_LEGACY_AUTH is true for this non-local target",
-                   "the per-request X-S43-Password fallback (break-glass/"
-                   "env-operator only; real dashboard/API consumers never "
-                   "need it) must be rejected outside local/dev")
-
-        heart = str(data.get("S43_HEART_ENABLED", ""))
-        rep.record(PASS if _is_explicitly_true(heart) else FAIL,
-                   "S43_HEART_ENABLED is true for this non-local target",
-                   "the Heart (human-governed threat-assessment staging, "
-                   "core/governance/heart.py) must be explicitly enabled "
-                   "for a controlled-beta target -- missing, malformed, "
-                   "false, or ambiguous values all fail this gate")
-
-        governance = str(data.get("S43_GOVERNANCE_ENABLED", ""))
-        rep.record(PASS if _is_explicitly_true(governance) else FAIL,
-                   _GOVERNANCE_CHECK_NAME_PREPARE, _GOVERNANCE_CHECK_DETAIL)
-        required = str(data.get("S43_GOVERNANCE_REQUIRED", ""))
-        rep.record(FAIL if _is_explicitly_false(required) else PASS,
-                   "S43_GOVERNANCE_REQUIRED is not disabled",
-                   "a governance failure must keep /ready false")
+        check_app_flag_invariants(rep, data)
 
 
 # =============================================================================
@@ -1032,8 +1034,20 @@ _GOVERNANCE_CHECK_NAME = (
 )
 _GOVERNANCE_CHECK_DETAIL = (
     "the governance orchestrator (core/governance/orchestrator.py) is the "
-    "only authority that stages or resolves a Heart recommendation; an "
-    "enabled Heart without it fails to start and keeps /ready false"
+    "only authority that stages or resolves a governed decision; the Heart "
+    "reports evidence and has none of its own"
+)
+
+#: The deployment invariant: these two flags are set together or not at all.
+#: core/api/main.py::_validate_security_config refuses to start otherwise, so
+#: this check exists to catch it BEFORE the deployment goes out.
+_HEART_NEEDS_GOVERNANCE_NAME = (
+    "S43_HEART_ENABLED=true is accompanied by S43_GOVERNANCE_ENABLED=true"
+)
+_HEART_NEEDS_GOVERNANCE_DETAIL = (
+    "the Heart has no decision authority of its own: enabling it without "
+    "the governance orchestrator is a configuration error and the API "
+    "refuses to start with it"
 )
 
 _HEART_CHECK_NAME = (
@@ -1213,20 +1227,21 @@ def check_kube_legacy_auth_runtime(rep: Report, context: str, namespace: str) ->
         check_name=_LEGACY_AUTH_CHECK_NAME, check_detail=_LEGACY_AUTH_CHECK_DETAIL)
 
 
-def check_kube_governance_runtime(rep: Report, context: str, namespace: str) -> None:
-    """Verify-phase companion to the S43_GOVERNANCE_ENABLED prepare check."""
-    print("\n== kubernetes runtime: effective S43_GOVERNANCE_ENABLED ==")
-    _check_kube_env_var_runtime(
-        rep, context, namespace, env_var="S43_GOVERNANCE_ENABLED",
-        check_name=_GOVERNANCE_CHECK_NAME, check_detail=_GOVERNANCE_CHECK_DETAIL)
-
-
 def check_kube_heart_runtime(rep: Report, context: str, namespace: str) -> None:
     """Verify-phase companion to check_kube_prereqs's S43_HEART_ENABLED check."""
     print("\n== kubernetes runtime: effective S43_HEART_ENABLED ==")
     _check_kube_env_var_runtime(
         rep, context, namespace, env_var="S43_HEART_ENABLED",
         check_name=_HEART_CHECK_NAME, check_detail=_HEART_CHECK_DETAIL)
+
+
+def check_kube_governance_runtime(rep: Report, context: str,
+                                  namespace: str) -> None:
+    """Verify-phase companion to the S43_GOVERNANCE_ENABLED prepare check."""
+    print("\n== kubernetes runtime: effective S43_GOVERNANCE_ENABLED ==")
+    _check_kube_env_var_runtime(
+        rep, context, namespace, env_var="S43_GOVERNANCE_ENABLED",
+        check_name=_GOVERNANCE_CHECK_NAME, check_detail=_GOVERNANCE_CHECK_DETAIL)
 
 
 # =============================================================================
@@ -1289,10 +1304,10 @@ def run(args: argparse.Namespace) -> int:
                                   args.compose_files)
             check_compose_legacy_auth_runtime(rep, args.project, args.env_file,
                                               args.compose_files)
-            check_compose_heart_runtime(rep, args.project, args.env_file,
-                                        args.compose_files)
             check_compose_governance_runtime(rep, args.project, args.env_file,
                                              args.compose_files)
+            check_compose_heart_runtime(rep, args.project, args.env_file,
+                                        args.compose_files)
     else:
         if args.phase == "prepare":
             check_tools(rep, ["kubectl", "openssl"])
@@ -1306,8 +1321,8 @@ def run(args: argparse.Namespace) -> int:
                                args.from_external_host)
             check_kube_runtime(rep, args.context, args.namespace)
             check_kube_legacy_auth_runtime(rep, args.context, args.namespace)
-            check_kube_heart_runtime(rep, args.context, args.namespace)
             check_kube_governance_runtime(rep, args.context, args.namespace)
+            check_kube_heart_runtime(rep, args.context, args.namespace)
 
     code = rep.exit_code()
     s = rep.summary()

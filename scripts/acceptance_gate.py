@@ -103,7 +103,17 @@ def job_env(job: dict) -> dict:
     return env
 
 
+def option_like(entries) -> list[str]:
+    """Manifest path/ignore entries that pytest would parse as OPTIONS. The gate runs
+    pytest as an argument vector (no shell), so this is not shell injection; it only
+    keeps a manifest entry from smuggling in a pytest option (-p, --rootdir, -k, ...)."""
+    return [e for e in entries if not isinstance(e, str) or e.startswith("-")]
+
+
 def pytest_cmd(name: str, job: dict, report: Path, *, collect_only: bool) -> list[str]:
+    bad = option_like([*job["paths"], *job.get("ignore", [])])
+    if bad:
+        raise SystemExit(f"{name}: manifest path/ignore entries must be paths, not options: {bad}")
     cmd = [python_for(job), "-m", "pytest", "-p", "acceptance_recorder", "-p", "no:cacheprovider",
            "--acc-report", str(report), "--acc-job", name, "-q", "-rA", *job["paths"]]
     for ignored in job.get("ignore", []):
@@ -172,6 +182,8 @@ def collect_all(out: Path, manifest: dict) -> dict[str, int]:
         inv = out / "inventory" / f"_all-{profile}.json"
         env = job_env({"python": profile})
         paths = profile_paths(manifest, profile)
+        if option_like(paths):
+            raise SystemExit(f"profile {profile!r}: manifest paths must be paths, not options: {option_like(paths)}")
         proc = subprocess.run([python_for({"python": profile}), "-m", "pytest", "-p", "acceptance_recorder",
                                "-p", "no:cacheprovider", "--acc-report", str(inv), "--acc-job", f"_all-{profile}",
                                "-q", "--collect-only", *paths],
@@ -346,6 +358,8 @@ def manifest_errors(manifest: dict) -> list[str]:
             errs.append(f"{name}: unsupported manifest key(s) {sorted(extra)}")
         if job.get("kind") == "pytest" and not job.get("paths"):
             errs.append(f"{name}: pytest job with no paths")
+        if job.get("kind") == "pytest" and option_like([*(job.get("paths") or []), *job.get("ignore", [])]):
+            errs.append(f"{name}: path/ignore entries must be paths, not pytest options")
     return errs
 
 

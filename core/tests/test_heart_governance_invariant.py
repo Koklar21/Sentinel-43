@@ -234,3 +234,41 @@ def test_compose_defaults_are_a_valid_combination():
 def test_the_env_example_states_the_requirement():
     text = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
     assert "REQUIRES S43_GOVERNANCE_ENABLED=true" in text
+
+
+# ---------------------------------------------------------------------------
+# PR #294 review remediation: the invariant must hold for malformed values, must
+# not fire when the Heart is off, and must be reached from BOTH deployment paths
+# (a parallel per-flag implementation once replaced the shared helper).
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("governance", ["maybe", "tru", "2", "enable", ""])
+def test_preflight_fails_a_malformed_or_missing_governance_value_with_the_heart_on(governance):
+    rep = _Rep()
+    preflight.check_app_flag_invariants(rep, _compose_env(S43_GOVERNANCE_ENABLED=governance))
+    assert rep.status_of(_INVARIANT) == preflight.FAIL
+    assert rep.status_of("S43_GOVERNANCE_ENABLED is true") == preflight.FAIL
+
+
+@pytest.mark.parametrize("heart", ["false", "0", "off"])
+def test_a_disabled_heart_does_not_fail_the_dependency_alone(heart):
+    rep = _Rep()
+    preflight.check_app_flag_invariants(
+        rep, _compose_env(S43_HEART_ENABLED=heart, S43_GOVERNANCE_ENABLED="false"))
+    assert rep.status_of(_INVARIANT) == preflight.PASS
+    # ...while the independent beta checks still fail closed on each flag.
+    assert rep.status_of("S43_HEART_ENABLED is true") == preflight.FAIL
+    assert rep.status_of("S43_GOVERNANCE_ENABLED is true") == preflight.FAIL
+
+
+def test_both_deployment_paths_enforce_the_invariant_through_the_shared_helper():
+    import inspect
+
+    assert "check_app_flag_invariants(rep, env)" in inspect.getsource(preflight.check_compose_config)
+    assert "check_app_flag_invariants(rep, data)" in inspect.getsource(preflight.check_kube_prereqs)
+
+
+def test_compose_verify_phase_passes_the_parsed_compose_files():
+    import inspect
+
+    src = inspect.getsource(preflight.run)
+    assert "args.file)" not in src and "args.compose_files)" in src
