@@ -568,9 +568,11 @@ async def bootstrap_claimed(
 
     The claim creates the first account in an empty store, and no code path
     deletes accounts (they are deactivated or demoted instead), so "any
-    account exists" is the durable record that bootstrap has completed.
-    Unlike the active-admin count, it does not revert when every admin is
-    deactivated -- that state is a lockout to recover, not a fresh install.
+    account exists" records that bootstrap has completed. Unlike the
+    active-admin count, it does not revert when every admin is deactivated --
+    that state is a lockout to recover, not a fresh install. It is not a
+    separate consumed-bootstrap marker: deleting every account row directly
+    in the database reopens bootstrap.
     """
     result = await session.execute(
         select(
@@ -732,8 +734,8 @@ async def create_first_admin(
         ADMIN_INVARIANT_LOCK_KEY,
     )
 
-    # Closed permanently once any account exists -- not merely while an
-    # active admin exists -- so deactivating every admin cannot reopen it.
+    # Closed once any account exists -- not merely while an active admin
+    # exists -- so deactivating every admin cannot reopen it.
     if await bootstrap_claimed(
         session
     ):

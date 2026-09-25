@@ -934,8 +934,9 @@ The security invariant is:
 
 > Exactly one initial bootstrap operation may succeed.
 
-Bootstrap closes permanently once the first account exists. Deactivating or
-demoting every administrator does not reopen it. Who is authorized to make
+Bootstrap closes once the first account exists, and no application path
+reopens it: deactivating or demoting every administrator does not. Deleting
+every account row directly in the database would. Who is authorized to make
 the first claim is not yet decided: today it is whoever claims an empty
 deployment first. See `docs/BETA_RUNBOOK.md` §16a for the claim procedure
 and admin recovery.

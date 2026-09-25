@@ -580,10 +580,14 @@ who may replace administrators when none remain, has not been decided (see
   the claim commits in one transaction, so an interrupted claim leaves
   nothing behind and can be retried. Outside local/test, a backend that
   cannot serialize claims refuses with `503`.
-- **Permanently closed.** Once any account exists, `/bootstrap/admin`
-  returns `409` and `/bootstrap/status` reports `initialized: true` for the
-  life of the database. Deactivating or demoting every admin, even directly
-  in the database, does not reopen it.
+- **Closed for every application path.** Once any account exists,
+  `/bootstrap/admin` returns `409` and `/bootstrap/status` reports
+  `initialized: true`. Deactivating or demoting every admin, even directly
+  in the database, does not reopen it, and the API cannot delete an account.
+  It is not yet a separate consumed-bootstrap marker: deleting every account
+  row directly in the database reopens the claim. Anyone with that database
+  access could already insert an admin row, so treat database write access
+  as full control of identity.
 - **Not yet authorized.** The route is unauthenticated: on an empty store,
   whoever reaches it first becomes the first administrator. The procedure
   below (claim at once, then confirm it was you) is the only mitigation
@@ -600,6 +604,9 @@ who may replace administrators when none remain, has not been decided (see
   tokens, the Fenrir token) never yield a human operator identity, and
   governance refuses and audits them as approvers. The authoritative audit
   store (§12) is append-only: no route or role can edit or delete a record.
+- **Account changes are not yet audited.** The first claim, account
+  creation, role and activation changes, and password resets are not
+  written to the authoritative audit store; governance decisions are.
 
 ### Claiming the first administrator (Compose and Kubernetes)
 
