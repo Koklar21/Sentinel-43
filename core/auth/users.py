@@ -117,6 +117,15 @@ class FirstAdminExistsError(AccountError):
     """Raised when first-admin bootstrap has already been completed."""
 
 
+class BootstrapClaimUnavailableError(AccountError):
+    """Raised when the first-admin claim cannot be serialized on this backend.
+
+    Outside local/test the one-time claim is only accepted where concurrent
+    claims are serialized (the PostgreSQL advisory lock). Refusing is safer
+    than letting two racing claims both observe an empty account store.
+    """
+
+
 class UsernameTakenError(AccountError):
     def __init__(self, username: str) -> None:
         super().__init__(
@@ -552,6 +561,28 @@ async def count_active_admins(
     )
 
 
+async def bootstrap_claimed(
+    session: AsyncSession,
+) -> bool:
+    """True once the first-admin claim has committed.
+
+    The claim creates the first account in an empty store, and no code path
+    deletes accounts (they are deactivated or demoted instead), so "any
+    account exists" is the durable record that bootstrap has completed.
+    Unlike the active-admin count, it does not revert when every admin is
+    deactivated -- that state is a lockout to recover, not a fresh install.
+    """
+    result = await session.execute(
+        select(
+            User.user_id
+        ).limit(
+            1
+        )
+    )
+
+    return result.scalar_one_or_none() is not None
+
+
 async def get_user_by_username(
     session: AsyncSession,
     username: str,
@@ -619,7 +650,8 @@ async def list_users(
 async def _pg_advisory_xact_lock(
     session: AsyncSession,
     key: int,
-) -> None:
+) -> bool:
+    """Take a transaction-scoped advisory lock; False when none was taken."""
     try:
         bind = session.get_bind()
         dialect_name = bind.dialect.name
@@ -627,7 +659,7 @@ async def _pg_advisory_xact_lock(
         dialect_name = ""
 
     if dialect_name != "postgresql":
-        return
+        return False
 
     await session.execute(
         text(
@@ -637,6 +669,7 @@ async def _pg_advisory_xact_lock(
             "key": key
         },
     )
+    return True
 
 
 # =============================================================================
@@ -694,15 +727,20 @@ async def create_first_admin(
     password: str,
     email: str | None = None,
 ) -> User:
-    await _pg_advisory_xact_lock(
+    locked = await _pg_advisory_xact_lock(
         session,
         ADMIN_INVARIANT_LOCK_KEY,
     )
 
-    if await count_active_admins(
+    # Closed permanently once any account exists -- not merely while an
+    # active admin exists -- so deactivating every admin cannot reopen it.
+    if await bootstrap_claimed(
         session
-    ) > 0:
+    ):
         raise FirstAdminExistsError()
+
+    if not locked and not _is_local():
+        raise BootstrapClaimUnavailableError()
 
     if await get_user_by_username(
         session,
@@ -812,6 +850,7 @@ __all__ = [
     "APPROVED_ROLES",
     "AccountError",
     "Base",
+    "BootstrapClaimUnavailableError",
     "FirstAdminExistsError",
     "LastAdminError",
     "NAMING_CONVENTION",
@@ -819,6 +858,7 @@ __all__ = [
     "UsernameTakenError",
     "_pg_advisory_xact_lock",
     "authenticate_user",
+    "bootstrap_claimed",
     "clear_db_factories_for_tests",
     "count_active_admins",
     "create_first_admin",

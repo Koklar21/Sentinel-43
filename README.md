@@ -934,6 +934,12 @@ The security invariant is:
 
 > Exactly one initial bootstrap operation may succeed.
 
+Bootstrap closes permanently once the first account exists. Deactivating or
+demoting every administrator does not reopen it. Who is authorized to make
+the first claim is not yet decided: today it is whoever claims an empty
+deployment first. See `docs/BETA_RUNBOOK.md` §16a for the claim procedure
+and admin recovery.
+
 This does NOT mean Sentinel-43 supports only one administrator.
 
 Additional administrators may exist according to normal authorization and

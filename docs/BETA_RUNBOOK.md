@@ -146,11 +146,11 @@ explicitly anyway: `deploy_preflight.py` (§15) **fails** (not merely notes)
 a beta/non-local target unless it is an explicit `true`, whatever the
 running image's default.
 
-This does not disable break-glass entirely — it disables the *password
-fallback for already-issued legacy tokens*. Recovery access when locked out
-still works through the normal bootstrap/break-glass login flow; it just
-can no longer be satisfied by a per-request password on an old-style token
-afterward.
+Rejecting legacy authentication also makes the break-glass env operator
+unusable outside local: it has no server-side session, so its token is
+refused on every protected route. It was never an administrator recovery
+path either — it always gets role `operator` and cannot reach `/users`.
+Bootstrap does not reopen when administrators are lost; see §16a.
 
 ## 7. Service-token separation
 
@@ -567,6 +567,106 @@ outage** — this is expected, not a bug. `scripts/k8s_policy_check.py`'s
 `check_singleton_workloads()` fails the manifest build if anything sets
 `replicas != 1` for `s43-api`, switches its strategy, or adds a
 PodDisruptionBudget selecting it.
+
+## 16a. Platform ownership: first administrator claim and admin recovery
+
+**Status: partly open.** Who is *authorized* to make the first claim, and
+who may replace administrators when none remain, has not been decided (see
+"Open owner decision" below). What is enforced today:
+
+- **One-time claim.** `POST /bootstrap/admin` creates the first account,
+  role `admin`, in an empty account store. Concurrent claims are serialized
+  by a PostgreSQL advisory lock (exactly one succeeds, the rest get `409`);
+  the claim commits in one transaction, so an interrupted claim leaves
+  nothing behind and can be retried. Outside local/test, a backend that
+  cannot serialize claims refuses with `503`.
+- **Permanently closed.** Once any account exists, `/bootstrap/admin`
+  returns `409` and `/bootstrap/status` reports `initialized: true` for the
+  life of the database. Deactivating or demoting every admin, even directly
+  in the database, does not reopen it.
+- **Not yet authorized.** The route is unauthenticated: on an empty store,
+  whoever reaches it first becomes the first administrator. The procedure
+  below (claim at once, then confirm it was you) is the only mitigation
+  until the owner decision is implemented.
+- **An operator login is not ownership.** The break-glass env operator
+  (`S43_OPERATOR_USERNAME` / `S43_OPERATOR_PASSWORD_HASH`) is always role
+  `operator`, cannot manage accounts, and outside local its token is refused
+  (§6).
+- **Administrators do not outrank governance.** The `admin` role grants
+  account management (`/users`) only. Approving or vetoing a staged action
+  requires the server-recorded identity of an authenticated human operator;
+  no role skips HUMAN_GATED review. Shared-secret credentials (Remote
+  Gateway `OWNER`/`ADMIN`/`AUDITOR` tokens, the Watchtower service and admin
+  tokens, the Fenrir token) never yield a human operator identity, and
+  governance refuses and audits them as approvers. The authoritative audit
+  store (§12) is append-only: no route or role can edit or delete a record.
+
+### Claiming the first administrator (Compose and Kubernetes)
+
+Claim as soon as the stack first reports ready, before sharing the URL. No
+default admin account exists and none is created for you. The username and
+password are read from the terminal and piped to `curl`, so they never
+appear in a URL, a process argument list, shell history or an API log.
+Only the HTTP status is printed, because a validation error response would
+echo the submitted values.
+
+Set the target first:
+
+- **Compose:** `S43_URL=https://<your host>` — the API is reachable only
+  through `s43-proxy`. With the self-signed development certificate, add
+  `--cacert deploy/proxy/certs/s43.crt` to the `curl` below; never use `-k`.
+- **Kubernetes:** the Ingress URL, `S43_URL=https://<your host>`; or, before
+  the Ingress and TLS are live, run
+  `kubectl -n sentinel43 port-forward svc/s43-api 8000:8000` in another
+  terminal, set `S43_URL=http://127.0.0.1:8000`, and add
+  `-H 'Host: s43-api'` to the `curl` below (`s43-api` is in
+  `S43_TRUSTED_HOSTS`, §14).
+
+```bash
+python3 -c '
+import getpass, json, sys
+sys.stderr.write("first admin username: "); sys.stderr.flush()
+user = sys.stdin.readline().strip()
+pw = getpass.getpass("password (12+ characters): ")
+if len(pw) < 12 or pw != getpass.getpass("repeat password: "):
+    sys.exit("password too short or not matching; nothing was sent")
+json.dump({"username": user, "password": pw}, sys.stdout)
+' | curl -sS -o /dev/null -w '%{http_code}\n' \
+      -H 'Content-Type: application/json' --data-binary @- \
+      "$S43_URL/bootstrap/admin"
+```
+
+| Status | Meaning |
+|---|---|
+| `201` | You are the first administrator. Confirm by signing in to the dashboard with those credentials. |
+| `409` on your **first** attempt | Someone else already claimed this deployment. Treat it as compromised: take the stack down, destroy the database volume/PVC, and redeploy. |
+| `409` after an attempt that printed no status | The earlier claim may have committed. Sign in with the credentials you chose: success means the claim was yours; failure means treat it as compromised, as above. |
+| `503` | The account store is not PostgreSQL (outside local/test), or the API or database is unavailable. Nothing was created. |
+| `422` | The username or password was rejected. Nothing was created. |
+
+Then, signed in as that admin, create the other accounts through `/users`,
+including a second active admin, so that one lost credential is not a
+lockout.
+
+### When every administrator is lost or deactivated
+
+The API cannot reach this state on its own: `PATCH /users` refuses to
+deactivate or demote the last active admin, and no admin can deactivate
+their own account. It can still happen if the only admin's password is lost,
+or through direct database edits. Recovery never reopens `/bootstrap/admin`,
+and there is currently **no in-product recovery path**: the break-glass env
+operator cannot manage accounts. Until the owner decision below is
+implemented, the only recovery is restoring a PostgreSQL backup (§11) taken
+while an admin was usable. Keep two active admins so this is never needed.
+
+### Open owner decision
+
+The record does not settle which authority may make the first claim and
+replace administrators when none remain. Candidates: the holder of the
+deployment secret store (a one-time claim secret whose hash is provisioned
+in `.env` / `sentinel43-secrets`), or the holder of container-exec access
+(an in-container CLI). Neither is implemented. This section changes when
+one is chosen.
 
 ## 17. Browser and WSS acceptance
 

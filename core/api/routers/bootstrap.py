@@ -18,11 +18,18 @@ exists before the first administrator account is created.
 
 Security invariants:
     - bootstrap may create exactly one initial active admin
-    - concurrent bootstrap attempts are serialized by create_first_admin()
-    - account creation is committed atomically
+    - concurrent bootstrap attempts are serialized by create_first_admin();
+      outside local/test a backend that cannot serialize them refuses (503)
+    - account creation is committed atomically; an interrupted claim leaves
+      nothing behind and may be retried
     - schema/model initialization is owned by application startup, not by an
       unauthenticated HTTP request
-    - bootstrap becomes permanently unavailable once an active admin exists
+    - bootstrap becomes permanently unavailable once the first account
+      exists; deactivating or demoting every admin does NOT reopen it
+
+Open: the claim is not yet bound to a deployment authority -- whoever
+reaches this route first on an empty store becomes the first admin. See
+docs/BETA_RUNBOOK.md "Platform ownership".
 """
 
 from __future__ import annotations
@@ -35,9 +42,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...auth.deps import get_db_session
 from ...auth.users import (
+    BootstrapClaimUnavailableError,
     FirstAdminExistsError,
     UsernameTakenError,
-    count_active_admins,
+    bootstrap_claimed,
     create_first_admin,
 )
 
@@ -146,13 +154,11 @@ async def bootstrap_status(
         get_db_session
     ),
 ) -> BootstrapStatusResponse:
-    """Return whether Sentinel-43 already has an active administrator."""
-    admins = await count_active_admins(
-        session
-    )
-
+    """Return whether the one-time first-admin claim has been completed."""
     return BootstrapStatusResponse(
-        initialized=admins > 0
+        initialized=await bootstrap_claimed(
+            session
+        )
     )
 
 
@@ -198,6 +204,18 @@ async def bootstrap_admin(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Username already exists.",
+        ) from exc
+
+    except BootstrapClaimUnavailableError as exc:
+        await _rollback_safely(
+            session
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "First-admin bootstrap requires a PostgreSQL account store "
+                "outside local/test."
+            ),
         ) from exc
 
     except HTTPException:

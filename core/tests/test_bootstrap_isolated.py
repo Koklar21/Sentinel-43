@@ -43,8 +43,8 @@
 # ORM model bound to Postgres-specific behavior (Uuid columns, async
 # engine). Standing up aiosqlite (not currently a dependency) just to get
 # an async DB session would add a new package for a test-only path, and the
-# route logic being tested here doesn't touch SQL — count_active_admins(),
-# create_user(), get_user_by_username(), and authenticate_user() are called
+# route logic being tested here doesn't touch SQL — bootstrap_claimed(),
+# create_first_admin(), and authenticate_user() are called
 # by name from bootstrap.py / auth.py, so monkeypatching those call sites
 # with in-memory equivalents exercises the exact same route code without
 # needing a database at all.
@@ -107,6 +107,9 @@ class _FakeUserStore:
     async def count_active_admins(self, session=None) -> int:
         return sum(1 for u in self.users.values() if u.role == "admin" and u.is_active)
 
+    async def bootstrap_claimed(self, session=None) -> bool:
+        return bool(self.users)
+
     async def get_user_by_username(self, session, username: str) -> _FakeUser | None:
         return self.users.get(username)
 
@@ -131,11 +134,11 @@ class _FakeUserStore:
     async def create_first_admin(
         self, session, *, username: str, password: str, email: str | None = None
     ) -> _FakeUser:
-        # Mirrors core.auth.users.create_first_admin: gate on the count and
-        # the username, raise the same exceptions. The advisory lock is a
-        # no-op here (single-threaded dict store); the real cross-process
-        # behaviour is covered by test_bootstrap_concurrency.py.
-        if await self.count_active_admins(session) > 0:
+        # Mirrors core.auth.users.create_first_admin: gate on any account
+        # existing and on the username, raise the same exceptions. The
+        # advisory lock is a no-op here (single-threaded dict store); the real
+        # cross-process behaviour is covered by test_account_transactions_pg.py.
+        if await self.bootstrap_claimed(session):
             raise users_module.FirstAdminExistsError()
         if await self.get_user_by_username(session, username) is not None:
             raise users_module.UsernameTakenError(username)
@@ -242,8 +245,8 @@ def fresh_user_store(monkeypatch) -> _FakeUserStore:
     Point bootstrap.py's module-level imports and auth.py's call-time
     imports at a fresh, empty fake store for the duration of one test.
 
-    bootstrap.py imports count_active_admins/create_user/get_user_by_username
-    /init_models at module load time, so they're patched on
+    bootstrap.py imports bootstrap_claimed/create_first_admin at module load
+    time, so they're patched on
     bootstrap_module directly. auth.py re-imports authenticate_user from
     core.auth.users inside each function call (see reverify_password() /
     _validate_credentials()), so patching users_module.authenticate_user is
@@ -252,7 +255,7 @@ def fresh_user_store(monkeypatch) -> _FakeUserStore:
     store = _FakeUserStore()
     session_store = _FakeSessionStore(store)
 
-    monkeypatch.setattr(bootstrap_module, "count_active_admins", store.count_active_admins)
+    monkeypatch.setattr(bootstrap_module, "bootstrap_claimed", store.bootstrap_claimed)
     monkeypatch.setattr(bootstrap_module, "create_first_admin", store.create_first_admin)
     # The bootstrap router no longer performs schema creation -- Alembic is the
     # sole schema authority -- so there is no init_models to patch here.
