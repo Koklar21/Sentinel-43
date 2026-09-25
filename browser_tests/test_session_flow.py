@@ -13,9 +13,29 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from _spa import do_login
+
+
+def wait_until_true(page, expression: str, timeout_ms: int = 15_000, interval_ms: int = 100) -> None:
+    """Poll a JS expression from Python until it is truthy.
+
+    page.wait_for_function() cannot be used for a condition that is not already true
+    on its first check: its polling loop evaluates the predicate with eval(), which
+    the SPA's real CSP (script-src 'self', no 'unsafe-eval') refuses. page.evaluate()
+    goes through the DevTools protocol and is not subject to that, so polling it
+    keeps the CSP untouched while still proving the condition is eventually reached.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    while True:
+        if page.evaluate(f"() => !!({expression})"):
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"timed out after {timeout_ms} ms waiting for: {expression}")
+        page.wait_for_timeout(interval_ms)
 
 
 def page_fetch(page, path: str, method: str = "GET", headers: dict | None = None,
@@ -54,7 +74,7 @@ def test_page_and_shipped_assets_load_without_fatal_js_errors(stack, page):
 
     page.wait_for_selector("#s43-login-overlay")
     assert page.evaluate("typeof window.SentinelAuth === 'object'")
-    assert page._s43_console_errors == [], page._s43_console_errors
+    assert page._s43_console_errors == [], (page._s43_console_errors, page._s43_error_sources)
 
 
 def test_login_through_the_real_ui_reaches_an_authorized_view(stack, page):
@@ -255,7 +275,7 @@ def test_reconnect_backoff_survives_repeated_pre_auth_closes(stack, page):
     # A reset-on-open bug plateaus at reconnectAttempts <= 1 forever (each
     # cycle's spurious reset undoes the previous cycle's single increment).
     # The fix lets it climb past that on every full outage cycle.
-    page.wait_for_function("window.SentinelWS.reconnectAttempts >= 3", timeout=15_000)
+    wait_until_true(page, "window.SentinelWS.reconnectAttempts >= 3", timeout_ms=15_000)
     attempts_at_three = page.evaluate("window.SentinelWS.reconnectAttempts")
     assert attempts_at_three >= 3, (
         "reconnectAttempts did not grow past a pre-auth close reset -- "
