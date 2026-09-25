@@ -267,8 +267,37 @@ def test_both_deployment_paths_enforce_the_invariant_through_the_shared_helper()
     assert "check_app_flag_invariants(rep, data)" in inspect.getsource(preflight.check_kube_prereqs)
 
 
-def test_compose_verify_phase_passes_the_parsed_compose_files():
-    import inspect
+def _compose_verify_calls(monkeypatch, argv):
+    """Run the REAL parser + run() for `compose --phase verify`, recording the file
+    list each Compose runtime check actually receives (no docker involved)."""
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(preflight, "check_hostname_resolves", lambda rep, host: False)
+    for name in ("check_compose_runtime", "check_compose_legacy_auth_runtime",
+                 "check_compose_governance_runtime", "check_compose_heart_runtime"):
+        monkeypatch.setattr(
+            preflight, name,
+            lambda rep, project, env_file, files, _n=name: calls.__setitem__(_n, list(files)))
+    return calls, preflight.main(argv)
 
-    src = inspect.getsource(preflight.run)
-    assert "args.file)" not in src and "args.compose_files)" in src
+
+def test_the_compose_file_argument_really_parses_to_compose_files():
+    args = preflight.build_parser().parse_args(
+        ["compose", "--phase", "verify", "-f", "a.yml", "--compose-file", "b.yml"])
+    assert args.compose_files == ["a.yml", "b.yml"]
+    assert not hasattr(args, "file")  # the attribute the old code (wrongly) read
+
+
+def test_compose_verify_passes_the_parsed_file_list_to_every_runtime_check(monkeypatch, capsys):
+    calls, _ = _compose_verify_calls(
+        monkeypatch, ["compose", "--phase", "verify", "-f", "a.yml", "-f", "b.yml"])
+    assert set(calls) == {"check_compose_runtime", "check_compose_legacy_auth_runtime",
+                          "check_compose_governance_runtime", "check_compose_heart_runtime"}
+    assert all(files == ["a.yml", "b.yml"] for files in calls.values()), calls
+
+
+def test_compose_verify_never_reads_a_nonexistent_args_file(monkeypatch, capsys):
+    # With the old `args.file` this raised AttributeError before reaching the check.
+    try:
+        _compose_verify_calls(monkeypatch, ["compose", "--phase", "verify"])
+    except AttributeError as exc:  # pragma: no cover - the regression being guarded
+        pytest.fail(f"compose verify raised AttributeError: {exc}")

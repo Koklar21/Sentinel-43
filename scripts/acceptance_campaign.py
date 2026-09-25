@@ -168,6 +168,26 @@ def check_command(name: str) -> list[str]:
     return GATE[:0] + [sys.executable, str(ROOT / "scripts" / "acceptance_campaign.py"), "check", name]
 
 
+COMPOSE_VALIDATION_PEPPER_PREFIX = "ci-compose-validation-only-NOT-A-SECRET-"
+
+
+def compose_validation_env() -> dict:
+    """Environment for `docker compose config` ONLY.
+
+    Compose files require S43_SESSION_HASH_PEPPER (``${VAR:?...}``) and `config -q`
+    interpolates it, so validating the files needs *a* value. It gets a fresh,
+    ephemeral, unmistakably non-production one, handed to that one child process and
+    never exported, written, or reused: `config` renders the file and starts nothing.
+    A value already present in the caller's environment is left alone. The
+    requirement itself is not weakened -- the compose files still refuse to start
+    without it, and nothing here reaches a real deployment.
+    """
+    env = os.environ.copy()
+    if not env.get("S43_SESSION_HASH_PEPPER"):
+        env["S43_SESSION_HASH_PEPPER"] = COMPOSE_VALIDATION_PEPPER_PREFIX + secrets.token_hex(16)
+    return env
+
+
 def do_check(name: str) -> int:
     """Body of a required non-pytest check. Exit code is the check verdict."""
     rendered = []
@@ -178,7 +198,7 @@ def do_check(name: str) -> int:
             cmd = ["docker", "compose", "--env-file", ".env.example"]
             for f in files:
                 cmd += ["-f", f]
-            r = run(cmd + ["config", "-q"], capture_output=True, text=True)
+            r = run(cmd + ["config", "-q"], capture_output=True, text=True, env=compose_validation_env())
             print(files, "rc", r.returncode, r.stderr[-500:])
             rc |= r.returncode
         return rc
