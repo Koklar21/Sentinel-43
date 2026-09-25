@@ -79,6 +79,10 @@ jobs:
         run: pip install pyyaml
 
       - name: Validate Compose files
+        # `docker compose config` requires S43_SESSION_HASH_PEPPER to interpolate.
+        # The check supplies a fresh, ephemeral, clearly non-production placeholder
+        # (prefix "ci-compose-validation-only-NOT-A-SECRET-") to that one command
+        # only; no secret store is read and nothing is deployed or started.
         run: python scripts/acceptance_campaign.py check compose
 
       - name: Render and validate every overlay

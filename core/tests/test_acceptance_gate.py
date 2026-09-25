@@ -638,3 +638,39 @@ def test_manifest_entries_that_look_like_pytest_options_are_refused(tmp_path, fi
     # the run itself must be refused, not merely reported afterwards
     run = _run(root, out, "run-job", "unit", "--out", str(out))
     assert run.returncode != 0 and "not options" in run.stderr + run.stdout
+
+
+# ------------------------------------------ compose validation secret hygiene
+def _campaign():
+    import importlib
+
+    sys.path.insert(0, str(REPO / "scripts"))
+    try:
+        return importlib.import_module("acceptance_campaign")
+    finally:
+        sys.path.remove(str(REPO / "scripts"))
+
+
+def test_compose_validation_gets_an_ephemeral_clearly_non_production_pepper(monkeypatch):
+    campaign = _campaign()
+    monkeypatch.delenv("S43_SESSION_HASH_PEPPER", raising=False)
+    first = campaign.compose_validation_env()["S43_SESSION_HASH_PEPPER"]
+    second = campaign.compose_validation_env()["S43_SESSION_HASH_PEPPER"]
+    assert first.startswith(campaign.COMPOSE_VALIDATION_PEPPER_PREFIX) and "NOT-A-SECRET" in first
+    assert first != second  # fresh each time, never a fixed value
+    assert "S43_SESSION_HASH_PEPPER" not in os.environ  # not exported to anything else
+
+
+def test_compose_validation_never_overrides_a_value_the_caller_already_has(monkeypatch):
+    campaign = _campaign()
+    monkeypatch.setenv("S43_SESSION_HASH_PEPPER", "caller-value")
+    assert campaign.compose_validation_env()["S43_SESSION_HASH_PEPPER"] == "caller-value"
+
+
+def test_the_pepper_requirement_is_not_weakened_and_only_config_gets_the_placeholder():
+    for name in ("docker-compose.yml",):
+        text = (REPO / name).read_text(encoding="utf-8")
+        assert "${S43_SESSION_HASH_PEPPER:?" in text  # still refuses to start without it
+    src = (REPO / "scripts" / "acceptance_campaign.py").read_text(encoding="utf-8")
+    assert src.count("env=compose_validation_env()") == 1  # only the `config -q` validation call
+    assert 'cmd + ["config", "-q"]' in src
