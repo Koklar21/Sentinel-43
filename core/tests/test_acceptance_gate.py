@@ -674,3 +674,124 @@ def test_the_pepper_requirement_is_not_weakened_and_only_config_gets_the_placeho
     src = (REPO / "scripts" / "acceptance_campaign.py").read_text(encoding="utf-8")
     assert src.count("env=compose_validation_env()") == 1  # only the `config -q` validation call
     assert 'cmd + ["config", "-q"]' in src
+
+
+# ------------------------------- interpreter-profile node-ID reconciliation (hosted CI)
+# pytest-playwright (browser venv only) parametrizes node IDs "...::test[chromium]"; the
+# main interpreter reports the same test as "...::test". The hosted gate collected the
+# browser profile's whole tree under the MAIN interpreter, so the IDs never reconciled.
+# The fix is to collect each profile with its own interpreter -- never to strip suffixes.
+PARAM_CONFTEST = chr(10).join([
+    "import os",
+    "def pytest_generate_tests(metafunc):",
+    "    if os.environ.get('PARAMS_ON') and 'flavour' in metafunc.fixturenames:",
+    "        metafunc.parametrize('flavour', ['chromium', 'firefox'])",
+    "",
+])
+PARAM_FLOW = chr(10).join([
+    "import pytest",
+    "@pytest.fixture",
+    "def flavour():",
+    "    return 'plain'",
+    "def test_flow(flavour):",
+    "    assert flavour",
+    "",
+])
+PARAM_FILES = dict(TARGET_FILES, **{"browser_tests/conftest.py": PARAM_CONFTEST, "browser_tests/test_flow.py": PARAM_FLOW})
+
+
+def _param_stack(tmp: Path, monkeypatch, *, whole_tree_env: bool) -> tuple[Path, Path]:
+    """Job runs with parametrization on. whole_tree_env=False models the hosted bug (the
+    profile's whole-tree collection did NOT see the parametrizing plugin)."""
+    root, out, _ = build(tmp, PARAM_FILES, manifest=BROWSER_MANIFEST, ini="[pytest]" + chr(10))
+    manifest = json.loads((root / "acceptance" / "suites.json").read_text(encoding="utf-8"))
+    manifest["jobs"]["browser-disposable"].update(env={"PARAMS_ON": "1"}, requires_env=[])  # _run() strips S43_*
+    (root / "acceptance" / "suites.json").write_text(json.dumps(manifest), encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "params")
+    for step in (["inventory", "--out", str(out)], ["inventory-all", "--out", str(out)]):
+        if whole_tree_env:
+            monkeypatch.setenv("PARAMS_ON", "1")
+        else:
+            monkeypatch.delenv("PARAMS_ON", raising=False)
+        _run(root, out, *step)
+    monkeypatch.delenv("PARAMS_ON", raising=False)
+    _run(root, out, "run-job", "unit", "--out", str(out))
+    _run(root, out, "run-job", "browser-target", "--out", str(out))
+    _run(root, out, "run-check", "--out", str(out), "lint", "--", sys.executable, "-c", "pass", "mycheck")
+    _run(root, out, "run-job", "browser-disposable", "--out", str(out))
+    return root, out
+
+
+def test_a_profile_collected_by_the_wrong_interpreter_is_still_reported(tmp_path, monkeypatch):
+    root, out = _param_stack(tmp_path, monkeypatch, whole_tree_env=False)
+    ok, text = verify(root, out, "pr-ci")
+    assert not ok
+    assert "does not report" in text and "NO executed required path" in text
+    assert "a job executed a test no whole-tree profile ever saw" in text  # nothing was hidden or stripped
+
+
+def test_parametrized_ids_reconcile_exactly_when_the_profile_uses_one_interpreter(tmp_path, monkeypatch):
+    root, out = _param_stack(tmp_path, monkeypatch, whole_tree_env=True)
+    verdict_ok, text = verify(root, out, "pr-ci")
+    cov = json.loads((out / "coverage_map.json").read_text(encoding="utf-8"))["tests"]
+    ids = {t for t in cov if t.startswith("browser_tests/")}
+    assert ids == {"browser_tests/test_flow.py::test_flow[chromium]",
+                   "browser_tests/test_flow.py::test_flow[firefox]"}  # distinct, not collapsed
+    assert verdict_ok, text
+
+
+def test_a_missing_parametrization_is_not_masked_by_its_sibling(tmp_path, monkeypatch):
+    root, out = _param_stack(tmp_path, monkeypatch, whole_tree_env=True)
+    for name in ("browser-disposable.results.json",):
+        res = out / "jobs" / name
+        edit_json(res, lambda d: (d["results"].pop("browser_tests/test_flow.py::test_flow[firefox]"),
+                                  d.__setitem__("collected", [i for i in d["collected"] if "[firefox]" not in i])))
+    ok, text = verify(root, out, "pr-ci")
+    assert not ok  # firefox never executed: the passing chromium sibling must not stand in for it
+
+
+def test_inventory_all_can_be_limited_to_one_profile_and_rejects_unknown_ones(tmp_path):
+    root, out, _ = build(tmp_path, BROWSER_FILES, manifest=BROWSER_MANIFEST, ini="[pytest]" + chr(10))
+    for f in (out / "inventory").glob("_all-*"):
+        f.unlink()
+    r = _run(root, out, "inventory-all", "--out", str(out), "--profile", "main")
+    assert r.returncode == 0
+    assert (out / "inventory" / "_all-main.json").exists() and not (out / "inventory" / "_all-browser.json").exists()
+    bad = _run(root, out, "inventory-all", "--out", str(out), "--profile", "nope")
+    assert bad.returncode != 0 and "unknown interpreter profile" in bad.stderr + bad.stdout
+    ok, text = verify(root, out, "pr-ci")  # verify still demands every profile
+    assert not ok and "whole-tree inventory missing/incomplete for profile(s): ['browser']" in text
+
+
+def test_the_real_repo_refuses_to_run_the_browser_profile_under_the_main_interpreter(tmp_path, monkeypatch):
+    sys.path.insert(0, str(REPO / "scripts"))
+    try:
+        import importlib
+        monkeypatch.delenv("S43_ACC_ROOT", raising=False)
+        monkeypatch.delenv("S43_BROWSER_PYTHON", raising=False)
+        gate = importlib.import_module("acceptance_gate")
+        monkeypatch.setattr(gate, "ROOT", tmp_path)
+        monkeypatch.setattr(gate, "REPO_ROOT", tmp_path)  # "evaluating the repository itself", with no browser venv
+        with pytest.raises(SystemExit, match="browser profile needs its own interpreter"):
+            gate.python_for({"python": "browser"})
+        assert gate.python_for({"python": "main"}) == sys.executable
+        monkeypatch.setenv("S43_BROWSER_PYTHON", "/explicit/python")
+        assert gate.python_for({"python": "browser"}) == "/explicit/python"
+    finally:
+        sys.path.remove(str(REPO / "scripts"))
+
+
+def test_the_workflow_collects_each_profile_with_its_own_interpreter():
+    import yaml
+
+    jobs = yaml.safe_load((REPO / ".github" / "workflows" / "k8s.yml").read_text(encoding="utf-8"))["jobs"]
+
+    def steps(job):
+        return [st for st in jobs[job]["steps"] if "inventory-all" in st.get("run", "")]
+
+    (main_step,) = steps("test")
+    assert "inventory-all --out acceptance_out --profile main" in main_step["run"]
+    (browser_step,) = steps("browser-smoke")
+    assert "inventory-all --out acceptance_out --profile browser" in browser_step["run"]
+    assert browser_step["env"]["S43_BROWSER_PYTHON"].endswith(".venv-browser/bin/python")

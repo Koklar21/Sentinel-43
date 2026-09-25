@@ -130,7 +130,10 @@ jobs:
       - name: Record the test inventory before execution
         run: |
           python scripts/acceptance_gate.py inventory --out acceptance_out --job core-isolated --job core-live
-          python scripts/acceptance_gate.py inventory-all --out acceptance_out
+          # Only the interpreter this job has. The "browser" profile must be collected by
+          # the browser venv (pytest-playwright adds "[chromium]" to node IDs), which is
+          # done in the browser-smoke job below; verify requires BOTH profiles.
+          python scripts/acceptance_gate.py inventory-all --out acceptance_out --profile main
       - name: Isolated application and security tests
         # Live tests run in the next required step against real processes.
         run: python scripts/acceptance_gate.py run-job core-isolated --out acceptance_out
@@ -245,7 +248,9 @@ jobs:
       - name: Record the browser test inventory before execution
         env:
           S43_BROWSER_PYTHON: .venv-browser/bin/python
-        run: python scripts/acceptance_gate.py inventory --out acceptance_out --job browser-disposable --job browser-target
+        run: |
+          python scripts/acceptance_gate.py inventory --out acceptance_out --job browser-disposable --job browser-target
+          python scripts/acceptance_gate.py inventory-all --out acceptance_out --profile browser
       - name: Run the browser SPA smoke against a disposable HTTPS stack
         env:
           S43_BROWSER_PYTHON: .venv-browser/bin/python
