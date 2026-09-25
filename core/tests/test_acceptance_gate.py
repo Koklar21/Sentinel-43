@@ -4,7 +4,7 @@
 #
 # Each scenario builds a small synthetic project, runs the REAL pipeline
 # (inventory -> inventory-all -> run-job -> run-check -> verify) through the gate
-# CLI, and asserts that verify refuses to produce ACCEPTANCE PASS -- for
+# CLI, and asserts that verify refuses to produce a PASS -- for
 # skip/xfail/xpass/errors/collection problems/config-level deselection or
 # omission -- or, for the tampering scenarios, that a doctored copy of an
 # otherwise-good evidence directory is rejected.
@@ -75,7 +75,7 @@ def build(tmp: Path, files: dict[str, str], *, ini: str | None = None, manifest:
     _run(root, out, "run-job", "unit", "--out", str(out))
     if run_check:
         _run(root, out, "run-check", "--out", str(out), "lint", "--", sys.executable, "-c", "pass", "mycheck")
-    return root, out, _run(root, out, "verify", "--out", str(out))
+    return root, out, _run(root, out, "verify", "--out", str(out), "--mode", "final-beta")
 
 
 @pytest.fixture(scope="module")
@@ -92,8 +92,8 @@ def clone(good, tmp_path: Path) -> tuple[Path, Path]:
     return root, out
 
 
-def verify(root: Path, out: Path) -> tuple[bool, str]:
-    r = _run(root, out, "verify", "--out", str(out))
+def verify(root: Path, out: Path, mode: str = "final-beta") -> tuple[bool, str]:
+    r = _run(root, out, "verify", "--out", str(out), "--mode", mode)
     return r.returncode == 0, r.stdout + r.stderr
 
 
@@ -114,7 +114,8 @@ def rebind(out: Path) -> None:
 def test_baseline_passes_and_reports_unique_vs_executions(good):
     root, out = good
     verdict = json.loads((out / "verdict.json").read_text(encoding="utf-8"))
-    assert verdict["verdict"] == "ACCEPTANCE PASS"
+    assert verdict["verdict"] == "FINAL-BETA ACCEPTANCE PASS"
+    assert verdict["mode"] == "final-beta" and verdict["final_beta_acceptance"] == "PASS"
     assert verdict["unique_tests_collected"] == verdict["unique_tests_qualified"] == 3
     assert verdict["total_test_executions"] == 3
 
@@ -145,7 +146,7 @@ def test_baseline_passes_and_reports_unique_vs_executions(good):
 def test_bad_runs_never_pass(tmp_path, name, files, ini, needle):
     root, out, result = build(tmp_path, files, ini=ini)
     assert result.returncode != 0, f"{name} produced a PASS:\n{result.stdout}"
-    assert "ACCEPTANCE FAIL" in result.stdout
+    assert "FINAL-BETA ACCEPTANCE FAIL" in result.stdout
     assert needle.lower() in (result.stdout + result.stderr).lower(), (name, result.stdout[-1500:])
 
 
@@ -368,3 +369,182 @@ def test_recorder_flags_real_duplicate_node_ids(tmp_path):
     data = json.loads(report.read_text(encoding="utf-8"))
     assert proc.returncode != 0
     assert data["duplicate_ids"] and any("duplicated" in v for v in data["violations"])
+
+
+# ===================================================================== modes
+# `verify --mode pr-ci` verifies only what ordinary PR CI owns; `--mode final-beta`
+# is the strict complete gate. The mode is explicit and required, and a PR-CI
+# verdict can never stand in for a final-beta one.
+TARGET_FILES = dict(GOOD, **{"target_tests/test_t.py": "def test_target():\n    assert True\n"})
+TARGET_MANIFEST = json.loads(json.dumps(MANIFEST))
+TARGET_MANIFEST["jobs"]["browser-target"] = {
+    "kind": "pytest", "python": "main", "paths": ["target_tests"], "ignore": [], "env": {},
+    "requires_env": ["S43_TARGET_BASE_URL"],
+}
+
+
+def build_pr_ci(tmp: Path, files: dict[str, str] | None = None, *, ini: str | None = None,
+                mark_unmet: bool = False) -> tuple[Path, Path]:
+    """PR CI's real situation: everything it owns ran; browser-target could not (no target)."""
+    root, out, _ = build(tmp, files or TARGET_FILES, ini=ini, manifest=TARGET_MANIFEST)
+    if mark_unmet:
+        _run(root, out, "mark-unmet", "browser-target", "--out", str(out), "--reason", "no target")
+    return root, out
+
+
+@pytest.fixture(scope="module")
+def pr_ci_good(tmp_path_factory):
+    root, out = build_pr_ci(tmp_path_factory.mktemp("prci"))
+    ok, text = verify(root, out, "pr-ci")
+    assert ok, text
+    return root, out
+
+
+def verdict_of(out: Path) -> dict:
+    return json.loads((out / "verdict.json").read_text(encoding="utf-8"))
+
+
+def test_pr_ci_passes_without_target_and_says_target_acceptance_was_not_performed(pr_ci_good):
+    root, out = pr_ci_good
+    v = verdict_of(out)
+    assert v["verdict"] == "PR-CI PASS" and v["mode"] == "pr-ci"
+    assert v["final_beta_acceptance"] == "NOT PERFORMED IN PR CI"
+    assert v["not_performed"] == ["browser-target"]
+    row = next(r for r in v["jobs"] if r["job"] == "browser-target")
+    assert row["status"] == "NOT PERFORMED IN PR CI" and row["status"] != "PASS"
+    assert "FINAL-BETA" not in v["verdict"]
+    md = (out / "verdict.md").read_text(encoding="utf-8")
+    assert "NOT PERFORMED IN PR CI" in md and "FINAL-BETA ACCEPTANCE PASS" not in md
+
+
+def test_final_beta_on_the_same_evidence_fails_because_browser_target_is_unmet(pr_ci_good, tmp_path):
+    root, out = clone(pr_ci_good, tmp_path)
+    ok, text = verify(root, out, "final-beta")
+    assert not ok and "FINAL-BETA ACCEPTANCE FAIL" in text
+    v = verdict_of(out)
+    assert v["mode"] == "final-beta" and v["final_beta_acceptance"] == "FAIL" and v["not_performed"] == []
+    assert any(f.startswith("browser-target:") for f in v["failures"] + v["env_unmet"])
+
+
+def test_final_beta_fails_when_browser_target_marked_unmet(tmp_path):
+    root, out = build_pr_ci(tmp_path, mark_unmet=True)
+    ok, text = verify(root, out, "final-beta")
+    assert not ok and "ENV-UNMET" in text and "no target" in text
+
+
+def test_final_beta_fails_when_any_required_job_is_unexecuted(pr_ci_good, tmp_path):
+    root, out = clone(pr_ci_good, tmp_path)
+    (out / "jobs" / "unit.meta.json").unlink()
+    ok, text = verify(root, out, "final-beta")
+    assert not ok and "never ran" in text
+
+
+def test_verify_requires_an_explicit_mode(pr_ci_good, tmp_path):
+    root, out = clone(pr_ci_good, tmp_path)
+    r = _run(root, out, "verify", "--out", str(out))
+    assert r.returncode != 0 and "--mode" in r.stderr
+    bogus = _run(root, out, "verify", "--out", str(out), "--mode", "auto")
+    assert bogus.returncode != 0
+
+
+def test_green_browser_target_evidence_does_not_turn_pr_ci_into_final_beta(pr_ci_good, tmp_path):
+    root, out = clone(pr_ci_good, tmp_path)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("S43_")}
+    env.update(S43_ACC_ROOT=str(root), S43_TARGET_BASE_URL="http://target.invalid")
+    subprocess.run([sys.executable, str(GATE), "run-job", "browser-target", "--out", str(out)],
+                   cwd=root, env=env, capture_output=True, text=True)
+    ok, _ = verify(root, out, "pr-ci")
+    v = verdict_of(out)
+    assert ok and v["verdict"] == "PR-CI PASS" and v["final_beta_acceptance"] == "NOT PERFORMED IN PR CI"
+    row = next(r for r in v["jobs"] if r["job"] == "browser-target")
+    assert row["status"] == "NOT PERFORMED IN PR CI"
+
+
+def test_pr_ci_pass_artifact_is_replaced_never_reused_by_a_failing_final_beta_verify(pr_ci_good, tmp_path):
+    root, out = clone(pr_ci_good, tmp_path)
+    assert verify(root, out, "pr-ci")[0] and verdict_of(out)["verdict"] == "PR-CI PASS"
+    ok, _ = verify(root, out, "final-beta")
+    assert not ok
+    v = verdict_of(out)
+    assert v["verdict"] == "FINAL-BETA ACCEPTANCE FAIL"
+    assert "PR-CI PASS" not in (out / "verdict.md").read_text(encoding="utf-8")
+
+
+def test_a_failed_verify_never_leaves_an_earlier_pass_verdict_behind(pr_ci_good, tmp_path):
+    root, out = clone(pr_ci_good, tmp_path)
+    assert verify(root, out, "pr-ci")[0]
+    (out / "jobs" / "unit.results.json").write_text("{}", encoding="utf-8")
+    ok, _ = verify(root, out, "pr-ci")
+    assert not ok and verdict_of(out)["verdict"] == "PR-CI FAIL"
+
+
+def test_pr_ci_exemption_is_a_closed_code_level_set():
+    sys.path.insert(0, str(REPO / "scripts"))
+    try:
+        import importlib
+        os.environ.pop("S43_ACC_ROOT", None)
+        gate = importlib.import_module("acceptance_gate")
+        assert gate.PR_CI_NOT_PERFORMED == frozenset({"browser-target"})
+        assert gate.PR_CI_NOT_PERFORMED <= gate.MINIMUM_REQUIRED_JOBS
+        trimmed = json.loads(json.dumps(gate.load_manifest()))
+        trimmed["jobs"].pop("browser-target")
+        assert any("browser-target" in e for e in gate.manifest_errors(trimmed))  # floor holds in both modes
+        with pytest.raises(ValueError):
+            gate.verify_evidence(Path("."), mode="", write=False)
+    finally:
+        sys.path.remove(str(REPO / "scripts"))
+
+
+def _own(body: str) -> dict:
+    return dict(TARGET_FILES, **{"tests/test_a.py": body})
+
+
+# PR-CI is not a weaker gate for the work it owns: every hostile scenario still fails it.
+@pytest.mark.parametrize("name,files,ini,needle", [
+    ("skip", _own("import pytest\n@pytest.mark.skip(reason='r')\ndef test_one(): pass\ndef test_two(): pass\n"), None, "SKIPPED"),
+    ("xfail", _own("import pytest\n@pytest.mark.xfail\ndef test_one(): assert 0\ndef test_two(): pass\n"), None, "XFAILED"),
+    ("xpass", _own("import pytest\n@pytest.mark.xfail\ndef test_one(): pass\ndef test_two(): pass\n"), None, "XPASSED"),
+    ("failing", _own("def test_one(): assert 0\ndef test_two(): pass\n"), None, "FAILED"),
+    ("deselect", TARGET_FILES, "[pytest]\naddopts = -k test_one\n", "deselected"),
+    ("omitted-file", dict(TARGET_FILES, **{"extra/test_c.py": "def test_c(): pass\n"}), None, "omitted from every required job"),
+    ("ignored-file", TARGET_FILES, "[pytest]\naddopts = --ignore=tests/test_b.py\n", "yielded no passing test"),
+])
+def test_pr_ci_still_rejects_every_owned_defect(tmp_path, name, files, ini, needle):
+    root, out = build_pr_ci(tmp_path, files, ini=ini)
+    ok, text = verify(root, out, "pr-ci")
+    assert not ok, f"{name} passed PR-CI:\n{text}"
+    assert "PR-CI FAIL" in text and needle.lower() in text.lower(), (name, text[-1500:])
+
+
+def test_pr_ci_fails_when_an_owned_check_was_never_recorded(tmp_path):
+    root, out = build_pr_ci(tmp_path)
+    (out / "jobs" / "lint.meta.json").unlink()
+    ok, text = verify(root, out, "pr-ci")
+    assert not ok and "lint" in text
+
+
+@pytest.mark.parametrize("tamper,needle", [
+    ("missing-results", "PR-CI FAIL"),
+    ("garbage-results", "incomplete"),
+    ("hand-edited", "sha256 mismatch"),
+    ("other-commit", "does not match the current"),
+    ("stale", "stale"),
+    ("manifest-changed", "different acceptance/suites.json"),
+])
+def test_pr_ci_rejects_missing_tampered_stale_and_mismatched_evidence(pr_ci_good, tmp_path, tamper, needle):
+    root, out = clone(pr_ci_good, tmp_path)
+    res = out / "jobs" / "unit.results.json"
+    if tamper == "missing-results":
+        res.unlink()
+    elif tamper == "garbage-results":
+        res.write_text("not json", encoding="utf-8")
+    elif tamper == "hand-edited":
+        edit_json(res, lambda d: d.update(tampered=True))
+    elif tamper == "other-commit":
+        (root / "tests" / "test_a.py").write_text("def test_one(): pass\ndef test_two(): pass\n# drift\n", encoding="utf-8")
+    elif tamper == "stale":
+        edit_json(out / "jobs" / "unit.meta.json", lambda m: m.update(started=1.0, finished=2.0))
+    elif tamper == "manifest-changed":
+        edit_json(root / "acceptance" / "suites.json", lambda m: m.update(_note="edited after the run"))
+    ok, text = verify(root, out, "pr-ci")
+    assert not ok and "PR-CI FAIL" in text and needle.lower() in text.lower(), (tamper, text[-1200:])

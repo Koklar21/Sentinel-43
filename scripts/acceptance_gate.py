@@ -4,7 +4,7 @@
 Acceptance rule: every collected test executes and PASSES or FAILS. Any skip,
 xfail, xpass, collection/setup error, deselection, missing dependency, missing
 required environment, unexecuted required job, or missing/incomplete result
-artifact makes the overall result ACCEPTANCE FAIL. A job's own exit status is
+artifact makes the overall result a FAIL (FINAL-BETA ACCEPTANCE FAIL / PR-CI FAIL). A job's own exit status is
 never sufficient on its own: ``verify`` re-derives the verdict from the
 machine-readable per-test-ID reports and reconciles them against an inventory
 recorded before execution.
@@ -18,9 +18,17 @@ Sub-commands (all read ``acceptance/suites.json``):
   mark-unmet JOB --out DIR --reason R  record a required job that cannot run
   record-ci  JOB --out DIR --result R  record a CI job's conclusion for a required check
   revision   --out DIR                 write revision.json (host side of a container run)
-  verify     --out DIR                 reconcile everything, write the verdict
+  verify     --out DIR --mode M        reconcile everything, write the verdict.
+                                       --mode is REQUIRED (there is no default):
+                                       final-beta = the strict, complete gate;
+                                       pr-ci      = only the work ordinary PR CI owns
+                                                    (see PR_CI_NOT_PERFORMED)
 
-Exit codes: 0 ACCEPTANCE PASS, 1 ACCEPTANCE FAIL (or a job failed), 3 job
+Verdicts are scoped by mode: ``FINAL-BETA ACCEPTANCE PASS/FAIL`` and ``PR-CI
+PASS/FAIL``. A PR-CI PASS never means final beta acceptance passed: it records
+deployed-target acceptance as ``NOT PERFORMED IN PR CI``.
+
+Exit codes: 0 PASS (of the requested mode), 1 FAIL (or a job failed), 3 job
 environment prerequisite unmet (run-job only).
 """
 
@@ -290,6 +298,13 @@ MINIMUM_REQUIRED_JOBS = frozenset({
     "browser-disposable", "browser-target", "check-compose-config", "check-k8s-policy",
     "check-kubeconform", "check-image-scan", "check-kind-smoke",
 })
+# Jobs ordinary PR CI cannot own because it provisions no authorized deployed
+# target or target credentials. Like MINIMUM_REQUIRED_JOBS this lives in reviewed
+# CODE, not the manifest, so the manifest cannot widen the exemption. Only
+# ``verify --mode pr-ci`` consults it; final-beta ignores it entirely.
+PR_CI_NOT_PERFORMED = frozenset({"browser-target"})
+MODES = {"pr-ci": "PR-CI", "final-beta": "FINAL-BETA ACCEPTANCE"}
+NOT_PERFORMED_STATUS = "NOT PERFORMED IN PR CI"
 _JOB_KEYS = {"kind", "python", "description", "paths", "ignore", "env", "forbid_env", "requires_env", "evidence"}
 _OUTCOMES = {"passed", "failed", "skipped", "xfailed", "xpassed", "error", "not_run"}
 MAX_AGE_SECONDS = 48 * 3600
@@ -444,9 +459,15 @@ def check_check_job(name, job, meta, bad):
         bad("recorded command is not the prescribed check")
 
 
-def verify_evidence(out: Path, *, current: dict | None = None, now: float | None = None,
+def verify_evidence(out: Path, *, mode: str, current: dict | None = None, now: float | None = None,
                     write: bool = True) -> dict:
+    if mode not in MODES:  # no default: an unselected/unknown mode must never be guessed
+        raise ValueError(f"verification mode must be one of {sorted(MODES)}, got {mode!r}")
     manifest = load_manifest()
+    not_performed = PR_CI_NOT_PERFORMED if mode == "pr-ci" else frozenset()
+    if write:  # a stale verdict from an earlier run/mode must never survive a failed verify
+        for stale in ("verdict.json", "verdict.md", "coverage_map.json"):
+            (out / stale).unlink(missing_ok=True)
     manifest_sha = sha256_file(MANIFEST)
     now = time.time() if now is None else now
     current = current or revision()
@@ -459,6 +480,12 @@ def verify_evidence(out: Path, *, current: dict | None = None, now: float | None
     for name, job in manifest["jobs"].items():
         row = {"job": name, "kind": job.get("kind"), "status": "PASS", "why": [], "counts": {}}
         rows.append(row)
+        if name in not_performed:
+            # Deliberately not evaluated: a PR-CI verdict must not claim this job, so any
+            # evidence for it (even a green one) is neither read nor counted.
+            row["status"] = NOT_PERFORMED_STATUS
+            row["why"].append("deployed-target acceptance is not performed in PR CI")
+            continue
 
         def bad(msg, kind="fail", _row=row, _name=name):
             _row["status"] = "ENV-UNMET" if kind == "env" and _row["status"] != "FAIL" else "FAIL"
@@ -495,6 +522,14 @@ def verify_evidence(out: Path, *, current: dict | None = None, now: float | None
     # pytest-playwright parametrizes by browser name). A test ID counts as seen by
     # the whole-tree collection if ANY profile reports it.
     coverage: dict[str, dict] = {}
+    performed_jobs = [j for n, j in manifest["jobs"].items() if n not in not_performed and j.get("kind") == "pytest"]
+    deferred_jobs = [j for n, j in manifest["jobs"].items() if n in not_performed and j.get("kind") == "pytest"]
+
+    def deferred(tid: str) -> bool:
+        """True when the ONLY jobs covering this test are ones PR CI does not perform."""
+        rel = tid.split("::")[0]
+        return (any(covered(rel, j) for j in deferred_jobs)
+                and not any(covered(rel, j) for j in performed_jobs))
     profiles = python_profiles(manifest)
     all_invs = {p: read_json(out / "inventory" / f"_all-{p}.json") for p in profiles}
     missing_profiles = [p for p, d in all_invs.items() if not isinstance(d, dict) or d.get("complete") is not True]
@@ -521,6 +556,8 @@ def verify_evidence(out: Path, *, current: dict | None = None, now: float | None
                 failures.append(f"{name}: collected {len(leaked)} ID(s) its own profile's whole-tree "
                                 f"collection does not report, e.g. {sorted(leaked)[:2]}")
         for tid in sorted(whole_ids):
+            if deferred(tid):
+                continue
             jobs_for = per_id_jobs.get(tid, {})
             coverage[tid] = {"jobs": sorted(jobs_for), "outcomes": jobs_for}
             if not jobs_for:
@@ -531,7 +568,7 @@ def verify_evidence(out: Path, *, current: dict | None = None, now: float | None
             failures.append(f"a job executed a test no whole-tree profile ever saw: {tid}")
 
     executed_files = {tid.split("::")[0] for tid, c in coverage.items() if any(o == "passed" for o in c["outcomes"].values())}
-    for f in sorted(test_files(manifest) - executed_files):
+    for f in sorted(f for f in test_files(manifest) - executed_files if not deferred(f + "::")):
         failures.append(f"test file yielded no passing test in any job (ignored/deselected by configuration?): {f}")
     pytest_jobs = [j for j in manifest["jobs"].values() if j.get("kind") == "pytest"]
     uncovered = sorted(f for f in test_files(manifest) if not any(covered(f, j) for j in pytest_jobs))
@@ -557,8 +594,13 @@ def verify_evidence(out: Path, *, current: dict | None = None, now: float | None
         for o in r.values():
             outcome_totals[o] = outcome_totals.get(o, 0) + 1
     passed_all = not failures and not env_unmet
+    label = MODES[mode]
     verdict = {
-        "verdict": "ACCEPTANCE PASS" if passed_all else "ACCEPTANCE FAIL",
+        "verdict": f"{label} PASS" if passed_all else f"{label} FAIL",
+        "mode": mode,
+        "final_beta_acceptance": ("PASS" if passed_all else "FAIL") if mode == "final-beta"
+                                 else NOT_PERFORMED_STATUS,
+        "not_performed": sorted(not_performed),
         "revision": current,
         "unique_tests_collected": len(coverage),
         "unique_tests_qualified": unique_qualified,
@@ -571,6 +613,8 @@ def verify_evidence(out: Path, *, current: dict | None = None, now: float | None
         write_json(out / "verdict.json", verdict)
         write_json(out / "coverage_map.json", {"revision": current, "tests": coverage})
         lines = [f"# {verdict['verdict']}", "",
+                 f"mode: `{mode}`; final beta acceptance: **{verdict['final_beta_acceptance']}**"
+                 + (f" (not performed: {', '.join(sorted(not_performed))})" if not_performed else ""), "",
                  f"revision `{current['head']}` (branch {current['branch']}), tree fingerprint "
                  f"`{current['tree_fingerprint'][:16]}`, {len(current['dirty_files'])} uncommitted file(s)", "",
                  f"UNIQUE tests collected: {verdict['unique_tests_collected']}; UNIQUE tests qualified "
@@ -588,12 +632,12 @@ def verify_evidence(out: Path, *, current: dict | None = None, now: float | None
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
-    verdict = verify_evidence(Path(args.out))
+    verdict = verify_evidence(Path(args.out), mode=args.mode)
     print((Path(args.out) / "verdict.md").read_text(encoding="utf-8"))
     if verdict["failures"] or verdict["env_unmet"]:
         print(f"\n{len(verdict['failures'])} failure(s), {len(verdict['env_unmet'])} unmet prerequisite(s)",
               file=sys.stderr)
-    return 0 if verdict["verdict"] == "ACCEPTANCE PASS" else 1
+    return 0 if verdict["verdict"].endswith(" PASS") else 1
 
 
 def main() -> int:
@@ -612,7 +656,8 @@ def main() -> int:
     p.add_argument("--result", required=True); p.set_defaults(fn=cmd_record_ci)
     p = sub.add_parser("revision"); p.add_argument("--out", required=True)
     p.set_defaults(fn=lambda a: write_json(Path(a.out) / "revision.json", revision()) or 0)
-    p = sub.add_parser("verify"); p.add_argument("--out", required=True); p.set_defaults(fn=cmd_verify)
+    p = sub.add_parser("verify"); p.add_argument("--out", required=True)
+    p.add_argument("--mode", required=True, choices=sorted(MODES)); p.set_defaults(fn=cmd_verify)
     args = ap.parse_args()
     if getattr(args, "command", None) and args.command[:1] == ["--"]:
         args.command = args.command[1:]

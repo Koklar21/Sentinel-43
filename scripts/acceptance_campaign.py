@@ -273,7 +273,7 @@ def main() -> int:
         gate("run-check", "--out", out, job, "--", *check_command(name))
     gate("mark-unmet", "check-kind-smoke", "--out", out,
          "--reason", "kind + Calico smoke deploy needs a hosted CI runner / kind binary; none available locally")
-    return gate("verify", "--out", out)
+    return gate("verify", "--out", out, "--mode", "final-beta")
 
 
 if __name__ == "__main__":
