@@ -100,6 +100,10 @@ PLACEHOLDER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# S43_OPERATOR_PASSWORD_HASH is listed so it is always examined, but it is
+# not required: the break-glass login it belongs to is refused outside
+# local/dev/test. It may be absent; if present it must be well-formed,
+# because the API refuses to start outside local on a malformed one.
 REQUIRED_SECRETS = [
     "S43_JWT_SECRET", "S43_AUTH_PEPPER", "S43_SESSION_HASH_PEPPER",
     "SENTINEL_LOG_SALT",
@@ -659,6 +663,11 @@ def check_compose_config(rep: Report, env_file: str, hostname: str,
     for key in REQUIRED_SECRETS:
         val = env.get(key, "")
         if key == "S43_OPERATOR_PASSWORD_HASH":
+            if not val:
+                rep.record(PASS, f"{key} not needed for a non-local target",
+                           "absent; the break-glass login is refused outside "
+                           "local/dev/test")
+                continue
             status, detail = operator_hash_status(val)
             rep.record(status, f"{key} is a well-formed Argon2id hash", detail)
             continue

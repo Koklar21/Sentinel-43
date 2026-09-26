@@ -54,7 +54,6 @@ kubectl create secret generic sentinel43-secrets -n sentinel43 \
   --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
   --from-literal=DATABASE_URL="postgresql+asyncpg://s43:${POSTGRES_PASSWORD}@s43-db:5432/s43" \
   --from-literal=S43_JWT_SECRET="$S43_JWT_SECRET" \
-  --from-literal=S43_OPERATOR_PASSWORD_HASH="$S43_OPERATOR_PASSWORD_HASH" \
   --from-literal=S43_AUTH_PEPPER="$S43_AUTH_PEPPER" \
   --from-literal=S43_SESSION_HASH_PEPPER="$S43_SESSION_HASH_PEPPER" \
   --from-literal=S43_AUDIT_HMAC_KEY="$S43_AUDIT_HMAC_KEY" \
@@ -62,7 +61,7 @@ kubectl create secret generic sentinel43-secrets -n sentinel43 \
   --from-literal=S43_WATCHTOWER_SERVICE_TOKEN="$S43_WATCHTOWER_SERVICE_TOKEN"
 ```
 
-Those nine are the **required** keys — they are exactly the non-optional
+Those eight are the **required** keys — they are exactly the non-optional
 keys in `base/secret.example.yaml`, and the API or Watchtower fails closed
 without each of them. Two were missing from this command until the
 Kubernetes parity pass and are not optional:
@@ -88,7 +87,11 @@ absent-means-disabled, and each fails closed rather than degrading:
   # Only with S43_SPARTA_ENABLED="true" in the ConfigMap. Two distinct
   # credentials; generate them independently.
   --from-literal=S43_SPARTA_NODE_TOKEN="$S43_SPARTA_NODE_TOKEN" \
-  --from-literal=S43_SPARTA_TOKEN_SECRET="$S43_SPARTA_TOKEN_SECRET"
+  --from-literal=S43_SPARTA_TOKEN_SECRET="$S43_SPARTA_TOKEN_SECRET" \
+  # Break-glass env operator: overlays/dev ONLY (SENTINEL_ENV=development).
+  # Outside local/dev/test its login is refused whatever is set, so never
+  # provision it for overlays/beta; a malformed value there refuses startup.
+  --from-literal=S43_OPERATOR_PASSWORD_HASH="$S43_OPERATOR_PASSWORD_HASH"
 ```
 
 `REDIS_PASSWORD` / `REDIS_URL` are **no longer provisioned** — there is no

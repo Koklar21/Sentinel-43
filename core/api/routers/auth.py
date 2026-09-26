@@ -19,7 +19,7 @@ Responsibilities:
     - session-bound access-token support
     - refresh rotation
     - logout / session revocation
-    - scoped break-glass authentication
+    - scoped break-glass authentication (local/dev/test only)
     - legacy-auth observability during migration
 
 This module does not own user persistence or session persistence primitives.
@@ -541,10 +541,18 @@ def _valid_argon2_hash(
 
 
 async def _env_operator_allowed() -> bool:
+    # The env-var operator is a local/dev/test break-glass only. Outside it
+    # the login is refused whatever else is configured -- armed or not, with
+    # or without an active admin, with or without a database -- because the
+    # token it would issue has no server-side session and every protected
+    # route there refuses it (legacy_auth_is_rejected).
+    if not _is_local():
+        return False
+
     if _env_bool(
         "S43_BREAK_GLASS_ARMED",
         False,
-        strict=not _is_local(),
+        strict=False,
     ):
         return True
 
@@ -1624,7 +1632,8 @@ async def login(
             session_bound=True,
         )
 
-    # Break-glass/env operator path. This intentionally remains legacy-style
+    # Break-glass/env operator path, reachable only in local/dev/test
+    # (_env_operator_allowed). This intentionally remains legacy-style
     # because it has no DB-backed server session.
     token, exp_dt = _issue_token(
         subject=subject,

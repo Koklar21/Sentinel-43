@@ -18,6 +18,7 @@ Responsibilities:
     - safely add or intentionally rotate managed .env keys
     - validate managed .env secrets
     - generate the break-glass Argon2id password hash interactively
+      (local/dev/test only: that login is refused outside it)
 
 This module does not rotate secrets automatically, does not modify DATABASE_URL,
 and must not be imported by the running API as a security dependency.
@@ -289,7 +290,8 @@ def render_env_block(
         [
             "",
             "# Set manually:",
-            "# S43_OPERATOR_PASSWORD_HASH=<generated with --password-hash>",
+            "# S43_OPERATOR_PASSWORD_HASH=<generated with --password-hash; "
+            "local/dev/test only, leave unset for beta/production>",
             "# DATABASE_URL=postgresql+asyncpg://s43:<POSTGRES_PASSWORD>@s43-db:5432/s43",
             "",
         ]
@@ -721,7 +723,10 @@ def _build_parser() -> argparse.ArgumentParser:
     mode.add_argument(
         "--password-hash",
         action="store_true",
-        help="Interactively generate S43_OPERATOR_PASSWORD_HASH.",
+        help=(
+            "Interactively generate S43_OPERATOR_PASSWORD_HASH (break-glass, "
+            "local/dev/test only; its login is refused outside it)."
+        ),
     )
 
     parser.add_argument(

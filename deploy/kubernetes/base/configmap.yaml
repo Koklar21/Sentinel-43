@@ -50,7 +50,9 @@ data:
   S43_JWT_AUDIENCE: "sentinel-43-dashboard"
   S43_JWT_TTL_SECONDS: "28800"
 
-  # Operator / session configuration
+  # Operator / session configuration. S43_OPERATOR_USERNAME names the
+  # break-glass env operator, which only the dev overlay (local) can use;
+  # outside local/dev/test its login is refused.
   S43_OPERATOR_USERNAME: "operator"
   S43_WS_REQUIRE_AUTH: "true"
   S43_SESSION_ACCESS_TTL_SECONDS: "900"

@@ -19,9 +19,6 @@ from urllib.request import urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-
-from core.auth.users import hash_password  # noqa: E402 (sys.path must be set first)
 
 
 def wait_ready(process: subprocess.Popen, url: str) -> None:
@@ -66,16 +63,9 @@ def run_live_suite(database_url: str, *, api_port: int = 18000, watchtower_port:
     # core.audit.store decodes this via bytes.fromhex and requires >= 32
     # decoded bytes -- hex, not urlsafe, and token_hex(32) is exactly that.
     audit_hmac_key = secrets.token_hex(32)
-    # P0-1: the break-glass operator hash must be Argon2id, produced by the
-    # project's own canonical generator, exactly like a real deployment's
-    # S43_OPERATOR_PASSWORD_HASH — not the retired unsalted SHA-256 digest
-    # of a random token, which core.api.main._validate_security_config()
-    # correctly refuses to start on in SENTINEL_ENV=production (as set
-    # below), which is exactly why this fixture was failing CI.
-    operator_hash = hash_password(password)
     sensitive = [
         database_url, password, jwt_secret, pepper, service_token,
-        operator_hash, audit_hmac_key,
+        audit_hmac_key,
     ]
     for value in sensitive:
         print(f"::add-mask::{value}", flush=True)
@@ -94,15 +84,11 @@ def run_live_suite(database_url: str, *, api_port: int = 18000, watchtower_port:
         "S43_WS_REQUIRE_AUTH": "true",
         "S43_ENABLE_TEST_INJECTION": "false",
         "S43_SECRETS_ROTATED_AT": datetime.now(timezone.utc).isoformat(),
-        "S43_OPERATOR_USERNAME": "ci-live-operator",
-        "S43_OPERATOR_PASSWORD_HASH": operator_hash,
-        # The env-var operator is scoped break-glass now (RELEASE_FINDINGS #11)
-        # -- inert once a DB admin exists. test_bootstrap.py creates one in
-        # this same run, so arm break-glass explicitly for the disposable CI
-        # database so test_system_smoke.py's live-login (which uses this
-        # env-operator) still works. Its token has no server-side session,
-        # so outside local every protected route refuses it (see below).
-        "S43_BREAK_GLASS_ARMED": "true",
+        # No S43_OPERATOR_USERNAME / S43_OPERATOR_PASSWORD_HASH /
+        # S43_BREAK_GLASS_ARMED: the env-operator break-glass login is
+        # refused outside development/local/test, armed or not, so in this
+        # production-mode API it can authenticate nothing.
+        #
         # SENTINEL_ENV=production: the API refuses to start unless this is
         # explicitly true, and per-request password authentication is
         # refused whatever it is set to.
@@ -184,7 +170,18 @@ def run_live_suite(database_url: str, *, api_port: int = 18000, watchtower_port:
                 # Lets test_bootstrap.py establish its own fresh/initialized
                 # state on THIS disposable database (it refuses anything else).
                 "S43_LIVE_TEST_DB_DSN": database_url,
-                "S43_LIVE_TEST_USERNAME": "ci-live-operator",
+                # UNRESOLVED (D3/D4): test_system_smoke.py's credentialed
+                # tests need a session-bound account on this stack, and none
+                # exists. On a fresh store the first account IS the bootstrap
+                # claim, and /users needs an admin first, so provisioning one
+                # here means making the first claim on the harness's behalf --
+                # the first-claim authority that is not yet decided (D4) --
+                # and test_bootstrap.py truncates users in this same job
+                # anyway. These used to name the env operator, which is
+                # refused outside local now. They stay set so those tests
+                # run and fail at login (401) instead of skipping; core-live
+                # requires them.
+                "S43_LIVE_TEST_USERNAME": "ci-live-session-operator",
                 "S43_LIVE_TEST_PASSWORD": password,
             })
             accept_out = os.environ.get("S43_ACCEPTANCE_OUT")
