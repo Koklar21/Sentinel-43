@@ -27,6 +27,7 @@ name: Kubernetes
 on:
   pull_request:
     paths:
+      - ".dockerignore"
       - "requirements*.txt"
       - "core/**"
       - "migrations/**"
@@ -42,6 +43,7 @@ on:
   push:
     branches: [main]
     paths:
+      - ".dockerignore"
       - "requirements*.txt"
       - "scripts/ci_live_tests.py"
       - "core/**"
