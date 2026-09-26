@@ -43,7 +43,9 @@
 # break-glass/env-operator) is a compatibility path the real shipped
 # consumers (browser dashboard's normal account path, dashboard Python
 # clients, browser_tests/) never depend on for a real operator/admin
-# account; only the break-glass path does. Outside local/dev/test the API
+# account; only the break-glass path does, and that login is itself refused
+# outside local/dev/test (so S43_OPERATOR_PASSWORD_HASH is not provisioned
+# for this overlay). Outside local/dev/test the API
 # refuses to start unless this is explicitly "true" -- unset, blank, "false"
 # and malformed values all refuse (core/api/routers/auth.py::
 # validate_legacy_auth_config) -- and refuses the fallback whatever the

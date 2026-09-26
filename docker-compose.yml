@@ -194,7 +194,10 @@ services:
       S43_JWT_AUDIENCE: ${S43_JWT_AUDIENCE:-sentinel-43-dashboard}
       S43_JWT_TTL_SECONDS: ${S43_JWT_TTL_SECONDS:-28800}
 
-      # Operator credentials
+      # Break-glass env operator -- LOCAL/DEV/TEST ONLY. With a non-local
+      # SENTINEL_ENV (the default here is production) this login is refused
+      # whatever is set, armed or not; leave the hash empty there. Accounts
+      # live in the database (docs/BETA_RUNBOOK.md §16a).
       S43_OPERATOR_USERNAME: ${S43_OPERATOR_USERNAME:-operator}
       S43_OPERATOR_PASSWORD_HASH: ${S43_OPERATOR_PASSWORD_HASH}
 

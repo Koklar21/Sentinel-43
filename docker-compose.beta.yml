@@ -23,5 +23,7 @@ services:
       # it fails to start and keeps /ready false. Required, like the Heart.
       S43_GOVERNANCE_ENABLED: ${S43_GOVERNANCE_ENABLED:?set S43_GOVERNANCE_ENABLED=true in .env for a beta target}
       S43_GOVERNANCE_REQUIRED: "true"
-      # Break-glass stays disarmed in the beta package.
+      # Break-glass stays disarmed in the beta package. It could not be used
+      # anyway: the env-operator login is refused outside local/dev/test,
+      # armed or not.
       S43_BREAK_GLASS_ARMED: "false"

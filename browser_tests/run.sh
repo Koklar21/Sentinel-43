@@ -55,8 +55,10 @@ trap cleanup EXIT
 # to be minimal at all. Building the real image and running the helper
 # inside a throwaway container from it needs nothing extra in
 # .venv-browser, and computes the hash with the exact same code/environment
-# that will later verify it -- the same pattern
-# scripts/ci_live_tests.py already uses for its own break-glass hash.
+# that will later verify it. That operator credential is inert here: the
+# stack is SENTINEL_ENV=beta, where the break-glass env-operator login is
+# refused, and the browser flows use database accounts. It only has to be
+# well-formed, because a malformed hash refuses startup outside local.
 HASH_HELPER_IMAGE=s43browser-hash-helper
 docker build -q -t "$HASH_HELPER_IMAGE" -f core/api/Dockerfile . >/dev/null
 

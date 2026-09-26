@@ -577,8 +577,23 @@ def _validate_security_config() -> None:
                 raise RuntimeError(
                     "S43_OPERATOR_PASSWORD_HASH is not a well-formed Argon2id "
                     "hash. Legacy SHA-256 break-glass hashes are not accepted "
-                    "outside local/dev/test."
+                    "outside local/dev/test. The break-glass login it belongs "
+                    "to is unavailable here anyway: remove the value, or fix it."
                 )
+
+        # The env-operator break-glass login is local/dev/test only
+        # (routers/auth.py::_env_operator_allowed). Say so when it is
+        # configured here, instead of letting it look usable.
+        if operator_hash or (
+            os.getenv("S43_BREAK_GLASS_ARMED", "").strip().lower() in _TRUE_VALUES
+        ):
+            logger.warning(
+                "Break-glass env-operator login is configured "
+                "(S43_OPERATOR_PASSWORD_HASH / S43_BREAK_GLASS_ARMED) but is "
+                "unavailable outside development/local/test: every login with "
+                "it is refused in environment %r.",
+                SENTINEL_ENV,
+            )
 
         # The app cannot cryptographically prove the external edge terminated
         # TLS from CORS settings alone. Require an explicit deployment assertion

@@ -56,9 +56,10 @@ Before starting, have ready:
   — this becomes `S43_TRUSTED_PROXIES`.
 - A container registry you can push to (GHCR, ECR, GCR, etc.) — **this repo
   does not provide one or push to one automatically for the beta overlay.**
-- 12 generated secret values (§4) plus a real Argon2id operator password
-  hash (§5) — none of these ship with real values; the checked-in examples
-  are placeholders that must not reach a real deployment.
+- 12 generated secret values (§4) — none ship with real values; the
+  checked-in examples are placeholders that must not reach a real
+  deployment. The break-glass operator hash (§5) is **not** a beta input:
+  that login is refused outside local/dev/test.
 
 ## 4. Secret generation and rotation
 
@@ -68,9 +69,9 @@ Managed via `core/cli/generate_secrets.py`. It manages 12 keys:
 `SENTINEL_REMOTE_TOKEN_ADMIN`, `SENTINEL_REMOTE_TOKEN_AUDITOR`,
 `S43_FENRIR_API_TOKEN`, `S43_WATCHTOWER_SERVICE_TOKEN`,
 `S43_AUDIT_HMAC_KEY`, `POSTGRES_PASSWORD`, `REDIS_PASSWORD`.
-`S43_OPERATOR_PASSWORD_HASH` and `DATABASE_URL` are deliberately **not** in
-this list — set those manually (§5, and your real Postgres connection
-string).
+`DATABASE_URL` is deliberately **not** in this list — set it to your real
+Postgres connection string. Neither is `S43_OPERATOR_PASSWORD_HASH`, which
+only a local/dev/test stack uses (§5); leave it empty for beta.
 
 ```bash
 # Generate/add any missing managed secrets into a real .env file
@@ -95,7 +96,15 @@ way, applied as a Secret instead of an `.env` file.
 `S43_SECRETS_ROTATED_AT` should be updated (ISO-8601 timestamp) whenever
 you rotate; `deploy_preflight.py` checks it isn't more than 90 days stale.
 
-## 5. The Argon2id operator hash — including Compose's `$` escaping trap
+## 5. The Argon2id operator hash (local/dev/test only) — and Compose's `$` escaping trap
+
+**Not for beta.** This hash belongs to the break-glass env operator, whose
+login is refused outside `SENTINEL_ENV` `development`/`dev`/`local`/`test`
+— armed or not, with or without an active admin. Do not provision it for a
+beta or production target; if it is set there, it must still be a
+well-formed Argon2id hash or the API refuses to start, so leave it empty.
+Accounts on a beta target are database accounts (§16a). The rest of this
+section applies to local development stacks.
 
 ```bash
 python -m core.cli.generate_secrets --password-hash
@@ -122,9 +131,10 @@ Sentinel-43 has two ways a bearer token can authenticate: **session-bound**
 (normal login, tied to a live server-side session — no password needed
 again) and **legacy/break-glass** (a long-lived token for accounts with no
 DB session, re-verified with a password, via `X-S43-Password`, on every
-request). The legacy fallback exists for break-glass access when no DB
-admin exists yet or when explicitly armed (`S43_BREAK_GLASS_ARMED=true`) —
-it is not something a normal operator/admin account needs.
+request). The legacy fallback exists for local/dev/test break-glass access
+when no DB admin exists yet or when explicitly armed
+(`S43_BREAK_GLASS_ARMED=true`) — it is not something a normal
+operator/admin account needs, and it does not exist outside local.
 
 **For beta, legacy authentication must be rejected.** The Kubernetes beta
 overlay now sets this:
@@ -149,13 +159,16 @@ If a deployment that worked before now stops at startup with a
 `.env` (or ConfigMap). Any client that relied on `X-S43-Password` outside
 local has to log in for a session instead.
 
-Rejecting legacy authentication also makes the break-glass env operator
-unusable outside local. Its login can still succeed there (when armed, or
-while no admin is active) and return a token, but that token has no
-server-side session, so every protected route refuses it. It was never an
-administrator recovery path either — it always gets role `operator` and
-cannot reach `/users`. Bootstrap does not reopen when administrators are
-lost; see §16a.
+**The break-glass env operator is unavailable outside local/dev/test.**
+Its login (`S43_OPERATOR_USERNAME` / `S43_OPERATOR_PASSWORD_HASH`) is
+refused there with `401 Invalid credentials` and issues no token — armed or
+not, with or without an active admin, with or without a database. The token
+it used to issue had no server-side session, so every protected route would
+have refused it anyway. The API logs a startup warning when that credential
+is configured in a non-local environment. It was never an administrator
+recovery path either — it always gets role `operator` and cannot reach
+`/users`. There is currently no non-local emergency operator access and no
+in-product administrator recovery (§16a).
 
 ## 7. Service-token separation
 
@@ -599,8 +612,8 @@ who may replace administrators when none remain, has not been decided (see
   until the owner decision is implemented.
 - **An operator login is not ownership.** The break-glass env operator
   (`S43_OPERATOR_USERNAME` / `S43_OPERATOR_PASSWORD_HASH`) is always role
-  `operator`, cannot manage accounts, and outside local its token is refused
-  (§6).
+  `operator`, cannot manage accounts, and outside local its login is refused
+  and issues no token (§6).
 - **Administrators do not outrank governance.** The `admin` role grants
   account management (`/users`) only. Approving or vetoing a staged action
   requires the server-recorded identity of an authenticated human operator;
@@ -667,7 +680,8 @@ deactivate or demote the last active admin, and no admin can deactivate
 their own account. It can still happen if the only admin's password is lost,
 or through direct database edits. Recovery never reopens `/bootstrap/admin`,
 and there is currently **no in-product recovery path**: the break-glass env
-operator cannot manage accounts. Until the owner decision below is
+operator cannot manage accounts, and outside local/dev/test it cannot log
+in at all. Until the owner decision below is
 implemented, the only recovery is restoring a PostgreSQL backup (§11) taken
 while an admin was usable. Keep two active admins so this is never needed.
 
