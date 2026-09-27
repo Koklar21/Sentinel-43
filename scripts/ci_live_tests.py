@@ -56,7 +56,6 @@ def run_live_suite(database_url: str, *, api_port: int = 18000, watchtower_port:
     this directly, with its own guard that only accepts a loopback database it
     created itself.
     """
-    password = secrets.token_urlsafe(32)
     jwt_secret = secrets.token_urlsafe(32)
     pepper = secrets.token_urlsafe(32)
     service_token = secrets.token_urlsafe(32)
@@ -64,7 +63,7 @@ def run_live_suite(database_url: str, *, api_port: int = 18000, watchtower_port:
     # decoded bytes -- hex, not urlsafe, and token_hex(32) is exactly that.
     audit_hmac_key = secrets.token_hex(32)
     sensitive = [
-        database_url, password, jwt_secret, pepper, service_token,
+        database_url, jwt_secret, pepper, service_token,
         audit_hmac_key,
     ]
     for value in sensitive:
@@ -168,21 +167,17 @@ def run_live_suite(database_url: str, *, api_port: int = 18000, watchtower_port:
             test_env.update({
                 "S43_TEST_API_URL": f"http://127.0.0.1:{api_port}",
                 # Lets test_bootstrap.py establish its own fresh/initialized
-                # state on THIS disposable database (it refuses anything else).
+                # state on THIS disposable database (it refuses anything
+                # else). test_system_smoke.py's `_live_session` fixture uses
+                # the same DSN the same way: reset users, claim bootstrap
+                # itself, log in for a real session-bound token. Resolves
+                # the D3/D4 gap this comment used to describe -- the harness
+                # makes its own first-claim on its own disposable store, not
+                # on behalf of any real deployment, exactly like
+                # test_bootstrap.py already did. No S43_LIVE_TEST_USERNAME/
+                # PASSWORD needed here: those name a pre-existing account on
+                # a real target, which this disposable stack never has.
                 "S43_LIVE_TEST_DB_DSN": database_url,
-                # UNRESOLVED (D3/D4): test_system_smoke.py's credentialed
-                # tests need a session-bound account on this stack, and none
-                # exists. On a fresh store the first account IS the bootstrap
-                # claim, and /users needs an admin first, so provisioning one
-                # here means making the first claim on the harness's behalf --
-                # the first-claim authority that is not yet decided (D4) --
-                # and test_bootstrap.py truncates users in this same job
-                # anyway. These used to name the env operator, which is
-                # refused outside local now. They stay set so those tests
-                # run and fail at login (401) instead of skipping; core-live
-                # requires them.
-                "S43_LIVE_TEST_USERNAME": "ci-live-session-operator",
-                "S43_LIVE_TEST_PASSWORD": password,
             })
             accept_out = os.environ.get("S43_ACCEPTANCE_OUT")
             if accept_out:

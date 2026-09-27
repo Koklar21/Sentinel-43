@@ -270,7 +270,7 @@ def test_first_run_bootstrap_flow_creates_admin(fresh_deployment) -> None:
 
     protected_response = requests.get(
         f"{API_URL}/watchtower/status",
-        headers={"Authorization": f"Bearer {token}", "X-S43-Password": password},
+        headers={"Authorization": f"Bearer {token}"},
         timeout=5,
     )
     assert protected_response.status_code == 200, (

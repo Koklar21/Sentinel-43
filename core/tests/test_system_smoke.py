@@ -36,6 +36,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 
 import pytest
 import requests
@@ -123,59 +124,132 @@ def test_watchtower_bridge_reports_reachable() -> None:
 # Live auth round-trip
 #
 # Everything above proves the container is UP. It does not prove the
-# container's actual deployed env vars are correct — S43_OPERATOR_PASSWORD_HASH,
-# S43_JWT_SECRET, etc. test_auth_login.py only proves the Python test
-# environment is internally consistent; it never touches the real .env file
-# baked into the running Docker container. A typo'd hash there would pass
-# every existing test and still lock every operator out in production.
+# container's actual deployed env vars are correct — S43_JWT_SECRET etc.
+# test_auth_login.py only proves the Python test environment is internally
+# consistent; it never touches the real .env file baked into the running
+# container. This is the one thing in the whole suite that can catch that
+# class of bug end-to-end against the real deployment.
 #
-# This test is the one thing in the whole suite that can catch that class of
-# bug — but it needs real credentials for whatever environment API_URL points
-# at, which must never be hardcoded here. Skips cleanly if they're not set,
-# so it doesn't break CI for anyone who hasn't configured a live target.
+# The env-operator break-glass login has no server-side session and is
+# refused outside local (D1/D2) — it is not a route to a credential here.
+# The only supported non-local path is a DB-backed human account created
+# through the real API and authenticated through the real session/login
+# flow, so that is what this file exercises, exactly like
+# test_bootstrap.py's fresh_deployment/initialized_deployment fixtures do
+# for the bootstrap endpoint itself:
+#
+#   - Against the disposable CI/acceptance database (S43_LIVE_TEST_DB_DSN
+#     set to a loopback, s43_ci-/s43_accept-prefixed DSN): the
+#     `_live_session` fixture below resets the users table and claims
+#     bootstrap itself, establishing its own account fresh at the point of
+#     use — independent of whatever test_bootstrap.py's fixtures did
+#     earlier in the same run, and never dependent on file/test order.
+#   - Against a real target (S43_LIVE_TEST_USERNAME/PASSWORD naming an
+#     already-provisioned human account, no disposable DSN): the fixture
+#     logs in with those credentials as-is and never truncates anything.
+#   - With neither configured, the credentialed tests skip cleanly, as
+#     before.
 # =============================================================================
+
+_DISPOSABLE_DB_PREFIXES = ("s43_ci", "s43_accept")
+
+
+def _disposable_db_dsn() -> str | None:
+    from urllib.parse import urlsplit
+
+    dsn = os.getenv("S43_LIVE_TEST_DB_DSN", "")
+    if not dsn:
+        return None
+    parts = urlsplit(dsn)
+    api_host = urlsplit(API_URL).hostname
+    if (
+        parts.hostname not in ("127.0.0.1", "localhost")
+        or api_host not in ("127.0.0.1", "localhost")
+        or not (parts.path.lstrip("/")).startswith(_DISPOSABLE_DB_PREFIXES)
+    ):
+        return None
+    return dsn
+
+
+def _reset_users_on_disposable_db(dsn: str) -> None:
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine(dsn.replace("+asyncpg", "+psycopg"))
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("TRUNCATE users CASCADE"))
+    finally:
+        engine.dispose()
+
+
+def _login(username: str, password: str) -> str:
+    response = requests.post(
+        f"{API_URL}/auth/login",
+        json={"username": username, "password": password},
+        headers=_LOGIN_HEADERS,
+        timeout=5,
+    )
+    assert response.status_code == 200, (
+        f"Live login failed against {API_URL}: "
+        f"{response.status_code} {response.text[:300]}"
+    )
+    token = response.json().get("token")
+    assert token, "Live login returned 200 but no token field"
+    return token
+
 
 _LIVE_USERNAME = os.getenv("S43_LIVE_TEST_USERNAME")
 _LIVE_PASSWORD = os.getenv("S43_LIVE_TEST_PASSWORD")
 
 _skip_reason = (
-    "S43_LIVE_TEST_USERNAME / S43_LIVE_TEST_PASSWORD not set — "
-    "skipping live auth round-trip against the real deployed container. "
-    "Set both to verify actual .env credentials, not just the test suite's "
-    "own seeded environment."
+    "Neither a disposable S43_LIVE_TEST_DB_DSN nor S43_LIVE_TEST_USERNAME / "
+    "S43_LIVE_TEST_PASSWORD are set — skipping the live auth round-trip. "
+    "Set the disposable DSN (CI/acceptance) or real target credentials to "
+    "run it."
 )
 
 
-@pytest.mark.skipif(
-    not (_LIVE_USERNAME and _LIVE_PASSWORD),
-    reason=_skip_reason,
-)
-def test_live_login_and_protected_route_round_trip() -> None:
+@pytest.fixture
+def _live_session() -> str:
+    """A live, session-bound Bearer token — never the break-glass path.
+
+    Establishes its own account state at the point of use so it never
+    depends on what test_bootstrap.py's fixtures left behind, or on test
+    order within this file.
     """
-    Logs in against the actual running container using real operator
-    credentials, then uses the returned token against a protected route.
-    This is the live-container equivalent of test_auth_login.py's
+    dsn = _disposable_db_dsn()
+    if dsn is not None:
+        _reset_users_on_disposable_db(dsn)
+        username = f"smoke-{uuid.uuid4().hex[:8]}"
+        password = "a-perfectly-long-enough-password-123"
+        create_response = requests.post(
+            f"{API_URL}/bootstrap/admin",
+            json={"username": username, "password": password},
+            timeout=5,
+        )
+        assert create_response.status_code == 201, (
+            f"could not establish a live session account: "
+            f"{create_response.status_code} {create_response.text[:300]}"
+        )
+        return _login(username, password)
+
+    if _LIVE_USERNAME and _LIVE_PASSWORD:
+        return _login(_LIVE_USERNAME, _LIVE_PASSWORD)
+
+    pytest.skip(_skip_reason)
+
+
+def test_live_login_and_protected_route_round_trip(_live_session: str) -> None:
+    """
+    Logs in against the actual running container (via the `_live_session`
+    fixture) and uses the returned token against a protected route. This is
+    the live-container equivalent of test_auth_login.py's
     test_protected_route_accepts_valid_token — same assertion, but proving
     the real deployment's config, not the test harness's seeded one.
     """
-    login_response = requests.post(
-        f"{API_URL}/auth/login",
-        json={"username": _LIVE_USERNAME, "password": _LIVE_PASSWORD},
-        headers=_LOGIN_HEADERS,
-        timeout=5,
-    )
-    assert login_response.status_code == 200, (
-        f"Live login failed against {API_URL} — check S43_OPERATOR_USERNAME / "
-        f"S43_OPERATOR_PASSWORD_HASH in the deployed .env: "
-        f"{login_response.status_code} {login_response.text[:300]}"
-    )
-
-    token = login_response.json().get("token")
-    assert token, "Live login returned 200 but no token field"
-
     verify_response = requests.get(
         f"{API_URL}/auth/verify",
-        headers={"Authorization": f"Bearer {token}"},
+        headers={"Authorization": f"Bearer {_live_session}"},
         timeout=5,
     )
     assert verify_response.status_code == 200, (
@@ -186,10 +260,6 @@ def test_live_login_and_protected_route_round_trip() -> None:
     assert verify_response.json().get("valid") is True
 
 
-@pytest.mark.skipif(
-    not (_LIVE_USERNAME and _LIVE_PASSWORD),
-    reason=_skip_reason,
-)
 def test_live_protected_route_rejects_missing_token() -> None:
     """
     Companion to the round-trip test above — confirms the real deployment
@@ -207,16 +277,13 @@ def test_live_protected_route_rejects_missing_token() -> None:
     )
 
 
-@pytest.mark.skipif(
-    not (_LIVE_USERNAME and _LIVE_PASSWORD),
-    reason=_skip_reason,
-)
-def test_live_system_status_and_routes_require_auth() -> None:
+def test_live_system_status_and_routes_require_auth(_live_session: str) -> None:
     """
     /system/status and /system/routes are gated with _require_operator() in
     main.py — confirm both reject an unauthenticated request and accept a
-    live operator token, and that /system/routes returns a well-formed
-    route list once authenticated.
+    live, session-bound Bearer token (via the `_live_session` fixture, never
+    the retired X-S43-Password legacy fallback), and that /system/routes
+    returns a well-formed route list once authenticated.
     """
     for endpoint in ("/system/status", "/system/routes"):
         response = requests.get(f"{API_URL}{endpoint}", timeout=5)
@@ -225,19 +292,7 @@ def test_live_system_status_and_routes_require_auth() -> None:
             f"{response.status_code}: {response.text[:300]}"
         )
 
-    login_response = requests.post(
-        f"{API_URL}/auth/login",
-        json={"username": _LIVE_USERNAME, "password": _LIVE_PASSWORD},
-        headers=_LOGIN_HEADERS,
-        timeout=5,
-    )
-    assert login_response.status_code == 200, (
-        f"Live login failed against {API_URL}: "
-        f"{login_response.status_code} {login_response.text[:300]}"
-    )
-    token = login_response.json().get("token")
-    assert token, "Live login returned 200 but no token field"
-    headers = {"Authorization": f"Bearer {token}", "X-S43-Password": _LIVE_PASSWORD}
+    headers = {"Authorization": f"Bearer {_live_session}"}
 
     status_response = requests.get(f"{API_URL}/system/status", headers=headers, timeout=5)
     assert status_response.status_code == 200, (
