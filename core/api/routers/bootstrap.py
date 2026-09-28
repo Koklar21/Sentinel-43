@@ -36,7 +36,7 @@ docs/BETA_RUNBOOK.md "Platform ownership".
 
 from __future__ import annotations
 
-from typing import Final
+from typing import Any, Final
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -174,7 +174,7 @@ async def bootstrap_admin(
     session: AsyncSession = Depends(
         get_db_session
     ),
-    authority: object = Depends(
+    authority: Any = Depends(
         get_runtime_authority
     ),
 ) -> BootstrapAdminResponse:
