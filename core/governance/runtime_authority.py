@@ -47,6 +47,12 @@ class Sentinel43RuntimeAuthority:
         self._orchestrator = orchestrator
         self._engine: Any | None = None
 
+        from .identity import IdentityGovernanceService
+
+        self._identity = IdentityGovernanceService(
+            audit_sink=self._orchestrator.append_authoritative_audit
+        )
+
         # The owner source directory is part of the live runtime, not a
         # historical appendix. Load the three non-engine owner components
         # exactly once and bind all of them to this same authority.
@@ -58,6 +64,11 @@ class Sentinel43RuntimeAuthority:
     def orchestrator(self) -> SystemOrchestrator:
         """Subordinate governance service, exposed for compatibility only."""
         return self._orchestrator
+
+    @property
+    def identity(self) -> Any:
+        """Governed account/session mutation service."""
+        return self._identity
 
     @property
     def nexus(self) -> Any:
