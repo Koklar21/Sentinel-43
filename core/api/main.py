@@ -2643,6 +2643,23 @@ async def _shutdown_runtime() -> None:
                     exc_info=True,
                 )
 
+    # Sentinel-43 owns the governance/owner-engine lifecycle. Shut that
+    # authority down while the authoritative audit store is still available,
+    # then clear the temporary subordinate compatibility alias.
+    if runtime.sentinel43 is not None:
+        try:
+            await asyncio.to_thread(runtime.sentinel43.shutdown)
+        except Exception:
+            logger.warning(
+                "Sentinel43RuntimeAuthority shutdown error",
+                exc_info=True,
+            )
+        finally:
+            runtime.sentinel43 = None
+            runtime.orchestrator = None
+            if runtime.subsystems.get(SUBSYS_GOVERNANCE) is not None:
+                runtime.subsystems.mark_stopped(SUBSYS_GOVERNANCE)
+
     # The Heart owns no unmanaged resource of its own (SentinelCoreStore
     # connects per-call, like AuditStore's own connection discipline), but
     # a stale reference must not survive shutdown -- a repeated lifespan in
