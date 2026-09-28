@@ -123,6 +123,38 @@ def test_api_composition_root_enters_sentinel43_authority():
     assert "runtime.orchestrator = build_orchestrator_from_settings(" not in source
 
 
+def test_runtime_authority_loads_all_owner_components():
+    source = (
+        CORE / "governance" / "runtime_authority.py"
+    ).read_text(encoding="utf-8")
+    loader = (
+        CORE / "governance" / "owner_components.py"
+    ).read_text(encoding="utf-8")
+
+    assert "load_owner_runtime_components(self)" in source
+    for filename, class_name in (
+        ("Sentienal_Nexus.py", "SentinelNexus"),
+        ("Sentienal_core.py", "SentinelNode"),
+        ("sentinel_AI_escalation.py", "SentinelAIEscalation"),
+    ):
+        assert filename in loader
+        assert class_name in loader
+
+
+def test_public_recommendation_path_crosses_the_nexus():
+    authority_source = (
+        CORE / "governance" / "runtime_authority.py"
+    ).read_text(encoding="utf-8")
+    nexus_source = (
+        REPO_ROOT / "Sentinel-43" / "Sentienal_Nexus.py"
+    ).read_text(encoding="utf-8")
+
+    assert "self._owner_components.nexus.submit_recommendation" in authority_source
+    assert "self._owner_components.nexus.resolve_recommendation" in authority_source
+    assert "_stage_recommendation_from_nexus" in nexus_source
+    assert "_resolve_recommendation_from_nexus" in nexus_source
+
+
 def test_the_only_engine_class_loaded_is_the_owner_response_engine():
     from core.governance.sentinel43_engine import ENGINE_CLASS_NAME
 
