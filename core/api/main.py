@@ -2482,100 +2482,6 @@ async def _start_reliability() -> None:
         logger.error("Event reliability layer unavailable", exc_info=True)
 
 
-async def _register_remote_dispatch_handlers() -> None:
-    try:
-        from .routers.remote_gateway import (
-            RemoteEventActivationRequest,
-            RemoteEventType,
-            register_dispatch_handler,
-        )
-
-        async def approve_handler(
-            body: RemoteEventActivationRequest,
-        ) -> str:
-            action_id = str(
-                body.payload.get("action_id") or ""
-            ).strip()
-            decision_id = str(
-                body.payload.get("decision_id") or ""
-            ).strip()
-
-            if not action_id:
-                raise HTTPException(
-                    status_code=422,
-                    detail="remote approval requires payload.action_id",
-                )
-
-            action = await _resolve_governance_and_commit_action(
-                action_id=action_id,
-                decision_id=decision_id or None,
-                approved=True,
-                allowed_statuses={"STAGED"},
-                new_status="APPROVED",
-                reason=body.reason,
-                operator=body.operator_id,
-            )
-            await _broadcast_dashboard_event(
-                "action_status_changed",
-                {"action": action},
-            )
-            return (
-                f"Action {action_id} approved via remote gateway "
-                f"by {body.operator_id}."
-            )
-
-        async def veto_handler(
-            body: RemoteEventActivationRequest,
-        ) -> str:
-            action_id = str(
-                body.payload.get("action_id") or ""
-            ).strip()
-            decision_id = str(
-                body.payload.get("decision_id") or ""
-            ).strip()
-
-            if not action_id:
-                raise HTTPException(
-                    status_code=422,
-                    detail="remote veto requires payload.action_id",
-                )
-
-            action = await _resolve_governance_and_commit_action(
-                action_id=action_id,
-                decision_id=decision_id or None,
-                approved=False,
-                allowed_statuses={"PENDING", "STAGED"},
-                new_status="VETOED",
-                reason=body.reason,
-                operator=body.operator_id,
-            )
-            await _broadcast_dashboard_event(
-                "action_status_changed",
-                {"action": action},
-            )
-            return (
-                f"Action {action_id} vetoed via remote gateway "
-                f"by {body.operator_id}."
-            )
-
-        register_dispatch_handler(
-            RemoteEventType.APPROVE_DECISION,
-            approve_handler,
-        )
-        register_dispatch_handler(
-            RemoteEventType.VETO_DECISION,
-            veto_handler,
-        )
-        logger.info("Remote gateway APPROVE/VETO handlers registered")
-    except Exception:
-        if _env_bool("S43_REMOTE_GATEWAY_REQUIRED", False):
-            raise
-        logger.error(
-            "Remote gateway dispatch handler registration failed",
-            exc_info=True,
-        )
-
-
 async def _shutdown_runtime() -> None:
     if runtime.stop_heartbeat_event is not None:
         runtime.stop_heartbeat_event.set()
@@ -2767,7 +2673,6 @@ async def lifespan(api: FastAPI):
         await _start_reliability()
         await _start_governance()
         await _start_heart()
-        await _register_remote_dispatch_handlers()
 
         # Registration failures are observable, but do not necessarily mean
         # the API itself cannot serve. Deployments that require Watchtower can
