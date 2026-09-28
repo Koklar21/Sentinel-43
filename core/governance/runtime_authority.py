@@ -141,6 +141,42 @@ class Sentinel43RuntimeAuthority:
     def count_pending_recommendations(self) -> int:
         return self._orchestrator.count_pending_recommendations()
 
+    def list_pending_recommendations(self, limit: int = 500) -> list[dict[str, Any]]:
+        return self._orchestrator.list_pending_recommendations(limit)
+
+    def list_pending_reviews(self) -> list[dict[str, Any]]:
+        return self._orchestrator.list_pending_reviews()
+
+    def record_denied_decision(
+        self,
+        decision_id: str,
+        *,
+        operator_id: str,
+        reason_code: str,
+        identity_type: str,
+    ) -> None:
+        self._orchestrator.record_denied_decision(
+            decision_id,
+            operator_id=operator_id,
+            reason_code=reason_code,
+            identity_type=identity_type,
+        )
+
+    def resolve_human_decision(
+        self,
+        decision_id: str,
+        *,
+        approved: bool,
+        operator_id: str,
+        reason: str,
+    ) -> Any:
+        return self._orchestrator.resolve_human_decision(
+            decision_id,
+            approved=approved,
+            operator_id=operator_id,
+            reason=reason,
+        )
+
     def expire_unverifiable_recommendation(
         self,
         action_id: str,
