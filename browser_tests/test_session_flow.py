@@ -77,6 +77,62 @@ def test_page_and_shipped_assets_load_without_fatal_js_errors(stack, page):
     assert page._s43_console_errors == [], (page._s43_console_errors, page._s43_error_sources)
 
 
+def test_first_run_ui_offers_governed_admin_bootstrap(stack, page):
+    """The shipped SPA shows first-admin setup before login when uninitialized.
+
+    Endpoint responses are intercepted only to create the otherwise
+    impossible "fresh DB" browser state inside the already-bootstrapped
+    session-scoped browser stack. Backend bootstrap semantics are covered by
+    the real bootstrap tests; this proves the real shipped auth.js UI contract.
+    """
+    submitted: list[dict] = []
+
+    def bootstrap_status(route):
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"initialized": false}',
+        )
+
+    def bootstrap_admin(route):
+        submitted.append(route.request.post_data_json)
+        route.fulfill(
+            status=201,
+            content_type="application/json",
+            body='{"username":"first-owner","role":"admin"}',
+        )
+
+    page.route("**/bootstrap/status", bootstrap_status)
+    page.route("**/bootstrap/admin", bootstrap_admin)
+
+    response = page.goto(stack["base_url"] + "/dashboard")
+    assert response is not None and response.status == 200
+
+    page.wait_for_selector("#s43-bootstrap-overlay", state="visible")
+    assert page.locator("#s43-login-overlay").count() == 0
+
+    page.fill("#s43-bootstrap-username", "first-owner")
+    page.fill("#s43-bootstrap-email", "owner@example.test")
+    page.fill("#s43-bootstrap-password", "correct-horse-battery-staple")
+    page.fill("#s43-bootstrap-confirm", "correct-horse-battery-staple")
+    page.click("#s43-bootstrap-btn")
+
+    page.wait_for_selector("#s43-login-overlay", state="visible")
+    page.wait_for_selector("#s43-bootstrap-overlay", state="hidden")
+
+    assert submitted == [
+        {
+            "username": "first-owner",
+            "password": "correct-horse-battery-staple",
+            "email": "owner@example.test",
+        }
+    ]
+    assert page.input_value("#s43-username") == "first-owner"
+    assert "Administrator created" in (
+        page.text_content("#s43-login-err") or ""
+    )
+
+
 def test_login_through_the_real_ui_reaches_an_authorized_view(stack, page):
     do_login(page, stack["base_url"], *stack["admin"])
     assert page.evaluate("window.SentinelAuth.hasToken()") is True
