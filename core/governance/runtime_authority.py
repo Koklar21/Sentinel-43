@@ -92,10 +92,10 @@ class Sentinel43RuntimeAuthority:
             engine.shutdown()
             raise
 
-        previous = self._engine
+        # bind_recommendation_runtime owns replacement cleanup for the
+        # previously-bound engine.  Keep our reference aligned without
+        # shutting the same engine down twice.
         self._engine = engine
-        if previous is not None and previous is not engine:
-            previous.shutdown()
 
     def detach_recommendation_store(self) -> None:
         """Detach and stop the owned recommendation engine exactly once."""
