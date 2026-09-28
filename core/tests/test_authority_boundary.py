@@ -218,6 +218,33 @@ def test_the_durable_store_itself_holds_no_authorization_logic():
         assert term not in source
 
 
+def test_identity_mutations_enter_the_runtime_authority():
+    bootstrap = (
+        CORE / "api" / "routers" / "bootstrap.py"
+    ).read_text(encoding="utf-8")
+    users = (
+        CORE / "api" / "routers" / "users.py"
+    ).read_text(encoding="utf-8")
+
+    assert "authority.identity.bootstrap_first_admin(" in bootstrap
+    assert "create_first_admin(" not in bootstrap
+
+    for call in (
+        "authority.identity.create_account(",
+        "authority.identity.update_account(",
+        "authority.identity.reset_password(",
+    ):
+        assert call in users
+
+    for forbidden in (
+        "create_user(",
+        "set_user_active(",
+        "set_user_role(",
+        "set_user_password(",
+    ):
+        assert forbidden not in users
+
+
 # ---------------------------------------------------------------------------
 # 5. No API route bypasses the orchestrator
 # ---------------------------------------------------------------------------
