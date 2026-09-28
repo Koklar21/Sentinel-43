@@ -657,6 +657,18 @@ def dev_store_factory() -> StoreProtocol:
 # Public dependency providers
 # =============================================================================
 
+def get_runtime_authority(request: Request) -> Any:
+    """Return the one live Sentinel-43 runtime authority for API mutations."""
+    runtime = getattr(request.app.state, "runtime", None)
+    authority = getattr(runtime, "sentinel43", None)
+    if authority is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Sentinel-43 runtime authority is unavailable.",
+        )
+    return authority
+
+
 def get_engine() -> EngineProtocol:
     """Resolve and validate the configured engine dependency."""
     config = load_config()
@@ -720,6 +732,7 @@ __all__ = [
     "dev_engine_factory",
     "dev_store_factory",
     "get_engine",
+    "get_runtime_authority",
     "get_store",
     "register_dependencies_with_watchtower",
     "require_admin",
