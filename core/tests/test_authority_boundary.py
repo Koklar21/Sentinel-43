@@ -161,6 +161,30 @@ def test_the_only_engine_class_loaded_is_the_owner_response_engine():
     assert ENGINE_CLASS_NAME == "Sentinel43ResponseEngine"
 
 
+def test_runtime_authority_owns_the_monitoring_manager():
+    authority_source = (
+        CORE / "governance" / "runtime_authority.py"
+    ).read_text(encoding="utf-8")
+    composition_source = (
+        CORE / "governance" / "composition.py"
+    ).read_text(encoding="utf-8")
+    api_source = (
+        CORE / "api" / "main.py"
+    ).read_text(encoding="utf-8")
+
+    assert "self._monitoring_manager = monitoring_manager" in authority_source
+    assert "def monitoring_manager(" in authority_source
+    assert "monitoring_manager=monitoring_manager" in composition_source
+    assert (
+        "runtime.monitoring_manager = runtime.sentinel43.monitoring_manager"
+        in api_source
+    )
+    assert (
+        "runtime.sentinel43 is None and runtime.monitoring_manager is not None"
+        in api_source
+    )
+
+
 # ---------------------------------------------------------------------------
 # 2 + 3. The Heart and the detection stack are evidence layers only
 # ---------------------------------------------------------------------------
