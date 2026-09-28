@@ -155,6 +155,26 @@ def test_public_recommendation_path_crosses_the_nexus():
     assert "_resolve_recommendation_from_nexus" in nexus_source
 
 
+def test_owner_components_cannot_reach_the_subordinate_orchestrator():
+    """Owner components enter through Sentinel43RuntimeAuthority, including
+    read-only mode discovery; the subordinate governor is not exposed."""
+    authority_source = (
+        CORE / "governance" / "runtime_authority.py"
+    ).read_text(encoding="utf-8")
+
+    assert "def orchestrator(" not in authority_source
+    assert "def governance_mode(" in authority_source
+
+    for relative in (
+        "Sentinel-43/Sentienal_Nexus.py",
+        "Sentinel-43/Sentienal_core.py",
+        "Sentinel-43/sentinel_AI_escalation.py",
+    ):
+        source = (REPO_ROOT / relative).read_text(encoding="utf-8")
+        assert "authority.orchestrator" not in source
+        assert ".governance_mode" in source
+
+
 def test_the_only_engine_class_loaded_is_the_owner_response_engine():
     from core.governance.sentinel43_engine import ENGINE_CLASS_NAME
 
