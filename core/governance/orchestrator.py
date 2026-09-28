@@ -665,6 +665,17 @@ class SystemOrchestrator:
 
             raise
 
+    def append_authoritative_audit(
+        self,
+        payload: dict[str, Any],
+    ) -> None:
+        """Public audit sink for the owning Sentinel-43 runtime authority.
+
+        The authority owns composition; this subordinate service still owns
+        the established fail-closed audit mechanics.
+        """
+        self._append_audit(payload)
+
     def _filter_metadata(
         self,
         metadata: Mapping[str, Any],
@@ -1401,35 +1412,32 @@ class SystemOrchestrator:
     # Threat-recommendation governance: the owner-designated engine decides
     # ------------------------------------------------------------------
 
-    def attach_recommendation_store(
+    def bind_recommendation_runtime(
         self,
         store: Any,
         *,
+        engine: Any,
         operator_authenticator: Callable[[DecisionPrincipal], bool] | None,
         max_pending_actions: int,
     ) -> None:
-        """Bind the ONE durable store and start the owner engine on it.
+        """Bind runtime pieces owned by :class:`Sentinel43RuntimeAuthority`.
 
-        The engine (Sentinel-43/Shadow_mode.py Sentinel43ResponseEngine) plans,
-        stages and resolves; its authenticator is bound to the server-verified
-        principal and fails closed without ``operator_authenticator``. If the
-        engine cannot be loaded this raises, so nothing can be decided.
+        This service deliberately does NOT construct the owner-designated
+        engine.  Sentinel-43's top-level runtime authority owns that lifecycle
+        and injects the single engine instance here for existing governance
+        mechanics to use.
         """
-        from .sentinel43_engine import GovernedEngine
-
+        if store is None:
+            raise ValueError("recommendation store is required")
+        if engine is None:
+            raise ValueError("owner engine is required")
         if not 1 <= int(max_pending_actions) <= 100_000:
             raise ValueError("max_pending_actions must be between 1 and 100000")
+
         authenticator = (
             operator_authenticator
             if operator_authenticator is not None
             else (lambda _principal: False)
-        )
-        engine = GovernedEngine(
-            store,
-            human_authenticator=authenticator,
-            # One ledger: the engine's own events go to the same audit store
-            # every governed decision is written to.
-            audit_sink=self._append_audit,
         )
         with self._recommendation_lock:
             previous = self._engine
@@ -1437,7 +1445,7 @@ class SystemOrchestrator:
             self._operator_authenticator = authenticator
             self._max_pending_recommendations = int(max_pending_actions)
             self._engine = engine
-        if previous is not None:
+        if previous is not None and previous is not engine:
             previous.shutdown()
 
     def record_denied_decision(
