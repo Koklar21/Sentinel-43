@@ -41,9 +41,10 @@ does not replace the owner's review of the change that implements it.
 
 - `Shadow_mode.py` → `Sentinel43ResponseEngine` is the **orchestration engine**.
   `core/governance/sentinel43_engine.py` loads this file **unmodified** (its
-  sha256 is recorded on every decision it makes) and hands it to
-  `SystemOrchestrator`, which is the single authority every Heart finding is
-  reported to. The engine's own code decides:
+  sha256 is recorded on every decision it makes). The top-level
+  `Sentinel43RuntimeAuthority` owns that engine and the subordinate
+  `SystemOrchestrator`; every Heart finding enters through that Sentinel-43
+  authority boundary. The engine's own code decides:
   - what response a finding warrants (`plan_response`),
   - whether it is staged, including its dedupe (`stage_directive`),
   - approve / veto, behind its fail-closed `operator_authenticator`
@@ -130,7 +131,7 @@ subject it targets, not which producer reported it, so there is nothing to
 count a source against. The ingestion rate limit bounds one producer's flow
 at the boundary instead.
 
-## What does not run, and why
+## What is not yet integrated as live runtime responsibility
 
 - `Sentienal_Nexus.py`, `Shadow_mode.py`'s own `OversightEngine`/`SentinelNexus`,
   and `sentinel_AI_escalation.py` are alternative versions of the same stack.
