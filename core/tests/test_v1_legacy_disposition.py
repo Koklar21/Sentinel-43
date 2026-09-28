@@ -437,54 +437,18 @@ def test_unauthenticated_and_service_callers_cannot_resolve(client, governed_act
 
 
 # ---------------------------------------------------------------------------
-# No alternate route: the remote gateway's approve/veto handlers
+# No alternate route: service-token Remote Gateway is not a human surface
 # ---------------------------------------------------------------------------
-def _gateway_request(event_type, action_id, decision_id, operator_id="remote-admin"):
-    from core.api.routers.remote_gateway import RemoteEventActivationRequest
-
-    return RemoteEventActivationRequest(
-        operator_id=operator_id,
-        target_id="sentinel43-api",
-        event_type=event_type,
-        reason="remote decision attempt via the gateway",
-        correlation_id="gw-correlation-0001",
-        dry_run=False,
-        payload={"action_id": action_id, "decision_id": decision_id},
-    )
-
-
-@pytest.mark.parametrize("verb", ["approve", "veto"])
-def test_the_remote_gateway_cannot_decide_a_governed_action(client, governed_action, verb):
-    """The gateway authenticates a ROLE token (recorded as the
-    service:remote-gateway identity) and takes operator_id from the request
-    body. That is a service credential with a self-asserted name, so the
-    REAL registered handler is refused at the shared decision point."""
-    from fastapi import HTTPException
-
+def test_the_remote_gateway_has_no_approve_or_veto_capability():
     from core.api.routers import remote_gateway
     from core.api.routers.remote_gateway import RemoteEventType
 
-    action, orchestrator, audit, decision_id = governed_action
-    event_type = (
-        RemoteEventType.APPROVE_DECISION if verb == "approve"
-        else RemoteEventType.VETO_DECISION
-    )
-    handler = remote_gateway._dispatch_registry[event_type]
+    values = {event.value for event in RemoteEventType}
+    assert "approve_decision" not in values
+    assert "veto_decision" not in values
 
-    with pytest.raises(HTTPException) as refused:
-        client.portal.call(
-            handler, _gateway_request(event_type, action["id"], decision_id)
-        )
-    assert refused.value.status_code == 403
-
-    modern = client.get("/actions", headers=_headers())
-    committed = next(a for a in modern.json() if a["id"] == action["id"])
-    assert committed["status"] == "STAGED"
-    assert decision_id in {r["decision_id"] for r in orchestrator.list_pending_reviews()}
-
-    denied = [
-        r for r in audit.get_records(component="governance", correlation_id=decision_id)
-        if r.get("decision") == "DENIED"
-    ]
-    assert denied and denied[-1]["reason_code"] == "NO_AUTHENTICATION_CONTEXT"
-    assert denied[-1]["operator_id"] == "remote-admin"
+    # Human decisions are not merely unregistered; no dispatch registry entry
+    # can name a capability that the gateway's public event vocabulary lacks.
+    registered = {event.value for event in remote_gateway._dispatch_registry}
+    assert "approve_decision" not in registered
+    assert "veto_decision" not in registered
