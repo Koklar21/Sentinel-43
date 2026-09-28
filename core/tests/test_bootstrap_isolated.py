@@ -72,6 +72,7 @@ import core.api.routers.bootstrap as bootstrap_module  # noqa: E402
 import core.auth.deps as auth_deps_module  # noqa: E402
 import core.auth.sessions as sessions_module  # noqa: E402
 import core.auth.users as users_module  # noqa: E402
+import core.governance.identity as identity_module  # noqa: E402
 from core.api.main import app  # noqa: E402
 
 PROTECTED_URL = "/watchtower/status"
@@ -256,7 +257,7 @@ def fresh_user_store(monkeypatch) -> _FakeUserStore:
     session_store = _FakeSessionStore(store)
 
     monkeypatch.setattr(bootstrap_module, "bootstrap_claimed", store.bootstrap_claimed)
-    monkeypatch.setattr(bootstrap_module, "create_first_admin", store.create_first_admin)
+    monkeypatch.setattr(identity_module, "create_first_admin", store.create_first_admin)
     # The bootstrap router no longer performs schema creation -- Alembic is the
     # sole schema authority -- so there is no init_models to patch here.
     monkeypatch.setattr(bootstrap_module, "init_models", store.init_models, raising=False)
@@ -269,9 +270,20 @@ def fresh_user_store(monkeypatch) -> _FakeUserStore:
     monkeypatch.setattr(sessions_module, "create_session", session_store.create_session)
     monkeypatch.setattr(sessions_module, "resolve_live_session", session_store.resolve_live_session)
 
+    authority = type(
+        "_FakeAuthority",
+        (),
+        {
+            "identity": identity_module.IdentityGovernanceService(
+                audit_sink=lambda _payload: None
+            )
+        },
+    )()
     app.dependency_overrides[auth_deps_module.get_db_session] = _fake_get_db_session
+    app.dependency_overrides[bootstrap_module.get_runtime_authority] = lambda: authority
     yield store
     app.dependency_overrides.pop(auth_deps_module.get_db_session, None)
+    app.dependency_overrides.pop(bootstrap_module.get_runtime_authority, None)
 
 
 @pytest.fixture
