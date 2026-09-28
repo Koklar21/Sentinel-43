@@ -1,8 +1,10 @@
 # Sentinel-43/ — owner-designated orchestration core
 
-This directory holds the original Sentinel-43 orchestration sources. One of
-them now runs as the orchestration engine; the rest are preserved design
-sources.
+This directory holds the owner-designated Sentinel-43 orchestration sources.
+All four are current runtime sources. Shadow_mode.py is the single response
+engine; Sentienal_Nexus.py, Sentienal_core.py, and sentinel_AI_escalation.py
+are loaded as subordinate runtime components owned by
+Sentinel43RuntimeAuthority.
 
 ## Instruction this integration follows
 
@@ -131,24 +133,32 @@ subject it targets, not which producer reported it, so there is nothing to
 count a source against. The ingestion rate limit bounds one producer's flow
 at the boundary instead.
 
-## What is not yet integrated as live runtime responsibility
+## Current owner-source runtime wiring
 
-- `Sentienal_Nexus.py`, `Shadow_mode.py`'s own `OversightEngine`/`SentinelNexus`,
-  and `sentinel_AI_escalation.py` are alternative versions of the same stack.
-  Running them alongside the engine would create a second authority and a
-  second (in-memory) approval queue, and their approval paths execute on
-  approval. `sentinel_AI_escalation.py` carries the same response engine as
-  `Shadow_mode.py`.
-- `Sentienal_core.py`'s Watchtower generates anomalies with `random.random()`
-  against hard-coded principals, and its IAM "quarantine" only logs. There is
-  no real capability to run.
+- `Sentienal_Nexus.py` is the live Nexus entry contract. Public recommendation
+  staging and resolution enter `Sentinel43RuntimeAuthority`, cross the Nexus,
+  and only then hand off to the subordinate `SystemOrchestrator`.
+- `Sentienal_core.py` is the live node/core contract. It owns no local worker,
+  scheduler, Watchtower, audit DB, approval queue, or executor; it reports into
+  the same runtime authority.
+- `sentinel_AI_escalation.py` is the live AI/detection escalation contract.
+  It carries evidence and recommendation vocabulary but does not plan or
+  execute responses; the owner engine remains authoritative for planning.
+- `Shadow_mode.py` is the one live response engine. It requires an injected
+  governed `ActionStore`, supports only SHADOW/HUMAN_GATED, and contains no
+  standalone SQLite runtime or autonomous executor.
+- `core/governance/owner_components.py` loads the three non-engine owner
+  sources by path, records their canonical SHA-256 provenance, and binds one
+  instance of each to the single `Sentinel43RuntimeAuthority`.
 
-These files are not loaded and are excluded from the runtime image.
+All four owner sources ship in the runtime image. None creates a second
+authority, store, approval queue, scheduler, Watchtower, or executor.
 
 ## Rules
 
-- Do not edit these files: the runtime records the engine file's sha256, and
-  its behavior is the owner's design.
+- These are current owner sources and may be updated deliberately when the
+  architecture requires it. Any change to `Shadow_mode.py` must update the
+  reviewed `EXPECTED_ENGINE_SHA256` pin in the same change.
 - `ACTIVE` / `AUTONOMOUS_VETO` stays prohibited. Nothing here may be wired to
   execute an effect.
 - Security review: a bounded review of the changed authority boundary and
