@@ -20,8 +20,10 @@ created here and injected into that service rather than being constructed by
 it.
 
 The owner-designated Nexus, node/core, and AI-escalation sources are loaded
-and owned here as live runtime components. Auth, users, bootstrap, Watchtower,
-and the dashboard are integrated in later steps through this same boundary.
+and owned here as live runtime components. The shared monitoring/evidence
+manager and identity/session mutation service are also owned here. Watchtower
+transport, remaining detection lifecycle, and the dashboard are integrated
+through this same boundary.
 """
 
 from __future__ import annotations
