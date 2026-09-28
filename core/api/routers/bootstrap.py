@@ -48,8 +48,8 @@ from ...auth.users import (
     FirstAdminExistsError,
     UsernameTakenError,
     bootstrap_claimed,
-    create_first_admin,
 )
+from ..deps import get_runtime_authority
 
 router = APIRouter(
     prefix="/bootstrap",
@@ -174,18 +174,19 @@ async def bootstrap_admin(
     session: AsyncSession = Depends(
         get_db_session
     ),
+    authority: object = Depends(
+        get_runtime_authority
+    ),
 ) -> BootstrapAdminResponse:
     """Create the single first-run administrator account."""
 
     try:
-        user = await create_first_admin(
+        user = await authority.identity.bootstrap_first_admin(
             session,
             username=body.username,
             password=body.password,
             email=body.email,
         )
-
-        await session.commit()
 
     except FirstAdminExistsError as exc:
         await _rollback_safely(
