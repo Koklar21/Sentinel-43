@@ -19,9 +19,9 @@ a subordinate governance service; the owner-designated response engine is
 created here and injected into that service rather than being constructed by
 it.
 
-Step 1 intentionally does not absorb auth, users, bootstrap, Watchtower, or
-the dashboard yet.  Those surfaces are integrated in later steps through this
-same authority boundary.
+The owner-designated Nexus, node/core, and AI-escalation sources are loaded
+and owned here as live runtime components. Auth, users, bootstrap, Watchtower,
+and the dashboard are integrated in later steps through this same boundary.
 """
 
 from __future__ import annotations
@@ -47,10 +47,37 @@ class Sentinel43RuntimeAuthority:
         self._orchestrator = orchestrator
         self._engine: Any | None = None
 
+        # The owner source directory is part of the live runtime, not a
+        # historical appendix. Load the three non-engine owner components
+        # exactly once and bind all of them to this same authority.
+        from .owner_components import load_owner_runtime_components
+
+        self._owner_components = load_owner_runtime_components(self)
+
     @property
     def orchestrator(self) -> SystemOrchestrator:
         """Subordinate governance service, exposed for compatibility only."""
         return self._orchestrator
+
+    @property
+    def nexus(self) -> Any:
+        """The live owner-designated Nexus entry component."""
+        return self._owner_components.nexus
+
+    @property
+    def node(self) -> Any:
+        """The live owner-designated node/core component."""
+        return self._owner_components.node
+
+    @property
+    def ai_escalation(self) -> Any:
+        """The live owner-designated AI-escalation component."""
+        return self._owner_components.ai_escalation
+
+    @property
+    def owner_component_identities(self) -> dict[str, dict[str, str]]:
+        """Source provenance for the three loaded owner components."""
+        return self._owner_components.identity_map()
 
     @property
     def recommendation_store_attached(self) -> bool:
@@ -119,6 +146,11 @@ class Sentinel43RuntimeAuthority:
     # ------------------------------------------------------------------
 
     def stage_recommendation(self, recommendation: Any) -> Any:
+        """Public governed entry: every recommendation crosses the Nexus."""
+        return self._owner_components.nexus.submit_recommendation(recommendation)
+
+    def _stage_recommendation_from_nexus(self, recommendation: Any) -> Any:
+        """Nexus-only handoff into the subordinate governance service."""
         return self._orchestrator.stage_recommendation(recommendation)
 
     def resolve_recommendation(
@@ -130,6 +162,25 @@ class Sentinel43RuntimeAuthority:
         reason: str = "",
         principal: DecisionPrincipal | None = None,
     ) -> dict[str, Any]:
+        """Public governed decision entry: resolution crosses the Nexus."""
+        return self._owner_components.nexus.resolve_recommendation(
+            action_id,
+            approved=approved,
+            operator_id=operator_id,
+            reason=reason,
+            principal=principal,
+        )
+
+    def _resolve_recommendation_from_nexus(
+        self,
+        action_id: str,
+        *,
+        approved: bool,
+        operator_id: str,
+        reason: str = "",
+        principal: DecisionPrincipal | None = None,
+    ) -> dict[str, Any]:
+        """Nexus-only handoff into the subordinate governance service."""
         return self._orchestrator.resolve_recommendation(
             action_id,
             approved=approved,
