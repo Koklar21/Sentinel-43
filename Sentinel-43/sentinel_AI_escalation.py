@@ -62,7 +62,6 @@ from typing import Any, Mapping, Sequence
 
 from core.governance.orchestrator import (
     DecisionPrincipal,
-    GovernanceMode,
     ThreatRecommendation,
 )
 from core.governance.runtime_authority import Sentinel43RuntimeAuthority
@@ -327,8 +326,7 @@ class SentinelAIEscalation:
 
     @property
     def mode(self) -> SentinelMode:
-        raw = self._authority.orchestrator.default_mode
-        value = raw.value if isinstance(raw, GovernanceMode) else str(raw)
+        value = self._authority.governance_mode
         return SentinelMode(value.strip().upper())
 
     def build_assessment(
