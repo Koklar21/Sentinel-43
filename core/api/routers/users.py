@@ -38,20 +38,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...auth.deps import get_db_session
 from ...auth.users import (
-    ADMIN_INVARIANT_LOCK_KEY,
     APPROVED_ROLES,
     User,
-    _pg_advisory_xact_lock,
-    count_active_admins,
-    create_user,
-    get_user_by_id,
     get_user_by_username,
     list_users,
-    set_user_active,
-    set_user_password,
-    set_user_role,
 )
-from ..deps import require_admin
+from ...governance.identity import (
+    IdentityLastAdminRefused,
+    IdentitySelfDeactivationRefused,
+    IdentityTargetNotFound,
+)
+from ..deps import get_runtime_authority, require_admin
 
 logger = logging.getLogger(__name__)
 
@@ -217,70 +214,6 @@ def _parse_user_id(raw: str) -> uuid.UUID:
         ) from exc
 
 
-async def _revoke_sessions(
-    session: AsyncSession,
-    user_id: uuid.UUID,
-    *,
-    reason: str,
-) -> None:
-    """Revoke every live session for a security-sensitive account change.
-
-    This operation is part of the caller's transaction. Failure is fatal to the
-    account mutation so the database cannot commit a password/role/active-state
-    change while leaving stale authenticated sessions alive.
-    """
-    from ...auth.sessions import revoke_all_user_sessions
-
-    try:
-        await revoke_all_user_sessions(
-            session,
-            user_id,
-            reason=reason,
-        )
-    except Exception as exc:
-        logger.error(
-            "Session revocation failed for user_id=%s reason=%s",
-            user_id,
-            reason,
-            exc_info=True,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Session revocation service is unavailable.",
-        ) from exc
-
-
-async def _would_orphan_admins(
-    session: AsyncSession,
-    target: User,
-    *,
-    new_is_active: bool | None,
-    new_role: str | None,
-) -> bool:
-    if not (
-        bool(target.is_active)
-        and str(target.role).lower() == "admin"
-    ):
-        return False
-
-    effective_is_active = (
-        bool(target.is_active)
-        if new_is_active is None
-        else bool(new_is_active)
-    )
-
-    effective_role = (
-        str(target.role).lower()
-        if new_role is None
-        else new_role
-    )
-
-    if effective_is_active and effective_role == "admin":
-        return False
-
-    return await count_active_admins(session) <= 1
-
-
 async def _rollback_safely(session: AsyncSession) -> None:
     try:
         await session.rollback()
@@ -299,7 +232,9 @@ async def _rollback_safely(session: AsyncSession) -> None:
 )
 async def create_account(
     body: CreateUserRequest,
+    admin: str = Depends(require_admin),
     session: AsyncSession = Depends(get_db_session),
+    authority: object = Depends(get_runtime_authority),
 ) -> UserResponse:
     """Create a new operator/admin account."""
 
@@ -315,14 +250,14 @@ async def create_account(
         )
 
     try:
-        user = await create_user(
+        user = await authority.identity.create_account(
             session,
+            actor=admin,
             username=body.username,
             password=body.password,
             role=body.role,
             email=body.email,
         )
-        await session.commit()
 
     except IntegrityError as exc:
         await _rollback_safely(session)
@@ -374,114 +309,38 @@ async def update_account(
     body: UpdateUserRequest,
     admin: str = Depends(require_admin),
     session: AsyncSession = Depends(get_db_session),
+    authority: object = Depends(get_runtime_authority),
 ) -> UserResponse:
-    """Update account activation state and/or role."""
+    """Update account activation state and/or role through Sentinel-43."""
 
     parsed_id = _parse_user_id(user_id)
 
-    target = await get_user_by_id(
-        session,
-        parsed_id,
-    )
+    try:
+        target = await authority.identity.update_account(
+            session,
+            actor=admin,
+            user_id=parsed_id,
+            new_is_active=body.is_active,
+            new_role=body.role,
+        )
 
-    if target is None:
+    except IdentityTargetNotFound as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No account with that user_id.",
-        )
+        ) from exc
 
-    if (
-        target.username == admin
-        and body.is_active is False
-    ):
+    except IdentitySelfDeactivationRefused as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="You cannot deactivate your own account.",
-        )
+        ) from exc
 
-    new_role = body.role
-
-    touches_admin_count = (
-        (
-            body.is_active is not None
-            and str(target.role).lower() == "admin"
-        )
-        or (
-            new_role is not None
-            and (
-                str(target.role).lower() == "admin"
-                or new_role == "admin"
-            )
-        )
-    )
-
-    try:
-        if touches_admin_count:
-            await _pg_advisory_xact_lock(
-                session,
-                ADMIN_INVARIANT_LOCK_KEY,
-            )
-
-        if await _would_orphan_admins(
-            session,
-            target,
-            new_is_active=body.is_active,
-            new_role=new_role,
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "Cannot deactivate or demote the last active admin."
-                ),
-            )
-
-        role_changed = (
-            new_role is not None
-            and new_role != str(target.role).lower()
-        )
-
-        deactivated = (
-            body.is_active is False
-            and bool(target.is_active)
-        )
-
-        if role_changed:
-            target = await set_user_role(
-                session,
-                target,
-                role=new_role,
-            )
-
-        if (
-            body.is_active is not None
-            and bool(body.is_active) != bool(target.is_active)
-        ):
-            target = await set_user_active(
-                session,
-                target,
-                is_active=body.is_active,
-            )
-
-        # Any role change or deactivation invalidates current authentication
-        # context. Do this before commit in the same transaction.
-        if deactivated:
-            await _revoke_sessions(
-                session,
-                target.user_id,
-                reason="account_disabled",
-            )
-        elif role_changed:
-            await _revoke_sessions(
-                session,
-                target.user_id,
-                reason="role_changed",
-            )
-
-        await session.commit()
-
-    except HTTPException:
-        await _rollback_safely(session)
-        raise
+    except IdentityLastAdminRefused as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot deactivate or demote the last active admin.",
+        ) from exc
 
     except IntegrityError as exc:
         await _rollback_safely(session)
@@ -489,6 +348,10 @@ async def update_account(
             status_code=status.HTTP_409_CONFLICT,
             detail="Account update conflicted with existing data.",
         ) from exc
+
+    except HTTPException:
+        await _rollback_safely(session)
+        raise
 
     except Exception:
         await _rollback_safely(session)
@@ -504,37 +367,27 @@ async def update_account(
 async def reset_account_password(
     user_id: str,
     body: ResetPasswordRequest,
+    admin: str = Depends(require_admin),
     session: AsyncSession = Depends(get_db_session),
+    authority: object = Depends(get_runtime_authority),
 ) -> UserResponse:
-    """Reset an account password and revoke every existing session."""
+    """Reset an account password through Sentinel-43 and revoke sessions."""
 
     parsed_id = _parse_user_id(user_id)
 
-    target = await get_user_by_id(
-        session,
-        parsed_id,
-    )
+    try:
+        target = await authority.identity.reset_password(
+            session,
+            actor=admin,
+            user_id=parsed_id,
+            new_password=body.new_password,
+        )
 
-    if target is None:
+    except IdentityTargetNotFound as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No account with that user_id.",
-        )
-
-    try:
-        target = await set_user_password(
-            session,
-            target,
-            password=body.new_password,
-        )
-
-        await _revoke_sessions(
-            session,
-            target.user_id,
-            reason="password_reset",
-        )
-
-        await session.commit()
+        ) from exc
 
     except HTTPException:
         await _rollback_safely(session)
