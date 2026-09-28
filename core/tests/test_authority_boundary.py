@@ -99,6 +99,30 @@ def test_no_second_decision_engine_is_constructed():
     assert offenders == []
 
 
+def test_sentinel43_runtime_authority_owns_engine_construction():
+    """The owner engine is constructed by Sentinel-43 itself, never by the
+    subordinate SystemOrchestrator."""
+    authority_source = (
+        CORE / "governance" / "runtime_authority.py"
+    ).read_text(encoding="utf-8")
+    orchestrator_source = (
+        CORE / "governance" / "orchestrator.py"
+    ).read_text(encoding="utf-8")
+
+    assert "GovernedEngine(" in authority_source
+    assert "GovernedEngine(" not in orchestrator_source
+    assert "bind_recommendation_runtime(" in orchestrator_source
+
+
+def test_api_composition_root_enters_sentinel43_authority():
+    """The API hosts Sentinel-43; it does not construct an independent
+    SystemOrchestrator as the runtime root."""
+    source = (CORE / "api" / "main.py").read_text(encoding="utf-8")
+    assert "runtime.sentinel43 = build_runtime_authority_from_settings(" in source
+    assert "runtime.orchestrator = runtime.sentinel43.orchestrator" in source
+    assert "runtime.orchestrator = build_orchestrator_from_settings(" not in source
+
+
 def test_the_only_engine_class_loaded_is_the_owner_response_engine():
     from core.governance.sentinel43_engine import ENGINE_CLASS_NAME
 
