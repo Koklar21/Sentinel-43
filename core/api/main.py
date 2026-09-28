@@ -1703,7 +1703,14 @@ async def _start_fenrir() -> None:
     try:
         from core.detection.feniri_hunter import FenrirHunter
 
-        runtime.fenrir_instance = FenrirHunter()
+        if runtime.sentinel43 is None:
+            raise RuntimeError(
+                "Fenrir requires the Sentinel-43 runtime authority"
+            )
+
+        runtime.fenrir_instance = FenrirHunter(
+            authority=runtime.sentinel43
+        )
         await runtime.fenrir_instance.start()
         # Feed allowlisted originating events into the SAME detector instance
         # Fenrir evaluates (no second detector, queue or bus).
@@ -2359,8 +2366,9 @@ async def _start_heart() -> None:
                 restored,
             )
 
-        if runtime.fenrir_instance is not None:
-            runtime.fenrir_instance.heart = runtime.heart
+        # build_heart_from_settings() attaches this instance to the
+        # Sentinel-43 runtime authority. Fenrir receives only that authority.
+        runtime.heart = runtime.sentinel43.heart
 
         # A store that is ALREADY at or over the ceiling keeps working and
         # keeps observing, but cannot stage. The new limit stops that state
@@ -2392,8 +2400,8 @@ async def _start_heart() -> None:
         logger.info("Heart (ThreatGovernor) started (mode=%s)", resolved_default_mode)
     except Exception as exc:
         runtime.heart = None
-        if runtime.fenrir_instance is not None:
-            runtime.fenrir_instance.heart = None
+        if runtime.sentinel43 is not None:
+            runtime.sentinel43.detach_heart()
         # A Heart that failed to start must not leave its decisions reachable
         # through the orchestrator either.
         if runtime.sentinel43 is not None:
@@ -2767,11 +2775,13 @@ async def lifespan(api: FastAPI):
     try:
         await _start_monitoring_manager()
         await _start_sparta()
-        await _start_fenrir()
         await _start_audit_store()
         await _start_reliability()
         await _start_governance()
+        # Heart recovery completes before Fenrir begins producing live
+        # assessments, so no finding can race around the authority boundary.
         await _start_heart()
+        await _start_fenrir()
         await _register_remote_dispatch_handlers()
 
         # Registration failures are observable, but do not necessarily mean
