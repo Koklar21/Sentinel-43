@@ -21,7 +21,7 @@ Security properties:
     - no configured tokens => authenticated routes fail closed
     - live dispatch is disabled by default
     - live dispatch requires an explicitly registered in-process handler
-    - human-gated approve/veto payloads require both action_id and decision_id
+    - service-token gateway operations never perform human approval/veto
     - payload size/key/depth limits are enforced before dispatch
     - correlation IDs are replay-protected within a bounded retention window
     - authentication-failure state is bounded
@@ -57,7 +57,7 @@ from typing import Any, Awaitable, Callable, Final
 from uuid import uuid4
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ...monitoring.watchtower_client import watchtower_request
 from ...security_context import IdentityType, client_ip_of, set_identity
@@ -264,8 +264,6 @@ class RemoteEventType(str, Enum):
     FORCE_SYNC = "force_sync"
     ROTATE_REMOTE_TOKEN = "rotate_remote_token"
     REQUEST_DIAGNOSTIC_SNAPSHOT = "request_diagnostic_snapshot"
-    APPROVE_DECISION = "approve_decision"
-    VETO_DECISION = "veto_decision"
 
 
 ROLE_EVENT_POLICY: Final[dict[OperatorRole, frozenset[RemoteEventType]]] = {
@@ -275,8 +273,6 @@ ROLE_EVENT_POLICY: Final[dict[OperatorRole, frozenset[RemoteEventType]]] = {
             RemoteEventType.FORCE_SYNC,
             RemoteEventType.ROTATE_REMOTE_TOKEN,
             RemoteEventType.REQUEST_DIAGNOSTIC_SNAPSHOT,
-            RemoteEventType.APPROVE_DECISION,
-            RemoteEventType.VETO_DECISION,
         }
     ),
     OperatorRole.ADMIN: frozenset(
@@ -284,8 +280,6 @@ ROLE_EVENT_POLICY: Final[dict[OperatorRole, frozenset[RemoteEventType]]] = {
             RemoteEventType.FORCE_HEALTH_CHECK,
             RemoteEventType.FORCE_SYNC,
             RemoteEventType.REQUEST_DIAGNOSTIC_SNAPSHOT,
-            RemoteEventType.APPROVE_DECISION,
-            RemoteEventType.VETO_DECISION,
         }
     ),
     OperatorRole.AUDITOR: frozenset(
@@ -637,44 +631,6 @@ class RemoteEventActivationRequest(StrictModel):
 
         return cleaned
 
-    @model_validator(mode="after")
-    def validate_governance_payload(
-        self,
-    ) -> "RemoteEventActivationRequest":
-        if self.event_type not in {
-            RemoteEventType.APPROVE_DECISION,
-            RemoteEventType.VETO_DECISION,
-        }:
-            return self
-
-        action_id = str(
-            self.payload.get("action_id") or ""
-        ).strip()
-        decision_id = str(
-            self.payload.get("decision_id") or ""
-        ).strip()
-
-        if not action_id:
-            raise ValueError(
-                f"{self.event_type.value} requires payload.action_id"
-            )
-
-        if not decision_id:
-            raise ValueError(
-                f"{self.event_type.value} requires payload.decision_id"
-            )
-
-        if not _SAFE_ID_RE.fullmatch(action_id):
-            raise ValueError(
-                "payload.action_id contains unsupported characters"
-            )
-
-        if not _SAFE_ID_RE.fullmatch(decision_id):
-            raise ValueError(
-                "payload.decision_id contains unsupported characters"
-            )
-
-        return self
 
 
 class RemoteEventActivationResponse(StrictModel):
