@@ -68,7 +68,6 @@ from typing import Any, Mapping
 
 from core.governance.orchestrator import (
     DecisionPrincipal,
-    GovernanceMode,
     ThreatRecommendation,
 )
 from core.governance.runtime_authority import Sentinel43RuntimeAuthority
@@ -282,8 +281,7 @@ class SentinelNode:
 
     @property
     def mode(self) -> DeploymentMode:
-        raw = self._authority.orchestrator.default_mode
-        value = raw.value if isinstance(raw, GovernanceMode) else str(raw)
+        value = self._authority.governance_mode
         return DeploymentMode(value.strip().upper())
 
     def set_mode(self, mode: DeploymentMode | str) -> None:
