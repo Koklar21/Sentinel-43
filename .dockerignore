@@ -123,13 +123,16 @@ Thumbs.db
 
 # -----------------------------------------------------------------------------
 # Owner-designated orchestration core (Sentinel-43/).
-# Shadow_mode.py ships because the runtime loads its Sentinel43ResponseEngine
-# as the orchestration engine (core/governance/sentinel43_engine.py), with its
-# execution paths contained. The other prototypes are not loaded and do not
-# ship. See Sentinel-43/README.md.
+# Ship the complete owner-designated runtime source set. Shadow_mode.py is the
+# live response engine today; Nexus, node/core, and AI-escalation are being
+# integrated under Sentinel43RuntimeAuthority and must be present in the image
+# when that wiring lands. This packaging change alone does not activate them.
 # -----------------------------------------------------------------------------
 Sentinel-43/*
 !Sentinel-43/Shadow_mode.py
+!Sentinel-43/Sentienal_Nexus.py
+!Sentinel-43/Sentienal_core.py
+!Sentinel-43/sentinel_AI_escalation.py
 !Sentinel-43/README.md
 
 # -----------------------------------------------------------------------------
