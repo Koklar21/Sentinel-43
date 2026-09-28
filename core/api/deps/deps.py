@@ -669,6 +669,12 @@ def get_runtime_authority(request: Request) -> Any:
     return authority
 
 
+def get_optional_runtime_authority(request: Request) -> Any | None:
+    """Return the live authority when present, without creating a fallback."""
+    runtime = getattr(request.app.state, "runtime", None)
+    return getattr(runtime, "sentinel43", None)
+
+
 def get_engine() -> EngineProtocol:
     """Resolve and validate the configured engine dependency."""
     config = load_config()
@@ -732,6 +738,7 @@ __all__ = [
     "dev_engine_factory",
     "dev_store_factory",
     "get_engine",
+    "get_optional_runtime_authority",
     "get_runtime_authority",
     "get_store",
     "register_dependencies_with_watchtower",
