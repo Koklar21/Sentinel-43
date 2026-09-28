@@ -245,6 +245,30 @@ def test_identity_mutations_enter_the_runtime_authority():
         assert forbidden not in users
 
 
+def test_session_mutations_enter_the_runtime_authority():
+    auth_path = CORE / "api" / "routers" / "auth.py"
+    called = _calls_in(auth_path)
+    source = auth_path.read_text(encoding="utf-8")
+
+    for governed in (
+        "create_login_session",
+        "rotate_session_refresh",
+        "logout_session_by_refresh",
+    ):
+        assert governed in called
+
+    assert "authority.identity.create_login_session(" in source
+    assert "authority.identity.rotate_session_refresh(" in source
+    assert "authority.identity.logout_session_by_refresh(" in source
+
+    for forbidden in (
+        "create_session",
+        "rotate_refresh",
+        "logout_by_refresh",
+    ):
+        assert forbidden not in called
+
+
 # ---------------------------------------------------------------------------
 # 5. No API route bypasses the orchestrator
 # ---------------------------------------------------------------------------
