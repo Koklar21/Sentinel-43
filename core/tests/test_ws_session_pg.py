@@ -74,11 +74,38 @@ def client(monkeypatch):
 
     from fastapi.testclient import TestClient
     import core.api.main as main_module
+    from core.api.deps import (
+        get_optional_runtime_authority,
+        get_runtime_authority,
+    )
+    from core.governance.identity import IdentityGovernanceService
+
+    authority = type(
+        "_TestAuthority",
+        (),
+        {
+            "identity": IdentityGovernanceService(
+                audit_sink=lambda _payload: None
+            )
+        },
+    )()
+    main_module.app.dependency_overrides[get_optional_runtime_authority] = (
+        lambda: authority
+    )
+    main_module.app.dependency_overrides[get_runtime_authority] = (
+        lambda: authority
+    )
 
     with TestClient(main_module.app) as c:
         c._db = eng  # type: ignore[attr-defined]
         yield c
 
+    main_module.app.dependency_overrides.pop(
+        get_optional_runtime_authority, None
+    )
+    main_module.app.dependency_overrides.pop(
+        get_runtime_authority, None
+    )
     users_mod._engine = None
     users_mod._sessionmaker = None
     with eng.begin() as c:
