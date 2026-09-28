@@ -40,11 +40,12 @@ from datetime import datetime, timezone
 from typing import Any, Final
 
 import jwt as pyjwt
-from fastapi import APIRouter, Header, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ...security.jwt_constants import APPROVED_JWT_ALGORITHMS
 from ...security_context import client_ip_of
+from ..deps import get_runtime_authority
 
 logger = logging.getLogger(__name__)
 
@@ -1386,55 +1387,35 @@ def _clear_session_cookies(
 async def _create_login_session(
     *,
     user_id: str,
+    subject: str,
     request: Request,
+    authority: Any,
 ) -> tuple[str, str, str]:
     from ...auth.sessions import (
-        create_session,
         generate_csrf_token,
         generate_refresh_secret,
     )
-    from ...auth.users import (
-        get_sessionmaker,
-    )
+    from ...auth.users import get_sessionmaker
 
-    refresh_secret = (
-        generate_refresh_secret()
-    )
-    csrf_token = (
-        generate_csrf_token()
-    )
+    refresh_secret = generate_refresh_secret()
+    csrf_token = generate_csrf_token()
 
     # Canonical resolver: the firewall owns the trusted-proxy decision.
     client_ip = client_ip_of(request)
+    user_agent = request.headers.get("user-agent")
 
-    user_agent = request.headers.get(
-        "user-agent"
-    )
-
-    sessionmaker = (
-        get_sessionmaker()
-    )
-
+    sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
-        row = await create_session(
+        row = await authority.identity.create_login_session(
             session,
-            user_id=uuid.UUID(
-                user_id
-            ),
+            actor=subject,
+            user_id=uuid.UUID(user_id),
             refresh_secret=refresh_secret,
             client_ip=client_ip,
             user_agent=user_agent,
         )
 
-        await session.commit()
-
-    return (
-        str(
-            row.sid
-        ),
-        refresh_secret,
-        csrf_token,
-    )
+    return str(row.sid), refresh_secret, csrf_token
 
 
 async def resolve_session_subject(
@@ -1551,6 +1532,7 @@ async def login(
     body: LoginRequest,
     request: Request,
     response: Response,
+    authority: Any = Depends(get_runtime_authority),
 ) -> LoginResponse:
     _check_state_change_origin(
         request
@@ -1591,7 +1573,9 @@ async def login(
                 csrf_token,
             ) = await _create_login_session(
                 user_id=user_id,
+                subject=subject,
                 request=request,
+                authority=authority,
             )
 
         except Exception as exc:
@@ -1658,6 +1642,7 @@ async def login(
 async def refresh(
     request: Request,
     response: Response,
+    authority: Any = Depends(get_runtime_authority),
 ) -> RefreshResponse:
     _check_state_change_origin(
         request
@@ -1688,12 +1673,8 @@ async def refresh(
         SessionRevokedError,
         csrf_tokens_match,
         generate_refresh_secret,
-        rotate_refresh,
     )
-    from ...auth.users import (
-        get_sessionmaker,
-        get_user_by_id,
-    )
+    from ...auth.users import get_sessionmaker
 
     csrf_cookie = request.cookies.get(
         CSRF_COOKIE_NAME
@@ -1734,38 +1715,26 @@ async def refresh(
 
     async with sessionmaker() as session:
         try:
-            row, _outcome = await rotate_refresh(
+            row, _outcome, owner = await authority.identity.rotate_session_refresh(
                 session,
                 presented_secret=cookie,
                 new_refresh_secret=new_secret,
             )
 
         except RefreshReuseError as exc:
-            await session.commit()
-            _clear_session_cookies(
-                response
-            )
+            _clear_session_cookies(response)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=(
-                    "Session ended. Log in again."
-                ),
-                headers={
-                    "WWW-Authenticate": "Bearer"
-                },
+                detail="Session ended. Log in again.",
+                headers={"WWW-Authenticate": "Bearer"},
             ) from exc
 
         except SessionOwnerInactiveError as exc:
-            await session.commit()
-            _clear_session_cookies(
-                response
-            )
+            _clear_session_cookies(response)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Account is disabled.",
-                headers={
-                    "WWW-Authenticate": "Bearer"
-                },
+                headers={"WWW-Authenticate": "Bearer"},
             ) from exc
 
         except (
@@ -1773,49 +1742,16 @@ async def refresh(
             SessionRevokedError,
             SessionExpiredError,
         ) as exc:
-            await session.rollback()
-            _clear_session_cookies(
-                response
-            )
+            _clear_session_cookies(response)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=(
-                    "Session is no longer valid. "
-                    "Log in again."
-                ),
-                headers={
-                    "WWW-Authenticate": "Bearer"
-                },
+                detail="Session is no longer valid. Log in again.",
+                headers={"WWW-Authenticate": "Bearer"},
             ) from exc
-
-        owner = await get_user_by_id(
-            session,
-            row.user_id,
-        )
-
-        if (
-            owner is None
-            or not owner.is_active
-        ):
-            await session.rollback()
-            _clear_session_cookies(
-                response
-            )
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Account is disabled.",
-                headers={
-                    "WWW-Authenticate": "Bearer"
-                },
-            )
 
         subject = owner.username
         role = owner.role
-        user_id = str(
-            owner.user_id
-        )
-
-        await session.commit()
+        user_id = str(owner.user_id)
 
     token, exp_dt = _issue_token(
         subject=subject,
@@ -1848,6 +1784,7 @@ async def refresh(
 async def logout(
     request: Request,
     response: Response,
+    authority: Any = Depends(get_runtime_authority),
 ) -> dict[str, bool]:
     _check_state_change_origin(
         request
@@ -1866,13 +1803,8 @@ async def logout(
             "ok": True
         }
 
-    from ...auth.sessions import (
-        csrf_tokens_match,
-        logout_by_refresh,
-    )
-    from ...auth.users import (
-        get_sessionmaker,
-    )
+    from ...auth.sessions import csrf_tokens_match
+    from ...auth.users import get_sessionmaker
 
     if not csrf_tokens_match(
         request.cookies.get(
@@ -1896,11 +1828,10 @@ async def logout(
         )
 
         async with sessionmaker() as session:
-            await logout_by_refresh(
+            await authority.identity.logout_session_by_refresh(
                 session,
                 presented_secret=cookie,
             )
-            await session.commit()
 
     except Exception as exc:
         _clear_session_cookies(
