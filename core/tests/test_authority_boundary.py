@@ -303,6 +303,25 @@ def test_session_mutations_enter_the_runtime_authority():
         assert forbidden not in called
 
 
+def test_remote_role_tokens_are_not_a_human_decision_capability():
+    remote_source = (
+        CORE / "api" / "routers" / "remote_gateway.py"
+    ).read_text(encoding="utf-8")
+    api_source = (
+        CORE / "api" / "main.py"
+    ).read_text(encoding="utf-8")
+
+    assert "REMOTE_NON_DECISION_EVENTS" in remote_source
+    assert "APPROVE_DECISION" not in remote_source.split(
+        "ROLE_EVENT_POLICY", 1
+    )[1].split("_AUDIT_VISIBLE_ROLES", 1)[0]
+    assert "VETO_DECISION" not in remote_source.split(
+        "ROLE_EVENT_POLICY", 1
+    )[1].split("_AUDIT_VISIBLE_ROLES", 1)[0]
+    assert "approve_handler" not in api_source
+    assert "veto_handler" not in api_source
+
+
 # ---------------------------------------------------------------------------
 # 5. No API route bypasses the orchestrator
 # ---------------------------------------------------------------------------
