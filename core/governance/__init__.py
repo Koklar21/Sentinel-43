@@ -20,7 +20,11 @@ authoritative audit writer is injected at composition time.
 
 from __future__ import annotations
 
-from .composition import build_heart_from_settings, build_orchestrator_from_settings
+from .composition import (
+    build_heart_from_settings,
+    build_orchestrator_from_settings,
+    build_runtime_authority_from_settings,
+)
 from .heart import (
     ActionSink,
     DecisionPrincipal,
@@ -29,6 +33,7 @@ from .heart import (
     ThreatGovernor,
     UnauthorizedDecision,
 )
+from .runtime_authority import Sentinel43RuntimeAuthority
 from .orchestrator import (
     CallerContext,
     Decision,
@@ -50,6 +55,7 @@ __all__ = [
     "HeartDecision",
     "PendingReview",
     "ReasonCode",
+    "Sentinel43RuntimeAuthority",
     "SystemOrchestrator",
     "ThreatGovernor",
     "TransactionContext",
@@ -57,4 +63,5 @@ __all__ = [
     "UnauthorizedDecision",
     "build_heart_from_settings",
     "build_orchestrator_from_settings",
+    "build_runtime_authority_from_settings",
 ]
