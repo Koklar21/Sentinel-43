@@ -13,8 +13,9 @@
 
 """Governance composition.
 
-Assembles a :class:`SystemOrchestrator` from an already-validated settings
-object supplied by the API composition root.
+Assembles the Sentinel-43 runtime authority and its subordinate governance
+services from an already-validated settings object supplied by the API
+composition root.
 
 This module performs:
     - no environment reads
@@ -35,6 +36,7 @@ from core.guards.velocity import VelocityConfig, VelocityGuard
 from core.sentinel43_core_db import SentinelCoreStore
 
 from .heart import HeartConfig, ThreatGovernor
+from .runtime_authority import Sentinel43RuntimeAuthority
 from .orchestrator import (
     DEFAULT_REVIEW_TTL_SECONDS,
     MAX_PENDING_REVIEWS,
@@ -115,6 +117,26 @@ def build_orchestrator_from_settings(
     )
 
 
+def build_runtime_authority_from_settings(
+    settings: Any,
+    *,
+    audit_store: AuditWriter,
+    monitoring_manager: Any | None = None,
+) -> Sentinel43RuntimeAuthority:
+    """Build the one top-level Sentinel-43 runtime authority.
+
+    SystemOrchestrator remains the implementation of the established
+    governance mechanics, but it is owned by Sentinel-43 rather than being the
+    architectural root itself.
+    """
+    orchestrator = build_orchestrator_from_settings(
+        settings,
+        audit_store=audit_store,
+        monitoring_manager=monitoring_manager,
+    )
+    return Sentinel43RuntimeAuthority(orchestrator)
+
+
 def build_heart_from_settings(
     settings: Any,
     *,
@@ -133,8 +155,9 @@ def build_heart_from_settings(
     environment parsing. ``audit_store`` and ``core_store`` must already be
     initialized -- this function performs no filesystem/network I/O.
 
-    ``authority`` is the SystemOrchestrator that governs every Heart
-    recommendation. It is bound here to the SAME ``core_store`` the Heart
+    ``authority`` is the top-level Sentinel43RuntimeAuthority that governs
+    every Heart recommendation. It binds its subordinate orchestrator and
+    owner engine to the SAME ``core_store`` the Heart
     was given, so there is exactly one durable pending-decision store, and
     ``operator_authenticator`` becomes the authority's (fail-closed when
     absent). With no authority the Heart stages and resolves nothing.
@@ -193,4 +216,8 @@ def build_heart_from_settings(
     )
 
 
-__all__ = ["build_heart_from_settings", "build_orchestrator_from_settings"]
+__all__ = [
+    "build_heart_from_settings",
+    "build_orchestrator_from_settings",
+    "build_runtime_authority_from_settings",
+]
