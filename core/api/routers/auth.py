@@ -45,7 +45,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ...security.jwt_constants import APPROVED_JWT_ALGORITHMS
 from ...security_context import client_ip_of
-from ..deps import get_runtime_authority
+from ..deps import get_optional_runtime_authority, get_runtime_authority
 
 logger = logging.getLogger(__name__)
 
@@ -850,6 +850,12 @@ def _issue_token(
     }
 
     if user_id is not None:
+        if authority is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Sentinel-43 runtime authority is unavailable.",
+            )
+
         try:
             payload["user_id"] = str(
                 uuid.UUID(
@@ -1532,7 +1538,7 @@ async def login(
     body: LoginRequest,
     request: Request,
     response: Response,
-    authority: Any = Depends(get_runtime_authority),
+    authority: Any | None = Depends(get_optional_runtime_authority),
 ) -> LoginResponse:
     _check_state_change_origin(
         request
