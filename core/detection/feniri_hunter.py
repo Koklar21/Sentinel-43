@@ -779,6 +779,8 @@ class FenrirHunter:
     def __init__(
         self,
         config: FenrirConfig | None = None,
+        *,
+        authority: Any | None = None,
     ) -> None:
         self.config = (
             config
@@ -808,11 +810,11 @@ class FenrirHunter:
         self._started = False
         self._lifecycle_lock = asyncio.Lock()
 
-        # Optional: set post-construction by the API composition root once
-        # the Heart (core.governance.heart.ThreatGovernor) has started.
-        # Never required -- Fenrir's own detection/reporting must keep
-        # working unchanged whether or not a Heart is wired in.
-        self.heart: Any | None = None
+        # Embedded Sentinel-43 binds the top-level runtime authority here.
+        # Fenrir never receives Heart directly: detection reports upward to
+        # S43, which owns the Heart and every consequential downstream path.
+        # Standalone Fenrir may omit authority and remains observational only.
+        self.authority: Any | None = authority
         self._heart_unavailable_logged = False
         # (identity, ip, kind) -> evidence_seq last handed to the Heart
         # successfully. Bounded; unchanged evidence is not re-submitted.
@@ -1094,13 +1096,13 @@ class FenrirHunter:
         self,
         assessment: ThreatAssessment,
     ) -> None:
-        """Hand-off to the Heart, if one is wired in.
+        """Hand-off to Sentinel-43 authority, which owns the Heart.
 
         Fenrir's own detection and reporting continue unconditionally
         either way (called from observe_signals() after the finding is
         already built) -- raw evidence is never lost because the Heart is
         unavailable, and this method never raises to its caller. But
-        unavailability itself must not be silent: an unresolved recommendation
+        authority unavailability itself must not be silent: an unresolved recommendation
         that was never even attempted is different from a genuinely
         corroboration-pending one, and an operator watching Fenrir's own
         metrics/logs must be able to tell the two apart. Failure here is
@@ -1108,14 +1110,14 @@ class FenrirHunter:
         still reported through Fenrir's normal path; only Heart-governed
         staging of it did not happen.
         """
-        heart = self.heart
+        authority = self.authority
 
-        if heart is None:
+        if authority is None:
             self.metrics["heart_unavailable"] += 1
             if not self._heart_unavailable_logged:
                 self._heart_unavailable_logged = True
                 logger.warning(
-                    "Heart is not wired in -- Fenrir findings are reported "
+                    "Sentinel-43 authority is not wired in -- Fenrir findings are reported "
                     "as usual but are not entering human-governed staging. "
                     "(Logged once; see the heart_unavailable metric for "
                     "the ongoing count.)"
@@ -1139,7 +1141,7 @@ class FenrirHunter:
         try:
             await asyncio.get_running_loop().run_in_executor(
                 self._ensure_executor(),
-                heart.observe,
+                authority.observe_threat,
                 assessment,
             )
         except Exception:
