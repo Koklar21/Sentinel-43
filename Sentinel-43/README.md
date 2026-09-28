@@ -54,8 +54,9 @@ does not replace the owner's review of the change that implements it.
 - Adapted, and only these:
   - **Storage:** its `ActionStore` is served by the one durable
     `SentinelCoreStore`; there is no second ledger.
-  - **Execution is contained:** `_executor_loop` and `_execute_approved_now`
-    are no-ops, executor claims are refused, and ACTIVE mode is refused.
+  - **Execution is absent:** the owner engine itself has no ACTIVE mode,
+    executor loop, standalone integration execution, or execute-on-approval
+    path. The store adapter also refuses executor claims as defense in depth.
     Approval is recorded; nothing is executed.
   - **Authentication:** its authenticator is bound to the server-verified
     human principal of the decision in progress.
@@ -112,10 +113,10 @@ does not replace the owner's review of the change that implements it.
 
 ## Which original oversight controls are active
 
-`OversightEngine` in this file holds the original design's staging controls.
-They are enforced in the production path by `SystemOrchestrator`, against the
-one durable store -- the class itself is not instantiated, because it carries
-its own in-memory pending queue and would be a second authority:
+The original oversight responsibilities remain active, but the obsolete
+standalone `OversightEngine` implementation has been removed from the live
+owner engine. The controls are enforced by the current engine, Heart, and
+`SystemOrchestrator` against the one durable store:
 
 | Oversight control | Where it is enforced now |
 | --- | --- |
