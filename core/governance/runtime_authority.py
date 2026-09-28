@@ -90,6 +90,22 @@ class Sentinel43RuntimeAuthority:
         """Source provenance for the three loaded owner components."""
         return self._owner_components.identity_map()
 
+    def authority_snapshot(self) -> dict[str, Any]:
+        """Read-only proof of the live Sentinel-43 authority composition.
+
+        The snapshot exposes identities and state, never subordinate service
+        objects, stores, queues, authenticators, or mutation capabilities.
+        """
+        mode = self._orchestrator.default_mode
+        return {
+            "authority": type(self).__name__,
+            "mode": str(getattr(mode, "value", mode)).strip().upper(),
+            "owner_components": self.owner_component_identities,
+            "owner_engine": self.engine_identity,
+            "recommendation_store_attached": self.recommendation_store_attached,
+            "external_execution_supported": False,
+        }
+
     @property
     def recommendation_store_attached(self) -> bool:
         return self._orchestrator.recommendation_store_attached
