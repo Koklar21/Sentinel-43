@@ -63,9 +63,11 @@ window.SentinelAuth = (() => {
    Config
    ========================================================================= */
 
-const LOGIN_ENDPOINT    = "/auth/login";
-const REFRESH_ENDPOINT  = "/auth/refresh";
-const LOGOUT_ENDPOINT   = "/auth/logout";
+const LOGIN_ENDPOINT     = "/auth/login";
+const REFRESH_ENDPOINT   = "/auth/refresh";
+const LOGOUT_ENDPOINT    = "/auth/logout";
+const BOOTSTRAP_STATUS_ENDPOINT = "/bootstrap/status";
+const BOOTSTRAP_ADMIN_ENDPOINT  = "/bootstrap/admin";
 const CSRF_COOKIE       = "s43_csrf";
 const CSRF_HEADER       = "X-S43-CSRF";
 const TOKEN_KEY         = "SENTINEL_JWT";
@@ -257,6 +259,271 @@ async function refreshSession() {
         clearTimeout(t);
     }
 }
+
+/* =========================================================================
+   First-run bootstrap
+
+   The dashboard is only a transport/UI client. The backend decides whether
+   bootstrap is open and the POST is governed by Sentinel43RuntimeAuthority.
+   ========================================================================= */
+
+async function getBootstrapStatus() {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), REFRESH_TIMEOUT_MS);
+    try {
+        const res = await fetch(BOOTSTRAP_STATUS_ENDPOINT, {
+            method: "GET",
+            credentials: "same-origin",
+            cache: "no-store",
+            signal: controller.signal,
+        });
+        if (!res.ok) {
+            throw new Error("Unable to determine Sentinel-43 initialization state.");
+        }
+        const body = await res.json().catch(() => ({}));
+        if (typeof body.initialized !== "boolean") {
+            throw new Error("Bootstrap status response is invalid.");
+        }
+        return body.initialized;
+    } catch (err) {
+        if (err.name === "AbortError") {
+            throw new Error("Bootstrap status request timed out.");
+        }
+        throw err;
+    } finally {
+        clearTimeout(t);
+    }
+}
+
+async function createFirstAdmin(username, password, email) {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), LOGIN_TIMEOUT_MS);
+    try {
+        const res = await fetch(BOOTSTRAP_ADMIN_ENDPOINT, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "same-origin",
+            cache: "no-store",
+            signal: controller.signal,
+            body: JSON.stringify({
+                username,
+                password,
+                email: email || null,
+            }),
+        });
+        const body = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+            const detail = typeof body.detail === "string" ? body.detail : "";
+            const error = new Error(
+                detail || "Unable to create the initial Sentinel-43 administrator."
+            );
+            error.status = res.status;
+            throw error;
+        }
+
+        return body;
+    } catch (err) {
+        if (err.name === "AbortError") {
+            throw new Error("First-admin creation timed out.");
+        }
+        throw err;
+    } finally {
+        clearTimeout(t);
+    }
+}
+
+function buildBootstrapOverlay() {
+    if (!document.getElementById("s43-bootstrap-styles")) {
+        const style = document.createElement("style");
+        style.id = "s43-bootstrap-styles";
+        style.textContent = `
+            #s43-bootstrap-overlay {
+                position: fixed; inset: 0; z-index: 10000;
+                background: rgba(0, 8, 20, 0.985);
+                display: flex; align-items: center; justify-content: center;
+                font-family: 'Courier New', Courier, monospace;
+            }
+            #s43-bootstrap-box {
+                width: 380px; max-width: calc(100vw - 32px); padding: 2rem;
+                box-sizing: border-box;
+                border: 1px solid rgba(0, 229, 255, 0.25);
+                background: #000d1a;
+                box-shadow: 0 0 52px rgba(0, 229, 255, 0.08);
+            }
+            #s43-bootstrap-title {
+                color: #00e5ff; font-size: 1.05rem; font-weight: bold;
+                letter-spacing: 0.16em; margin-bottom: 0.35rem;
+            }
+            #s43-bootstrap-sub {
+                color: rgba(0,229,255,0.52); font-size: 0.65rem;
+                line-height: 1.55; margin-bottom: 1.6rem;
+            }
+            .s43bf { margin-bottom: 1rem; }
+            .s43bf label {
+                display:block; color:rgba(0,229,255,0.58); font-size:0.6rem;
+                letter-spacing:0.16em; margin-bottom:0.35rem;
+            }
+            .s43bf input {
+                width:100%; box-sizing:border-box; padding:0.55rem 0.65rem;
+                background:rgba(0,229,255,0.03); color:#d0f0ff;
+                border:1px solid rgba(0,229,255,0.22); outline:none;
+                font-family:inherit;
+            }
+            .s43bf input:focus { border-color:rgba(0,229,255,0.65); }
+            #s43-bootstrap-err {
+                display:none; margin:0.3rem 0 1rem; padding:0.5rem 0.65rem;
+                color:#ff5252; border:1px solid rgba(255,82,82,0.28);
+                background:rgba(255,82,82,0.05); font-size:0.72rem;
+            }
+            #s43-bootstrap-btn {
+                width:100%; padding:0.7rem; font-family:inherit;
+                letter-spacing:0.16em; color:#00e5ff; cursor:pointer;
+                background:rgba(0,229,255,0.08);
+                border:1px solid rgba(0,229,255,0.38);
+            }
+            #s43-bootstrap-btn:disabled { opacity:0.42; cursor:not-allowed; }
+            #s43-bootstrap-foot {
+                margin-top:1rem; color:rgba(0,229,255,0.38);
+                font-size:0.58rem; line-height:1.5; text-align:center;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    if (document.getElementById("s43-bootstrap-overlay")) return;
+
+    const overlay = document.createElement("div");
+    overlay.id = "s43-bootstrap-overlay";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+    overlay.setAttribute("aria-label", "Initialize Sentinel-43");
+    overlay.innerHTML = `
+        <div id="s43-bootstrap-box">
+            <div id="s43-bootstrap-title">INITIALIZE SENTINEL&#8209;43</div>
+            <div id="s43-bootstrap-sub">
+                No account exists yet. Create the first administrator.
+                This one-time claim closes as soon as the account is created.
+            </div>
+            <form id="s43-bootstrap-form" autocomplete="off" novalidate>
+                <div class="s43bf">
+                    <label for="s43-bootstrap-username">ADMIN USERNAME</label>
+                    <input id="s43-bootstrap-username" type="text"
+                           autocomplete="username" spellcheck="false" autocapitalize="none" />
+                </div>
+                <div class="s43bf">
+                    <label for="s43-bootstrap-email">EMAIL (OPTIONAL)</label>
+                    <input id="s43-bootstrap-email" type="email" autocomplete="email" />
+                </div>
+                <div class="s43bf">
+                    <label for="s43-bootstrap-password">PASSWORD (12+ CHARACTERS)</label>
+                    <input id="s43-bootstrap-password" type="password"
+                           autocomplete="new-password" />
+                </div>
+                <div class="s43bf">
+                    <label for="s43-bootstrap-confirm">CONFIRM PASSWORD</label>
+                    <input id="s43-bootstrap-confirm" type="password"
+                           autocomplete="new-password" />
+                </div>
+                <div id="s43-bootstrap-err" role="alert" aria-live="polite"></div>
+                <button id="s43-bootstrap-btn" type="submit">CREATE FIRST ADMIN</button>
+            </form>
+            <div id="s43-bootstrap-foot">
+                Account authority remains server-side. The dashboard cannot assign
+                any role other than the one-time administrator bootstrap.
+            </div>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const form = document.getElementById("s43-bootstrap-form");
+    const errEl = document.getElementById("s43-bootstrap-err");
+    const btn = document.getElementById("s43-bootstrap-btn");
+
+    function showError(message) {
+        errEl.textContent = message;
+        errEl.style.display = "block";
+    }
+
+    form.addEventListener("submit", async event => {
+        event.preventDefault();
+
+        const username = document.getElementById("s43-bootstrap-username").value.trim();
+        const email = document.getElementById("s43-bootstrap-email").value.trim();
+        const password = document.getElementById("s43-bootstrap-password").value;
+        const confirm = document.getElementById("s43-bootstrap-confirm").value;
+
+        if (!username || !password) {
+            showError("Username and password are required.");
+            return;
+        }
+        if (username.length > USERNAME_MAX_LEN) {
+            showError("Username is too long.");
+            return;
+        }
+        if (password.length < 12) {
+            showError("Password must contain at least 12 characters.");
+            return;
+        }
+        if (password.length > PASSWORD_MAX_LEN) {
+            showError("Password is too long.");
+            return;
+        }
+        if (password !== confirm) {
+            showError("Passwords do not match.");
+            return;
+        }
+
+        errEl.style.display = "none";
+        btn.disabled = true;
+        btn.textContent = "CREATING…";
+
+        try {
+            await createFirstAdmin(username, password, email);
+            hideBootstrapOverlay();
+
+            // Bootstrap created the account only. Authentication still uses
+            // the normal /auth/login session flow.
+            buildOverlay();
+            const loginUser = document.getElementById("s43-username");
+            if (loginUser) loginUser.value = username;
+            showOverlay("Administrator created. Authenticate to enter Sentinel-43.");
+        } catch (err) {
+            if (err.status === 409) {
+                hideBootstrapOverlay();
+                showOverlay(
+                    "Sentinel-43 was initialized by another request. Authenticate with an existing account."
+                );
+                return;
+            }
+            showError(err.message || "Unable to create the first administrator.");
+            btn.disabled = false;
+            btn.textContent = "CREATE FIRST ADMIN";
+        } finally {
+            const p = document.getElementById("s43-bootstrap-password");
+            const q = document.getElementById("s43-bootstrap-confirm");
+            if (p) p.value = "";
+            if (q) q.value = "";
+        }
+    });
+
+    setTimeout(() => {
+        const input = document.getElementById("s43-bootstrap-username");
+        if (input) input.focus();
+    }, 50);
+}
+
+function showBootstrapOverlay() {
+    buildBootstrapOverlay();
+    const overlay = document.getElementById("s43-bootstrap-overlay");
+    if (overlay) overlay.style.display = "flex";
+}
+
+function hideBootstrapOverlay() {
+    const overlay = document.getElementById("s43-bootstrap-overlay");
+    if (overlay) overlay.style.display = "none";
+}
+
 
 /* =========================================================================
    Login overlay
@@ -507,6 +774,38 @@ async function init() {
 
     const staleToken = getToken();
     if (staleToken) clearToken();
+
+    let initialized;
+    try {
+        initialized = await getBootstrapStatus();
+    } catch (err) {
+        const message = err && err.message
+            ? err.message
+            : "Unable to determine Sentinel-43 initialization state.";
+        if (document.readyState === "loading") {
+            document.addEventListener(
+                "DOMContentLoaded",
+                () => showOverlay(message, true),
+                { once: true }
+            );
+        } else {
+            showOverlay(message, true);
+        }
+        return;
+    }
+
+    if (!initialized) {
+        if (document.readyState === "loading") {
+            document.addEventListener(
+                "DOMContentLoaded",
+                () => showBootstrapOverlay(),
+                { once: true }
+            );
+        } else {
+            showBootstrapOverlay();
+        }
+        return;
+    }
 
     const refreshed = await refreshSession();
     if (refreshed && setToken(refreshed)) {
