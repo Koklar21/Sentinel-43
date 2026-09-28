@@ -322,6 +322,23 @@ def test_remote_role_tokens_are_not_a_human_decision_capability():
     assert "veto_handler" not in api_source
 
 
+def test_dashboard_bootstrap_uses_only_governed_backend_endpoints():
+    source = (
+        REPO_ROOT / "dashboard" / "assets" / "js" / "auth.js"
+    ).read_text(encoding="utf-8")
+
+    assert '"/bootstrap/status"' in source
+    assert '"/bootstrap/admin"' in source
+    assert "getBootstrapStatus()" in source
+    assert "createFirstAdmin(username, password, email)" in source
+    # Role assignment is intentionally absent from the browser payload; the
+    # one-time backend contract owns the fact that this account is an admin.
+    bootstrap_payload = source.split(
+        "async function createFirstAdmin", 1
+    )[1].split("function buildBootstrapOverlay", 1)[0]
+    assert "role:" not in bootstrap_payload
+
+
 # ---------------------------------------------------------------------------
 # 5. No API route bypasses the orchestrator
 # ---------------------------------------------------------------------------
