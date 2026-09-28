@@ -54,6 +54,7 @@ class Sentinel43RuntimeAuthority:
         self._orchestrator = orchestrator
         self._engine: Any | None = None
         self._monitoring_manager = monitoring_manager
+        self._heart: Any | None = None
 
         from .identity import IdentityGovernanceService
 
@@ -72,6 +73,28 @@ class Sentinel43RuntimeAuthority:
     def orchestrator(self) -> SystemOrchestrator:
         """Subordinate governance service, exposed for compatibility only."""
         return self._orchestrator
+
+    @property
+    def heart(self) -> Any | None:
+        """The one Heart/ThreatGovernor owned by this runtime."""
+        return self._heart
+
+    def attach_heart(self, heart: Any) -> None:
+        if heart is None:
+            raise ValueError("Sentinel43RuntimeAuthority requires a Heart instance")
+        if self._heart is not None and self._heart is not heart:
+            raise RuntimeError("a different Heart is already attached")
+        self._heart = heart
+
+    def detach_heart(self) -> None:
+        self._heart = None
+
+    def observe_threat(self, assessment: Any) -> Any:
+        """Detection-layer ingress. Fenrir reports to S43, never Heart directly."""
+        heart = self._heart
+        if heart is None:
+            raise RuntimeError("Sentinel-43 Heart is not attached")
+        return heart.observe(assessment)
 
     @property
     def monitoring_manager(self) -> Any | None:
@@ -176,6 +199,7 @@ class Sentinel43RuntimeAuthority:
                     # already stopped and detached from this authority.
                     pass
         finally:
+            self.detach_heart()
             self.detach_recommendation_store()
 
     # ------------------------------------------------------------------
