@@ -389,7 +389,9 @@ class SentinelNexus:
             )
 
         try:
-            result = self._authority.stage_recommendation(recommendation)
+            result = self._authority._stage_recommendation_from_nexus(
+                recommendation
+            )
         except Exception:
             self.metrics.submission_failures += 1
             raise
@@ -409,7 +411,7 @@ class SentinelNexus:
         """Resolve only through the live Sentinel-43 human-decision path."""
 
         try:
-            result = self._authority.resolve_recommendation(
+            result = self._authority._resolve_recommendation_from_nexus(
                 action_id,
                 approved=approved,
                 operator_id=operator_id,
