@@ -305,6 +305,106 @@ class IdentityGovernanceService:
             await self._rollback_safely(session)
             raise
 
+    async def create_login_session(
+        self,
+        session: AsyncSession,
+        *,
+        actor: str,
+        user_id: uuid.UUID,
+        refresh_secret: str,
+        client_ip: str | None,
+        user_agent: str | None,
+    ) -> Any:
+        """Create and commit one DB-backed login session through S43."""
+        from core.auth.sessions import create_session
+
+        self._authorize(
+            operation="create_login_session",
+            actor=actor,
+            target=str(user_id),
+        )
+        try:
+            row = await create_session(
+                session,
+                user_id=user_id,
+                refresh_secret=refresh_secret,
+                client_ip=client_ip,
+                user_agent=user_agent,
+            )
+            await session.commit()
+            return row
+        except Exception:
+            await self._rollback_safely(session)
+            raise
+
+    async def rotate_session_refresh(
+        self,
+        session: AsyncSession,
+        *,
+        presented_secret: str,
+        new_refresh_secret: str,
+    ) -> tuple[Any, Any, User]:
+        """Rotate refresh state while preserving revocation-on-abuse semantics."""
+        from core.auth.sessions import (
+            RefreshReuseError,
+            SessionOwnerInactiveError,
+            rotate_refresh,
+        )
+
+        self._authorize(
+            operation="rotate_session_refresh",
+            actor="session:refresh",
+            target="presented_session",
+        )
+        try:
+            row, outcome = await rotate_refresh(
+                session,
+                presented_secret=presented_secret,
+                new_refresh_secret=new_refresh_secret,
+            )
+            owner = await get_user_by_id(session, row.user_id)
+            if owner is None or not bool(owner.is_active):
+                raise IdentityGovernanceError(
+                    "rotated session owner is unavailable or inactive"
+                )
+            await session.commit()
+            return row, outcome, owner
+
+        except (RefreshReuseError, SessionOwnerInactiveError):
+            # The primitive intentionally revokes the session before raising.
+            # Persist that security state before propagating the refusal.
+            await session.commit()
+            raise
+
+        except Exception:
+            await self._rollback_safely(session)
+            raise
+
+    async def logout_session_by_refresh(
+        self,
+        session: AsyncSession,
+        *,
+        presented_secret: str,
+    ) -> bool:
+        """Revoke a server-side session through the S43 authority."""
+        from core.auth.sessions import logout_by_refresh
+
+        self._authorize(
+            operation="logout_session",
+            actor="session:logout",
+            target="presented_session",
+        )
+        try:
+            revoked = await logout_by_refresh(
+                session,
+                presented_secret=presented_secret,
+            )
+            await session.commit()
+            return bool(revoked)
+        except Exception:
+            await self._rollback_safely(session)
+            raise
+
     async def reset_password(
         self,
         session: AsyncSession,
