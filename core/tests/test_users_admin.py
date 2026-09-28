@@ -65,6 +65,7 @@ os.environ.setdefault("S43_JWT_AUDIENCE", JWT_AUDIENCE)
 import core.api.routers.users as users_router_module  # noqa: E402
 import core.auth.deps as auth_deps_module  # noqa: E402
 import core.auth.users as users_module  # noqa: E402
+import core.governance.identity as identity_module  # noqa: E402
 from core.api.main import app  # noqa: E402
 from core.auth.users import hash_password  # noqa: E402
 
@@ -258,15 +259,26 @@ def store(monkeypatch) -> Generator[_FakeUserStore, None, None]:
     monkeypatch.setenv("S43_OPERATOR_USERNAME", ENV_OPERATOR_NAME)
     monkeypatch.setenv("S43_OPERATOR_PASSWORD_HASH", ENV_OPERATOR_HASH)
 
-    # users.py imports these from core.auth.users at module load time.
-    monkeypatch.setattr(users_router_module, "count_active_admins", s.count_active_admins)
-    monkeypatch.setattr(users_router_module, "create_user", s.create_user)
-    monkeypatch.setattr(users_router_module, "get_user_by_id", s.get_user_by_id)
+    # Router reads remain direct; consequential mutations now live in the
+    # authority-owned identity governance service.
     monkeypatch.setattr(users_router_module, "get_user_by_username", s.get_user_by_username)
     monkeypatch.setattr(users_router_module, "list_users", s.list_users)
-    monkeypatch.setattr(users_router_module, "set_user_active", s.set_user_active)
-    monkeypatch.setattr(users_router_module, "set_user_role", s.set_user_role)
-    monkeypatch.setattr(users_router_module, "set_user_password", s.set_user_password)
+
+    monkeypatch.setattr(identity_module, "count_active_admins", s.count_active_admins)
+    monkeypatch.setattr(identity_module, "create_user", s.create_user)
+    monkeypatch.setattr(identity_module, "get_user_by_id", s.get_user_by_id)
+    monkeypatch.setattr(identity_module, "set_user_active", s.set_user_active)
+    monkeypatch.setattr(identity_module, "set_user_role", s.set_user_role)
+    monkeypatch.setattr(identity_module, "set_user_password", s.set_user_password)
+
+    async def _fake_lock(_session, _key):
+        return None
+
+    async def _fake_revoke(_session, _user_id, *, reason):
+        return 0
+
+    monkeypatch.setattr(identity_module, "_pg_advisory_xact_lock", _fake_lock)
+    monkeypatch.setattr(identity_module, "revoke_all_user_sessions", _fake_revoke)
 
     # require_admin (core.api.deps.deps) and auth.py's reverify_password /
     # _validate_credentials import from core.auth.users at call time.
@@ -279,9 +291,20 @@ def store(monkeypatch) -> Generator[_FakeUserStore, None, None]:
     monkeypatch.setattr(sessions_module, "create_session", session_store.create_session)
     monkeypatch.setattr(sessions_module, "resolve_live_session", session_store.resolve_live_session)
 
+    authority = type(
+        "_FakeAuthority",
+        (),
+        {
+            "identity": identity_module.IdentityGovernanceService(
+                audit_sink=lambda _payload: None
+            )
+        },
+    )()
     app.dependency_overrides[auth_deps_module.get_db_session] = _fake_get_db_session
+    app.dependency_overrides[users_router_module.get_runtime_authority] = lambda: authority
     yield s
     app.dependency_overrides.pop(auth_deps_module.get_db_session, None)
+    app.dependency_overrides.pop(users_router_module.get_runtime_authority, None)
 
 
 @pytest.fixture
