@@ -27,11 +27,10 @@ Three things are adapted, and only these:
 1. **Storage.** The engine's ``ActionStore`` protocol is served by the existing
    ``SentinelCoreStore`` (:class:`CoreStoreActionStore`), so there is one
    durable pending-decision store, not a second SQLite ledger.
-2. **Execution is contained.** The engine's only two execution paths --
-   the ACTIVE executor thread (``_executor_loop``) and execute-on-approval
-   (``_execute_approved_now``) -- are replaced by no-ops in
-   :class:`_ContainedEngine`, the store refuses executor claims, and ACTIVE
-   staging is refused. Approval is recorded; nothing is executed.
+2. **Execution is absent and refused.** The owner engine itself has no ACTIVE
+   mode, executor thread, standalone integration execution, or execute-on-
+   approval path. The store adapter also refuses executor claims as defense in
+   depth. Approval is recorded; nothing external is executed.
 3. **Authentication context.** The engine's authenticator only ever sees an
    operator string, so it is bound to the server-verified principal of the
    decision in progress: it approves nothing outside such a call.
@@ -72,7 +71,7 @@ _ENGINE_MODULE_NAME = "sentinel43_owner_shadow_mode"
 #: that must update this pin in the same change, and
 #: test_owner_engine_integrity.py fails until it does.
 EXPECTED_ENGINE_SHA256 = (
-    "a8e63c44eb98b1b89a7c5da73807a3bb9818812d5fa77edc02bcd9c6e9d067a6"
+    "84840012e663f27b27b28c732789f8eab4310a0d4525ac5059c6f82a670c13a7"
 )
 
 
