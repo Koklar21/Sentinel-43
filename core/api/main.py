@@ -4806,6 +4806,16 @@ async def system_status(
         "/watchtower/status",
     )
 
+    authority_snapshot = (
+        runtime.sentinel43.authority_snapshot()
+        if runtime.sentinel43 is not None
+        else {
+            "authority": "Sentinel43RuntimeAuthority",
+            "state": "unavailable",
+            "external_execution_supported": False,
+        }
+    )
+
     return {
         "system": "sentinel-43",
         "status": "online",
@@ -4834,6 +4844,7 @@ async def system_status(
         "subsystems": runtime.subsystems.to_dict(),
         "readiness": runtime.subsystems.readiness().to_dict(),
         "watchtower": wt,
+        "sentinel43_authority": authority_snapshot,
         "timestamp": utc_now(),
     }
 
