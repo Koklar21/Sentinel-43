@@ -430,6 +430,10 @@ class RuntimeState:
 
     monitoring_manager: Any | None = None
     audit_store: Any | None = None
+    # Top-level Sentinel-43 orchestration authority.  The orchestrator field
+    # below is a temporary compatibility alias to sentinel43.orchestrator;
+    # it must never hold an independently-created instance.
+    sentinel43: Any | None = None
     orchestrator: Any | None = None
     heart: Any | None = None
     sparta_instance: Any | None = None
@@ -856,10 +860,9 @@ async def _resolve_governance_and_commit_action(
         )
 
     if str(action.get("action_type") or "") == "HEART_RECOMMENDATION":
-        # Resolved by the orchestrator directly -- the same authority object
-        # the transaction branch below uses -- not by the Heart, which holds
-        # no decision authority of its own.
-        authority = runtime.orchestrator
+        # Resolved through the top-level Sentinel-43 runtime authority --
+        # not by the Heart, which holds no decision authority of its own.
+        authority = runtime.sentinel43
         if authority is None or not authority.recommendation_store_attached:
             raise HTTPException(
                 status_code=409,
@@ -921,7 +924,7 @@ async def _resolve_governance_and_commit_action(
         # configured, and the decision was committed to the in-memory
         # store with no governance and no durable audit -- the default
         # path, since S43_GOVERNANCE_ENABLED defaults false.
-        if runtime.orchestrator is None:
+        if runtime.sentinel43 is None:
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -946,7 +949,7 @@ async def _resolve_governance_and_commit_action(
             try:
                 await asyncio.to_thread(
                     functools.partial(
-                        runtime.orchestrator.record_denied_decision,
+                        runtime.sentinel43.record_denied_decision,
                         resolved_decision_id or "",
                         operator_id=operator,
                         reason_code=denial,
@@ -973,7 +976,7 @@ async def _resolve_governance_and_commit_action(
             )
         try:
             await asyncio.to_thread(
-                runtime.orchestrator.resolve_human_decision,
+                runtime.sentinel43.resolve_human_decision,
                 resolved_decision_id,
                 approved=approved,
                 operator_id=operator,
@@ -1805,11 +1808,11 @@ async def _start_governance() -> None:
     if runtime.audit_store is None:
         raise RuntimeError(
             "Governance requires an initialized authoritative audit store. "
-            "Refusing to start SystemOrchestrator without one."
+            "Refusing to start Sentinel-43 runtime authority without one."
         )
 
     try:
-        from core.governance import build_orchestrator_from_settings
+        from core.governance import build_runtime_authority_from_settings
 
         # Mode validation (SHADOW | HUMAN_GATED, never ACTIVE) is enforced in
         # core.governance.composition. The composition root only reads the
@@ -1851,27 +1854,31 @@ async def _start_governance() -> None:
                 maximum=1_000_000,
             )
 
-        runtime.orchestrator = build_orchestrator_from_settings(
+        runtime.sentinel43 = build_runtime_authority_from_settings(
             Settings(),
             audit_store=runtime.audit_store,
             monitoring_manager=runtime.monitoring_manager,
         )
+        # Transitional compatibility only.  Sentinel43RuntimeAuthority owns
+        # this instance; nothing in the API constructs a second orchestrator.
+        runtime.orchestrator = runtime.sentinel43.orchestrator
         runtime.subsystems.mark_active(
             SUBSYS_GOVERNANCE,
             f"Human-gated orchestrator active (mode={resolved_default_mode}).",
         )
         logger.info(
-            "SystemOrchestrator started (mode=%s)",
+            "Sentinel43RuntimeAuthority started (mode=%s)",
             resolved_default_mode,
         )
     except Exception as exc:
+        runtime.sentinel43 = None
         runtime.orchestrator = None
         runtime.subsystems.mark_failed(
             SUBSYS_GOVERNANCE, f"Failed to start: {type(exc).__name__}"
         )
         if _env_bool("S43_GOVERNANCE_REQUIRED", True):
             raise
-        logger.error("SystemOrchestrator failed to start", exc_info=True)
+        logger.error("Sentinel43RuntimeAuthority failed to start", exc_info=True)
 
 
 def _heart_operator_authenticator(principal: Any) -> bool:
@@ -2058,7 +2065,7 @@ async def _rehydrate_heart_pending() -> int:
       * only a verified-equivalent duplicate already in the store is skipped;
         any other error propagates.
     """
-    authority = runtime.orchestrator
+    authority = runtime.sentinel43
     if authority is None or not authority.recommendation_store_attached:
         return 0
 
@@ -2235,14 +2242,14 @@ async def _start_heart() -> None:
         runtime.subsystems.mark_disabled(SUBSYS_HEART)
         return
 
-    if runtime.orchestrator is None:
+    if runtime.sentinel43 is None:
         runtime.subsystems.mark_failed(
             SUBSYS_HEART,
-            "Requires the governance orchestrator (S43_GOVERNANCE_ENABLED=true): "
+            "Requires the Sentinel-43 runtime authority (S43_GOVERNANCE_ENABLED=true): "
             "the Heart has no decision authority of its own.",
         )
         logger.error(
-            "The Heart is enabled but the governance orchestrator is not "
+            "The Heart is enabled but the Sentinel-43 runtime authority is not "
             "running; refusing to start the Heart without its authority."
         )
         return
@@ -2319,7 +2326,7 @@ async def _start_heart() -> None:
             audit_store=runtime.audit_store,
             core_store=core_store,
             monitoring_manager=runtime.monitoring_manager,
-            authority=runtime.orchestrator,
+            authority=runtime.sentinel43,
             action_sink=_HeartActionSink(asyncio.get_running_loop()),
             on_health_change=_report_heart_health,
             operator_authenticator=_heart_operator_authenticator,
@@ -2343,7 +2350,7 @@ async def _start_heart() -> None:
         # getting worse; it does not repair it, so say so rather than
         # reporting an unqualified "active".
         backlog = await asyncio.to_thread(
-            runtime.orchestrator.count_pending_recommendations
+            runtime.sentinel43.count_pending_recommendations
         )
         ceiling = runtime.heart.config.max_pending_actions
         if backlog >= ceiling:
@@ -2372,8 +2379,8 @@ async def _start_heart() -> None:
             runtime.fenrir_instance.heart = None
         # A Heart that failed to start must not leave its decisions reachable
         # through the orchestrator either.
-        if runtime.orchestrator is not None:
-            runtime.orchestrator.detach_recommendation_store()
+        if runtime.sentinel43 is not None:
+            runtime.sentinel43.detach_recommendation_store()
         runtime.subsystems.mark_failed(
             SUBSYS_HEART, f"Failed to start: {type(exc).__name__}"
         )
@@ -3068,7 +3075,7 @@ async def dashboard_incidents(
     """
     await _require_operator(request)
 
-    authority = runtime.orchestrator
+    authority = runtime.sentinel43
     if authority is None or not authority.recommendation_store_attached:
         raise HTTPException(
             status_code=409,
@@ -3190,7 +3197,7 @@ async def governance_pending_reviews(
 ) -> dict[str, Any]:
     await _require_operator(request)
 
-    if runtime.orchestrator is None:
+    if runtime.sentinel43 is None:
         return {
             "enabled": False,
             "pending": [],
@@ -3199,7 +3206,7 @@ async def governance_pending_reviews(
 
     try:
         pending = await asyncio.to_thread(
-            runtime.orchestrator.list_pending_reviews
+            runtime.sentinel43.list_pending_reviews
         )
     except Exception as exc:
         raise HTTPException(
@@ -3618,10 +3625,10 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                         },
                     )
 
-                if channel == "governance" and runtime.orchestrator is not None:
+                if channel == "governance" and runtime.sentinel43 is not None:
                     try:
                         pending = await asyncio.to_thread(
-                            runtime.orchestrator.list_pending_reviews
+                            runtime.sentinel43.list_pending_reviews
                         )
                     except Exception:
                         pending = []
