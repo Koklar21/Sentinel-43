@@ -583,7 +583,7 @@ def test_failed_recovery_blocks_readiness_but_not_liveness(monkeypatch):
 # ---------------------------------------------------------------------------
 # Recovery / live-ingestion race protection
 # ---------------------------------------------------------------------------
-def test_heart_attaches_to_authority_only_after_recovery_completes(monkeypatch):
+def test_heart_is_authority_owned_during_recovery_before_fenrir_starts(monkeypatch):
     directory, audit, _, _ = _stack()
     monkeypatch.setenv("S43_HEART_REQUIRED", "true")
     monkeypatch.setenv("S43_AUDIT_HMAC_KEY", "a" * 64)
@@ -594,7 +594,10 @@ def test_heart_attaches_to_authority_only_after_recovery_completes(monkeypatch):
     async def _recording_recovery() -> int:
         authority = main_module.runtime.sentinel43
         seen_during_recovery.append(
-            None if authority is None else authority.heart
+            {
+                "heart": None if authority is None else authority.heart,
+                "fenrir": main_module.runtime.fenrir_instance,
+            }
         )
         return 0
 
@@ -605,7 +608,9 @@ def test_heart_attaches_to_authority_only_after_recovery_completes(monkeypatch):
         _start_production_governance(test_client, monkeypatch, audit)
         test_client.portal.call(main_module._start_heart)
 
-        assert seen_during_recovery == [main_module.runtime.heart]
+        assert len(seen_during_recovery) == 1
+        assert seen_during_recovery[0]["heart"] is main_module.runtime.heart
+        assert seen_during_recovery[0]["fenrir"] is None
         assert main_module.runtime.sentinel43 is not None
         assert (
             main_module.runtime.sentinel43.heart
