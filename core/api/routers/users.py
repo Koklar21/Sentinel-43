@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Final
+from typing import Any, Final
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -234,7 +234,7 @@ async def create_account(
     body: CreateUserRequest,
     admin: str = Depends(require_admin),
     session: AsyncSession = Depends(get_db_session),
-    authority: object = Depends(get_runtime_authority),
+    authority: Any = Depends(get_runtime_authority),
 ) -> UserResponse:
     """Create a new operator/admin account."""
 
@@ -309,7 +309,7 @@ async def update_account(
     body: UpdateUserRequest,
     admin: str = Depends(require_admin),
     session: AsyncSession = Depends(get_db_session),
-    authority: object = Depends(get_runtime_authority),
+    authority: Any = Depends(get_runtime_authority),
 ) -> UserResponse:
     """Update account activation state and/or role through Sentinel-43."""
 
@@ -369,7 +369,7 @@ async def reset_account_password(
     body: ResetPasswordRequest,
     admin: str = Depends(require_admin),
     session: AsyncSession = Depends(get_db_session),
-    authority: object = Depends(get_runtime_authority),
+    authority: Any = Depends(get_runtime_authority),
 ) -> UserResponse:
     """Reset an account password through Sentinel-43 and revoke sessions."""
 
