@@ -268,24 +268,27 @@ class RemoteEventType(str, Enum):
     VETO_DECISION = "veto_decision"
 
 
+# Protocol-compatible decision event names remain parseable so old clients get
+# an explicit authorization refusal instead of a schema mystery. They are NOT
+# remote capabilities: the gateway authenticates service/role tokens, not a
+# server-verified human DecisionPrincipal.
+REMOTE_NON_DECISION_EVENTS: Final[frozenset[RemoteEventType]] = frozenset(
+    {
+        RemoteEventType.FORCE_HEALTH_CHECK,
+        RemoteEventType.FORCE_SYNC,
+        RemoteEventType.ROTATE_REMOTE_TOKEN,
+        RemoteEventType.REQUEST_DIAGNOSTIC_SNAPSHOT,
+    }
+)
+
+
 ROLE_EVENT_POLICY: Final[dict[OperatorRole, frozenset[RemoteEventType]]] = {
-    OperatorRole.OWNER: frozenset(
-        {
-            RemoteEventType.FORCE_HEALTH_CHECK,
-            RemoteEventType.FORCE_SYNC,
-            RemoteEventType.ROTATE_REMOTE_TOKEN,
-            RemoteEventType.REQUEST_DIAGNOSTIC_SNAPSHOT,
-            RemoteEventType.APPROVE_DECISION,
-            RemoteEventType.VETO_DECISION,
-        }
-    ),
+    OperatorRole.OWNER: REMOTE_NON_DECISION_EVENTS,
     OperatorRole.ADMIN: frozenset(
         {
             RemoteEventType.FORCE_HEALTH_CHECK,
             RemoteEventType.FORCE_SYNC,
             RemoteEventType.REQUEST_DIAGNOSTIC_SNAPSHOT,
-            RemoteEventType.APPROVE_DECISION,
-            RemoteEventType.VETO_DECISION,
         }
     ),
     OperatorRole.AUDITOR: frozenset(
@@ -315,7 +318,7 @@ REGISTERED_TARGETS: Final[dict[str, TargetPolicy]] = {
         target_id="local-sentinel",
         name="Local Sentinel-43 Instance",
         enabled=True,
-        allowed_events=frozenset(RemoteEventType),
+        allowed_events=REMOTE_NON_DECISION_EVENTS,
     )
 }
 
@@ -1685,7 +1688,10 @@ async def remote_gateway_health(
         ),
         available_events=[
             event.value
-            for event in RemoteEventType
+            for event in sorted(
+                REMOTE_NON_DECISION_EVENTS,
+                key=lambda item: item.value,
+            )
         ],
         event_buffer_max=config.max_event_records,
         event_buffer_durable=False,
