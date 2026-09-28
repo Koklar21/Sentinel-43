@@ -1466,41 +1466,14 @@ def test_a_legacy_row_whose_content_disagrees_is_quarantined(client):
     assert core.get_status("HEART-LEGACY000004") == ActionStatus.EXPIRED
 
 
-def test_the_remote_gateway_cannot_decide_a_heart_recommendation(client):
-    """Same rule on the recommendation path: the real gateway handler carries
-    no authenticated human, so the orchestrator refuses and audits it."""
-    from fastapi import HTTPException
+def test_the_remote_gateway_exposes_no_human_decision_events():
+    """A service-token gateway is not a human decision surface at all."""
+    from core.api.routers.remote_gateway import RemoteEventType
 
-    from core.api.routers import remote_gateway
-    from core.api.routers.remote_gateway import (
-        RemoteEventActivationRequest,
-        RemoteEventType,
-    )
+    event_values = {event.value for event in RemoteEventType}
+    assert "approve_decision" not in event_values
+    assert "veto_decision" not in event_values
 
-    _, audit, core, heart = _stack()
-    action_id = _stage(heart, "203.0.113.140")
-    _use(heart)
-    assert _recover(client) == 1
-
-    handler = remote_gateway._dispatch_registry[RemoteEventType.APPROVE_DECISION]
-    with pytest.raises(HTTPException) as refused:
-        client.portal.call(
-            handler,
-            RemoteEventActivationRequest(
-                operator_id="remote-admin",
-                target_id="sentinel43-api",
-                event_type=RemoteEventType.APPROVE_DECISION,
-                reason="remote decision attempt via the gateway",
-                correlation_id="gw-correlation-0002",
-                dry_run=False,
-                payload={"action_id": action_id, "decision_id": action_id},
-            ),
-        )
-    assert refused.value.status_code == 403
-    assert core.get_status(action_id) == ActionStatus.PENDING
-    last = audit.get_records(component="heart", correlation_id=action_id)[-1]
-    assert last["decision"] == "DENIED"
-    assert last["reason_code"] == "NO_AUTHENTICATION_CONTEXT"
 
 
 # ---------------------------------------------------------------------------
