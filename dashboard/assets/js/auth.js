@@ -1,7 +1,16 @@
 /* =============================================================================
    Sentinel-43 Dashboard
    auth.js — Operator login flow and JWT lifecycle
-   v1.8.0
+   v1.9.0
+
+   Changes from v1.8.0 (first-run dashboard onboarding):
+   - init() now checks GET /bootstrap/status after refresh fails.
+   - An uninitialized deployment renders first-admin setup in the same
+     fail-closed auth overlay and POSTs /bootstrap/admin.
+   - Successful bootstrap immediately authenticates through the normal
+     /auth/login session path; the dashboard never invents identity authority.
+   - If bootstrap status cannot be established, the overlay locks rather
+     than guessing whether login or first-admin creation is valid.
 
    Changes from v1.7.0 (next-PR Phase C — real-browser + same-origin beta):
    - The bearer access token is now held in module memory ONLY. It is no
@@ -63,18 +72,23 @@ window.SentinelAuth = (() => {
    Config
    ========================================================================= */
 
-const LOGIN_ENDPOINT    = "/auth/login";
-const REFRESH_ENDPOINT  = "/auth/refresh";
-const LOGOUT_ENDPOINT   = "/auth/logout";
+const LOGIN_ENDPOINT             = "/auth/login";
+const REFRESH_ENDPOINT           = "/auth/refresh";
+const LOGOUT_ENDPOINT            = "/auth/logout";
+const BOOTSTRAP_STATUS_ENDPOINT  = "/bootstrap/status";
+const BOOTSTRAP_ADMIN_ENDPOINT   = "/bootstrap/admin";
 const CSRF_COOKIE       = "s43_csrf";
 const CSRF_HEADER       = "X-S43-CSRF";
 const TOKEN_KEY         = "SENTINEL_JWT";
 const TOKEN_MIN_LEN     = 20;
 const TOKEN_MAX_LEN     = 4096;
 const USERNAME_MAX_LEN  = 128;
-const PASSWORD_MAX_LEN  = 1024;
-const LOGIN_TIMEOUT_MS  = 10_000;
+const PASSWORD_MIN_LEN   = 12;
+const PASSWORD_MAX_LEN   = 1024;
+const EMAIL_MAX_LEN      = 255;
+const LOGIN_TIMEOUT_MS   = 10_000;
 const REFRESH_TIMEOUT_MS = 8_000;
+const BOOTSTRAP_TIMEOUT_MS = 10_000;
 
 function _readCookie(name) {
     const m = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
@@ -226,6 +240,80 @@ async function attemptLogin(username, password) {
 }
 
 /* =========================================================================
+   First-run bootstrap
+   ========================================================================= */
+
+async function fetchBootstrapStatus() {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), BOOTSTRAP_TIMEOUT_MS);
+
+    try {
+        const res = await fetch(BOOTSTRAP_STATUS_ENDPOINT, {
+            method: "GET",
+            credentials: "same-origin",
+            cache: "no-store",
+            signal: controller.signal,
+        });
+
+        if (!res.ok) {
+            throw new Error("Unable to determine Sentinel-43 initialization state.");
+        }
+
+        const body = await res.json().catch(() => ({}));
+        if (typeof body.initialized !== "boolean") {
+            throw new Error("Server returned an invalid bootstrap status.");
+        }
+        return body.initialized;
+    } catch (err) {
+        if (err.name === "AbortError") {
+            throw new Error("Bootstrap status request timed out.");
+        }
+        throw err;
+    } finally {
+        clearTimeout(t);
+    }
+}
+
+async function bootstrapFirstAdmin(username, password, email) {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), BOOTSTRAP_TIMEOUT_MS);
+
+    try {
+        const payload = { username, password };
+        if (email) payload.email = email;
+
+        const res = await fetch(BOOTSTRAP_ADMIN_ENDPOINT, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+            credentials: "same-origin",
+            cache: "no-store",
+            signal: controller.signal,
+        });
+
+        const body = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+            const detail = typeof body.detail === "string" ? body.detail : "";
+            const err = new Error(
+                detail || "Unable to create the initial Sentinel-43 administrator."
+            );
+            err.status = res.status;
+            throw err;
+        }
+
+        return body;
+    } catch (err) {
+        if (err.name === "AbortError") {
+            throw new Error("Initial administrator request timed out.");
+        }
+        throw err;
+    } finally {
+        clearTimeout(t);
+    }
+}
+
+/* =========================================================================
    Refresh — exchange the HttpOnly refresh cookie for a new access token.
    Called on page load so a reload no longer forces a fresh login for a
    DB-account operator. Returns the new access token, or null.
@@ -296,6 +384,8 @@ function buildOverlay() {
             #s43-login-btn:hover:not(:disabled) { background: rgba(0,229,255,0.16); }
             #s43-login-btn:disabled { opacity: 0.42; cursor: not-allowed; }
             #s43-login-foot  { font-size: 0.6rem; color: rgba(0,229,255,0.35); text-align: center; margin-top: 1.25rem; min-height: 0.9rem; letter-spacing: 0.1em; }
+            #s43-bootstrap-note { display:none; font-size:0.67rem; line-height:1.45; color:rgba(0,229,255,0.58); margin:-0.6rem 0 1.25rem; }
+            #s43-email-wrap { display:none; }
         `;
         document.head.appendChild(style);
     }
@@ -314,7 +404,11 @@ function buildOverlay() {
                 <span id="s43-login-title">SENTINEL&#8209;43</span>
             </div>
             <div id="s43-login-sub">OPERATOR AUTHENTICATION REQUIRED</div>
-            <form id="s43-login-form" autocomplete="off" novalidate>
+            <div id="s43-bootstrap-note">
+                No Sentinel-43 account exists yet. Create the first administrator.
+                This one-time claim closes after the account is created.
+            </div>
+            <form id="s43-login-form" autocomplete="off" novalidate data-mode="login">
                 <div class="s43lf">
                     <label for="s43-username">USERNAME</label>
                     <input id="s43-username" type="text"
@@ -324,6 +418,10 @@ function buildOverlay() {
                     <label for="s43-password">PASSWORD</label>
                     <input id="s43-password" type="password" autocomplete="current-password" />
                 </div>
+                <div id="s43-email-wrap" class="s43lf">
+                    <label for="s43-email">EMAIL <span style="opacity:.55">(OPTIONAL)</span></label>
+                    <input id="s43-email" type="email" autocomplete="email" />
+                </div>
                 <div id="s43-login-err" role="alert" aria-live="polite"></div>
                 <button id="s43-login-btn" type="submit">AUTHENTICATE</button>
             </form>
@@ -332,7 +430,7 @@ function buildOverlay() {
     `;
     document.body.appendChild(overlay);
 
-    const _focusableIds = ["s43-username", "s43-password", "s43-login-btn"];
+    const _focusableIds = ["s43-username", "s43-password", "s43-email", "s43-login-btn"];
     overlay.addEventListener("keydown", e => {
         if (e.key !== "Tab") return;
         const focusable = _focusableIds
@@ -358,6 +456,9 @@ function buildOverlay() {
 
         const username = document.getElementById("s43-username").value.trim();
         const password = document.getElementById("s43-password").value;
+        const emailEl = document.getElementById("s43-email");
+        const email = emailEl ? emailEl.value.trim() : "";
+        const bootstrapMode = form.dataset.mode === "bootstrap";
 
         if (!username || !password) {
             _showErr("Username and password are required.");
@@ -371,13 +472,26 @@ function buildOverlay() {
             _showErr("Password is too long.");
             return;
         }
+        if (bootstrapMode && password.length < PASSWORD_MIN_LEN) {
+            _showErr(`Initial administrator password must be at least ${PASSWORD_MIN_LEN} characters.`);
+            return;
+        }
+        if (email.length > EMAIL_MAX_LEN) {
+            _showErr("Email is too long.");
+            return;
+        }
 
         errEl.style.display = "none";
         btn.disabled        = true;
-        btn.textContent     = "AUTHENTICATING…";
+        btn.textContent     = bootstrapMode ? "CREATING ADMIN…" : "AUTHENTICATING…";
         foot.textContent    = "";
 
         try {
+            if (bootstrapMode) {
+                await bootstrapFirstAdmin(username, password, email);
+                foot.textContent = "ADMIN CREATED — STARTING SESSION";
+            }
+
             const result = await attemptLogin(username, password);
 
             const tokenStored  = setToken(result.token);
@@ -408,7 +522,7 @@ function buildOverlay() {
                     : username;
 
             foot.textContent = `AUTHENTICATED — ${subject.toUpperCase()}`;
-            btn.textContent  = "ACCESS GRANTED";
+            btn.textContent  = bootstrapMode ? "SETUP COMPLETE" : "ACCESS GRANTED";
 
             await new Promise(r => setTimeout(r, 500));
             hideOverlay();
@@ -419,9 +533,16 @@ function buildOverlay() {
             }
 
         } catch (err) {
-            _showErr(err.message);
+            if (bootstrapMode && err && err.status === 409) {
+                setOverlayMode("login");
+                _showErr("Sentinel-43 was initialized by another request. Authenticate with the created account.");
+            } else {
+                _showErr(err.message);
+            }
             btn.disabled    = false;
-            btn.textContent = "AUTHENTICATE";
+            btn.textContent = form.dataset.mode === "bootstrap"
+                ? "CREATE INITIAL ADMIN"
+                : "AUTHENTICATE";
             document.getElementById("s43-password").value = "";
             document.getElementById("s43-password").focus();
         }
@@ -431,6 +552,39 @@ function buildOverlay() {
         errEl.textContent   = msg;
         errEl.style.display = "block";
     }
+}
+
+function setOverlayMode(mode) {
+    buildOverlay();
+
+    const form = document.getElementById("s43-login-form");
+    const sub = document.getElementById("s43-login-sub");
+    const note = document.getElementById("s43-bootstrap-note");
+    const emailWrap = document.getElementById("s43-email-wrap");
+    const password = document.getElementById("s43-password");
+    const btn = document.getElementById("s43-login-btn");
+
+    const bootstrapMode = mode === "bootstrap";
+    if (form) form.dataset.mode = bootstrapMode ? "bootstrap" : "login";
+    if (sub) {
+        sub.textContent = bootstrapMode
+            ? "FIRST-RUN ADMINISTRATOR SETUP"
+            : "OPERATOR AUTHENTICATION REQUIRED";
+    }
+    if (note) note.style.display = bootstrapMode ? "block" : "none";
+    if (emailWrap) emailWrap.style.display = bootstrapMode ? "block" : "none";
+    if (password) {
+        password.autocomplete = bootstrapMode ? "new-password" : "current-password";
+    }
+    if (btn) {
+        btn.textContent = bootstrapMode ? "CREATE INITIAL ADMIN" : "AUTHENTICATE";
+    }
+}
+
+function showBootstrapOverlay(message) {
+    buildOverlay();
+    setOverlayMode("bootstrap");
+    showOverlay(message);
 }
 
 function showOverlay(message, locked = false) {
@@ -480,6 +634,7 @@ window.addEventListener("sentinel:ws:auth_failed", () => {
     clearToken();
     _resetAuthReady();
     _markAuthLocked("WebSocket authentication rejected");
+    setOverlayMode("login");
     showOverlay("Session expired or rejected. Please re-authenticate.");
 });
 
@@ -521,18 +676,44 @@ async function init() {
         return;
     }
 
+    let initialized;
+    try {
+        initialized = await fetchBootstrapStatus();
+    } catch (err) {
+        const showUnavailable = () => {
+            setOverlayMode("login");
+            showOverlay(err.message || "Unable to determine initialization state.", true);
+        };
+        if (document.readyState === "loading") {
+            document.addEventListener("DOMContentLoaded", showUnavailable, { once: true });
+        } else {
+            showUnavailable();
+        }
+        return;
+    }
+
+    if (!initialized) {
+        const showSetup = () => showBootstrapOverlay();
+        if (document.readyState === "loading") {
+            document.addEventListener("DOMContentLoaded", showSetup, { once: true });
+        } else {
+            showSetup();
+        }
+        return;
+    }
+
     const expiredMsg = staleToken
         ? "Your session ended. Please authenticate again."
         : undefined;
 
-    if (document.readyState === "loading") {
-        document.addEventListener(
-            "DOMContentLoaded",
-            () => showOverlay(expiredMsg),
-            { once: true }
-        );
-    } else {
+    const showLogin = () => {
+        setOverlayMode("login");
         showOverlay(expiredMsg);
+    };
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", showLogin, { once: true });
+    } else {
+        showLogin();
     }
 }
 
@@ -559,6 +740,7 @@ return Object.freeze({
         _resetAuthReady();
         _markAuthLocked("Operator logged out");
         if (window.SentinelWS) window.SentinelWS.disconnect();
+        setOverlayMode("login");
         showOverlay("You have been logged out.");
     },
     refreshSession,
