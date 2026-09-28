@@ -61,9 +61,13 @@ class Sentinel43RuntimeAuthority:
         self._owner_components = load_owner_runtime_components(self)
 
     @property
-    def orchestrator(self) -> SystemOrchestrator:
-        """Subordinate governance service, exposed for compatibility only."""
-        return self._orchestrator
+    def governance_mode(self) -> str:
+        """Effective governance posture exposed by the authority itself.
+
+        Callers do not receive the subordinate SystemOrchestrator object.
+        """
+        mode = self._orchestrator.default_mode
+        return str(getattr(mode, "value", mode)).strip().upper()
 
     @property
     def identity(self) -> Any:
