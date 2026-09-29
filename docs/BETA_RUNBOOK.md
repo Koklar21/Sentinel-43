@@ -56,15 +56,15 @@ Before starting, have ready:
   — this becomes `S43_TRUSTED_PROXIES`.
 - A container registry you can push to (GHCR, ECR, GCR, etc.) — **this repo
   does not provide one or push to one automatically for the beta overlay.**
-- 12 generated secret values (§4) — none ship with real values; the
+- 13 generated secret values (§4) — none ship with real values; the
   checked-in examples are placeholders that must not reach a real
   deployment. The break-glass operator hash (§5) is **not** a beta input:
   that login is refused outside local/dev/test.
 
 ## 4. Secret generation and rotation
 
-Managed via `core/cli/generate_secrets.py`. It manages 12 keys:
-`S43_JWT_SECRET`, `S43_AUTH_PEPPER`, `S43_SESSION_HASH_PEPPER`,
+Managed via `core/cli/generate_secrets.py`. It manages 13 keys:
+`S43_JWT_SECRET`, `S43_BOOTSTRAP_CLAIM_TOKEN`, `S43_AUTH_PEPPER`, `S43_SESSION_HASH_PEPPER`,
 `SENTINEL_LOG_SALT`, `SENTINEL_REMOTE_TOKEN_OWNER`,
 `SENTINEL_REMOTE_TOKEN_ADMIN`, `SENTINEL_REMOTE_TOKEN_AUDITOR`,
 `S43_FENRIR_API_TOKEN`, `S43_WATCHTOWER_SERVICE_TOKEN`,
@@ -90,7 +90,7 @@ python -m core.cli.generate_secrets --check .env
 For Kubernetes, the equivalent values go into the `sentinel43-secrets`
 Secret in the `sentinel43` namespace (see `deploy/kubernetes/base/secret.example.yaml`
 for the full key list and `deploy/kubernetes/README.md` for the
-`kubectl create secret` invocation) — the same 12 keys generated the same
+`kubectl create secret` invocation) — the same 13 keys generated the same
 way, applied as a Secret instead of an `.env` file.
 
 `S43_SECRETS_ROTATED_AT` should be updated (ISO-8601 timestamp) whenever
@@ -588,9 +588,10 @@ PodDisruptionBudget selecting it.
 
 ## 16a. Platform ownership: first administrator claim and admin recovery
 
-**Status: partly open.** Who is *authorized* to make the first claim, and
-who may replace administrators when none remain, has not been decided (see
-"Open owner decision" below). What is enforced today:
+**Status: first-admin ownership closed; emergency admin recovery remains open.**
+The holder of the deployment secret store authorizes the first claim through
+`S43_BOOTSTRAP_CLAIM_TOKEN`. Who may replace administrators when none remain
+is still an owner decision. What is enforced today:
 
 - **One-time claim.** `POST /bootstrap/admin` creates the first account,
   role `admin`, in an empty account store. Concurrent claims are serialized
@@ -606,10 +607,13 @@ who may replace administrators when none remain, has not been decided (see
   row directly in the database reopens the claim. Anyone with that database
   access could already insert an admin row, so treat database write access
   as full control of identity.
-- **Not yet authorized.** The route is unauthenticated: on an empty store,
-  whoever reaches it first becomes the first administrator. The procedure
-  below (claim at once, then confirm it was you) is the only mitigation
-  until the owner decision is implemented.
+- **Deployment-authorized first claim.** Outside local/dev/test,
+  `POST /bootstrap/admin` requires the high-entropy
+  `S43_BOOTSTRAP_CLAIM_TOKEN` in `X-S43-Bootstrap-Token`. Missing
+  configuration refuses with `503`; a missing or incorrect presented token
+  refuses with `403`. The token grants no login/session rights and has no
+  purpose after the first account exists. Local/dev/test keeps the token
+  optional for developer setup.
 - **An operator login is not ownership.** The break-glass env operator
   (`S43_OPERATOR_USERNAME` / `S43_OPERATOR_PASSWORD_HASH`) is always role
   `operator`, cannot manage accounts, and outside local its login is refused
@@ -622,16 +626,18 @@ who may replace administrators when none remain, has not been decided (see
   tokens, the Fenrir token) never yield a human operator identity, and
   governance refuses and audits them as approvers. The authoritative audit
   store (§12) is append-only: no route or role can edit or delete a record.
-- **Account changes are not yet audited.** The first claim, account
-  creation, role and activation changes, and password resets are not
-  written to the authoritative audit store; governance decisions are.
+- **Account mutations are authority-audited.** First-admin claim, account
+  creation, role/activation changes, password resets, and session lifecycle
+  mutations cross `Sentinel43RuntimeAuthority.identity`, which emits the
+  authoritative identity-governance audit record before the mutation.
 
 ### Claiming the first administrator (Compose and Kubernetes)
 
 Claim as soon as the stack first reports ready, before sharing the URL. No
-default admin account exists and none is created for you. The username and
-password are read from the terminal and piped to `curl`, so they never
-appear in a URL, a process argument list, shell history or an API log.
+default admin account exists and none is created for you. The username,
+password, and deployment claim token are read without placing credentials in
+the URL or command history. The claim token comes from the same protected
+deployment secret source used to provision `S43_BOOTSTRAP_CLAIM_TOKEN`.
 Only the HTTP status is printed, because a validation error response would
 echo the submitted values.
 
@@ -648,6 +654,7 @@ Set the target first:
   `S43_TRUSTED_HOSTS`, §14).
 
 ```bash
+read -rsp 'deployment claim token: ' S43_BOOTSTRAP_CLAIM_TOKEN; echo
 python3 -c '
 import getpass, json, sys
 sys.stderr.write("first admin username: "); sys.stderr.flush()
@@ -657,16 +664,19 @@ if len(pw) < 12 or pw != getpass.getpass("repeat password: "):
     sys.exit("password too short or not matching; nothing was sent")
 json.dump({"username": user, "password": pw}, sys.stdout)
 ' | curl -sS -o /dev/null -w '%{http_code}\n' \
-      -H 'Content-Type: application/json' --data-binary @- \
-      "$S43_URL/bootstrap/admin"
+      -H 'Content-Type: application/json' \
+      -H "X-S43-Bootstrap-Token: $S43_BOOTSTRAP_CLAIM_TOKEN" \
+      --data-binary @- "$S43_URL/bootstrap/admin"
+unset S43_BOOTSTRAP_CLAIM_TOKEN
 ```
 
 | Status | Meaning |
 |---|---|
 | `201` | You are the first administrator. Confirm by signing in to the dashboard with those credentials. |
-| `409` on your **first** attempt | Someone else already claimed this deployment. Treat it as compromised: take the stack down, destroy the database volume/PVC, and redeploy. |
+| `403` | The deployment claim token is missing or incorrect. Nothing was created. |
+| `409` on your **first** authorized attempt | Someone else already claimed this deployment. Treat it as compromised: take the stack down, destroy the database volume/PVC, and redeploy. |
 | `409` after an attempt that printed no status | The earlier claim may have committed. Sign in with the credentials you chose: success means the claim was yours; failure means treat it as compromised, as above. |
-| `503` | The account store is not PostgreSQL (outside local/test), or the API or database is unavailable. Nothing was created. |
+| `503` | The deployment claim secret is not configured, the account store is not PostgreSQL (outside local/test), or the API/database is unavailable. Nothing was created. |
 | `422` | The username or password was rejected. Nothing was created. |
 
 Then, signed in as that admin, create the other accounts through `/users`,
@@ -685,14 +695,14 @@ in at all. Until the owner decision below is
 implemented, the only recovery is restoring a PostgreSQL backup (§11) taken
 while an admin was usable. Keep two active admins so this is never needed.
 
-### Open owner decision
+### Open owner decision: emergency administrator recovery
 
-The record does not settle which authority may make the first claim and
-replace administrators when none remain. Candidates: the holder of the
-deployment secret store (a one-time claim secret whose hash is provisioned
-in `.env` / `sentinel43-secrets`), or the holder of container-exec access
-(an in-container CLI). Neither is implemented. This section changes when
-one is chosen.
+First-admin ownership is now settled: the deployment secret holder authorizes
+the one-time claim with `S43_BOOTSTRAP_CLAIM_TOKEN`. The remaining decision
+is narrower: which deployment authority may recover or replace administrators
+when no usable admin remains. No in-product recovery path exists yet; until
+that separate mechanism is chosen and implemented, restore a known-good
+PostgreSQL backup and keep at least two active administrators.
 
 ## 17. Browser and WSS acceptance
 
