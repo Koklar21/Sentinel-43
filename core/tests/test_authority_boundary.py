@@ -141,6 +141,18 @@ def test_runtime_authority_loads_all_owner_components():
         assert class_name in loader
 
 
+def test_ai_escalation_uses_the_canonical_threat_types():
+    source = (
+        REPO_ROOT / "Sentinel-43" / "sentinel_AI_escalation.py"
+    ).read_text(encoding="utf-8")
+
+    assert "from core.detection.sentinel_threat_types import (" in source
+    assert "class ThreatAssessment" not in source
+    assert "class ThreatKind" not in source
+    assert "class ThreatSeverity" not in source
+    assert "class ThreatSourceKind" not in source
+
+
 def test_public_recommendation_path_crosses_the_nexus():
     authority_source = (
         CORE / "governance" / "runtime_authority.py"
