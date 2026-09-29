@@ -588,10 +588,10 @@ PodDisruptionBudget selecting it.
 
 ## 16a. Platform ownership: first administrator claim and admin recovery
 
-**Status: first-admin ownership closed; emergency admin recovery remains open.**
+**Status: first-admin ownership and emergency admin recovery closed.**
 The holder of the deployment secret store authorizes the first claim through
-`S43_BOOTSTRAP_CLAIM_TOKEN`. Who may replace administrators when none remain
-is still an owner decision. What is enforced today:
+`S43_BOOTSTRAP_CLAIM_TOKEN`; deployment exec authority handles emergency admin
+recovery without exposing a privileged network endpoint. What is enforced today:
 
 - **One-time claim.** `POST /bootstrap/admin` creates the first account,
   role `admin`, in an empty account store. Concurrent claims are serialized
@@ -683,26 +683,40 @@ Then, signed in as that admin, create the other accounts through `/users`,
 including a second active admin, so that one lost credential is not a
 lockout.
 
-### When every administrator is lost or deactivated
+### Emergency administrator recovery
 
-The API cannot reach this state on its own: `PATCH /users` refuses to
+The normal API cannot orphan the deployment: `PATCH /users` refuses to
 deactivate or demote the last active admin, and no admin can deactivate
-their own account. It can still happen if the only admin's password is lost,
-or through direct database edits. Recovery never reopens `/bootstrap/admin`,
-and there is currently **no in-product recovery path**: the break-glass env
-operator cannot manage accounts, and outside local/dev/test it cannot log
-in at all. Until the owner decision below is
-implemented, the only recovery is restoring a PostgreSQL backup (§11) taken
-while an admin was usable. Keep two active admins so this is never needed.
+their own account. A lockout can still happen if credentials are lost or
+identity rows are changed directly.
 
-### Open owner decision: emergency administrator recovery
+Recovery is intentionally **not an HTTP endpoint**. The deployment operator
+uses the exec-only CLI from a trusted host/container context:
 
-First-admin ownership is now settled: the deployment secret holder authorizes
-the one-time claim with `S43_BOOTSTRAP_CLAIM_TOKEN`. The remaining decision
-is narrower: which deployment authority may recover or replace administrators
-when no usable admin remains. No in-product recovery path exists yet; until
-that separate mechanism is chosen and implemented, restore a known-good
-PostgreSQL backup and keep at least two active administrators.
+```bash
+# Docker Compose
+docker compose exec s43-api python -m core.cli.recover_admin <username>
+
+# Kubernetes
+kubectl exec -n sentinel43 deployment/s43-api -c s43-api -- \
+  python -m core.cli.recover_admin <username>
+```
+
+The command prompts twice for a new password and never accepts it as a
+command-line argument. It targets an existing account only. Recovery:
+
+- requires PostgreSQL advisory locking and refuses weaker backends;
+- goes through `Sentinel43RuntimeAuthority.identity`, not direct SQL;
+- writes the authoritative identity-governance audit record before mutation;
+- restores the selected account to `role=admin` and `is_active=true`;
+- replaces its password;
+- revokes all of its existing sessions;
+- fails closed if authoritative audit initialization/write fails.
+
+Container/host exec is the recovery authority because it already represents
+deployment-level control. No network-facing recovery credential or permanent
+admin bypass is added. Keep two active administrators anyway; emergency
+recovery should remain exceptional.
 
 ## 17. Browser and WSS acceptance
 
