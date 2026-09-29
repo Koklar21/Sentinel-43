@@ -1701,7 +1701,9 @@ async def _start_fenrir() -> None:
     try:
         from core.detection.feniri_hunter import FenrirHunter
 
-        runtime.fenrir_instance = FenrirHunter()
+        runtime.fenrir_instance = FenrirHunter(
+            authority=runtime.sentinel43
+        )
         await runtime.fenrir_instance.start()
         # Feed allowlisted originating events into the SAME detector instance
         # Fenrir evaluates (no second detector, queue or bus).
@@ -2446,8 +2448,10 @@ async def _start_heart() -> None:
                 restored,
             )
 
-        if runtime.fenrir_instance is not None:
-            runtime.fenrir_instance.heart = runtime.heart
+        # build_heart_from_settings() attaches Heart to the S43 authority.
+        # Fenrir never receives Heart directly.
+        if runtime.sentinel43 is not None:
+            runtime.heart = runtime.sentinel43.heart
 
         # A store that is ALREADY at or over the ceiling keeps working and
         # keeps observing, but cannot stage. The new limit stops that state
@@ -2479,8 +2483,8 @@ async def _start_heart() -> None:
         logger.info("Heart (ThreatGovernor) started (mode=%s)", resolved_default_mode)
     except Exception as exc:
         runtime.heart = None
-        if runtime.fenrir_instance is not None:
-            runtime.fenrir_instance.heart = None
+        if runtime.sentinel43 is not None:
+            runtime.sentinel43.detach_heart()
         # A Heart that failed to start must not leave its decisions reachable
         # through the orchestrator either.
         if runtime.sentinel43 is not None:
@@ -2759,11 +2763,14 @@ async def lifespan(api: FastAPI):
     try:
         await _start_monitoring_manager()
         await _start_sparta()
-        await _start_fenrir()
         await _start_audit_store()
         await _start_reliability()
         await _start_governance()
+        # Heart recovery must finish before Fenrir can submit a live finding
+        # into the governed path. With governance disabled, Fenrir still
+        # starts observational-only with authority=None.
         await _start_heart()
+        await _start_fenrir()
 
         # Registration failures are observable, but do not necessarily mean
         # the API itself cannot serve. Deployments that require Watchtower can
