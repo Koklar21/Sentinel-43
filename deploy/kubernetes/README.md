@@ -75,10 +75,6 @@ Add these **only if you are using the feature they belong to**. Each one is
 absent-means-disabled, and each fails closed rather than degrading:
 
 ```bash
-  # Watchtower administrative routes (s43-core). NOT the service token:
-  # that authenticates s43-api as a machine, this authorizes an admin
-  # action. Unset => those routes answer 503.
-  --from-literal=S43_ADMIN_TOKEN="$S43_ADMIN_TOKEN" \
   # Remote operator gateway (core/api/routers/remote_gateway.py). Each role
   # is independent; an unset role is simply not issued.
   --from-literal=SENTINEL_REMOTE_TOKEN_OWNER="$SENTINEL_REMOTE_TOKEN_OWNER" \
