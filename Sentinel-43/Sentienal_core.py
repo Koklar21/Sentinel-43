@@ -215,6 +215,11 @@ class RuntimeObservation:
     event_id: str = ""
 
     def __post_init__(self) -> None:
+        source = (
+            self.source
+            if isinstance(self.source, RuntimeSource)
+            else RuntimeSource(str(self.source).strip().lower())
+        )
         component = str(self.component or "").strip()
         event = str(self.event or "").strip().lower()
         if not component or len(component) > 128:
@@ -269,6 +274,7 @@ class RuntimeObservation:
         if len(event_id) > 256:
             raise ValueError("event_id too long")
 
+        object.__setattr__(self, "source", source)
         object.__setattr__(self, "component", component)
         object.__setattr__(self, "event", event)
         object.__setattr__(self, "metadata", MappingProxyType(metadata))
