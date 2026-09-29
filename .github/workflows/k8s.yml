@@ -387,6 +387,7 @@ jobs:
             --from-literal=POSTGRES_PASSWORD="$PG_PW" \
             --from-literal=DATABASE_URL="postgresql+asyncpg://s43:${PG_PW}@s43-db:5432/s43" \
             --from-literal=S43_JWT_SECRET="$(gen)" \
+            --from-literal=S43_BOOTSTRAP_CLAIM_TOKEN="$(gen)" \
             --from-literal=S43_OPERATOR_PASSWORD_HASH="$OPERATOR_HASH" \
             --from-literal=S43_AUTH_PEPPER="$(gen)" \
             --from-literal=S43_SESSION_HASH_PEPPER="$(gen)" \
