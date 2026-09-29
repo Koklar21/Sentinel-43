@@ -21,7 +21,7 @@
 #
 # POST /internal/events/broadcast used to be gated with _require_operator()
 # (dashboard operator JWT + X-S43-Password), even though its only real
-# caller — FenrirHunter (core/detection/feniri_hunter.py) — sends
+# caller — FenrirHunter (core/detection/fenrir_hunter.py) — sends
 # `Authorization: Bearer <S43_FENRIR_API_TOKEN>` and never a password
 # header. That meant every real call from Fenrir was silently rejected
 # with 401 before the token was ever inspected. The route now checks
