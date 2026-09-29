@@ -88,6 +88,11 @@ _SECRET_SPECS: Final[tuple[SecretSpec, ...]] = (
         "JWT signing",
     ),
     SecretSpec(
+        "S43_BOOTSTRAP_CLAIM_TOKEN",
+        _urlsafe,
+        "Bootstrap ownership",
+    ),
+    SecretSpec(
         "S43_AUTH_PEPPER",
         _hex,
         "Authentication hardening",
