@@ -40,8 +40,6 @@ TEST_ISSUER = "sentinel-43"
 TEST_AUDIENCE = "sentinel-43-dashboard"
 
 SERVICE_TOKEN = "svc-" + "z" * 40           # shape of an opaque shared secret
-ADMIN_TOKEN = "adm-" + "q" * 40
-
 
 @pytest.fixture
 def env(monkeypatch):
@@ -51,7 +49,6 @@ def env(monkeypatch):
     monkeypatch.setenv("S43_JWT_AUDIENCE", TEST_AUDIENCE)
     monkeypatch.setenv("S43_WATCHTOWER_SERVICE_TOKEN", SERVICE_TOKEN)
     monkeypatch.setenv("S43_FENRIR_API_TOKEN", SERVICE_TOKEN)
-    monkeypatch.setenv("S43_ADMIN_TOKEN", ADMIN_TOKEN)
     yield
 
 
@@ -109,19 +106,11 @@ class TestHumanCredentialCannotSatisfyServiceAuth:
             main_module._require_fenrir_service_token(_fenrir_request(_human_jwt()))
         assert ei.value.status_code == 401
 
-    def test_human_jwt_rejected_by_watchtower_admin_token(self, env):
-        from core.monitoring.watchtower import _require_admin_token
-        with pytest.raises(HTTPException) as ei:
-            _require_admin_token(_human_jwt(role="admin"))
-        assert ei.value.status_code == 401
-
     def test_refresh_credential_rejected_by_service_verifiers(self, env):
-        from core.monitoring.watchtower import _require_service_token, _require_admin_token
+        from core.monitoring.watchtower import _require_service_token
         refresh = S.generate_refresh_secret()
         with pytest.raises(HTTPException):
             _require_service_token(authorization=f"Bearer {refresh}")
-        with pytest.raises(HTTPException):
-            _require_admin_token(refresh)
 
     def test_refresh_credential_is_not_a_jwt(self, env):
         with pytest.raises(HTTPException) as ei:
@@ -177,7 +166,7 @@ class TestServiceTokenCannotSatisfyHumanAuth:
         from core.monitoring import watchtower as wt
         import core.api.main as main_module
 
-        for fn in (wt._require_service_token, wt._require_admin_token,
+        for fn in (wt._require_service_token,
                    main_module._require_fenrir_service_token):
             src = inspect.getsource(fn)
             assert "verify_jwt_token" not in src, fn.__name__
@@ -205,7 +194,7 @@ def test_service_verifier_accepts_its_own_token(env):
 # token must not satisfy a human or another-service verifier.
 # ===========================================================================
 
-SPARTA_NODE_TOKEN = "spn-" + "k" * 40          # distinct from SERVICE_TOKEN / ADMIN_TOKEN
+SPARTA_NODE_TOKEN = "spn-" + "k" * 40          # distinct from SERVICE_TOKEN
 SPARTA_TOKEN_SECRET = "sps-" + "m" * 40
 
 
@@ -330,11 +319,9 @@ class TestSpartaTokenCannotSatisfyOtherIdentities:
         assert ei.value.status_code == 401
 
     def test_L_sparta_token_rejected_by_watchtower(self, env):
-        from core.monitoring.watchtower import _require_service_token, _require_admin_token
+        from core.monitoring.watchtower import _require_service_token
         with pytest.raises(HTTPException):
             _require_service_token(authorization=f"Bearer {SPARTA_NODE_TOKEN}")
-        with pytest.raises(HTTPException):
-            _require_admin_token(SPARTA_NODE_TOKEN)
 
     def test_L_sparta_token_rejected_by_fenrir(self, env):
         import core.api.main as main_module
