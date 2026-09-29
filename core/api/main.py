@@ -534,14 +534,6 @@ def _validate_security_config() -> None:
             raise RuntimeError(
                 "Production Sentinel-43 API requires S43_WS_REQUIRE_AUTH=true"
             )
-        bootstrap_claim_token = os.getenv("S43_BOOTSTRAP_CLAIM_TOKEN", "")
-        if len(bootstrap_claim_token) < 32:
-            raise RuntimeError(
-                "Non-local Sentinel-43 API requires S43_BOOTSTRAP_CLAIM_TOKEN "
-                "with at least 32 characters so first-admin bootstrap is bound "
-                "to deployment authority."
-            )
-
         if ALLOW_DEV_OPERATOR_FALLBACK:
             raise RuntimeError(
                 "S43_ALLOW_DEV_OPERATOR_FALLBACK must be false outside "
