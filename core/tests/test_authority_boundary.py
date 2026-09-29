@@ -263,6 +263,9 @@ def test_fenrir_reports_through_s43_authority_not_heart_directly():
     assert "def attach_heart(" in authority
     assert "def observe_threat(" in authority
     assert "def threat_ingress_available(" in authority
+    assert "self._owner_components.ai_escalation.build_envelope(" in authority
+    assert "envelope.assessment" in authority
+    assert "mode=envelope.requested_mode.value" in authority
 
     assert "runtime.sentinel43.attach_heart(runtime.heart)" in api
     assert "runtime.fenrir_instance.heart" not in api
