@@ -14,6 +14,8 @@ services:
     environment:
       # Session-only authentication: no per-request X-S43-Password fallback.
       S43_REJECT_LEGACY_AUTH: ${S43_REJECT_LEGACY_AUTH:?set S43_REJECT_LEGACY_AUTH=true in .env for a beta target}
+      # Bind the unauthenticated first-admin route to deployment ownership.
+      S43_BOOTSTRAP_CLAIM_TOKEN: ${S43_BOOTSTRAP_CLAIM_TOKEN:?set S43_BOOTSTRAP_CLAIM_TOKEN to a generated secret in .env for a beta target}
       # The Heart (human-governed threat staging) must be an explicit choice.
       S43_HEART_ENABLED: ${S43_HEART_ENABLED:?set S43_HEART_ENABLED=true in .env for a beta target}
       # A failed Heart blocks /ready (fail closed).
