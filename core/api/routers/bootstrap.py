@@ -86,6 +86,7 @@ class StrictModel(BaseModel):
 
 class BootstrapStatusResponse(StrictModel):
     initialized: bool
+    claim_token_required: bool
 
 
 class BootstrapAdminRequest(StrictModel):
@@ -202,7 +203,8 @@ async def bootstrap_status(
     return BootstrapStatusResponse(
         initialized=await bootstrap_claimed(
             session
-        )
+        ),
+        claim_token_required=not _is_local_environment(),
     )
 
 
