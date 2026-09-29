@@ -123,6 +123,32 @@ spec:
           command: ["uvicorn", "core.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--forwarded-allow-ips", "127.0.0.1"]
           ports:
             - {containerPort: 8000, name: http}
+          # Runtime/deployment provenance for SentinelNode. These are supplied
+          # by Kubernetes' Downward API and are observational metadata only;
+          # the service-account token remains unmounted and none of these
+          # fields establishes authentication or decision authority.
+          env:
+            - name: S43_RUNTIME_PLATFORM
+              value: "kubernetes"
+            - name: S43_RUNTIME_ROLE
+              value: "api"
+            - name: S43_K8S_WORKLOAD
+              value: "s43-api"
+            - name: S43_K8S_POD_NAME
+              valueFrom:
+                fieldRef: {fieldPath: metadata.name}
+            - name: S43_K8S_NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
+            - name: S43_K8S_NODE_NAME
+              valueFrom:
+                fieldRef: {fieldPath: spec.nodeName}
+            - name: S43_K8S_POD_IP
+              valueFrom:
+                fieldRef: {fieldPath: status.podIP}
+            - name: S43_K8S_SERVICE_ACCOUNT
+              valueFrom:
+                fieldRef: {fieldPath: spec.serviceAccountName}
           envFrom:
             - configMapRef: {name: sentinel43-config}
             - secretRef: {name: sentinel43-secrets}
