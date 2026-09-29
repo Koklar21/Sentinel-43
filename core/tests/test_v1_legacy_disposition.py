@@ -180,7 +180,7 @@ def test_v1_approve_is_refused_when_no_governance_backend_is_configured(
     it previously committed the approval with no governance evaluation and no
     durable audit of the decision.
     """
-    assert main_module.runtime.orchestrator is None
+    assert main_module.runtime.sentinel43 is None
 
     response = client.post(
         f"/v1/actions/{staged_action['id']}/approve",
@@ -201,7 +201,7 @@ def test_v1_approve_is_refused_when_no_governance_backend_is_configured(
 def test_v1_veto_is_refused_when_no_governance_backend_is_configured(
     client, staged_action
 ):
-    assert main_module.runtime.orchestrator is None
+    assert main_module.runtime.sentinel43 is None
 
     response = client.post(
         f"/v1/actions/{staged_action['id']}/veto",
@@ -218,7 +218,7 @@ def test_v1_veto_is_refused_when_no_governance_backend_is_configured(
 def test_the_modern_route_is_refused_on_the_same_terms(client, staged_action):
     """Proof that this is not a v1-only control: the modern route shares the
     one choke point and refuses identically, so there is no alternate route."""
-    assert main_module.runtime.orchestrator is None
+    assert main_module.runtime.sentinel43 is None
 
     response = client.post(
         f"/actions/{staged_action['id']}/approve",
