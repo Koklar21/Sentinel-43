@@ -20,9 +20,11 @@ its own approval/veto logic, and ACTIVE auto-execution.
 That is not the current Sentinel-43 architecture.
 
 AI/detection may produce assessments, but escalation does not own response
-authority. Escalation is an intake/translation boundary that reports governed
-recommendations into Sentinel43RuntimeAuthority. Response planning remains the
-responsibility of the one owner-designated engine loaded from Shadow_mode.py.
+authority. Escalation consumes the SAME canonical ThreatAssessment used by
+Fenrir and Heart, adds escalation provenance/fingerprinting, and reports
+governed recommendations into Sentinel43RuntimeAuthority. Response planning
+remains the responsibility of the one owner-designated engine loaded from
+Shadow_mode.py.
 
 Current flow:
 
@@ -52,7 +54,6 @@ from __future__ import annotations
 
 import enum
 import hashlib
-import ipaddress
 import json
 import logging
 import time
@@ -60,6 +61,12 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
+from core.detection.sentinel_threat_types import (
+    ThreatAssessment,
+    ThreatKind,
+    ThreatSeverity,
+    ThreatSourceKind,
+)
 from core.governance.orchestrator import (
     DecisionPrincipal,
     ThreatRecommendation,
@@ -90,83 +97,9 @@ UNSUPPORTED_AUTONOMOUS_MODES: frozenset[str] = frozenset(
 # Assessment contract
 # =============================================================================
 
-
-class ThreatKind(str, enum.Enum):
-    GENERIC_INTRUSION = "GENERIC_INTRUSION"
-    MALWARE_DELIVERY = "MALWARE_DELIVERY"
-    SPYWARE_ACTIVITY = "SPYWARE_ACTIVITY"
-    DATA_EXFILTRATION = "DATA_EXFILTRATION"
-    CREDENTIAL_ATTACK = "CREDENTIAL_ATTACK"
-    UNKNOWN = "UNKNOWN"
-
-
-class ThreatSourceKind(str, enum.Enum):
-    HUMAN_LIKELY = "HUMAN_LIKELY"
-    AI_AUTOMATION_LIKELY = "AI_AUTOMATION_LIKELY"
-    MIXED_OR_UNKNOWN = "MIXED_OR_UNKNOWN"
-
-
-class ThreatSeverity(str, enum.Enum):
-    LOW = "LOW"
-    MEDIUM = "MEDIUM"
-    HIGH = "HIGH"
-    CRITICAL = "CRITICAL"
-
-
-@dataclass(frozen=True, slots=True)
-class ThreatAssessment:
-    """Typed escalation input.
-
-    This is evidence. It does not authorize a response, choose an action, or
-    mutate state.
-    """
-
-    identity: str
-    source_ip: str
-    threat_kind: ThreatKind
-    severity: ThreatSeverity
-    source_kind: ThreatSourceKind
-    score: float
-    indicators: Mapping[str, Any] = field(default_factory=dict)
-    supporting_tags: tuple[str, ...] = ()
-    window_size: int = 0
-    generated_at: float = field(default_factory=time.time)
-
-    def __post_init__(self) -> None:
-        identity = str(self.identity or "").strip()
-        source_ip = normalize_ip(self.source_ip)
-        score = float(self.score)
-        window_size = int(self.window_size)
-
-        if not identity:
-            raise ValueError("identity is required")
-        if len(identity) > 256:
-            raise ValueError("identity too long")
-        if not source_ip:
-            raise ValueError("source_ip is required")
-        if not 0.0 <= score <= 100.0:
-            raise ValueError("score must be within [0.0, 100.0]")
-        if window_size < 0:
-            raise ValueError("window_size must be >= 0")
-
-        indicators = dict(self.indicators or {})
-        if len(_json_dumps(indicators).encode("utf-8")) > 20_000:
-            raise ValueError("indicators are too large")
-
-        tags = tuple(
-            str(tag).strip()[:128]
-            for tag in self.supporting_tags
-            if str(tag).strip()
-        )
-
-        object.__setattr__(self, "identity", identity)
-        object.__setattr__(self, "source_ip", source_ip)
-        object.__setattr__(self, "score", score)
-        object.__setattr__(self, "window_size", window_size)
-        object.__setattr__(self, "indicators", MappingProxyType(indicators))
-        object.__setattr__(self, "supporting_tags", tags)
-        object.__setattr__(self, "generated_at", float(self.generated_at))
-
+# ThreatAssessment and its enums are the canonical live detector/governance
+# types from core.detection.sentinel_threat_types. This owner source does not
+# maintain a parallel assessment model.
 
 # =============================================================================
 # Response vocabulary
@@ -252,11 +185,12 @@ class Metrics:
 
 
 def normalize_ip(value: str) -> str:
-    raw = str(value or "").strip()
-    try:
-        return str(ipaddress.ip_address(raw))
-    except ValueError:
-        return raw
+    """Trim an address before constructing the canonical assessment.
+
+    Syntax/semantic interpretation remains the detector/network boundary's
+    responsibility; escalation does not invent a second IP-validation model.
+    """
+    return str(value or "").strip()
 
 
 def sanitize_key_component(value: str, *, max_len: int = 200) -> str:
@@ -345,13 +279,17 @@ class SentinelAIEscalation:
     ) -> ThreatAssessment:
         assessment = ThreatAssessment(
             identity=identity,
-            source_ip=source_ip,
+            source_ip=normalize_ip(source_ip),
             threat_kind=threat_kind,
             severity=severity,
             source_kind=source_kind,
             score=score,
             indicators=indicators or {},
-            supporting_tags=tuple(supporting_tags),
+            supporting_tags=[
+                str(tag).strip()[:128]
+                for tag in supporting_tags
+                if str(tag).strip()
+            ],
             window_size=window_size,
             generated_at=(
                 time.time() if generated_at is None else float(generated_at)
