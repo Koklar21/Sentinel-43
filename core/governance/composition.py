@@ -134,7 +134,10 @@ def build_runtime_authority_from_settings(
         audit_store=audit_store,
         monitoring_manager=monitoring_manager,
     )
-    return Sentinel43RuntimeAuthority(orchestrator)
+    return Sentinel43RuntimeAuthority(
+        orchestrator,
+        monitoring_manager=monitoring_manager,
+    )
 
 
 def build_heart_from_settings(
