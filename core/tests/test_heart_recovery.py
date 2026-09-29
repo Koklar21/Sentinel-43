@@ -890,7 +890,7 @@ def test_concurrent_decisions_resolve_exactly_once():
 # ---------------------------------------------------------------------------
 def _start_production_heart(client, monkeypatch, directory: Path, audit):
     """Compose Heart first, then bind a real Fenrir to the S43 authority."""
-    import core.detection.feniri_hunter as fenrir_module
+    import core.detection.fenrir_hunter as fenrir_module
 
     monkeypatch.setenv("S43_HEART_ENABLED", "true")
     monkeypatch.setenv("S43_GOVERNANCE_ENABLED", "true")
