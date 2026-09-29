@@ -302,9 +302,11 @@ def store(monkeypatch) -> Generator[_FakeUserStore, None, None]:
     )()
     app.dependency_overrides[auth_deps_module.get_db_session] = _fake_get_db_session
     app.dependency_overrides[users_router_module.get_runtime_authority] = lambda: authority
+    app.dependency_overrides[auth_deps_module.get_optional_runtime_authority] = lambda: authority
     yield s
     app.dependency_overrides.pop(auth_deps_module.get_db_session, None)
     app.dependency_overrides.pop(users_router_module.get_runtime_authority, None)
+    app.dependency_overrides.pop(auth_deps_module.get_optional_runtime_authority, None)
 
 
 @pytest.fixture
