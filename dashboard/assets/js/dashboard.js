@@ -166,6 +166,10 @@ const el = {
     authStateText: $("authStateText"),
     pollText:      $("pollText"),
     demoText:      $("demoText"),
+    authorityStateText: $("authorityStateText"),
+    ownerEngineText: $("ownerEngineText"),
+    ownerComponentsText: $("ownerComponentsText"),
+    externalExecText: $("externalExecText"),
     refreshBtn: $("refreshBtn"),
     injectBtn:  $("injectBtn"),
     exportBtn:  $("exportBtn"),
@@ -582,6 +586,10 @@ const api = {
         CONFIG.DEMO_MODE
             ? Promise.resolve({ ...DEMO_SUMMARY })
             : Promise.resolve(null),
+    systemStatus: () =>
+        CONFIG.DEMO_MODE
+            ? Promise.resolve(null)
+            : fetchJson("/system/status"),
 };
 
 // =============================================================================
@@ -1019,6 +1027,85 @@ function setGovernanceMode(mode) {
     }
 }
 
+function renderAuthorityProvenance(systemStatus) {
+    const authority =
+        systemStatus &&
+        typeof systemStatus === "object" &&
+        !Array.isArray(systemStatus)
+            ? systemStatus.sentinel43_authority
+            : null;
+
+    if (!authority || typeof authority !== "object") {
+        if (el.authorityStateText) el.authorityStateText.textContent = "UNAVAILABLE";
+        if (el.ownerEngineText) el.ownerEngineText.textContent = "UNAVAILABLE";
+        if (el.ownerComponentsText) el.ownerComponentsText.textContent = "UNAVAILABLE";
+        if (el.externalExecText) el.externalExecText.textContent = "UNKNOWN";
+        return;
+    }
+
+    const authorityName = normalizeString(
+        authority.authority,
+        "Sentinel43RuntimeAuthority"
+    );
+    const authorityState = normalizeString(authority.state, "").toUpperCase();
+    const mode = normalizeString(authority.mode, "").toUpperCase();
+
+    if (el.authorityStateText) {
+        el.authorityStateText.textContent = [authorityName, mode || authorityState]
+            .filter(Boolean)
+            .join(" · ");
+        el.authorityStateText.style.color =
+            authorityState === "UNAVAILABLE" ? "var(--red)" : "var(--green)";
+    }
+
+    const engine =
+        authority.owner_engine &&
+        typeof authority.owner_engine === "object"
+            ? authority.owner_engine
+            : {};
+    const engineClass = normalizeString(engine.class, "UNAVAILABLE");
+    const engineHash = normalizeString(
+        engine.sha256 ?? engine.digest ?? engine.hash,
+        ""
+    );
+    if (el.ownerEngineText) {
+        el.ownerEngineText.textContent = engineHash
+            ? engineClass + " · " + engineHash.slice(0, 12)
+            : engineClass;
+    }
+
+    const components =
+        authority.owner_components &&
+        typeof authority.owner_components === "object" &&
+        !Array.isArray(authority.owner_components)
+            ? authority.owner_components
+            : {};
+    const names = Object.keys(components).sort();
+    if (el.ownerComponentsText) {
+        el.ownerComponentsText.textContent = names.length
+            ? String(names.length) + " · " + names.join(", ")
+            : "NONE";
+        el.ownerComponentsText.title = names.map(name => {
+            const identity = components[name] ?? {};
+            const hash = normalizeString(
+                identity.sha256 ?? identity.digest ?? identity.hash,
+                ""
+            );
+            return hash ? name + ": " + hash : name;
+        }).join("\n");
+    }
+
+    const externalSupported = authority.external_execution_supported === true;
+    if (el.externalExecText) {
+        el.externalExecText.textContent = externalSupported ? "SUPPORTED" : "DISABLED";
+        el.externalExecText.style.color = externalSupported
+            ? "var(--red)"
+            : "var(--green)";
+    }
+
+    if (mode) setGovernanceMode(mode);
+}
+
 // =============================================================================
 // Assessment Metrics
 // =============================================================================
@@ -1173,10 +1260,11 @@ async function performRefresh(manual = false) {
     if (manual) setStatus("Syncing");
     try {
         updateStaticConfig();
-        const [rawActions, vault, summary] = await Promise.all([
+        const [rawActions, vault, summary, systemStatus] = await Promise.all([
             api.listActions(),
             api.vaultStats().catch(() => null),
             api.dashboardSummary().catch(() => null),
+            api.systemStatus().catch(() => null),
         ]);
         replaceActions(rawActions, wsConnected ? "live-sync" : "poll-sync");
         const records = extractVaultRecords(vault);
@@ -1186,6 +1274,7 @@ async function performRefresh(manual = false) {
                 : "--";
         }
         if (summary) updateAssessmentMetrics(summary);
+        if (systemStatus) renderAuthorityProvenance(systemStatus);
         setStatus(wsConnected ? "Live" : "Online");
         if (manual) {
             log(`Refresh complete — ${applyFilters(allActions).length} action(s) visible.`, "ok");
