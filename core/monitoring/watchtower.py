@@ -1240,42 +1240,6 @@ def get_node() -> WatchtowerNode:
 
 
 # =============================================================================
-# Admin auth
-# =============================================================================
-
-def _require_admin_token(token: str | None) -> None:
-    """Authenticate a Watchtower admin operator via ``X-S43-Admin-Token``.
-
-    A distinct identity from ``_require_service_token``: the admin token
-    (``S43_ADMIN_TOKEN``) is never interchangeable with the internal service
-    token, and neither accepts a human JWT/session credential.
-
-    Follows the same fail-closed contract as ``_require_service_token``
-    below: 503 when the token is not configured on this server (so a
-    misconfigured deployment reports missing configuration rather than
-    disguising it as a credential failure), 401 for a missing or wrong
-    token. Compared as bytes -- ``secrets.compare_digest`` raises TypeError
-    on a str containing non-ASCII characters, which a client could
-    previously send to force a 500.
-    """
-    expected = (os.getenv("S43_ADMIN_TOKEN") or "").strip()
-    if not expected:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Watchtower admin authentication is not configured on this server.",
-        )
-
-    supplied = (token or "").strip()
-    if not supplied or not secrets.compare_digest(
-        supplied.encode("utf-8"), expected.encode("utf-8")
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized.",
-        )
-
-
-# =============================================================================
 # Internal-service auth (Pass 1 — direct Watchtower exposure)
 # =============================================================================
 
@@ -1419,41 +1383,6 @@ def create_watchtower_router(node: WatchtowerNode) -> APIRouter:
             logger.exception("Analyze failed: %s", exc)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    @router.post("/state/{state_name}", dependencies=_service_auth)
-    def change_state(
-        state_name: str,
-        x_s43_admin_token: str | None = Header(default=None),
-    ) -> dict[str, Any]:
-        # Two gates: the service token (transport auth, same as every other
-        # route) plus the stricter admin token for the state change itself.
-        _require_admin_token(x_s43_admin_token)
-
-        try:
-            requested_state = WatchtowerState[state_name.upper()]
-        except KeyError as exc:
-            raise HTTPException(status_code=400, detail=f"Invalid state: {state_name}") from exc
-
-        previous_state = node.state
-        applied = node.set_state(requested_state)
-        current_state = node.state
-
-        if not applied:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    f"State transition {previous_state.value} -> {requested_state.value} "
-                    f"is not allowed. Node remains in state {current_state.value}."
-                ),
-            )
-
-        return {
-            "node_id": node.config.node_id,
-            "previous_state": previous_state.value,
-            "state": current_state.value,
-            "applied": True,
-            "manual_override": True,
-            "note": "Admin state change bypasses automatic recovery hysteresis.",
-        }
 
     return router
 
