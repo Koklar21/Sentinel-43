@@ -1351,10 +1351,10 @@ memory file has been corrected to reflect this (see note after this subsystem's 
 |---|---|---|---|---|---|
 | SP-001 | File-integrity watchdog (`SpartaCore.check_integrity`, SHA-256 vs. operator-configured digests) | PROVEN ACTIVE | read-only (detection) + write (event log) | behavioral, `test_pr275_corrections.py` (5+ tests) | High |
 | SP-002 | Async watchdog loop (`SpartaCore.run`, scheduled by `main.py` as `asyncio.create_task`) | PROVEN ACTIVE | n/a (lifecycle) | not directly tested as a running loop in this pass (tests call `check_integrity()` directly) | Med |
-| SP-003 | `/node` mesh API (`create_node_router` — health/status/events/auth/register/heartbeat/unlock) | PROVEN ACTIVE, gated (see below) | read-only (health/status/events) / write (auth/register/heartbeat/unlock) | behavioral, `test_service_identity_separation.py::TestSpartaNodeBoundary` (7+ tests) | High |
+| SP-003 | `/node` mesh API (`create_node_router` — health/status/events/auth/register/heartbeat) | PROVEN ACTIVE, gated (see below) | read-only (health/status/events) / evidence/auth bookkeeping writes (auth/register/heartbeat) | behavioral, `test_service_identity_separation.py::TestSpartaNodeBoundary` | High |
 | SP-004 | Two-layer fail-closed gating: absent entirely if disabled, 503 if enabled-but-unconfigured | PROVEN ACTIVE | read-only (gate) | behavioral, confirmed by direct calls to `_require_node_token` in both test files | High |
 | SP-005 | Cross-service-token rejection specific to Sparta's verifier | PROVEN ACTIVE | n/a (negative security property) | behavioral, 6 dedicated cross-identity tests | High |
-| SP-006 | `/node/unlock` → `acknowledge_recovery` — clears only SpartaCore's own state flag | PROVEN ACTIVE | write (self-scoped only) | behavioral, confirmed by docstring + `test_monitoring_fault_does_not_change_sparta_state` | High |
+| SP-006 | Direct `/node/unlock` recovery control | **REMOVED** — machine-token callers may not acknowledge a security recovery outside Sentinel-43 governance | n/a | source-boundary guard; internal `acknowledge_recovery` retained | High |
 | SP-007 | `TrafficClass.SPARTA_NODE` firewall rate-limit bucket (`/node/` prefix, 600/60s) | PROVEN ACTIVE | n/a (already inventoried as part of Subsystem 2's M-002) | behavioral, Subsystem 2 evidence | High |
 
 **SP-001/SP-004 detail:** `watched_files` (path→expected-SHA-256 map) is built entirely
@@ -1369,14 +1369,15 @@ silent allow) if the node token is missing — confirmed by tracing both
 `RuntimeSpartaProxy.__getattr__`'s `RuntimeError`-on-`None` path and
 `_require_node_token`'s own direct 503 check.
 
-**SP-006 note — same "advisory scoped to itself" pattern as Fenrir (Subsystem 10):**
-SpartaCore's only "write" capability that could sound consequential
-(`/node/unlock`) is documented, and confirmed by test, to change **only SpartaCore's own**
-`COMPROMISED`→`OPERATIONAL` state flag — "It does not alter firewall, auth, routing, or
-any other subsystem" (source docstring, quoted directly). This is the third subsystem in
-a row (Watchtower's alerting, Fenrir's staging-only hand-off, now this) where this audit
-independently verified an "advisory only" claim against actual code rather than accepting
-the module's own docstring at face value.
+**SP-006 note:** the former `/node/unlock` route accepted a Sparta machine
+credential plus caller-supplied operator text and then acknowledged recovery locally.
+Although the state change was self-scoped, it was still a consequential security-state
+mutation outside Sentinel-43's human authority boundary. The public route and request
+model are removed. `SpartaCore.acknowledge_recovery()` remains an internal recovery
+primitive: it re-runs integrity verification and only permits
+`COMPROMISED -> OPERATIONAL` when the configured files verify cleanly. A future manual
+operator acknowledgement must bind that primitive to a server-verified human through
+Sentinel-43 governance rather than restoring a node-token shortcut.
 
 **Test-coverage note, in contrast with Subsystem 8's AuditStore finding:** unlike the
 audit store, SpartaCore's security-relevant logic (the node-auth boundary, cross-identity
