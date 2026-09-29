@@ -129,6 +129,19 @@ def test_sentinel43_runtime_authority_owns_engine_construction():
     assert "bind_recommendation_runtime(" in orchestrator_source
 
 
+def test_bounded_audit_reads_use_the_canonical_orchestrator_store():
+    """Recovery-facing audit reads must use the store actually owned by the
+    subordinate orchestrator, never a nonexistent shadow attribute."""
+    source = (
+        CORE / "governance" / "orchestrator.py"
+    ).read_text(encoding="utf-8")
+
+    assert "self._audit_store" not in source
+    assert "self.audit_store.verify_integrity()" in source
+    assert "self.audit_store.get_records(" in source
+    assert "self.audit_store.get_records_without_component(" in source
+
+
 def test_api_composition_root_has_only_the_sentinel43_authority_handle():
     """The API hosts one authority and exposes no subordinate orchestrator
     runtime alias that future callers could mistake for a second entry path."""
