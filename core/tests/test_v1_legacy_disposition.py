@@ -292,6 +292,7 @@ def governed_action(monkeypatch):
 
     from core.audit import AuditConfig, AuditStore
     from core.governance import build_orchestrator_from_settings
+    from core.governance.runtime_authority import Sentinel43RuntimeAuthority
     from core.governance.orchestrator import CallerContext, DecisionStatus
 
     directory = Path(tempfile.mkdtemp(prefix="s43-v1-governed-"))
@@ -329,7 +330,8 @@ def governed_action(monkeypatch):
     action["payload"]["decision_id"] = decision.decision_id
     stored = asyncio.run(main_module._store_action(action))
 
-    monkeypatch.setattr(main_module.runtime, "orchestrator", orchestrator)
+    authority = Sentinel43RuntimeAuthority(orchestrator)
+    monkeypatch.setattr(main_module.runtime, "sentinel43", authority)
     yield stored, orchestrator, audit, decision.decision_id
 
 
