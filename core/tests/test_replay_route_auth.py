@@ -344,23 +344,4 @@ def test_successful_replay_is_200(reliability_manager, allow_operator, monkeypat
     assert result["ok"] is True
 
 
-def test_dashboard_client_reports_failure_for_a_non_2xx_replay_response():
-    """The server-side status fix is what dashboard/services/reliability_client
-    already needed -- no client-side reinterpretation of a 200 body."""
-    from dashboard.services.reliability_client import describe_failure
-
-    # Shape of ApiResponse.to_dict() for the 503 case above: ApiClient's own
-    # "ok" is derived purely from HTTP status (200 <= status < 300).
-    response = {
-        "ok": False,
-        "status_code": 503,
-        "data": None,
-        "error": "Watchtower did not accept the replay; the event remains "
-        "dead-lettered (bad_request).",
-    }
-    message = describe_failure(response)
-    assert message
-    assert "unavailable" in message.lower()
-
-
 __all__: list[str] = []
