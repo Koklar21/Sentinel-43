@@ -107,8 +107,7 @@ const DEV_JWT_KEYS = Object.freeze([
 ]);
 
 const MODE_ALIASES = Object.freeze({
-    SHADOW:          "ADVISORY",
-    AUTONOMOUS_VETO: "ACTIVE_PLANNING",
+    SHADOW: "ADVISORY",
 });
 
 const WT_PROBE_MS = 30_000;
