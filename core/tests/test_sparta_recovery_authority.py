@@ -27,8 +27,7 @@ def test_node_api_exposes_no_direct_recovery_acknowledgement():
 def test_internal_recovery_primitive_remains_fail_closed_on_integrity():
     source = SPARTA.read_text(encoding="utf-8")
     start = source.index("    def acknowledge_recovery(")
-    end = source.index("
-    async def run(", start)
+    end = source.index("\n    async def run(", start)
     block = source[start:end]
 
     assert "result = self.check_integrity()" in block
