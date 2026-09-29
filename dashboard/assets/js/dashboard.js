@@ -179,6 +179,27 @@ const el = {
     wtOverall:    $("wtOverall"),
     wtProbeTime:  $("wtProbeTime"),
     wtRefreshBtn: $("wtRefreshBtn"),
+    userCount:       $("userCount"),
+    usersStatus:     $("usersStatus"),
+    usersList:       $("usersList"),
+    usersRefreshBtn: $("usersRefreshBtn"),
+    createUserBtn:   $("createUserBtn"),
+    userModal:       $("userModal"),
+    userUsername:    $("userUsername"),
+    userEmail:       $("userEmail"),
+    userRole:        $("userRole"),
+    userPassword:    $("userPassword"),
+    userPasswordConfirm: $("userPasswordConfirm"),
+    userModalError:  $("userModalError"),
+    userCancel:      $("userCancel"),
+    userConfirm:     $("userConfirm"),
+    passwordResetModal: $("passwordResetModal"),
+    passwordResetTitle: $("passwordResetTitle"),
+    passwordResetInput: $("passwordResetInput"),
+    passwordResetConfirmInput: $("passwordResetConfirmInput"),
+    passwordResetError: $("passwordResetError"),
+    passwordResetCancel: $("passwordResetCancel"),
+    passwordResetConfirm: $("passwordResetConfirm"),
     actionsBody:    $("actionsBody"),
     emptyState:     $("emptyState"),
     searchInput:    $("searchInput"),
@@ -230,6 +251,10 @@ let kbToastTimer     = null;
 let injectInFlight   = false;
 let wsConnected      = false;
 let isLight          = false;
+let managedUsers     = [];
+let userManagementAvailable = false;
+let passwordResetTarget = null;
+let userMutationInFlight = false;
 
 // =============================================================================
 // Utilities
@@ -589,6 +614,25 @@ const api = {
         CONFIG.DEMO_MODE
             ? Promise.resolve(null)
             : fetchJson("/system/status"),
+    listUsers: () =>
+        CONFIG.DEMO_MODE
+            ? Promise.resolve([])
+            : fetchJson("/users?limit=500"),
+    createUser: payload =>
+        fetchJson("/users", {
+            method: "POST",
+            body: JSON.stringify(payload),
+        }),
+    updateUser: (userId, payload) =>
+        fetchJson(`/users/${encodeURIComponent(userId)}`, {
+            method: "PATCH",
+            body: JSON.stringify(payload),
+        }),
+    resetUserPassword: (userId, newPassword) =>
+        fetchJson(`/users/${encodeURIComponent(userId)}/password`, {
+            method: "POST",
+            body: JSON.stringify({ new_password: newPassword }),
+        }),
 };
 
 // =============================================================================
@@ -1667,6 +1711,275 @@ el.jwtConfirm?.addEventListener("click", async () => {
 });
 
 // =============================================================================
+// Admin Account Management
+// =============================================================================
+function normalizeUser(raw) {
+    return {
+        id: normalizeString(raw?.user_id, "").trim(),
+        username: normalizeString(raw?.username, "").trim(),
+        email: normalizeString(raw?.email, "").trim(),
+        role: normalizeString(raw?.role, "operator").trim().toLowerCase(),
+        active: raw?.is_active === true,
+        createdAt: normalizeString(raw?.created_at, ""),
+        lastLoginAt: normalizeString(raw?.last_login_at, ""),
+    };
+}
+
+function setUsersStatus(message, type = "info") {
+    if (!el.usersStatus) return;
+    el.usersStatus.hidden = false;
+    el.usersStatus.textContent = message;
+    el.usersStatus.style.color =
+        type === "err" ? "var(--red)" :
+        type === "ok" ? "var(--green)" :
+        type === "warn" ? "var(--amber)" :
+        "var(--muted)";
+}
+
+function renderUsers() {
+    if (!el.usersList) return;
+    if (el.userCount) el.userCount.textContent = String(managedUsers.length);
+
+    if (!userManagementAvailable) {
+        el.usersList.hidden = true;
+        return;
+    }
+
+    if (!managedUsers.length) {
+        el.usersList.hidden = true;
+        setUsersStatus("No accounts returned.", "warn");
+        return;
+    }
+
+    if (el.usersStatus) el.usersStatus.hidden = true;
+    el.usersList.hidden = false;
+    el.usersList.innerHTML = managedUsers.map(user => {
+        const created = user.createdAt
+            ? new Date(user.createdAt).toLocaleString()
+            : "unknown";
+        const lastLogin = user.lastLoginAt
+            ? new Date(user.lastLoginAt).toLocaleString()
+            : "never";
+        return (
+            `<div class="account-row" data-user-id="${escHtml(user.id)}">` +
+              `<div class="account-main">` +
+                `<div class="account-name">${escHtml(user.username)} ` +
+                  `<span class="tag ${user.active ? "approved" : "vetoed"}">${user.active ? "active" : "disabled"}</span></div>` +
+                `<div class="account-meta">${escHtml(user.email || "no email")} · created ${escHtml(created)} · last login ${escHtml(lastLogin)}</div>` +
+              `</div>` +
+              `<div class="account-actions">` +
+                `<select class="account-role" data-user-role="${escHtml(user.id)}" aria-label="Role for ${escHtml(user.username)}">` +
+                  `<option value="operator"${user.role === "operator" ? " selected" : ""}>operator</option>` +
+                  `<option value="admin"${user.role === "admin" ? " selected" : ""}>admin</option>` +
+                `</select>` +
+                `<button class="btn ${user.active ? "red" : "green"}" type="button" data-user-active="${escHtml(user.id)}" data-next-active="${user.active ? "false" : "true"}">${user.active ? "Disable" : "Enable"}</button>` +
+                `<button class="btn amber" type="button" data-user-password="${escHtml(user.id)}">Reset PW</button>` +
+              `</div>` +
+            `</div>`
+        );
+    }).join("");
+}
+
+async function refreshUsers({ quiet = false } = {}) {
+    if (CONFIG.DEMO_MODE) {
+        userManagementAvailable = false;
+        managedUsers = [];
+        if (el.userCount) el.userCount.textContent = "—";
+        setUsersStatus("Account administration is disabled in demo mode.");
+        if (el.createUserBtn) el.createUserBtn.disabled = true;
+        if (el.usersRefreshBtn) el.usersRefreshBtn.disabled = true;
+        renderUsers();
+        return;
+    }
+
+    try {
+        const raw = await api.listUsers();
+        if (!Array.isArray(raw)) throw new Error("User endpoint returned an invalid payload shape");
+        managedUsers = raw.map(normalizeUser).filter(user => user.id && user.username);
+        userManagementAvailable = true;
+        if (el.createUserBtn) el.createUserBtn.disabled = false;
+        if (el.usersRefreshBtn) el.usersRefreshBtn.disabled = false;
+        renderUsers();
+        if (!quiet) log(`Loaded ${managedUsers.length} account(s).`, "ok");
+    } catch (err) {
+        userManagementAvailable = false;
+        managedUsers = [];
+        if (el.userCount) el.userCount.textContent = "—";
+        const message = normalizeString(err?.message, "Account management unavailable.");
+        const forbidden = /^403\b/.test(message);
+        setUsersStatus(
+            forbidden
+                ? "Administrator role required for account management."
+                : `Account management unavailable: ${message}`,
+            forbidden ? "warn" : "err"
+        );
+        if (el.createUserBtn) el.createUserBtn.disabled = true;
+        renderUsers();
+        if (!quiet && !forbidden) log(message, "err");
+    }
+}
+
+function closeUserModal() {
+    if (!el.userModal) return;
+    el.userModal.hidden = true;
+    el.userModal.setAttribute("aria-hidden", "true");
+    if (el.userModalError) el.userModalError.textContent = "";
+    for (const node of [el.userUsername, el.userEmail, el.userPassword, el.userPasswordConfirm]) {
+        if (node) node.value = "";
+    }
+    if (el.userRole) el.userRole.value = "operator";
+}
+
+function openUserModal() {
+    if (!userManagementAvailable || !el.userModal) return;
+    closeUserModal();
+    el.userModal.hidden = false;
+    el.userModal.setAttribute("aria-hidden", "false");
+    setTimeout(() => el.userUsername?.focus(), 0);
+}
+
+async function createManagedUser() {
+    if (userMutationInFlight) return;
+    const username = el.userUsername?.value.trim() ?? "";
+    const email = el.userEmail?.value.trim() ?? "";
+    const role = el.userRole?.value ?? "operator";
+    const password = el.userPassword?.value ?? "";
+    const confirmation = el.userPasswordConfirm?.value ?? "";
+
+    let error = "";
+    if (!username) error = "Username is required.";
+    else if (password.length < 12) error = "Password must be at least 12 characters.";
+    else if (password !== confirmation) error = "Passwords do not match.";
+    else if (!["operator", "admin"].includes(role)) error = "Invalid role.";
+
+    if (error) {
+        if (el.userModalError) el.userModalError.textContent = error;
+        return;
+    }
+
+    userMutationInFlight = true;
+    if (el.userConfirm) el.userConfirm.disabled = true;
+    try {
+        const created = await api.createUser({
+            username,
+            password,
+            role,
+            email: email || null,
+        });
+        log(`Created ${normalizeString(created?.role, role)} account ${normalizeString(created?.username, username)}.`, "ok");
+        closeUserModal();
+        await refreshUsers({ quiet: true });
+    } catch (err) {
+        const message = normalizeString(err?.message, "User creation failed.");
+        if (el.userModalError) el.userModalError.textContent = message;
+        log(message, "err");
+    } finally {
+        userMutationInFlight = false;
+        if (el.userConfirm) el.userConfirm.disabled = false;
+    }
+}
+
+async function updateManagedUser(userId, payload) {
+    if (userMutationInFlight) return;
+    userMutationInFlight = true;
+    try {
+        const updated = await api.updateUser(userId, payload);
+        log(`Updated account ${normalizeString(updated?.username, userId)}.`, "ok");
+        await refreshUsers({ quiet: true });
+    } catch (err) {
+        const message = normalizeString(err?.message, "Account update failed.");
+        log(message, "err");
+        await refreshUsers({ quiet: true });
+    } finally {
+        userMutationInFlight = false;
+    }
+}
+
+function closePasswordResetModal() {
+    if (!el.passwordResetModal) return;
+    el.passwordResetModal.hidden = true;
+    el.passwordResetModal.setAttribute("aria-hidden", "true");
+    passwordResetTarget = null;
+    if (el.passwordResetInput) el.passwordResetInput.value = "";
+    if (el.passwordResetConfirmInput) el.passwordResetConfirmInput.value = "";
+    if (el.passwordResetError) el.passwordResetError.textContent = "";
+}
+
+function openPasswordResetModal(userId) {
+    const user = managedUsers.find(item => item.id === userId);
+    if (!user || !el.passwordResetModal) return;
+    passwordResetTarget = user;
+    if (el.passwordResetTitle) el.passwordResetTitle.textContent = `Reset Password · ${user.username}`;
+    el.passwordResetModal.hidden = false;
+    el.passwordResetModal.setAttribute("aria-hidden", "false");
+    setTimeout(() => el.passwordResetInput?.focus(), 0);
+}
+
+async function resetManagedUserPassword() {
+    if (userMutationInFlight || !passwordResetTarget) return;
+    const password = el.passwordResetInput?.value ?? "";
+    const confirmation = el.passwordResetConfirmInput?.value ?? "";
+    if (password.length < 12) {
+        if (el.passwordResetError) el.passwordResetError.textContent = "Password must be at least 12 characters.";
+        return;
+    }
+    if (password !== confirmation) {
+        if (el.passwordResetError) el.passwordResetError.textContent = "Passwords do not match.";
+        return;
+    }
+
+    const target = passwordResetTarget;
+    userMutationInFlight = true;
+    if (el.passwordResetConfirm) el.passwordResetConfirm.disabled = true;
+    try {
+        await api.resetUserPassword(target.id, password);
+        log(`Password reset for ${target.username}; existing sessions revoked.`, "ok");
+        closePasswordResetModal();
+        await refreshUsers({ quiet: true });
+    } catch (err) {
+        const message = normalizeString(err?.message, "Password reset failed.");
+        if (el.passwordResetError) el.passwordResetError.textContent = message;
+        log(message, "err");
+    } finally {
+        userMutationInFlight = false;
+        if (el.passwordResetConfirm) el.passwordResetConfirm.disabled = false;
+    }
+}
+
+el.usersRefreshBtn?.addEventListener("click", () => refreshUsers());
+el.createUserBtn?.addEventListener("click", openUserModal);
+el.userCancel?.addEventListener("click", closeUserModal);
+el.userConfirm?.addEventListener("click", createManagedUser);
+el.userModal?.addEventListener("click", event => {
+    if (event.target.hasAttribute("data-close-user")) closeUserModal();
+});
+
+el.passwordResetCancel?.addEventListener("click", closePasswordResetModal);
+el.passwordResetConfirm?.addEventListener("click", resetManagedUserPassword);
+el.passwordResetModal?.addEventListener("click", event => {
+    if (event.target.hasAttribute("data-close-password-reset")) closePasswordResetModal();
+});
+
+el.usersList?.addEventListener("change", event => {
+    const select = event.target.closest?.("[data-user-role]");
+    if (!select) return;
+    updateManagedUser(select.dataset.userRole, { role: select.value });
+});
+
+el.usersList?.addEventListener("click", event => {
+    const activeButton = event.target.closest?.("[data-user-active]");
+    if (activeButton) {
+        updateManagedUser(
+            activeButton.dataset.userActive,
+            { is_active: activeButton.dataset.nextActive === "true" }
+        );
+        return;
+    }
+    const passwordButton = event.target.closest?.("[data-user-password]");
+    if (passwordButton) openPasswordResetModal(passwordButton.dataset.userPassword);
+});
+
+// =============================================================================
 // Protected-activity lifecycle
 // =============================================================================
 function stopProtectedActivity() {
@@ -1687,6 +2000,7 @@ async function startProtectedActivity() {
         await Promise.allSettled([
             fetchWatchtower(),
             refreshDashboard(true, { force: true }),
+            refreshUsers({ quiet: true }),
         ]);
     } finally {
         authenticatedStartupInFlight = false;
