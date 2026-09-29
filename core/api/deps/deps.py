@@ -657,6 +657,24 @@ def dev_store_factory() -> StoreProtocol:
 # Public dependency providers
 # =============================================================================
 
+def get_audit_health_status(request: Request) -> str:
+    """Return the audit store's bounded last-known health value.
+
+    The router receives only the health value, never the mutable audit store.
+    Missing runtime/store state is reported explicitly rather than treated as
+    healthy.
+    """
+    runtime = getattr(request.app.state, "runtime", None)
+    store = getattr(runtime, "audit_store", None)
+    if store is None:
+        return "unavailable"
+
+    health = getattr(store, "last_known_health", None)
+    value = getattr(health, "value", health)
+    normalized = str(value or "").strip().lower()
+    return normalized or "unknown"
+
+
 def get_runtime_authority(request: Request) -> Any:
     """Return the one live Sentinel-43 runtime authority for API mutations."""
     runtime = getattr(request.app.state, "runtime", None)
@@ -737,6 +755,7 @@ __all__ = [
     "deps_status",
     "dev_engine_factory",
     "dev_store_factory",
+    "get_audit_health_status",
     "get_engine",
     "get_optional_runtime_authority",
     "get_runtime_authority",
