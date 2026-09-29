@@ -114,13 +114,13 @@ def test_sentinel43_runtime_authority_owns_engine_construction():
     assert "bind_recommendation_runtime(" in orchestrator_source
 
 
-def test_api_composition_root_enters_sentinel43_authority():
-    """The API hosts Sentinel-43; it does not construct an independent
-    SystemOrchestrator as the runtime root."""
+def test_api_composition_root_has_only_the_sentinel43_authority_handle():
+    """The API hosts one authority and exposes no subordinate orchestrator
+    runtime alias that future callers could mistake for a second entry path."""
     source = (CORE / "api" / "main.py").read_text(encoding="utf-8")
     assert "runtime.sentinel43 = build_runtime_authority_from_settings(" in source
-    assert "runtime.orchestrator = runtime.sentinel43.orchestrator" in source
-    assert "runtime.orchestrator = build_orchestrator_from_settings(" not in source
+    assert "runtime.orchestrator" not in source
+    assert "orchestrator: Any | None" not in source
 
 
 def test_runtime_authority_loads_all_owner_components():
