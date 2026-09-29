@@ -271,7 +271,7 @@ def test_runtime_authority_owns_the_monitoring_manager():
     [
         "core/governance/heart.py",
         "core/detection/sentinel_threat_detector.py",
-        "core/detection/feniri_hunter.py",
+        "core/detection/fenrir_hunter.py",
         "core/monitoring/manager.py",
     ],
 )
@@ -293,7 +293,7 @@ def test_the_evidence_layers_hold_no_decision_verbs(module):
 
 def test_fenrir_reports_through_s43_authority_not_heart_directly():
     fenrir = (
-        CORE / "detection" / "feniri_hunter.py"
+        CORE / "detection" / "fenrir_hunter.py"
     ).read_text(encoding="utf-8")
     authority = (
         CORE / "governance" / "runtime_authority.py"
