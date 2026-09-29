@@ -99,6 +99,21 @@ def test_no_second_decision_engine_is_constructed():
     assert offenders == []
 
 
+def test_recommendation_audit_names_sentinel43_as_authority():
+    source = (
+        CORE / "governance" / "orchestrator.py"
+    ).read_text(encoding="utf-8")
+
+    assert (
+        'RECOMMENDATION_AUTHORITY: Final[str] = '
+        '"sentinel43_runtime_authority"'
+    ) in source
+    assert (
+        'RECOMMENDATION_AUTHORITY: Final[str] = "system_orchestrator"'
+        not in source
+    )
+
+
 def test_sentinel43_runtime_authority_owns_engine_construction():
     """The owner engine is constructed by Sentinel-43 itself, never by the
     subordinate SystemOrchestrator."""
