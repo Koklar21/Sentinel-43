@@ -206,7 +206,7 @@ def build_heart_from_settings(
             max_pending_actions=heart_config.max_pending_actions,
         )
 
-    return ThreatGovernor(
+    heart = ThreatGovernor(
         audit_store=audit_store,
         velocity_guard=velocity_guard,
         core_store=core_store,
@@ -217,6 +217,9 @@ def build_heart_from_settings(
         on_health_change=on_health_change,
         authority=authority,
     )
+    if authority is not None:
+        authority.attach_heart(heart)
+    return heart
 
 
 __all__ = [
