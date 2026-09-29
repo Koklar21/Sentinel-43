@@ -20,8 +20,10 @@ created here and injected into that service rather than being constructed by
 it.
 
 The owner-designated Nexus, node/core, and AI-escalation sources are loaded
-and owned here as live runtime components. Auth, users, bootstrap, Watchtower,
-and the dashboard are integrated in later steps through this same boundary.
+and owned here as live runtime components. The shared monitoring/evidence
+manager and identity/session mutation service are also owned here. Watchtower
+transport, remaining detection lifecycle, and the dashboard are integrated
+through this same boundary.
 """
 
 from __future__ import annotations
@@ -41,11 +43,17 @@ class Sentinel43RuntimeAuthority:
     implementations.
     """
 
-    def __init__(self, orchestrator: SystemOrchestrator) -> None:
+    def __init__(
+        self,
+        orchestrator: SystemOrchestrator,
+        *,
+        monitoring_manager: Any | None = None,
+    ) -> None:
         if orchestrator is None:
             raise ValueError("Sentinel43RuntimeAuthority requires an orchestrator")
         self._orchestrator = orchestrator
         self._engine: Any | None = None
+        self._monitoring_manager = monitoring_manager
 
         from .identity import IdentityGovernanceService
 
@@ -64,6 +72,11 @@ class Sentinel43RuntimeAuthority:
     def orchestrator(self) -> SystemOrchestrator:
         """Subordinate governance service, exposed for compatibility only."""
         return self._orchestrator
+
+    @property
+    def monitoring_manager(self) -> Any | None:
+        """The one monitoring/evidence manager owned by this runtime."""
+        return self._monitoring_manager
 
     @property
     def identity(self) -> Any:
@@ -148,7 +161,22 @@ class Sentinel43RuntimeAuthority:
             raise RuntimeError("recommendation runtime remained attached")
 
     def shutdown(self) -> None:
-        self.detach_recommendation_store()
+        """Stop resources owned by the Sentinel-43 runtime authority."""
+        monitoring = self._monitoring_manager
+        self._monitoring_manager = None
+        try:
+            if monitoring is not None:
+                monitoring.stop()
+                try:
+                    from core.monitoring import set_monitoring_manager
+
+                    set_monitoring_manager(None)
+                except Exception:
+                    # Registry cleanup is best-effort; the owned instance is
+                    # already stopped and detached from this authority.
+                    pass
+        finally:
+            self.detach_recommendation_store()
 
     # ------------------------------------------------------------------
     # Authority surface used by Heart/API.
