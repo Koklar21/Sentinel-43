@@ -323,6 +323,8 @@ class NodeStatus:
     mode: str
     recommendation_store_attached: bool
     engine_identity: Mapping[str, str] | None
+    runtime_reporting_available: bool
+    runtime_sources_supported: tuple[str, ...]
     autonomous_execution_supported: bool
     local_scheduler_active: bool
     local_audit_store_active: bool
@@ -591,6 +593,12 @@ class SentinelNode:
                 self._authority.recommendation_store_attached
             ),
             engine_identity=self._authority.engine_identity,
+            runtime_reporting_available=(
+                self._authority.monitoring_manager is not None
+            ),
+            runtime_sources_supported=tuple(
+                source.value for source in RuntimeSource
+            ),
             autonomous_execution_supported=False,
             local_scheduler_active=False,
             local_audit_store_active=False,
