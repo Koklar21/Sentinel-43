@@ -72,7 +72,6 @@ GUARDED_ROUTES = (
     ("POST", "/watchtower/modules/register", {}),
     ("POST", "/watchtower/modules/heartbeat", {}),
     ("POST", "/watchtower/dependencies/report", {}),
-    ("POST", "/watchtower/state/DEGRADED", None),
 )
 
 
@@ -145,6 +144,19 @@ def test_guarded_route_rejects_non_bearer_scheme(wt_client: TestClient, method: 
         method, path, json=body, headers={"Authorization": SERVICE_TOKEN}
     )
     assert response.status_code == 401, (method, path, response.text)
+
+
+def test_manual_state_override_route_is_not_exposed(wt_client: TestClient):
+    """Watchtower lifecycle state is not a separate admin control plane.
+
+    Manual operator state changes must be introduced through Sentinel-43
+    governance, not by reviving a Watchtower-local admin token route.
+    """
+    response = wt_client.post(
+        "/watchtower/state/DEGRADED",
+        headers=_bearer(SERVICE_TOKEN),
+    )
+    assert response.status_code == 404
 
 
 # ---------------------------------------------------------------------------
