@@ -301,6 +301,31 @@ def test_the_durable_store_itself_holds_no_authorization_logic():
         assert term not in source
 
 
+def test_heart_recovery_reads_audit_through_s43_not_the_store():
+    authority_source = (
+        CORE / "governance" / "runtime_authority.py"
+    ).read_text(encoding="utf-8")
+    api_source = (
+        CORE / "api" / "main.py"
+    ).read_text(encoding="utf-8")
+
+    for method in (
+        "def verify_audit_integrity(",
+        "def get_audit_records(",
+        "def get_legacy_audit_records(",
+    ):
+        assert method in authority_source
+
+    recovery_start = api_source.index("async def _rehydrate_heart_pending()")
+    recovery_end = api_source.index("\nasync def ", recovery_start + 20)
+    recovery = api_source[recovery_start:recovery_end]
+
+    assert "authority.verify_audit_integrity" in recovery
+    assert "authority.get_audit_records" in recovery
+    assert "_legacy_heart_audit_index, authority" in recovery
+    assert "authority.audit_store" not in recovery
+
+
 def test_identity_mutations_enter_the_runtime_authority():
     bootstrap = (
         CORE / "api" / "routers" / "bootstrap.py"
