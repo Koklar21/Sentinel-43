@@ -42,7 +42,7 @@ from core.governance import (  # noqa: E402
     DecisionPrincipal,
     UnauthorizedDecision,
     build_heart_from_settings,
-    build_orchestrator_from_settings,
+    build_runtime_authority_from_settings,
 )
 from core.security_context import IdentityType  # noqa: E402
 from core.sentinel43_core_db import (  # noqa: E402
@@ -77,6 +77,7 @@ def _auth_env(monkeypatch):
     monkeypatch.setattr(runtime, "audit_store", None)
     monkeypatch.setattr(runtime, "fenrir_instance", None)
     monkeypatch.setattr(runtime, "orchestrator", None)
+    monkeypatch.setattr(runtime, "sentinel43", None)
     yield
     # Never leave a failed Heart behind for tests that share the process.
     runtime.subsystems.mark_disabled(main_module.SUBSYS_HEART)
@@ -119,12 +120,15 @@ def _stack():
 
 
 def _authority(audit, mode: str = "HUMAN_GATED"):
-    """The governance orchestrator every Heart decision goes through."""
+    """The Sentinel-43 runtime authority every Heart decision goes through."""
 
     class GovernanceSettings:
         default_mode = mode
 
-    return build_orchestrator_from_settings(GovernanceSettings(), audit_store=audit)
+    return build_runtime_authority_from_settings(
+        GovernanceSettings(),
+        audit_store=audit,
+    )
 
 
 #: The actions the engine's OWN policy produces for the assessment _stage
@@ -296,7 +300,8 @@ def _recover(client) -> int:
 
 def _use(heart) -> None:
     main_module.runtime.heart = heart
-    main_module.runtime.orchestrator = heart._authority
+    main_module.runtime.sentinel43 = heart._authority
+    main_module.runtime.orchestrator = heart._authority.orchestrator
     main_module.runtime.action_store.clear()
 
 
@@ -578,32 +583,40 @@ def test_failed_recovery_blocks_readiness_but_not_liveness(monkeypatch):
 # ---------------------------------------------------------------------------
 # Recovery / live-ingestion race protection
 # ---------------------------------------------------------------------------
-def test_fenrir_is_wired_to_heart_only_after_recovery_completes(monkeypatch):
+def test_heart_is_authority_owned_during_recovery_before_fenrir_starts(monkeypatch):
     directory, audit, _, _ = _stack()
     monkeypatch.setenv("S43_HEART_REQUIRED", "true")
     monkeypatch.setenv("S43_AUDIT_HMAC_KEY", "a" * 64)
     monkeypatch.setenv("S43_HEART_SQLITE_PATH", str(directory / "heart.sqlite3"))
 
-    fenrir = SimpleNamespace(heart=None)
     seen_during_recovery: list = []
 
     async def _recording_recovery() -> int:
-        seen_during_recovery.append(fenrir.heart)
+        authority = main_module.runtime.sentinel43
+        seen_during_recovery.append(
+            {
+                "heart": None if authority is None else authority.heart,
+                "fenrir": main_module.runtime.fenrir_instance,
+            }
+        )
         return 0
 
     monkeypatch.setattr(main_module, "_rehydrate_heart_pending", _recording_recovery)
 
     with TestClient(main_module.app) as test_client:
-        # The Heart is enabled only now, so THIS test drives the single
-        # _start_heart() whose recovery race it is measuring.
         monkeypatch.setenv("S43_HEART_ENABLED", "true")
         _start_production_governance(test_client, monkeypatch, audit)
-        main_module.runtime.fenrir_instance = fenrir
-        fenrir.heart = None
         test_client.portal.call(main_module._start_heart)
 
-        assert seen_during_recovery == [None], "Fenrir must not stage live while recovery reads pending rows"
-        assert fenrir.heart is main_module.runtime.heart is not None
+        assert len(seen_during_recovery) == 1
+        assert seen_during_recovery[0]["heart"] is main_module.runtime.heart
+        assert seen_during_recovery[0]["fenrir"] is None
+        assert main_module.runtime.sentinel43 is not None
+        assert (
+            main_module.runtime.sentinel43.heart
+            is main_module.runtime.heart
+            is not None
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -877,19 +890,23 @@ def test_concurrent_decisions_resolve_exactly_once():
 # exercised through the PRODUCTION composition, not a test-built component.
 # ---------------------------------------------------------------------------
 def _start_production_heart(client, monkeypatch, directory: Path, audit):
-    """Compose the Heart exactly as the running app does, with a real Fenrir."""
+    """Compose Heart first, then bind a real Fenrir to the runtime authority."""
     import core.detection.feniri_hunter as fenrir_module
 
     monkeypatch.setenv("S43_HEART_ENABLED", "true")
     monkeypatch.setenv("S43_GOVERNANCE_ENABLED", "true")
     monkeypatch.setenv("S43_AUDIT_HMAC_KEY", "a" * 64)
     monkeypatch.setenv("S43_HEART_SQLITE_PATH", str(directory / "heart.sqlite3"))
-    fenrir = fenrir_module.FenrirHunter()
     _start_production_governance(client, monkeypatch, audit)
-    main_module.runtime.fenrir_instance = fenrir
     client.portal.call(main_module._start_heart)
+
     assert main_module.runtime.heart is not None
-    assert fenrir.heart is main_module.runtime.heart
+    assert main_module.runtime.sentinel43 is not None
+    assert main_module.runtime.sentinel43.heart is main_module.runtime.heart
+
+    fenrir = fenrir_module.FenrirHunter(
+        authority=main_module.runtime.sentinel43
+    )
     return fenrir
 
 
