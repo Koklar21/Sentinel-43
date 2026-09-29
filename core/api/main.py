@@ -430,11 +430,8 @@ class RuntimeState:
 
     monitoring_manager: Any | None = None
     audit_store: Any | None = None
-    # Top-level Sentinel-43 orchestration authority.  The orchestrator field
-    # below is a temporary compatibility alias to sentinel43.orchestrator;
-    # it must never hold an independently-created instance.
+    # The one top-level Sentinel-43 orchestration authority.
     sentinel43: Any | None = None
-    orchestrator: Any | None = None
     heart: Any | None = None
     sparta_instance: Any | None = None
     sparta_task: asyncio.Task[Any] | None = None
@@ -1874,10 +1871,8 @@ async def _start_governance() -> None:
             audit_store=runtime.audit_store,
             monitoring_manager=runtime.monitoring_manager,
         )
-        # Transitional compatibility aliases only. Sentinel43RuntimeAuthority
-        # owns both instances; the API does not create a second orchestrator
-        # or a second monitoring manager.
-        runtime.orchestrator = runtime.sentinel43.orchestrator
+        # Monitoring remains the shared evidence manager owned by the
+        # Sentinel-43 runtime authority.
         runtime.monitoring_manager = runtime.sentinel43.monitoring_manager
         runtime.subsystems.mark_active(
             SUBSYS_GOVERNANCE,
@@ -1889,7 +1884,6 @@ async def _start_governance() -> None:
         )
     except Exception as exc:
         runtime.sentinel43 = None
-        runtime.orchestrator = None
         runtime.subsystems.mark_failed(
             SUBSYS_GOVERNANCE, f"Failed to start: {type(exc).__name__}"
         )
@@ -2579,7 +2573,6 @@ async def _shutdown_runtime() -> None:
             )
         finally:
             runtime.sentinel43 = None
-            runtime.orchestrator = None
             runtime.monitoring_manager = None
             if runtime.subsystems.get(SUBSYS_MONITORING) is not None:
                 runtime.subsystems.mark_stopped(SUBSYS_MONITORING)
