@@ -850,12 +850,9 @@ def _issue_token(
     }
 
     if user_id is not None:
-        if authority is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Sentinel-43 runtime authority is unavailable.",
-            )
-
+        # Authority/session validation happens before token serialization in
+        # the login/refresh paths. This pure JWT helper must not reach for an
+        # undeclared runtime authority or create a second authorization gate.
         try:
             payload["user_id"] = str(
                 uuid.UUID(
