@@ -305,6 +305,7 @@ class SentinelNexus:
             )
 
         self._authority = authority
+        self._integration = IntegrationHub()
         self.metrics = Metrics()
         logger.info(
             "[%s] Nexus bound to Sentinel43RuntimeAuthority",
@@ -314,6 +315,14 @@ class SentinelNexus:
     @property
     def authority(self) -> Sentinel43RuntimeAuthority:
         return self._authority
+
+    def describe_integration_boundary(self) -> dict[str, Any]:
+        """Read-only description of the live fail-closed effect boundary."""
+        return self._integration.describe_boundary()
+
+    def execute_external_effect(self, *_args: Any, **_kwargs: Any) -> None:
+        """Keep every external effect fail-closed at the Nexus boundary."""
+        return self._integration.execute_external_effect(*_args, **_kwargs)
 
     def get_mode(self) -> OpMode:
         value = self._authority.governance_mode
