@@ -28,24 +28,29 @@ This file therefore defines the current node/core facade and typed contracts.
 It owns no independent store, worker, scheduler, Watchtower, approval queue or
 executor.
 
+The current runtime now includes API, container/orchestrator and Kubernetes
+deployment context. Those sources report into this same node/core contract;
+they do not become parallel authorities.
+
 Current responsibility flow:
 
+    API / Kubernetes / container runtime
     monitoring / Watchtower / detectors
-                |
-                v
-        evidence / recommendation
-                |
-                v
-          SentinelNode
-                |
-                v
-      Sentinel43RuntimeAuthority
-          |              |
-          v              v
-   SystemOrchestrator   owner response engine
-          |
-          v
-   durable state + authoritative audit + human gate
+                  |
+                  v
+       runtime observation / evidence
+                  |
+                  v
+            SentinelNode
+                  |
+                  v
+        Sentinel43RuntimeAuthority
+            |              |
+            v              v
+     SystemOrchestrator   owner response engine
+            |
+            v
+     durable state + authoritative audit + human gate
 
 Supported governance modes are SHADOW and HUMAN_GATED only. Autonomous veto
 or delayed execution is intentionally unsupported.
@@ -113,6 +118,28 @@ class EventType(str, Enum):
     CORROBORATE = "CORROBORATE"
 
 
+class RuntimeSource(str, Enum):
+    """Known runtime/deployment reporting sources.
+
+    This vocabulary is intentionally broader than Kubernetes: the node/core
+    contract is the shared intake boundary for current and future runtime
+    environments.
+    """
+
+    API = "api"
+    KUBERNETES = "kubernetes"
+    WATCHTOWER = "watchtower"
+    FENRIR = "fenrir"
+    SPARTA = "sparta"
+    FIREWALL = "firewall"
+    DASHBOARD = "dashboard"
+    REMOTE_GATEWAY = "remote_gateway"
+    DOCKER = "docker"
+    LOCAL = "local"
+    SYSTEM = "system"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class AnomalyRecord:
     """Typed node-level observation contract.
@@ -164,6 +191,116 @@ class AnomalyRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class RuntimeObservation:
+    """Typed runtime/deployment observation reported toward Sentinel-43.
+
+    Kubernetes metadata is provenance only. It does not create a trusted
+    security principal, authorize an action, or count as independent threat
+    corroboration merely because it came from a cluster environment.
+    """
+
+    source: RuntimeSource
+    component: str
+    observed_at: dt.datetime
+    event: str = "runtime_identity"
+    instance_id: str = ""
+    platform: str = ""
+    role: str = ""
+    namespace: str = ""
+    workload: str = ""
+    node_name: str = ""
+    pod_name: str = ""
+    pod_ip: str = ""
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    event_id: str = ""
+
+    def __post_init__(self) -> None:
+        component = str(self.component or "").strip()
+        event = str(self.event or "").strip().lower()
+        if not component or len(component) > 128:
+            raise ValueError("component must be 1..128 characters")
+        if not event or len(event) > 128:
+            raise ValueError("event must be 1..128 characters")
+        if not isinstance(self.observed_at, dt.datetime):
+            raise TypeError("observed_at must be a datetime")
+        if self.observed_at.tzinfo is None:
+            raise ValueError("observed_at must be timezone-aware")
+
+        metadata = dict(self.metadata or {})
+        if len(_canonical_json(metadata).encode("utf-8")) > 20_000:
+            raise ValueError("metadata is too large")
+
+        bounded = {
+            "instance_id": 256,
+            "platform": 64,
+            "role": 64,
+            "namespace": 253,
+            "workload": 253,
+            "node_name": 253,
+            "pod_name": 253,
+            "pod_ip": 64,
+        }
+        for name, limit in bounded.items():
+            value = str(getattr(self, name) or "").strip()
+            if len(value) > limit:
+                raise ValueError(f"{name} is too long")
+            object.__setattr__(self, name, value)
+
+        event_id = str(self.event_id or "").strip()
+        if not event_id:
+            event_id = _hash_str(
+                _canonical_json(
+                    {
+                        "source": self.source.value,
+                        "component": component,
+                        "event": event,
+                        "observed_at": self.observed_at.astimezone(
+                            dt.timezone.utc
+                        ).isoformat(),
+                        "instance_id": self.instance_id,
+                        "namespace": self.namespace,
+                        "workload": self.workload,
+                        "pod_name": self.pod_name,
+                        "pod_ip": self.pod_ip,
+                        "metadata": metadata,
+                    }
+                )
+            )
+        if len(event_id) > 256:
+            raise ValueError("event_id too long")
+
+        object.__setattr__(self, "component", component)
+        object.__setattr__(self, "event", event)
+        object.__setattr__(self, "metadata", MappingProxyType(metadata))
+        object.__setattr__(self, "event_id", event_id)
+
+    def to_monitoring_event(self) -> dict[str, Any]:
+        """Project into the canonical MonitoringManager runtime envelope."""
+        source_identity = self.instance_id or self.component
+        return {
+            "event_id": self.event_id,
+            "kind": "runtime",
+            "source": self.source.value,
+            "source_identity": source_identity,
+            "created_at": self.observed_at.astimezone(
+                dt.timezone.utc
+            ).isoformat(),
+            "error_rate_percent": 0.0,
+            "crash_loop": False,
+            "platform": self.platform,
+            "runtime_role": self.role,
+            "runtime_event": self.event,
+            "instance_id": self.instance_id,
+            "namespace": self.namespace,
+            "workload": self.workload,
+            "node_name": self.node_name,
+            "pod_name": self.pod_name,
+            "pod_ip": self.pod_ip,
+            "runtime_metadata": dict(self.metadata),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class PendingAction:
     """Read-only reference to a governed action.
 
@@ -201,6 +338,8 @@ class Metrics:
     """
 
     anomalies_validated: int = 0
+    runtime_observations_reported: int = 0
+    runtime_observation_failures: int = 0
     recommendations_submitted: int = 0
     recommendations_resolved: int = 0
     submission_failures: int = 0
@@ -322,6 +461,63 @@ class SentinelNode:
 
         self.metrics.anomalies_validated += 1
         return anomaly
+
+    def build_runtime_observation(
+        self,
+        *,
+        source: RuntimeSource | str,
+        component: str,
+        event: str = "runtime_identity",
+        instance_id: str = "",
+        platform: str = "",
+        role: str = "",
+        namespace: str = "",
+        workload: str = "",
+        node_name: str = "",
+        pod_name: str = "",
+        pod_ip: str = "",
+        metadata: Mapping[str, Any] | None = None,
+        observed_at: dt.datetime | None = None,
+    ) -> RuntimeObservation:
+        resolved_source = (
+            source
+            if isinstance(source, RuntimeSource)
+            else RuntimeSource(str(source).strip().lower())
+        )
+        return RuntimeObservation(
+            source=resolved_source,
+            component=component,
+            event=event,
+            observed_at=observed_at or dt.datetime.now(dt.timezone.utc),
+            instance_id=instance_id,
+            platform=platform,
+            role=role,
+            namespace=namespace,
+            workload=workload,
+            node_name=node_name,
+            pod_name=pod_name,
+            pod_ip=pod_ip,
+            metadata=metadata or {},
+        )
+
+    def report_runtime_observation(
+        self,
+        observation: RuntimeObservation,
+    ) -> Any:
+        """Report runtime/deployment evidence through the S43 authority."""
+        if not isinstance(observation, RuntimeObservation):
+            raise TypeError(
+                "report_runtime_observation requires RuntimeObservation"
+            )
+        try:
+            result = self._authority._report_runtime_observation_from_node(
+                observation
+            )
+        except Exception:
+            self.metrics.runtime_observation_failures += 1
+            raise
+        self.metrics.runtime_observations_reported += 1
+        return result
 
     def submit_recommendation(
         self,
@@ -452,6 +648,9 @@ CORE_RESPONSIBILITY_MAP: Mapping[str, str] = MappingProxyType(
     {
         "node_orchestration": "Sentinel43RuntimeAuthority",
         "typed_anomaly_contract": "SentinelNode / monitoring evidence models",
+        "runtime_deployment_reporting": "SentinelNode -> Sentinel43RuntimeAuthority",
+        "api_runtime_reporting": "API composition root -> SentinelNode",
+        "kubernetes_runtime_reporting": "Kubernetes Downward API -> API -> SentinelNode",
         "event_replay_protection": "current monitoring/detection pipeline",
         "ingest_backpressure": "current monitoring/detection pipeline",
         "action_budget": "SystemOrchestrator governed path",
@@ -480,6 +679,8 @@ __all__ = [
     "NodeStatus",
     "PendingAction",
     "RiskLevel",
+    "RuntimeObservation",
+    "RuntimeSource",
     "SYSTEM_ID",
     "SentinelNode",
     "UNSUPPORTED_AUTONOMOUS_MODES",
