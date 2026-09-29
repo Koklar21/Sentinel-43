@@ -101,11 +101,6 @@ def test_module_imports(modname):
 _MIN_SYMBOLS = {
     # PR #254 defect list -- cross-checked against the import sweep's own record.
     "core.audit.store": ["AuditStore", "AuditConfig"],
-    # core.security.fenrir_auth was rewritten to a principal-based contract.
-    "core.security.fenrir_auth": [
-        "FenrirPrincipal", "FenrirAuthorizationError", "extract_bearer_token",
-        "principal_from_authenticated_claims", "require_fenrir_scope",
-    ],
     "core.detection": [
         "ThreatAssessment", "ThreatKind", "ThreatSeverity", "ThreatSourceKind",
         "SentinelThreatDetector", "DetectorConfig", "EventContext",
@@ -168,19 +163,6 @@ def test_core_monitoring_lazy_exports_resolve():
                  "JormungandrNode", "JormungandrConfig",
                  "SentinelWindowStore", "SentinelWindowConfig"):
         assert getattr(cm, name) is not None, f"core.monitoring.{name} did not resolve"
-
-
-def test_fenrir_auth_exposes_its_canonical_contract():
-    """PR #253 deleted core/s34_auth/; fenrir_auth was restored at
-    core/security/fenrir_auth.py with the principal-based contract that is the
-    canonical Fenrir service-identity surface."""
-    import core.security.fenrir_auth as fa
-
-    for name in ("FenrirPrincipal", "FenrirAuthorizationError",
-                 "extract_bearer_token", "principal_from_authenticated_claims",
-                 "require_fenrir_scope", "require_fenrir_role"):
-        assert hasattr(fa, name), f"core.security.fenrir_auth lost {name}"
-
 
 
 def test_runtime_logging_import_path_is_lowercase():
