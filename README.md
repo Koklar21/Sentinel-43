@@ -4,11 +4,12 @@
 
 Sentinel-43 is currently in:
 
-> LATE ALPHA — Beta Hardening and Deployment Preparation
+> LATE ALPHA — Architecture Consolidation, Beta Hardening, and Deployment Preparation
 
-Sentinel-43 is undergoing final architecture hardening, authentication
-modernization, deployment validation, migration infrastructure work,
-security regression testing, and Beta-readiness preparation.
+Sentinel-43 is undergoing architecture consolidation and hardening,
+session-authentication hardening, deployment validation, migration
+infrastructure work, security regression testing, and Beta-readiness
+preparation.
 
 This release is intended for controlled development and validation.
 
@@ -58,8 +59,10 @@ Sentinel-43 has progressed beyond the early Alpha architecture stage.
 
 Current Late Alpha work focuses on:
 
+- canonical runtime-authority consolidation
+- owner-designated core integration
 - security hardening
-- authentication modernization
+- session-authentication hardening
 - database migration infrastructure
 - Docker deployment validation
 - Kubernetes deployment architecture
@@ -74,6 +77,7 @@ Current Late Alpha work focuses on:
 - Beta deployment preparation
 - security regression testing
 - repository and documentation normalization
+- runtime and deployment provenance reporting
 
 The system currently has established Docker-based components for:
 
@@ -116,6 +120,12 @@ Established security work includes:
 - authentication timing mitigation
 - security regression testing
 - real PostgreSQL concurrency testing
+- single runtime-authority composition boundary
+- governed first-administrator dashboard onboarding
+- runtime-authority provenance reporting
+- removal of direct Watchtower manual-state authority
+- removal of direct Sparta recovery authority
+- removal of human-decision handling from the service-token remote gateway
 
 Security-sensitive behavior is tested against explicit invariants rather
 than relying solely on application startup or unit-level mocks.
@@ -132,13 +142,11 @@ continues.
 
 These include:
 
-## Authentication Modernization
+## Session Authentication and Legacy Retirement
 
-Sentinel-43 is transitioning away from its legacy repeated-password
-protected-request model toward a session-aware authentication
-architecture.
+Sentinel-43's non-local authentication path is session-aware.
 
-The target architecture includes:
+The current architecture includes:
 
 - short-lived access tokens
 - session-bound token identifiers
@@ -152,10 +160,14 @@ The target architecture includes:
 - account-state validation
 - WebSocket session-state validation
 
-Legacy authentication remains supported during the controlled migration.
+The repeated-password legacy protected-request path is refused outside
+local/dev/test environments. The environment-backed break-glass operator is
+also restricted to local/dev/test use and does not provide a production
+authentication bypass.
 
-The legacy authentication mechanism will not be removed until compatibility
-testing and migration gates have been satisfied.
+Any remaining legacy compatibility behavior is retained only for bounded
+development/migration purposes and must not be treated as a deployable
+production authentication mode.
 
 ---
 
@@ -247,7 +259,7 @@ Sentinel-43 follows a structured defensive decision pipeline:
         ↓
     Govern / Approve
         ↓
-    External Enforcement
+    Controlled Export / Independently Governed Enforcement
         ↓
     Audit
 
@@ -256,6 +268,36 @@ Not every deployment must contain every optional subsystem.
 The core architectural boundary remains:
 
     Analysis != Governance != Enforcement
+
+The current Late Alpha runtime does not support autonomous external
+execution. Governed approval records intent and authority; any external
+effect must remain independently controlled and explicitly integrated.
+
+---
+
+# Canonical Runtime Authority
+
+The live runtime is composed beneath one top-level authority:
+`Sentinel43RuntimeAuthority`.
+
+That authority owns the live Sentinel-43 governance composition, including
+the subordinate `SystemOrchestrator`, the owner-designated response engine,
+the owner-designated Nexus / node / AI-escalation components, governed
+identity/session mutation, and the shared monitoring/evidence boundary.
+
+The owner-designated sources under `Sentinel-43/` are live runtime sources,
+not historical examples. `Shadow_mode.py` is the single owner response
+engine; `Sentienal_Nexus.py`, `Sentienal_core.py`, and
+`sentinel_AI_escalation.py` are subordinate components loaded beneath the
+same runtime authority.
+
+The API, dashboard, Watchtower, Fenrir, Sparta, remote gateway, deployment
+reporting, and other integrations must not create parallel governance or
+execution authority.
+
+Runtime provenance is exposed as read-only authority/deployment state so an
+operator can determine which Sentinel-43 authority and owner components are
+actually active without receiving subordinate mutation objects.
 
 ---
 
@@ -531,6 +573,41 @@ security boundaries.
 
 ---
 
+## 10. Kubernetes Deployment Enforcement
+
+Role:
+
+> Deployment Isolation and Infrastructure Guardrails
+
+Kubernetes is an additional security and deployment layer around the
+Sentinel-43 runtime. It does not become a second governance authority.
+
+The controlled-Beta Kubernetes path provides or is being hardened around:
+
+- non-root workloads
+- explicit service accounts and service boundaries
+- Kubernetes Secrets
+- default-deny and least-required NetworkPolicy rules
+- internal-only PostgreSQL access
+- migration Jobs as the single schema-migration actor
+- readiness and liveness separation
+- ingress-controlled external exposure
+- TLS / certificate-management integration
+- runtime/deployment provenance reporting
+- deployment-specific trusted-proxy and host configuration
+
+The current Kubernetes manifests intentionally run the API as a singleton
+because several runtime states remain process-local, including event
+idempotency, Fenrir lifecycle state, Sparta watchdog state, and dashboard
+WebSocket clients. Horizontal API scaling must not be enabled until those
+shared-state requirements are deliberately externalized.
+
+Kubernetes enforcement supplements application-layer authorization,
+governance, Jormungandr boundaries, the Sentinel-43 firewall, Watchtower,
+Fenrir, and Sparta. It does not bypass or replace any of them.
+
+---
+
 # Service Identity Separation
 
 Sentinel-43 distinguishes human identities from machine/service identities.
@@ -581,7 +658,7 @@ Deployment operators are responsible for ensuring that:
 - proxy boundaries are explicitly configured
 - internal services are not unnecessarily published
 - database ports are not publicly exposed
-- Redis is not publicly exposed
+- any future shared-state datastore is not publicly exposed
 - service credentials remain internal
 - TLS termination is explicitly configured for production
 - public endpoints expose only necessary information
@@ -698,7 +775,8 @@ s43-proxy
 
 Exact service layout remains subject to change until Beta.
 
-Internal database and Redis services should not be exposed publicly.
+Internal database services and any future shared-state services should not
+be exposed publicly.
 
 ---
 
@@ -796,7 +874,7 @@ The Kubernetes architecture is designed around:
 - TLS termination
 - certificate-management integration
 - internal-only database services
-- internal-only Redis services
+- default-deny / least-required NetworkPolicy enforcement
 - least-required network exposure
 
 A production Kubernetes deployment is expected to use a dedicated migration
@@ -808,6 +886,10 @@ Ingress and TLS configuration must be completed with deployment-specific
 values.
 
 Placeholder configuration must never be treated as production-ready.
+
+The current Kubernetes deployment intentionally keeps `s43-api` at one
+replica with non-overlapping rollout behavior until process-local state is
+made safely shared.
 
 ---
 
@@ -827,8 +909,9 @@ Sentinel-43 containers are being hardened around:
 Production deployments should expose only the edge services required by the
 deployment architecture.
 
-PostgreSQL, Redis, internal service interfaces, and administrative
-interfaces should remain internal unless explicitly required.
+PostgreSQL, internal service interfaces, administrative interfaces, and any
+future shared-state datastore should remain internal unless explicitly
+required.
 
 ---
 
@@ -997,7 +1080,9 @@ granting autonomous enforcement authority.
 | ---- | -------- |
 | SHADOW | Observe and record. |
 | HUMAN_GATED | Recommendations require explicit operator approval before controlled export. |
-| AUTONOMOUS_VETO | Conservative policy mode capable of rejecting disallowed recommendations without granting autonomous enforcement authority. |
+
+`ACTIVE`, `AUTONOMOUS`, `AUTONOMOUS_VETO`, and delayed autonomous
+execution modes are not supported by the live owner core.
 
 Governance remains authoritative.
 
@@ -1071,7 +1156,7 @@ Large tests can heavily stress:
 
 - API workers
 - PostgreSQL
-- Redis
+- any reintroduced shared-state datastore
 - Docker
 - host CPU
 - host memory
@@ -1120,8 +1205,9 @@ Sentinel-43 will not be declared Beta solely because the code runs.
 
 Late Alpha must establish, at minimum:
 
-- stable authentication migration
-- controlled legacy-auth retirement path
+- stable session authentication
+- verified rejection of legacy protected-request authentication outside local/dev/test
+- bounded local/dev/test break-glass behavior
 - tested database migration infrastructure
 - validated fresh-install migration
 - validated existing-database migration
