@@ -76,6 +76,24 @@ def test_dashboard_does_not_import_core_implementation():
     assert not offenders, f"dashboard reaches into core: {offenders}"
 
 
+def test_live_dashboard_advertises_only_supported_governance_modes():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    javascript = (root / "assets" / "js" / "dashboard.js").read_text(
+        encoding="utf-8"
+    )
+    html = (root / "sentinel_43_dashboard.html").read_text(
+        encoding="utf-8"
+    )
+
+    for source in (javascript, html):
+        assert "AUTONOMOUS_VETO" not in source
+        assert "ACTIVE_PLANNING" not in source
+
+    assert 'SHADOW: "ADVISORY"' in javascript
+
+
 # --------------------------------------------------------------------------- #
 # canonical event envelope -- extracted at ONE boundary
 # --------------------------------------------------------------------------- #
