@@ -33,7 +33,7 @@ from core.api.middleware.sentinel_firewall_middleware import (  # noqa: E402
     SentinelFirewall,
 )
 from core.audit import AuditConfig, AuditStore  # noqa: E402
-from core.detection.feniri_hunter import FenrirHunter  # noqa: E402
+from core.detection.fenrir_hunter import FenrirHunter  # noqa: E402
 from core.detection.sentinel_threat_detector import (  # noqa: E402
     EventContext,
     SentinelThreatDetector,
