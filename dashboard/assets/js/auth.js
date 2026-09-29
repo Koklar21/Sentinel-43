@@ -12,7 +12,7 @@
    - If bootstrap status cannot be established, the overlay locks rather
      than guessing whether login or first-admin creation is valid.
 
-   Changes from v1.7.0 (next-PR Phase C — real-browser + same-origin beta):
+   Current same-origin session behavior:
    - The bearer access token is now held in module memory ONLY. It is no
      longer written to sessionStorage (init() refreshes it from the HttpOnly
      cookie on every load, so persistence bought nothing and was an XSS
@@ -21,7 +21,7 @@
      cleared on load.
    - No functional change to endpoints (still same-origin /auth/*).
 
-   Changes from v1.6.0 (beta-execution Phase 3 — browser session):
+   Session lifecycle behavior:
    - Login now also gets an HttpOnly refresh cookie + a JS-readable CSRF
      cookie (s43_csrf) + a sid-bound 15-min access token for DB accounts
      (result.session_bound === true). X-S43-Password is no longer required
