@@ -94,11 +94,24 @@ class Sentinel43RuntimeAuthority:
         self._heart = None
 
     def observe_threat(self, assessment: Any) -> Any:
-        """Detection-layer ingress. Fenrir reports to S43, never Heart directly."""
+        """Detection ingress through the owner AI-escalation contract.
+
+        Fenrir reports to Sentinel-43. The owner escalation component validates
+        the canonical assessment, governed subject and requested mode before
+        the same assessment reaches Heart. Escalation owns no response plan or
+        staging authority.
+        """
         heart = self._heart
         if heart is None:
             raise RuntimeError("Sentinel-43 Heart is not attached")
-        return heart.observe(assessment)
+
+        envelope = self._owner_components.ai_escalation.build_envelope(
+            assessment
+        )
+        return heart.observe(
+            envelope.assessment,
+            mode=envelope.requested_mode.value,
+        )
 
     @property
     def monitoring_manager(self) -> Any | None:
