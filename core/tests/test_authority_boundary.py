@@ -167,6 +167,24 @@ def test_public_recommendation_path_crosses_the_nexus():
     assert "_resolve_recommendation_from_nexus" in nexus_source
 
 
+def test_nexus_owns_one_fail_closed_integration_boundary():
+    nexus_source = (
+        REPO_ROOT / "Sentinel-43" / "Sentienal_Nexus.py"
+    ).read_text(encoding="utf-8")
+    authority_source = (
+        CORE / "governance" / "runtime_authority.py"
+    ).read_text(encoding="utf-8")
+
+    assert "self._integration = IntegrationHub()" in nexus_source
+    assert "def describe_integration_boundary(" in nexus_source
+    assert "def execute_external_effect(" in nexus_source
+    assert "direct external execution is not supported" in nexus_source
+
+    assert "nexus.describe_integration_boundary()" in authority_source
+    assert '"integration_boundary": integration' in authority_source
+    assert '"external_execution_supported": False' not in authority_source
+
+
 def test_owner_components_cannot_reach_the_subordinate_orchestrator():
     """Owner components enter through Sentinel43RuntimeAuthority, including
     read-only mode discovery; the subordinate governor is not exposed."""
