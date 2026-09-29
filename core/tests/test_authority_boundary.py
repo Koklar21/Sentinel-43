@@ -213,6 +213,16 @@ def test_the_evidence_layers_hold_no_decision_verbs(module):
     assert called & forbidden == set()
 
 
+def test_fenrir_reports_threats_to_authority_not_heart_directly():
+    path = CORE / "detection" / "feniri_hunter.py"
+    source = path.read_text(encoding="utf-8")
+    called = _calls_in(path)
+
+    assert "authority.observe_threat" in source
+    assert "heart.observe" not in source
+    assert "observe_threat" in called
+
+
 def test_the_heart_reaches_the_authority_only_through_its_two_entry_points():
     called = _calls_in(REPO_ROOT / "core/governance/heart.py")
     assert "stage_recommendation" in called
