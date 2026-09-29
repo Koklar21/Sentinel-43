@@ -1111,7 +1111,10 @@ class FenrirHunter:
         """
         authority = self.authority
 
-        if authority is None:
+        if (
+            authority is None
+            or not bool(getattr(authority, "threat_ingress_available", False))
+        ):
             self.metrics["heart_unavailable"] += 1
             if not self._heart_unavailable_logged:
                 self._heart_unavailable_logged = True
