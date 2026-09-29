@@ -137,6 +137,7 @@ class Sentinel43RuntimeAuthority:
         objects, stores, queues, authenticators, or mutation capabilities.
         """
         mode = self._orchestrator.default_mode
+        integration = self._owner_components.nexus.describe_integration_boundary()
         return {
             "authority": type(self).__name__,
             "mode": str(getattr(mode, "value", mode)).strip().upper(),
@@ -144,7 +145,10 @@ class Sentinel43RuntimeAuthority:
             "owner_engine": self.engine_identity,
             "recommendation_store_attached": self.recommendation_store_attached,
             "runtime_reporting_available": self._monitoring_manager is not None,
-            "external_execution_supported": False,
+            "integration_boundary": integration,
+            "external_execution_supported": bool(
+                integration.get("external_execution")
+            ),
         }
 
     def report_runtime_observation(self, observation: Any) -> Any:
