@@ -448,9 +448,15 @@ def test_fenrir_does_not_resubmit_unchanged_evidence_and_retries_after_failure()
                 raise RuntimeError("heart down")
 
     async def scenario() -> tuple[int, int, int]:
-        fenrir = FenrirHunter()
         counting = CountingHeart()
-        fenrir.heart = counting
+
+        class CountingAuthority:
+            threat_ingress_available = True
+
+            def observe_threat(self, assessment):
+                return counting.observe(assessment)
+
+        fenrir = FenrirHunter(authority=CountingAuthority())
 
         def feed(n: int) -> None:
             for _ in range(n):
@@ -488,11 +494,16 @@ def test_full_pipeline_firewall_only_stays_pending_second_producer_stages(tmp_pa
     audit, core, heart = _stores(tmp_path, staged=staged)
 
     async def scenario() -> None:
-        fenrir = FenrirHunter()
+        class HeartAuthority:
+            threat_ingress_available = True
+
+            def observe_threat(self, assessment):
+                return heart.observe(assessment)
+
+        fenrir = FenrirHunter(authority=HeartAuthority())
         manager = MonitoringManager(_Scanner())
         manager.start()
         manager.attach_threat_ingestor(fenrir.detector, producers={"firewall": LABEL, "sparta": "SpartaCore"})
-        fenrir.heart = heart
 
         _drive_firewall(manager, LABEL, requests=60)
         for _ in range(3):
