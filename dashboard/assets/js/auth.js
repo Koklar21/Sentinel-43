@@ -261,10 +261,13 @@ async function fetchBootstrapStatus() {
         }
 
         const body = await res.json().catch(() => ({}));
-        if (typeof body.initialized !== "boolean") {
+        if (
+            typeof body.initialized !== "boolean" ||
+            typeof body.claim_token_required !== "boolean"
+        ) {
             throw new Error("Server returned an invalid bootstrap status.");
         }
-        return body.initialized;
+        return body;
     } catch (err) {
         if (err.name === "AbortError") {
             throw new Error("Bootstrap status request timed out.");
@@ -470,6 +473,7 @@ function buildOverlay() {
         const claimTokenEl = document.getElementById("s43-bootstrap-token");
         const claimToken = claimTokenEl ? claimTokenEl.value : "";
         const bootstrapMode = form.dataset.mode === "bootstrap";
+        const claimTokenRequired = form.dataset.claimTokenRequired === "true";
 
         if (!username || !password) {
             _showErr("Username and password are required.");
@@ -491,7 +495,7 @@ function buildOverlay() {
             _showErr("Email is too long.");
             return;
         }
-        if (bootstrapMode && !claimToken) {
+        if (bootstrapMode && claimTokenRequired && !claimToken) {
             _showErr("Deployment claim token is required.");
             return;
         }
@@ -571,7 +575,7 @@ function buildOverlay() {
     }
 }
 
-function setOverlayMode(mode) {
+function setOverlayMode(mode, { claimTokenRequired = false } = {}) {
     buildOverlay();
 
     const form = document.getElementById("s43-login-form");
@@ -584,7 +588,11 @@ function setOverlayMode(mode) {
     const btn = document.getElementById("s43-login-btn");
 
     const bootstrapMode = mode === "bootstrap";
-    if (form) form.dataset.mode = bootstrapMode ? "bootstrap" : "login";
+    if (form) {
+        form.dataset.mode = bootstrapMode ? "bootstrap" : "login";
+        form.dataset.claimTokenRequired =
+            bootstrapMode && claimTokenRequired ? "true" : "false";
+    }
     if (sub) {
         sub.textContent = bootstrapMode
             ? "FIRST-RUN ADMINISTRATOR SETUP"
@@ -592,7 +600,10 @@ function setOverlayMode(mode) {
     }
     if (note) note.style.display = bootstrapMode ? "block" : "none";
     if (emailWrap) emailWrap.style.display = bootstrapMode ? "block" : "none";
-    if (tokenWrap) tokenWrap.style.display = bootstrapMode ? "block" : "none";
+    if (tokenWrap) {
+        tokenWrap.style.display =
+            bootstrapMode && claimTokenRequired ? "block" : "none";
+    }
     if (!bootstrapMode && tokenInput) tokenInput.value = "";
     if (password) {
         password.autocomplete = bootstrapMode ? "new-password" : "current-password";
@@ -602,9 +613,9 @@ function setOverlayMode(mode) {
     }
 }
 
-function showBootstrapOverlay(message) {
+function showBootstrapOverlay(message, claimTokenRequired = false) {
     buildOverlay();
-    setOverlayMode("bootstrap");
+    setOverlayMode("bootstrap", { claimTokenRequired });
     showOverlay(message);
 }
 
@@ -715,8 +726,11 @@ async function init() {
         return;
     }
 
-    if (!initialized) {
-        const showSetup = () => showBootstrapOverlay();
+    if (!initialized.initialized) {
+        const showSetup = () => showBootstrapOverlay(
+            undefined,
+            initialized.claim_token_required
+        );
         if (document.readyState === "loading") {
             document.addEventListener("DOMContentLoaded", showSetup, { once: true });
         } else {
