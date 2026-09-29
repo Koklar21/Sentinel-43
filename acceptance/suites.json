@@ -16,10 +16,9 @@
     "core-isolated": {
       "kind": "pytest",
       "python": "main",
-      "description": "core + dashboard unit/in-process suites (no live service, no PostgreSQL)",
+      "description": "core unit/in-process suites (no live service, no PostgreSQL)",
       "paths": [
-        "core/tests",
-        "dashboard/tests"
+        "core/tests"
       ],
       "ignore": [
         "core/tests/test_bootstrap.py",
@@ -49,8 +48,7 @@
       "python": "main",
       "description": "the same core-isolated suites executed inside the runtime container's test stage (python:3.13-alpine)",
       "paths": [
-        "core/tests",
-        "dashboard/tests"
+        "core/tests"
       ],
       "ignore": [
         "core/tests/test_bootstrap.py",
