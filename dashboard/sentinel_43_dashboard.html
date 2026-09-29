@@ -8,7 +8,7 @@
     v1.6.0 — Integrated from Replit spec review:
       + Operational Pipeline strip (Observe → … → Audit) — static, no JS needed
       + Watchtower subsystem health grid — JS-populated via GET /api/watchtower/status
-      + Mode alias mapping (SHADOW↔ADVISORY, AUTONOMOUS_VETO↔ACTIVE_PLANNING)
+      + Mode alias mapping (SHADOW↔ADVISORY; HUMAN_GATED uses its canonical name)
       + Assessment-layer metric row (Total Assessments, Critical Threats, Total Decisions, Fenrir Signals)
       + Watchtower overall status in header
 
@@ -655,9 +655,7 @@
   1. MODE ALIAS MAPPING
   ──────────────────────
   const MODE_ALIASES = {
-    SHADOW:           'ADVISORY',
-    HUMAN_GATED:      null,           // same name, hide alias
-    AUTONOMOUS_VETO:  'ACTIVE_PLANNING',
+    SHADOW: 'ADVISORY',
   };
 
   After setting modeText.textContent = mode:
