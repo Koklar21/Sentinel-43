@@ -4,20 +4,12 @@
 // UI logic module. WebSocket transport is handled by websocket.js which
 // dispatches sentinel:ws:* events consumed here.
 //
-// v1.8.0
-// Changes from v1.7.0 (next-PR Phase C — real-browser + same-origin beta):
-// - API_BASE defaults to location.origin (was http://localhost:8000). An
-//   empty meta[name="sentinel-api-base"] falls through to same-origin.
-// - The real session token is read from window.SentinelAuth.getToken()
-//   (memory) first; the sessionStorage read is kept only as back-compat.
+// Current live SPA behavior:
+// - API_BASE defaults to the page origin unless explicitly configured.
+// - Session access tokens are read from window.SentinelAuth.
+// - Protected polling is gated on authenticated lifecycle events.
+// - Cross-origin requests never receive Sentinel authentication headers.
 //
-// Changes (v1.7.0):
-// - RECONSTRUCTION NOTE: this file was recovered from a paste that had
-//   stripped the backticks from every template literal. Backticks have
-//   been restored based on context. Diff against your real working copy
-//   and run the linter/test suite before trusting this in production —
-//   this note exists so nobody assumes byte-for-byte fidelity with
-//   whatever is actually on disk.
 // - Added: fetchJson() no longer attaches Authorization/X-S43-Password to
 //   cross-origin requests. `credentials` was already gated to same-origin;
 //   the auth headers were not, which meant a misconfigured API_BASE could
