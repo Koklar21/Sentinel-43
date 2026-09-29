@@ -209,6 +209,22 @@
     #kbToast td:first-child{white-space:nowrap}
     kbd{background:var(--surface);border:1px solid var(--border2);border-radius:3px;padding:1px 5px;color:var(--text);font-family:var(--font-mono);font-size:10px}
 
+    /* ── Account administration ── */
+    .account-list{display:flex;flex-direction:column;gap:7px;padding:10px}
+    .account-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;padding:9px 10px;border:1px solid var(--border);border-radius:var(--r);background:var(--surface)}
+    .account-main{min-width:0}
+    .account-name{font-size:12px;font-weight:700;overflow-wrap:anywhere}
+    .account-meta{font-size:9px;font-family:var(--font-mono);color:var(--muted);margin-top:3px;overflow-wrap:anywhere}
+    .account-actions{display:flex;gap:5px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+    .account-empty{padding:18px 10px;text-align:center;font-family:var(--font-mono);font-size:10px;color:var(--muted)}
+    .account-role{padding:4px 7px;border:1px solid var(--border2);border-radius:var(--r);background:var(--panel);color:var(--text);font-family:var(--font-mono);font-size:10px}
+    .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+    .form-field{display:flex;flex-direction:column;gap:4px}
+    .form-field.full{grid-column:1/-1}
+    .form-field label{font-size:9px;font-family:var(--font-mono);color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+    .modal-card input[type=password],.modal-card input[type=email],.modal-card select{width:100%;padding:9px 11px;border-radius:var(--r);border:1px solid var(--border2);background:var(--surface);color:var(--text);font-family:var(--font-mono);font-size:12px;outline:none}
+    .modal-card input[type=password]:focus,.modal-card input[type=email]:focus,.modal-card select:focus{border-color:var(--cyan-glow)}
+
     /* ── Config grid ── */
     .cfg-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
     .cfg-box{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:9px 11px}
@@ -553,6 +569,21 @@
       <div id="wtProbeTime" class="wt-probe-time" aria-live="polite"></div>
     </div>
 
+    <!-- Admin-only account management. All mutations use the canonical /users
+         API, which is governed by Sentinel43RuntimeAuthority server-side. -->
+    <div class="panel">
+      <div class="panel-hdr">
+        <div class="panel-title"><span>//</span>ADMIN ACCOUNTS</div>
+        <div class="toolbar">
+          <span id="userCountChip" class="chip">USERS&nbsp;<strong id="userCount">—</strong></span>
+          <button id="usersRefreshBtn" class="btn ghost" type="button" title="Refresh accounts" aria-label="Refresh accounts">↻</button>
+          <button id="createUserBtn" class="btn cyan" type="button">＋ New User</button>
+        </div>
+      </div>
+      <div id="usersStatus" class="account-empty">Admin session required to load accounts.</div>
+      <div id="usersList" class="account-list" hidden aria-live="polite"></div>
+    </div>
+
     <!-- EXISTING: Runtime config panel -->
     <div class="panel">
       <div class="panel-hdr">
@@ -635,6 +666,67 @@
     <div class="modal-actions">
       <button id="injectCancel" class="btn" type="button">Cancel</button>
       <button id="injectConfirm" class="btn amber" type="button">⚡ Confirm Inject</button>
+    </div>
+  </div>
+</div>
+
+<div id="userModal" class="modal-overlay" hidden aria-hidden="true" role="dialog" aria-modal="true">
+  <div class="modal-bd" data-close-user></div>
+  <div class="modal-card">
+    <h3>Create Sentinel-43 User</h3>
+    <p>Creates a governed database account. Only an authenticated administrator can complete this action.</p>
+    <div class="form-grid">
+      <div class="form-field full">
+        <label for="userUsername">Username</label>
+        <input type="text" id="userUsername" maxlength="128" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="form-field full">
+        <label for="userEmail">Email (optional)</label>
+        <input type="email" id="userEmail" maxlength="255" autocomplete="off" />
+      </div>
+      <div class="form-field">
+        <label for="userRole">Role</label>
+        <select id="userRole">
+          <option value="operator" selected>operator</option>
+          <option value="admin">admin</option>
+        </select>
+      </div>
+      <div class="form-field">
+        <label for="userPassword">Password</label>
+        <input type="password" id="userPassword" minlength="12" maxlength="1024" autocomplete="new-password" />
+      </div>
+      <div class="form-field full">
+        <label for="userPasswordConfirm">Confirm password</label>
+        <input type="password" id="userPasswordConfirm" minlength="12" maxlength="1024" autocomplete="new-password" />
+      </div>
+    </div>
+    <div id="userModalError" class="modal-err"></div>
+    <div class="modal-actions">
+      <button id="userCancel" class="btn" type="button">Cancel</button>
+      <button id="userConfirm" class="btn cyan" type="button">Create User</button>
+    </div>
+  </div>
+</div>
+
+<div id="passwordResetModal" class="modal-overlay" hidden aria-hidden="true" role="dialog" aria-modal="true">
+  <div class="modal-bd" data-close-password-reset></div>
+  <div class="modal-card">
+    <h3 id="passwordResetTitle">Reset User Password</h3>
+    <p>Resetting a password revokes that user's live sessions.</p>
+    <div class="form-grid">
+      <div class="form-field full">
+        <label for="passwordResetInput">New password</label>
+        <input type="password" id="passwordResetInput" minlength="12" maxlength="1024" autocomplete="new-password" />
+      </div>
+      <div class="form-field full">
+        <label for="passwordResetConfirmInput">Confirm password</label>
+        <input type="password" id="passwordResetConfirmInput" minlength="12" maxlength="1024" autocomplete="new-password" />
+      </div>
+    </div>
+    <div id="passwordResetError" class="modal-err"></div>
+    <div class="modal-actions">
+      <button id="passwordResetCancel" class="btn" type="button">Cancel</button>
+      <button id="passwordResetConfirm" class="btn amber" type="button">Reset Password</button>
     </div>
   </div>
 </div>
