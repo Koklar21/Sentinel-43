@@ -79,9 +79,9 @@ class Sentinel43RuntimeAuthority:
         return str(getattr(mode, "value", mode)).strip().upper()
 
     @property
-    def heart(self) -> Any | None:
-        """The one Heart/ThreatGovernor owned by this runtime."""
-        return self._heart
+    def threat_ingress_available(self) -> bool:
+        """Whether a Heart is attached behind the authority boundary."""
+        return self._heart is not None
 
     def attach_heart(self, heart: Any) -> None:
         if heart is None:
