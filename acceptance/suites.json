@@ -46,7 +46,7 @@
     "core-isolated-container": {
       "kind": "pytest",
       "python": "main",
-      "description": "the same core-isolated suites executed inside the runtime container's test stage (python:3.13-alpine)",
+      "description": "the same core-isolated suite executed inside the runtime container's test stage (python:3.13-alpine)",
       "paths": [
         "core/tests"
       ],
