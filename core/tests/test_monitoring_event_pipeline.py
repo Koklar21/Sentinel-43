@@ -233,7 +233,7 @@ def test_fenrir_broadcast_uses_the_enforced_fenrir_namespace(monkeypatch):
     """/internal/events/broadcast 403s any event_type outside "fenrir.*".
     FenrirHunter sent "fenrir_finding" (underscore), so every broadcast was
     rejected and counted as broadcast_failures."""
-    from core.detection.feniri_hunter import FenrirConfig, FenrirHunter
+    from core.detection.fenrir_hunter import FenrirConfig, FenrirHunter
 
     monkeypatch.setenv("S43_FENRIR_BROADCAST_URL", "http://api.invalid/internal/events/broadcast")
     monkeypatch.setenv("S43_FENRIR_WATCHTOWER_URL", "")
