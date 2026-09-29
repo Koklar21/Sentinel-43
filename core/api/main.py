@@ -1300,6 +1300,7 @@ async def register_api_with_watchtower() -> dict[str, Any]:
             "environment": SENTINEL_ENV,
             "started_ts": START_TIME,
             "timestamp": utc_now(),
+            "runtime": _runtime_deployment_metadata(),
         },
     }
 
@@ -1812,6 +1813,87 @@ async def _start_audit_store() -> None:
     )
 
 
+def _runtime_deployment_metadata() -> dict[str, str]:
+    """Bounded process/deployment identity supplied by the composition root.
+
+    Kubernetes values come from the Downward API when present. They are
+    provenance only and never substitute for authentication/security context.
+    """
+    return {
+        "platform": _env_str("S43_RUNTIME_PLATFORM", "process")[:64],
+        "role": _env_str("S43_RUNTIME_ROLE", "api")[:64],
+        "instance_id": _env_str(
+            "S43_INSTANCE_ID",
+            _env_str("S43_K8S_POD_NAME", APP_NAME),
+        )[:256],
+        "namespace": _env_str("S43_K8S_NAMESPACE")[:253],
+        "workload": _env_str("S43_K8S_WORKLOAD")[:253],
+        "node_name": _env_str("S43_K8S_NODE_NAME")[:253],
+        "pod_name": _env_str("S43_K8S_POD_NAME")[:253],
+        "pod_ip": _env_str("S43_K8S_POD_IP")[:64],
+        "service_account": _env_str("S43_K8S_SERVICE_ACCOUNT")[:253],
+    }
+
+
+def _report_runtime_identity_to_sentinel43() -> None:
+    """Report API and Kubernetes runtime provenance through SentinelNode."""
+    authority = runtime.sentinel43
+    if authority is None:
+        return
+
+    context = _runtime_deployment_metadata()
+    node = authority.node
+
+    api_observation = node.build_runtime_observation(
+        source="api",
+        component=APP_NAME,
+        event="api_runtime_started",
+        instance_id=context["instance_id"],
+        platform=context["platform"],
+        role=context["role"],
+        namespace=context["namespace"],
+        workload=context["workload"],
+        node_name=context["node_name"],
+        pod_name=context["pod_name"],
+        pod_ip=context["pod_ip"],
+        metadata={
+            "environment": SENTINEL_ENV,
+            "version": APP_VERSION,
+        },
+    )
+    authority.report_runtime_observation(api_observation)
+
+    kubernetes_present = any(
+        context[key]
+        for key in (
+            "namespace",
+            "node_name",
+            "pod_name",
+            "pod_ip",
+            "service_account",
+        )
+    )
+    if kubernetes_present:
+        k8s_observation = node.build_runtime_observation(
+            source="kubernetes",
+            component=APP_NAME,
+            event="pod_identity",
+            instance_id=context["instance_id"],
+            platform="kubernetes",
+            role=context["role"],
+            namespace=context["namespace"],
+            workload=context["workload"],
+            node_name=context["node_name"],
+            pod_name=context["pod_name"],
+            pod_ip=context["pod_ip"],
+            metadata={
+                "environment": SENTINEL_ENV,
+                "service_account": context["service_account"],
+            },
+        )
+        authority.report_runtime_observation(k8s_observation)
+
+
 async def _start_governance() -> None:
     if not _env_bool("S43_GOVERNANCE_ENABLED", False):
         runtime.subsystems.mark_disabled(SUBSYS_GOVERNANCE)
@@ -1874,6 +1956,17 @@ async def _start_governance() -> None:
         # Monitoring remains the shared evidence manager owned by the
         # Sentinel-43 runtime authority.
         runtime.monitoring_manager = runtime.sentinel43.monitoring_manager
+
+        # Report API/runtime provenance through the owner-designated node
+        # contract. Kubernetes Downward API fields, when present, produce a
+        # second Kubernetes observation through the same authority path.
+        try:
+            await asyncio.to_thread(_report_runtime_identity_to_sentinel43)
+        except Exception:
+            logger.warning(
+                "Sentinel-43 runtime identity reporting failed",
+                exc_info=True,
+            )
         runtime.subsystems.mark_active(
             SUBSYS_GOVERNANCE,
             f"Human-gated orchestrator active (mode={resolved_default_mode}).",
