@@ -1021,9 +1021,10 @@ Bootstrap closes once the first account exists, and no application path
 reopens it: deactivating or demoting every administrator does not. Deleting
 every account row directly in the database would. Outside local/dev/test, the first claim is authorized by the deployment
 secret holder through `S43_BOOTSTRAP_CLAIM_TOKEN`; an empty or incorrect
-claim token is refused. Emergency administrator recovery after all usable
-admins are lost remains a separate open beta-closure decision. See
-`docs/BETA_RUNBOOK.md` §16a.
+claim token is refused. Emergency administrator recovery is also defined:
+a trusted deployment operator uses the exec-only recovery CLI through
+`Sentinel43RuntimeAuthority.identity`, with authoritative audit and no
+network-facing recovery endpoint. See `docs/BETA_RUNBOOK.md` §16a.
 
 This does NOT mean Sentinel-43 supports only one administrator.
 
