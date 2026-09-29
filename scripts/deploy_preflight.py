@@ -105,7 +105,8 @@ PLACEHOLDER_RE = re.compile(
 # local/dev/test. It may be absent; if present it must be well-formed,
 # because the API refuses to start outside local on a malformed one.
 REQUIRED_SECRETS = [
-    "S43_JWT_SECRET", "S43_AUTH_PEPPER", "S43_SESSION_HASH_PEPPER",
+    "S43_JWT_SECRET", "S43_BOOTSTRAP_CLAIM_TOKEN",
+    "S43_AUTH_PEPPER", "S43_SESSION_HASH_PEPPER",
     "SENTINEL_LOG_SALT",
     "POSTGRES_PASSWORD", "REDIS_PASSWORD", "S43_WATCHTOWER_SERVICE_TOKEN",
     "S43_OPERATOR_PASSWORD_HASH", "S43_SECRETS_ROTATED_AT",
@@ -729,8 +730,17 @@ def check_kube_prereqs(rep: Report, context: str, namespace: str) -> None:
             keys = set(json.loads(out).get("data", {}))
         except ValueError:
             keys = set()
-        missing = [k for k in ("POSTGRES_PASSWORD", "S43_JWT_SECRET",
-                               "S43_AUTH_PEPPER", "DATABASE_URL") if k not in keys]
+        missing = [k for k in (
+            "POSTGRES_PASSWORD",
+            "S43_JWT_SECRET",
+            "S43_BOOTSTRAP_CLAIM_TOKEN",
+            "S43_AUTH_PEPPER",
+            "S43_SESSION_HASH_PEPPER",
+            "S43_AUDIT_HMAC_KEY",
+            "S43_FENRIR_API_TOKEN",
+            "S43_WATCHTOWER_SERVICE_TOKEN",
+            "DATABASE_URL",
+        ) if k not in keys]
         rep.record(PASS if not missing else FAIL,
                    "sentinel43-secrets has the required keys",
                    f"missing {missing}" if missing else f"{len(keys)} keys")
