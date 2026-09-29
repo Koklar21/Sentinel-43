@@ -13,8 +13,10 @@
 
 """Sentinel-43 first-run bootstrap routes.
 
-These routes are intentionally unauthenticated because no operator identity
-exists before the first administrator account is created.
+No operator identity exists before the first administrator account is created.
+Outside local/dev/test, the one-time claim is therefore bound to a
+deployment-owned bootstrap claim secret instead of being open to the first
+network caller that reaches an empty account store.
 
 Security invariants:
     - bootstrap may create exactly one initial active admin
@@ -29,16 +31,18 @@ Security invariants:
       separate consumed-bootstrap marker -- deleting every account row
       directly in the database reopens it
 
-Open: the claim is not yet bound to a deployment authority -- whoever
-reaches this route first on an empty store becomes the first admin. See
-docs/BETA_RUNBOOK.md "Platform ownership".
+The bootstrap claim token is not an operator credential and grants no access
+after initialization. It only authorizes the one first-admin claim while the
+account store is empty.
 """
 
 from __future__ import annotations
 
+import hmac
+import os
 from typing import Any, Final
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -60,6 +64,12 @@ MAX_USERNAME_LEN: Final[int] = 128
 MIN_PASSWORD_LEN: Final[int] = 12
 MAX_PASSWORD_LEN: Final[int] = 1024
 MAX_EMAIL_LEN: Final[int] = 255
+BOOTSTRAP_TOKEN_HEADER: Final[str] = "X-S43-Bootstrap-Token"
+BOOTSTRAP_TOKEN_ENV: Final[str] = "S43_BOOTSTRAP_CLAIM_TOKEN"
+_MIN_BOOTSTRAP_TOKEN_LEN: Final[int] = 32
+_LOCAL_ENVS: Final[frozenset[str]] = frozenset(
+    {"development", "dev", "local", "test", "testing"}
+)
 
 
 # =============================================================================
@@ -131,6 +141,38 @@ class BootstrapAdminResponse(StrictModel):
 # Helpers
 # =============================================================================
 
+def _is_local_environment() -> bool:
+    raw = (
+        os.getenv("SENTINEL_ENV")
+        or os.getenv("S43_ENV")
+        or ""
+    )
+    return raw.strip().lower() in _LOCAL_ENVS
+
+
+def _require_bootstrap_claim(request: Request) -> None:
+    """Authorize the first-admin claim without creating a pre-admin identity."""
+    if _is_local_environment():
+        return
+
+    expected = os.getenv(BOOTSTRAP_TOKEN_ENV, "")
+    if len(expected) < _MIN_BOOTSTRAP_TOKEN_LEN:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "First-admin bootstrap is unavailable until "
+                "S43_BOOTSTRAP_CLAIM_TOKEN is configured."
+            ),
+        )
+
+    presented = request.headers.get(BOOTSTRAP_TOKEN_HEADER, "")
+    if not presented or not hmac.compare_digest(presented, expected):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid first-admin bootstrap claim.",
+        )
+
+
 async def _rollback_safely(
     session: AsyncSession,
 ) -> None:
@@ -171,6 +213,7 @@ async def bootstrap_status(
 )
 async def bootstrap_admin(
     body: BootstrapAdminRequest,
+    request: Request,
     session: AsyncSession = Depends(
         get_db_session
     ),
@@ -179,6 +222,8 @@ async def bootstrap_admin(
     ),
 ) -> BootstrapAdminResponse:
     """Create the single first-run administrator account."""
+
+    _require_bootstrap_claim(request)
 
     try:
         user = await authority.identity.bootstrap_first_admin(
