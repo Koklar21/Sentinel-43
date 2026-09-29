@@ -66,6 +66,10 @@ class IdentityLastAdminRefused(IdentityGovernanceError):
     """The change would remove the final active administrator."""
 
 
+class IdentityRecoveryUnavailable(IdentityGovernanceError):
+    """Emergency administrator recovery cannot be safely serialized."""
+
+
 class IdentityGovernanceService:
     """Own consequential account mutations beneath Sentinel-43 authority."""
 
@@ -305,6 +309,75 @@ class IdentityGovernanceService:
             await self._rollback_safely(session)
             raise
 
+    async def recover_admin(
+        self,
+        session: AsyncSession,
+        *,
+        actor: str,
+        username: str,
+        new_password: str,
+    ) -> User:
+        """Recover one existing account as an active administrator.
+
+        This is intended for deployment-exec recovery tooling, not an HTTP
+        endpoint. PostgreSQL advisory locking is mandatory so concurrent
+        recovery attempts cannot race account authority changes.
+        """
+        try:
+            locked = await _pg_advisory_xact_lock(
+                session,
+                ADMIN_INVARIANT_LOCK_KEY,
+            )
+            if not locked:
+                raise IdentityRecoveryUnavailable(
+                    "administrator recovery requires PostgreSQL advisory locking"
+                )
+
+            target = await get_user_by_username(session, username)
+            if target is None:
+                raise IdentityTargetNotFound(username)
+
+            self._authorize(
+                operation="recover_admin",
+                actor=actor,
+                target=target.username,
+                metadata={
+                    "previous_role": str(target.role),
+                    "previous_is_active": bool(target.is_active),
+                },
+            )
+
+            if str(target.role).lower() != "admin":
+                target = await set_user_role(
+                    session,
+                    target,
+                    role="admin",
+                )
+
+            if not bool(target.is_active):
+                target = await set_user_active(
+                    session,
+                    target,
+                    is_active=True,
+                )
+
+            target = await set_user_password(
+                session,
+                target,
+                password=new_password,
+            )
+            await self._revoke_sessions(
+                session,
+                target.user_id,
+                reason="admin_recovery",
+            )
+
+            await session.commit()
+            return target
+        except Exception:
+            await self._rollback_safely(session)
+            raise
+
     async def create_login_session(
         self,
         session: AsyncSession,
@@ -445,5 +518,6 @@ __all__ = [
     "IdentityGovernanceService",
     "IdentityLastAdminRefused",
     "IdentitySelfDeactivationRefused",
+    "IdentityRecoveryUnavailable",
     "IdentityTargetNotFound",
 ]
