@@ -1874,9 +1874,11 @@ async def _start_governance() -> None:
             audit_store=runtime.audit_store,
             monitoring_manager=runtime.monitoring_manager,
         )
-        # Transitional compatibility only.  Sentinel43RuntimeAuthority owns
-        # this instance; nothing in the API constructs a second orchestrator.
+        # Transitional compatibility aliases only. Sentinel43RuntimeAuthority
+        # owns both instances; the API does not create a second orchestrator
+        # or a second monitoring manager.
         runtime.orchestrator = runtime.sentinel43.orchestrator
+        runtime.monitoring_manager = runtime.sentinel43.monitoring_manager
         runtime.subsystems.mark_active(
             SUBSYS_GOVERNANCE,
             f"Human-gated orchestrator active (mode={resolved_default_mode}).",
@@ -2634,7 +2636,7 @@ async def _shutdown_runtime() -> None:
         runtime.reliability = None
         runtime.subsystems.mark_stopped(SUBSYS_RELIABILITY)
 
-    if runtime.monitoring_manager is not None:
+    if runtime.sentinel43 is None and runtime.monitoring_manager is not None:
         try:
             await asyncio.to_thread(runtime.monitoring_manager.stop)
         except Exception:
@@ -2672,6 +2674,9 @@ async def _shutdown_runtime() -> None:
         finally:
             runtime.sentinel43 = None
             runtime.orchestrator = None
+            runtime.monitoring_manager = None
+            if runtime.subsystems.get(SUBSYS_MONITORING) is not None:
+                runtime.subsystems.mark_stopped(SUBSYS_MONITORING)
             if runtime.subsystems.get(SUBSYS_GOVERNANCE) is not None:
                 runtime.subsystems.mark_stopped(SUBSYS_GOVERNANCE)
 
