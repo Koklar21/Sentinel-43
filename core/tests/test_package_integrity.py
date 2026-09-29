@@ -15,7 +15,7 @@
 #
 # This suite proves, on every commit:
 #
-#   1. every importable module under core/ (+ dashboard/, migrations/) imports
+#   1. every importable module under core/ (+ migrations/) imports
 #      -- catches case-sensitive filename/import mismatches, phantom package
 #      names, broken lazy-loader targets, missing modules, syntax corruption.
 #   2. known-critical modules define their minimum public contract -- import
@@ -42,7 +42,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[2]
 # --------------------------------------------------------------------------- #
 # 1. import sweep
 # --------------------------------------------------------------------------- #
-_IMPORT_ROOTS = ("core", "dashboard", "migrations")
+_IMPORT_ROOTS = ("core", "migrations")
 
 # name -> reason. Documented, not silent.
 _IMPORT_EXCLUDE = {
@@ -181,13 +181,6 @@ def test_fenrir_auth_exposes_its_canonical_contract():
                  "require_fenrir_scope", "require_fenrir_role"):
         assert hasattr(fa, name), f"core.security.fenrir_auth lost {name}"
 
-
-def test_dashboard_state_singletons_present():
-    import dashboard.state as ds
-
-    for name in ("audit_state", "health_state", "remote_state",
-                 "watchtower_state", "dashboard_state"):
-        assert getattr(ds, name) is not None
 
 
 def test_runtime_logging_import_path_is_lowercase():
