@@ -673,10 +673,6 @@ class SpartaCore:
 
         return True
 
-    # Node /unlock maps to the same operator-gated recovery path.
-    def unlock_lockdown(self, *, operator: str, reason: str) -> bool:
-        return self.acknowledge_recovery(operator=operator, reason=reason)
-
     async def run(
         self,
     ) -> None:
@@ -1028,11 +1024,6 @@ class NodeHeartbeatRequest(BaseModel):
     metrics: dict[str, Any] = Field(default_factory=dict)
 
 
-class NodeUnlockRequest(BaseModel):
-    operator: str = Field(default="unknown", min_length=1, max_length=120)
-    reason: str = Field(default="manual", min_length=1, max_length=512)
-
-
 # =============================================================================
 # Node API router
 # =============================================================================
@@ -1195,23 +1186,6 @@ def create_node_router(
             "timestamp": utc_now(),
         }
 
-    @router.post("/unlock")
-    def node_unlock(
-        request: Request,
-        body: NodeUnlockRequest,
-        authorization: str | None = Header(default=None),
-    ) -> dict[str, Any]:
-        core = _guard(request, authorization)
-        changed = core.unlock_lockdown(
-            operator=body.operator, reason=body.reason
-        )
-        return {
-            "status": "unlocked" if changed else "no_change",
-            "state": core.get_status()["state"],
-            "operator": body.operator,
-            "timestamp": utc_now(),
-        }
-
     return router
 
 
@@ -1255,7 +1229,6 @@ __all__ = [
     "NodeAuthRequest",
     "NodeHeartbeatRequest",
     "NodeRegisterRequest",
-    "NodeUnlockRequest",
     "SpartaCore",
     "SpartaState",
     "build_sparta_core",
