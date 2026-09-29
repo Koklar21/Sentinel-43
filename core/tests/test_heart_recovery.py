@@ -76,7 +76,6 @@ def _auth_env(monkeypatch):
     monkeypatch.setattr(runtime, "heart", None)
     monkeypatch.setattr(runtime, "audit_store", None)
     monkeypatch.setattr(runtime, "fenrir_instance", None)
-    monkeypatch.setattr(runtime, "orchestrator", None)
     yield
     # Never leave a failed Heart behind for tests that share the process.
     runtime.subsystems.mark_disabled(main_module.SUBSYS_HEART)
@@ -578,32 +577,42 @@ def test_failed_recovery_blocks_readiness_but_not_liveness(monkeypatch):
 # ---------------------------------------------------------------------------
 # Recovery / live-ingestion race protection
 # ---------------------------------------------------------------------------
-def test_fenrir_is_wired_to_heart_only_after_recovery_completes(monkeypatch):
+def test_heart_recovery_completes_before_fenrir_can_start(monkeypatch):
     directory, audit, _, _ = _stack()
     monkeypatch.setenv("S43_HEART_REQUIRED", "true")
     monkeypatch.setenv("S43_AUDIT_HMAC_KEY", "a" * 64)
     monkeypatch.setenv("S43_HEART_SQLITE_PATH", str(directory / "heart.sqlite3"))
 
-    fenrir = SimpleNamespace(heart=None)
-    seen_during_recovery: list = []
+    seen_during_recovery: list[dict[str, object]] = []
 
     async def _recording_recovery() -> int:
-        seen_during_recovery.append(fenrir.heart)
+        authority = main_module.runtime.sentinel43
+        seen_during_recovery.append(
+            {
+                "authority": authority,
+                "ingress_available": (
+                    False
+                    if authority is None
+                    else authority.threat_ingress_available
+                ),
+                "fenrir": main_module.runtime.fenrir_instance,
+            }
+        )
         return 0
 
     monkeypatch.setattr(main_module, "_rehydrate_heart_pending", _recording_recovery)
 
     with TestClient(main_module.app) as test_client:
-        # The Heart is enabled only now, so THIS test drives the single
-        # _start_heart() whose recovery race it is measuring.
         monkeypatch.setenv("S43_HEART_ENABLED", "true")
         _start_production_governance(test_client, monkeypatch, audit)
-        main_module.runtime.fenrir_instance = fenrir
-        fenrir.heart = None
         test_client.portal.call(main_module._start_heart)
 
-        assert seen_during_recovery == [None], "Fenrir must not stage live while recovery reads pending rows"
-        assert fenrir.heart is main_module.runtime.heart is not None
+        assert len(seen_during_recovery) == 1
+        assert seen_during_recovery[0]["authority"] is main_module.runtime.sentinel43
+        assert seen_during_recovery[0]["ingress_available"] is True
+        assert seen_during_recovery[0]["fenrir"] is None
+        assert main_module.runtime.heart is not None
+        assert main_module.runtime.sentinel43.threat_ingress_available is True
 
 
 # ---------------------------------------------------------------------------
@@ -877,20 +886,23 @@ def test_concurrent_decisions_resolve_exactly_once():
 # exercised through the PRODUCTION composition, not a test-built component.
 # ---------------------------------------------------------------------------
 def _start_production_heart(client, monkeypatch, directory: Path, audit):
-    """Compose the Heart exactly as the running app does, with a real Fenrir."""
+    """Compose Heart first, then bind a real Fenrir to the S43 authority."""
     import core.detection.feniri_hunter as fenrir_module
 
     monkeypatch.setenv("S43_HEART_ENABLED", "true")
     monkeypatch.setenv("S43_GOVERNANCE_ENABLED", "true")
     monkeypatch.setenv("S43_AUDIT_HMAC_KEY", "a" * 64)
     monkeypatch.setenv("S43_HEART_SQLITE_PATH", str(directory / "heart.sqlite3"))
-    fenrir = fenrir_module.FenrirHunter()
     _start_production_governance(client, monkeypatch, audit)
-    main_module.runtime.fenrir_instance = fenrir
     client.portal.call(main_module._start_heart)
+
     assert main_module.runtime.heart is not None
-    assert fenrir.heart is main_module.runtime.heart
-    return fenrir
+    assert main_module.runtime.sentinel43 is not None
+    assert main_module.runtime.sentinel43.threat_ingress_available is True
+
+    return fenrir_module.FenrirHunter(
+        authority=main_module.runtime.sentinel43
+    )
 
 
 def _feed_two_trusted_producers(fenrir, ip: str) -> None:
