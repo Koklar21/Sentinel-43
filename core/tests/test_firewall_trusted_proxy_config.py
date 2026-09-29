@@ -19,29 +19,19 @@
 #
 # core/tests/test_firewall_trusted_proxy_config.py
 #
-# core/middleware/sentinel_firewall.py's from_env() compatibility shim built
-# a "trusted_proxies" kwarg for FirewallConfig, but the real dataclass field
-# (core/api/middleware/sentinel_firewall_middleware.py) is
-# trusted_proxy_cidrs. _constructor_accepts() only forwards kwargs whose name
-# matches an actual constructor parameter, so the mismatched key was silently
-# dropped and trusted_proxy_cidrs was permanently (). Since
-# respect_x_forwarded_for defaults to True, that meant X-Forwarded-For was
-# trusted unconditionally from any caller — a real IP-spoofing gap in the
-# firewall's IP allow/block logic, rate-limiter key, and audit client_ip,
-# independent of Kubernetes. See docs/security/trusted_proxy_handling.md.
-#
-# This file proves S43_TRUSTED_PROXIES actually reaches
-# FirewallConfig.trusted_proxy_cidrs now, and that the safe-by-default
-# behavior (trust nobody when unset) is unchanged.
+# This file proves S43_TRUSTED_PROXIES reaches the single canonical
+# FirewallConfig.trusted_proxy_cidrs field and that the safe-by-default
+# behavior (trust nobody when unset) remains unchanged. The old compatibility
+# parser that once used a mismatched "trusted_proxies" kwarg has been removed;
+# both firewall import paths now expose the same implementation.
 # =============================================================================
 
 from __future__ import annotations
 
 import pytest
 
-# Importing this module (rather than the FirewallConfig re-exported straight
-# from sentinel_firewall_middleware) triggers the from_env() compatibility
-# shim's module-level attach logic — the same path core.api.main takes.
+# This compatibility import is intentionally the same class object exported
+# by core.api.middleware.sentinel_firewall_middleware and used by main.py.
 from core.middleware.sentinel_firewall import FirewallConfig
 
 
