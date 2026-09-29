@@ -1450,7 +1450,7 @@ class SystemOrchestrator:
 
     def verify_audit_integrity(self) -> Any:
         """Verify the canonical audit ledger through the governance service."""
-        return self._audit_store.verify_integrity()
+        return self.audit_store.verify_integrity()
 
     def get_audit_records(
         self,
@@ -1460,7 +1460,7 @@ class SystemOrchestrator:
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         """Bounded read of authenticated audit records."""
-        return self._audit_store.get_records(
+        return self.audit_store.get_records(
             component=component,
             correlation_id=correlation_id,
             limit=limit,
@@ -1472,7 +1472,7 @@ class SystemOrchestrator:
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         """Bounded read of authenticated pre-component audit records."""
-        return self._audit_store.get_records_without_component(limit=limit)
+        return self.audit_store.get_records_without_component(limit=limit)
 
     def record_denied_decision(
         self,
