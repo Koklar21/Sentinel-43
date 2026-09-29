@@ -120,8 +120,42 @@ class Sentinel43RuntimeAuthority:
             "owner_components": self.owner_component_identities,
             "owner_engine": self.engine_identity,
             "recommendation_store_attached": self.recommendation_store_attached,
+            "runtime_reporting_available": self._monitoring_manager is not None,
             "external_execution_supported": False,
         }
+
+    def report_runtime_observation(self, observation: Any) -> Any:
+        """Public runtime/deployment reporting entry through SentinelNode."""
+        return self._owner_components.node.report_runtime_observation(
+            observation
+        )
+
+    def _report_runtime_observation_from_node(
+        self,
+        observation: Any,
+    ) -> Any:
+        """Node-only handoff into the authority-owned monitoring pipeline."""
+        manager = self._monitoring_manager
+        if manager is None:
+            raise RuntimeError(
+                "Sentinel-43 monitoring manager is unavailable"
+            )
+
+        to_event = getattr(observation, "to_monitoring_event", None)
+        if not callable(to_event):
+            raise TypeError(
+                "runtime observation must expose to_monitoring_event()"
+            )
+
+        event = to_event()
+        return manager.analyze_event(
+            event,
+            source_ip=str(event.get("pod_ip") or "").strip() or None,
+            source_identity=str(
+                event.get("source_identity") or ""
+            ).strip() or None,
+            trusted_producer=None,
+        )
 
     @property
     def recommendation_store_attached(self) -> bool:
