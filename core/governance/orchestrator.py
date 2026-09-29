@@ -254,7 +254,7 @@ RECOMMENDATION_COMPONENT: Final[str] = "heart"
 
 #: Recorded as ``authority`` on every record this layer writes, so the ledger
 #: itself shows which component made the decision.
-RECOMMENDATION_AUTHORITY: Final[str] = "system_orchestrator"
+RECOMMENDATION_AUTHORITY: Final[str] = "sentinel43_runtime_authority"
 
 #: The durable ``primary_action`` written by recommendation builds that
 #: predate explicit operations. No operation was ever recorded for them.
