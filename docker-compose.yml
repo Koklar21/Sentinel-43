@@ -70,11 +70,6 @@ services:
       S43_WATCHTOWER_PORT: "9100"
       S43_WATCHTOWER_SERVICE_TOKEN: ${S43_WATCHTOWER_SERVICE_TOKEN}
 
-      # Watchtower operator-admin identity, distinct from the internal service
-      # token above (X-S43-Admin-Token). Empty = unconfigured: the admin route
-      # answers 503 rather than accepting anonymously.
-      S43_ADMIN_TOKEN: ${S43_ADMIN_TOKEN:-}
-
       DATABASE_URL: ${DATABASE_URL}
 
       S43_AUDIT_HMAC_KEY: ${S43_AUDIT_HMAC_KEY:?S43_AUDIT_HMAC_KEY is required}
