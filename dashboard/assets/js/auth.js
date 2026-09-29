@@ -77,6 +77,7 @@ const REFRESH_ENDPOINT           = "/auth/refresh";
 const LOGOUT_ENDPOINT            = "/auth/logout";
 const BOOTSTRAP_STATUS_ENDPOINT  = "/bootstrap/status";
 const BOOTSTRAP_ADMIN_ENDPOINT   = "/bootstrap/admin";
+const BOOTSTRAP_TOKEN_HEADER      = "X-S43-Bootstrap-Token";
 const CSRF_COOKIE       = "s43_csrf";
 const CSRF_HEADER       = "X-S43-CSRF";
 const TOKEN_KEY         = "SENTINEL_JWT";
@@ -274,7 +275,7 @@ async function fetchBootstrapStatus() {
     }
 }
 
-async function bootstrapFirstAdmin(username, password, email) {
+async function bootstrapFirstAdmin(username, password, email, claimToken) {
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), BOOTSTRAP_TIMEOUT_MS);
 
@@ -284,7 +285,10 @@ async function bootstrapFirstAdmin(username, password, email) {
 
         const res = await fetch(BOOTSTRAP_ADMIN_ENDPOINT, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+                "Content-Type": "application/json",
+                ...(claimToken ? { [BOOTSTRAP_TOKEN_HEADER]: claimToken } : {}),
+            },
             body: JSON.stringify(payload),
             credentials: "same-origin",
             cache: "no-store",
@@ -385,7 +389,7 @@ function buildOverlay() {
             #s43-login-btn:disabled { opacity: 0.42; cursor: not-allowed; }
             #s43-login-foot  { font-size: 0.6rem; color: rgba(0,229,255,0.35); text-align: center; margin-top: 1.25rem; min-height: 0.9rem; letter-spacing: 0.1em; }
             #s43-bootstrap-note { display:none; font-size:0.67rem; line-height:1.45; color:rgba(0,229,255,0.58); margin:-0.6rem 0 1.25rem; }
-            #s43-email-wrap { display:none; }
+            #s43-email-wrap, #s43-bootstrap-token-wrap { display:none; }
         `;
         document.head.appendChild(style);
     }
@@ -422,6 +426,11 @@ function buildOverlay() {
                     <label for="s43-email">EMAIL <span style="opacity:.55">(OPTIONAL)</span></label>
                     <input id="s43-email" type="email" autocomplete="email" />
                 </div>
+                <div id="s43-bootstrap-token-wrap" class="s43lf">
+                    <label for="s43-bootstrap-token">DEPLOYMENT CLAIM TOKEN</label>
+                    <input id="s43-bootstrap-token" type="password"
+                           autocomplete="off" spellcheck="false" />
+                </div>
                 <div id="s43-login-err" role="alert" aria-live="polite"></div>
                 <button id="s43-login-btn" type="submit">AUTHENTICATE</button>
             </form>
@@ -430,7 +439,7 @@ function buildOverlay() {
     `;
     document.body.appendChild(overlay);
 
-    const _focusableIds = ["s43-username", "s43-password", "s43-email", "s43-login-btn"];
+    const _focusableIds = ["s43-username", "s43-password", "s43-email", "s43-bootstrap-token", "s43-login-btn"];
     overlay.addEventListener("keydown", e => {
         if (e.key !== "Tab") return;
         const focusable = _focusableIds
@@ -458,6 +467,8 @@ function buildOverlay() {
         const password = document.getElementById("s43-password").value;
         const emailEl = document.getElementById("s43-email");
         const email = emailEl ? emailEl.value.trim() : "";
+        const claimTokenEl = document.getElementById("s43-bootstrap-token");
+        const claimToken = claimTokenEl ? claimTokenEl.value : "";
         const bootstrapMode = form.dataset.mode === "bootstrap";
 
         if (!username || !password) {
@@ -480,6 +491,10 @@ function buildOverlay() {
             _showErr("Email is too long.");
             return;
         }
+        if (bootstrapMode && !claimToken) {
+            _showErr("Deployment claim token is required.");
+            return;
+        }
 
         errEl.style.display = "none";
         btn.disabled        = true;
@@ -488,7 +503,7 @@ function buildOverlay() {
 
         try {
             if (bootstrapMode) {
-                await bootstrapFirstAdmin(username, password, email);
+                await bootstrapFirstAdmin(username, password, email, claimToken);
                 foot.textContent = "ADMIN CREATED — STARTING SESSION";
             }
 
@@ -513,6 +528,8 @@ function buildOverlay() {
 
             const passwordInput = document.getElementById("s43-password");
             if (passwordInput) passwordInput.value = "";
+            const claimInput = document.getElementById("s43-bootstrap-token");
+            if (claimInput) claimInput.value = "";
 
             _markAuthReady();
 
@@ -561,6 +578,8 @@ function setOverlayMode(mode) {
     const sub = document.getElementById("s43-login-sub");
     const note = document.getElementById("s43-bootstrap-note");
     const emailWrap = document.getElementById("s43-email-wrap");
+    const tokenWrap = document.getElementById("s43-bootstrap-token-wrap");
+    const tokenInput = document.getElementById("s43-bootstrap-token");
     const password = document.getElementById("s43-password");
     const btn = document.getElementById("s43-login-btn");
 
@@ -573,6 +592,8 @@ function setOverlayMode(mode) {
     }
     if (note) note.style.display = bootstrapMode ? "block" : "none";
     if (emailWrap) emailWrap.style.display = bootstrapMode ? "block" : "none";
+    if (tokenWrap) tokenWrap.style.display = bootstrapMode ? "block" : "none";
+    if (!bootstrapMode && tokenInput) tokenInput.value = "";
     if (password) {
         password.autocomplete = bootstrapMode ? "new-password" : "current-password";
     }
@@ -601,11 +622,13 @@ function showOverlay(message, locked = false) {
 
     const uEl = document.getElementById("s43-username");
     const pEl = document.getElementById("s43-password");
+    const tokenEl = document.getElementById("s43-bootstrap-token");
     const btn = document.getElementById("s43-login-btn");
     const foot = document.getElementById("s43-login-foot");
 
     if (uEl) uEl.disabled = locked;
     if (pEl) pEl.disabled = locked;
+    if (tokenEl) tokenEl.disabled = locked;
     if (btn) {
         btn.disabled    = locked;
         btn.textContent = locked ? "UNAVAILABLE" : "AUTHENTICATE";
