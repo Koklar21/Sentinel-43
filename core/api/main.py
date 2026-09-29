@@ -2133,14 +2133,14 @@ def _heart_row_problem(
     return None
 
 
-def _legacy_heart_audit_index(audit_store: Any) -> dict[str, list[dict[str, Any]]]:
+def _legacy_heart_audit_index(authority: Any) -> dict[str, list[dict[str, Any]]]:
     """Heart records that carry no ``component``, grouped by decision_id.
 
     Bounded: if the legacy ledger is larger than one read, recovery cannot
     prove it saw every relevant record, so it refuses rather than guess.
     """
     limit = _HEART_LEGACY_AUDIT_LIMIT
-    records = audit_store.get_records_without_component(limit=limit)
+    records = authority.get_legacy_audit_records(limit=limit)
     if len(records) >= limit:
         raise HeartRecoveryError(
             f"{len(records)}+ legacy audit records without a component; "
@@ -2186,8 +2186,9 @@ async def _rehydrate_heart_pending() -> int:
     if not rows:
         return 0
 
-    audit_store = authority.audit_store
-    verification = await asyncio.to_thread(audit_store.verify_integrity)
+    verification = await asyncio.to_thread(
+        authority.verify_audit_integrity
+    )
     if not getattr(verification, "valid", False):
         raise HeartRecoveryError(
             "audit ledger failed integrity verification during Heart recovery"
@@ -2219,7 +2220,7 @@ async def _rehydrate_heart_pending() -> int:
             continue
 
         audited = await asyncio.to_thread(
-            audit_store.get_records,
+            authority.get_audit_records,
             component="heart",
             correlation_id=action_id,
             limit=_HEART_AUDIT_LOOKUP_LIMIT,
@@ -2230,7 +2231,7 @@ async def _rehydrate_heart_pending() -> int:
             # decision must not be expired just because it predates them.
             if legacy_index is None:
                 legacy_index = await asyncio.to_thread(
-                    _legacy_heart_audit_index, audit_store
+                    _legacy_heart_audit_index, authority
                 )
             audited = legacy_index.get(action_id, [])
         problem = (
