@@ -1699,7 +1699,7 @@ async def _start_fenrir() -> None:
 
     runtime.subsystems.mark_starting(SUBSYS_FENRIR)
     try:
-        from core.detection.feniri_hunter import FenrirHunter
+        from core.detection.fenrir_hunter import FenrirHunter
 
         runtime.fenrir_instance = FenrirHunter(
             authority=runtime.sentinel43
