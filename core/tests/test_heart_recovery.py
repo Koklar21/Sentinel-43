@@ -42,7 +42,7 @@ from core.governance import (  # noqa: E402
     DecisionPrincipal,
     UnauthorizedDecision,
     build_heart_from_settings,
-    build_orchestrator_from_settings,
+    build_runtime_authority_from_settings,
 )
 from core.security_context import IdentityType  # noqa: E402
 from core.sentinel43_core_db import (  # noqa: E402
@@ -118,12 +118,15 @@ def _stack():
 
 
 def _authority(audit, mode: str = "HUMAN_GATED"):
-    """The governance orchestrator every Heart decision goes through."""
+    """The top-level Sentinel-43 authority every Heart decision goes through."""
 
     class GovernanceSettings:
         default_mode = mode
 
-    return build_orchestrator_from_settings(GovernanceSettings(), audit_store=audit)
+    return build_runtime_authority_from_settings(
+        GovernanceSettings(),
+        audit_store=audit,
+    )
 
 
 #: The actions the engine's OWN policy produces for the assessment _stage
@@ -295,7 +298,7 @@ def _recover(client) -> int:
 
 def _use(heart) -> None:
     main_module.runtime.heart = heart
-    main_module.runtime.orchestrator = heart._authority
+    main_module.runtime.sentinel43 = heart._authority
     main_module.runtime.action_store.clear()
 
 
@@ -304,7 +307,7 @@ def _start_production_governance(client, monkeypatch, audit) -> None:
     monkeypatch.setenv("S43_GOVERNANCE_ENABLED", "true")
     main_module.runtime.audit_store = audit
     client.portal.call(main_module._start_governance)
-    assert main_module.runtime.orchestrator is not None
+    assert main_module.runtime.sentinel43 is not None
 
 
 # ---------------------------------------------------------------------------
@@ -1344,7 +1347,7 @@ def test_the_route_resolves_through_the_orchestrator_not_the_heart(client):
 
     second = _stage(heart, "203.0.113.136")
     main_module.runtime.action_store.clear()
-    main_module.runtime.orchestrator = heart._authority
+    main_module.runtime.sentinel43 = heart._authority
     assert _recover(client) == 1
     heart._authority.detach_recommendation_store()
     refused = client.post(
@@ -1368,14 +1371,14 @@ def test_an_enabled_heart_without_its_authority_blocks_readiness(monkeypatch):
     monkeypatch.setenv("S43_HEART_SQLITE_PATH", str(directory / "heart.sqlite3"))
 
     async def _governance_never_starts() -> None:
-        main_module.runtime.orchestrator = None
+        main_module.runtime.sentinel43 = None
 
     monkeypatch.setattr(main_module, "_start_governance", _governance_never_starts)
 
     with TestClient(main_module.app) as test_client:
         main_module.runtime.audit_store = audit
 
-        assert main_module.runtime.orchestrator is None
+        assert main_module.runtime.sentinel43 is None
         assert main_module.runtime.heart is None
         status = main_module.runtime.subsystems.get(main_module.SUBSYS_HEART)
         assert "governance orchestrator" in status.detail, status.detail
