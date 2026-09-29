@@ -364,6 +364,48 @@ def summarize_subsystems(system_status: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def summarize_authority(system_status: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the read-only Sentinel-43 authority provenance snapshot."""
+    data = system_status.get("data") if isinstance(system_status, dict) else None
+    if not isinstance(data, dict):
+        data = system_status if isinstance(system_status, dict) else {}
+
+    raw = data.get("sentinel43_authority")
+    if not isinstance(raw, dict):
+        return {
+            "available": False,
+            "authority": "Sentinel43RuntimeAuthority",
+            "mode": "",
+            "owner_engine": {},
+            "owner_components": {},
+            "component_count": 0,
+            "recommendation_store_attached": False,
+            "runtime_reporting_available": False,
+            "external_execution_supported": False,
+        }
+
+    components = raw.get("owner_components")
+    if not isinstance(components, dict):
+        components = {}
+
+    engine = raw.get("owner_engine")
+    if not isinstance(engine, dict):
+        engine = {}
+
+    unavailable = str(raw.get("state") or "").strip().lower() == "unavailable"
+
+    return {
+        "available": not unavailable,
+        "authority": str(raw.get("authority") or "Sentinel43RuntimeAuthority"),
+        "mode": str(raw.get("mode") or "").strip().upper(),
+        "owner_engine": dict(engine),
+        "owner_components": dict(components),
+        "component_count": len(components),
+        "recommendation_store_attached": bool(raw.get("recommendation_store_attached")),
+        "runtime_reporting_available": bool(raw.get("runtime_reporting_available")),
+        "external_execution_supported": raw.get("external_execution_supported") is True,
+    }
+
 def classify_runtime(
     health: dict[str, Any],
     ready: dict[str, Any],
