@@ -47,7 +47,7 @@ from core.detection.sentinel_threat_types import (  # noqa: E402
 from core.governance import (  # noqa: E402
     HeartConfig,
     build_heart_from_settings,
-    build_orchestrator_from_settings,
+    build_runtime_authority_from_settings,
 )
 from core.monitoring import manager as manager_module  # noqa: E402
 from core.monitoring.event_types import normalize_event  # noqa: E402
@@ -149,7 +149,7 @@ def _stores(
     class GovernanceSettings:
         default_mode = "HUMAN_GATED"
 
-    authority = build_orchestrator_from_settings(
+    authority = build_runtime_authority_from_settings(
         GovernanceSettings(), audit_store=audit
     )
     heart = build_heart_from_settings(
@@ -448,9 +448,13 @@ def test_fenrir_does_not_resubmit_unchanged_evidence_and_retries_after_failure()
                 raise RuntimeError("heart down")
 
     async def scenario() -> tuple[int, int, int]:
-        fenrir = FenrirHunter()
         counting = CountingHeart()
-        fenrir.heart = counting
+
+        class CountingAuthority:
+            def observe_threat(self, assessment):
+                return counting.observe(assessment)
+
+        fenrir = FenrirHunter(authority=CountingAuthority())
 
         def feed(n: int) -> None:
             for _ in range(n):
@@ -488,11 +492,10 @@ def test_full_pipeline_firewall_only_stays_pending_second_producer_stages(tmp_pa
     audit, core, heart = _stores(tmp_path, staged=staged)
 
     async def scenario() -> None:
-        fenrir = FenrirHunter()
+        fenrir = FenrirHunter(authority=heart._authority)
         manager = MonitoringManager(_Scanner())
         manager.start()
         manager.attach_threat_ingestor(fenrir.detector, producers={"firewall": LABEL, "sparta": "SpartaCore"})
-        fenrir.heart = heart
 
         _drive_firewall(manager, LABEL, requests=60)
         for _ in range(3):
