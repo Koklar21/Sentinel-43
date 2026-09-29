@@ -237,7 +237,6 @@ _LAZY_EXPORTS: set[str] = {
     "NodeAuthRequest",
     "NodeHeartbeatRequest",
     "NodeRegisterRequest",
-    "NodeUnlockRequest",
     "SpartaCore",
     "SpartaState",
     "build_sparta_core",
