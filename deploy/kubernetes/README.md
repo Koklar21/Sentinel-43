@@ -54,6 +54,7 @@ kubectl create secret generic sentinel43-secrets -n sentinel43 \
   --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
   --from-literal=DATABASE_URL="postgresql+asyncpg://s43:${POSTGRES_PASSWORD}@s43-db:5432/s43" \
   --from-literal=S43_JWT_SECRET="$S43_JWT_SECRET" \
+  --from-literal=S43_BOOTSTRAP_CLAIM_TOKEN="$S43_BOOTSTRAP_CLAIM_TOKEN" \
   --from-literal=S43_AUTH_PEPPER="$S43_AUTH_PEPPER" \
   --from-literal=S43_SESSION_HASH_PEPPER="$S43_SESSION_HASH_PEPPER" \
   --from-literal=S43_AUDIT_HMAC_KEY="$S43_AUDIT_HMAC_KEY" \
@@ -61,13 +62,14 @@ kubectl create secret generic sentinel43-secrets -n sentinel43 \
   --from-literal=S43_WATCHTOWER_SERVICE_TOKEN="$S43_WATCHTOWER_SERVICE_TOKEN"
 ```
 
-Those eight are the **required** keys — they are exactly the non-optional
+Those nine are the **required** keys for controlled beta — they are the
 keys in `base/secret.example.yaml`, and the API or Watchtower fails closed
 without each of them. Two were missing from this command until the
 Kubernetes parity pass and are not optional:
 
 | Key | What breaks without it |
 | --- | --- |
+| `S43_BOOTSTRAP_CLAIM_TOKEN` | first-admin bootstrap refuses the claim because deployment ownership cannot be proven |
 | `S43_AUDIT_HMAC_KEY` | the authoritative HMAC-chained audit ledger has no key |
 | `S43_SESSION_HASH_PEPPER` | the canonical session verifier has no pepper |
 
