@@ -233,6 +233,33 @@ def test_the_evidence_layers_hold_no_decision_verbs(module):
     assert called & forbidden == set()
 
 
+def test_fenrir_reports_through_s43_authority_not_heart_directly():
+    fenrir = (
+        CORE / "detection" / "feniri_hunter.py"
+    ).read_text(encoding="utf-8")
+    authority = (
+        CORE / "governance" / "runtime_authority.py"
+    ).read_text(encoding="utf-8")
+    api = (
+        CORE / "api" / "main.py"
+    ).read_text(encoding="utf-8")
+
+    assert "self.heart" not in fenrir
+    assert "heart.observe" not in fenrir
+    assert "authority.observe_threat" in fenrir
+
+    assert "def attach_heart(" in authority
+    assert "def observe_threat(" in authority
+    assert "def threat_ingress_available(" in authority
+
+    assert "runtime.sentinel43.attach_heart(runtime.heart)" in api
+    assert "runtime.fenrir_instance.heart" not in api
+
+    heart_index = api.index("await _start_heart()")
+    fenrir_index = api.index("await _start_fenrir()")
+    assert heart_index < fenrir_index
+
+
 def test_the_heart_reaches_the_authority_only_through_its_two_entry_points():
     called = _calls_in(REPO_ROOT / "core/governance/heart.py")
     assert "stage_recommendation" in called
