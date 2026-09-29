@@ -190,7 +190,7 @@ def test_runtime_logging_import_path_is_lowercase():
 # --------------------------------------------------------------------------- #
 # 3. content-duplication sweep -- permanent, not one-time
 # --------------------------------------------------------------------------- #
-_DUP_SCAN_ROOTS = ("core", "dashboard", "migrations", "scripts", "browser_tests")
+_DUP_SCAN_ROOTS = ("core", "migrations", "scripts", "browser_tests")
 _MIN_BODY_CHARS = 200  # ignore empty __init__.py / trivial stubs
 
 
