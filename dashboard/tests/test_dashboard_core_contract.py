@@ -32,6 +32,7 @@ from dashboard.services.health_client import (
     NON_FAULT_STATES,
     SUBSYSTEM_STATES,
     classify_runtime,
+    summarize_authority,
     summarize_subsystems,
 )
 from dashboard.services.reliability_client import (
@@ -74,6 +75,48 @@ def test_dashboard_does_not_import_core_implementation():
             offenders.append(path.name)
 
     assert not offenders, f"dashboard reaches into core: {offenders}"
+
+
+# --------------------------------------------------------------------------- #
+# Sentinel-43 authority provenance
+# --------------------------------------------------------------------------- #
+
+def test_dashboard_preserves_owner_authority_provenance():
+    summary = summarize_authority(
+        {
+            "sentinel43_authority": {
+                "authority": "Sentinel43RuntimeAuthority",
+                "mode": "HUMAN_GATED",
+                "owner_engine": {
+                    "class": "Sentinel43ResponseEngine",
+                    "sha256": "abc123",
+                },
+                "owner_components": {
+                    "nexus": {"sha256": "nexus-sha"},
+                    "node": {"sha256": "node-sha"},
+                    "ai_escalation": {"sha256": "ai-sha"},
+                },
+                "recommendation_store_attached": True,
+                "runtime_reporting_available": True,
+                "external_execution_supported": False,
+            }
+        }
+    )
+
+    assert summary["available"] is True
+    assert summary["mode"] == "HUMAN_GATED"
+    assert summary["owner_engine"]["class"] == "Sentinel43ResponseEngine"
+    assert summary["component_count"] == 3
+    assert summary["recommendation_store_attached"] is True
+    assert summary["runtime_reporting_available"] is True
+    assert summary["external_execution_supported"] is False
+
+
+def test_missing_authority_snapshot_is_not_faked_as_healthy():
+    summary = summarize_authority({"subsystems": {}})
+    assert summary["available"] is False
+    assert summary["component_count"] == 0
+    assert summary["external_execution_supported"] is False
 
 
 # --------------------------------------------------------------------------- #
