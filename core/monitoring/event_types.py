@@ -244,6 +244,19 @@ class RuntimeEvent(BaseEvent):
     error_rate_percent: int | float = 0
     crash_loop: bool = False
 
+    # Deployment/runtime provenance. These fields are observational metadata;
+    # they never establish an authenticated identity or decision authority.
+    platform: str = ""
+    runtime_role: str = ""
+    runtime_event: str = ""
+    instance_id: str = ""
+    namespace: str = ""
+    workload: str = ""
+    node_name: str = ""
+    pod_name: str = ""
+    pod_ip: str = ""
+    runtime_metadata: dict[str, Any] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         BaseEvent.__post_init__(self)
 
@@ -257,6 +270,27 @@ class RuntimeEvent(BaseEvent):
             )
 
         self.error_rate_percent = value
+
+        bounds = {
+            "platform": 64,
+            "runtime_role": 64,
+            "runtime_event": 128,
+            "instance_id": 256,
+            "namespace": 253,
+            "workload": 253,
+            "node_name": 253,
+            "pod_name": 253,
+            "pod_ip": 64,
+        }
+        for name, limit in bounds.items():
+            cleaned = str(getattr(self, name) or "").strip()
+            if len(cleaned) > limit:
+                raise ValueError(f"{name} is too long")
+            setattr(self, name, cleaned)
+
+        if not isinstance(self.runtime_metadata, dict):
+            raise TypeError("runtime_metadata must be a dict")
+        self.runtime_metadata = dict(self.runtime_metadata)
 
 
 @dataclass(slots=True)
