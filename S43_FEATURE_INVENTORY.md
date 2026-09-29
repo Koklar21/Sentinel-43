@@ -1153,8 +1153,8 @@ routes without being the same code.
 
 | ID | Feature | Class | Consequential | Test strength | Confidence |
 |---|---|---|---|---|---|
-| WT-001 | Watchtower standalone app — 9 guarded + 2 open routes, service-token gate | PROVEN ACTIVE | mixed (see per-route) | behavioral, `test_watchtower_service_auth.py` (18 tests) | High |
-| WT-002 | Dual-gated state-change route (`POST /watchtower/state/{state_name}`) | PROVEN ACTIVE | write | behavioral (covered by the same 18-test file) | High |
+| WT-001 | Watchtower standalone app — service-token-gated operational/evidence routes + 2 open probes | PROVEN ACTIVE | mixed (see per-route) | behavioral, `test_watchtower_service_auth.py` | High |
+| WT-002 | Direct manual Watchtower state-change route | **REMOVED** — manual state control must not bypass Sentinel-43 governance | n/a | behavioral guard requires `/watchtower/state/*` to be absent | High |
 | WT-003 | "Node/module registration" — in-memory bookkeeping, not an access gate | PROVEN ACTIVE, but see finding | write (in-memory only) | behavioral, `test_module_register_roundtrip_with_token` | High |
 | WT-004 | "Scanning" (`WatchtowerNode.scan_event`/`WatchtowerSegment.scan`) — reactive threshold evaluation, not an active scan loop | PROVEN ACTIVE, terminology finding below | read-only (evaluation) | not directly named in the test list gathered; evaluated indirectly via `/watchtower/analyze` tests | Med |
 | WT-005 | Outbound client (`watchtower_client.py`) — "never raises," fully classified failure modes | PROVEN ACTIVE | dispatch | behavioral, `test_watchtower_client.py` (17 tests) | High |
@@ -1164,12 +1164,12 @@ routes without being the same code.
 
 **WT-001/WT-002 detail:** `/watchtower/health` and `/watchtower/ready` are the *only*
 unauthenticated routes on this app (explicit source comment: "probe targets for Docker
-and Kubernetes"). Every other route requires `Authorization: Bearer <token>` compared via
-`secrets.compare_digest` against `S43_WATCHTOWER_SERVICE_TOKEN`, fails closed with 503 if
-that env var is unset. `/watchtower/state/{state_name}` additionally requires a *second*,
-independent credential — `X-S43-Admin-Token` against `S43_ADMIN_TOKEN`, same
-constant-time/fail-closed pattern — the only route on this app with two independent
-gates, matching its being the most consequential one (a direct node-state change).
+and Kubernetes"). Every remaining operational/evidence route requires
+`Authorization: Bearer <token>` compared via `secrets.compare_digest` against
+`S43_WATCHTOWER_SERVICE_TOKEN` and fails closed with 503 if that env var is unset.
+The former direct `/watchtower/state/{state_name}` admin-token control plane was removed:
+Watchtower still performs its own automatic lifecycle transitions, but manual operator
+state mutation is not exposed outside the Sentinel-43 governance boundary.
 
 **WT-003/WT-004 — two more instances of this audit's recurring naming-vs-reality
 pattern (alongside Subsystem 1's R-060 `/v1/assess` and Subsystem 8's `/audit/health`):**
