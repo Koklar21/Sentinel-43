@@ -315,6 +315,30 @@ class Sentinel43RuntimeAuthority:
     def list_pending_reviews(self) -> list[dict[str, Any]]:
         return self._orchestrator.list_pending_reviews()
 
+    def verify_audit_integrity(self) -> Any:
+        """Verify the canonical audit ledger without exposing the store."""
+        return self._orchestrator.verify_audit_integrity()
+
+    def get_audit_records(
+        self,
+        *,
+        component: str,
+        correlation_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        return self._orchestrator.get_audit_records(
+            component=component,
+            correlation_id=correlation_id,
+            limit=limit,
+        )
+
+    def get_legacy_audit_records(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        return self._orchestrator.get_legacy_audit_records(limit=limit)
+
     def record_denied_decision(
         self,
         decision_id: str,
