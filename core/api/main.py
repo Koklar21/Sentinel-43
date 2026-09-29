@@ -2437,6 +2437,7 @@ async def _start_heart() -> None:
             on_health_change=_report_heart_health,
             operator_authenticator=_heart_operator_authenticator,
         )
+        runtime.sentinel43.attach_heart(runtime.heart)
 
         # Recovery finishes BEFORE Fenrir may stage live, otherwise a row
         # inserted but not yet audited would be read as unaudited and
@@ -2447,11 +2448,6 @@ async def _start_heart() -> None:
                 "Heart: restored %d pending recommendation(s) after restart",
                 restored,
             )
-
-        # build_heart_from_settings() attaches Heart to the S43 authority.
-        # Fenrir never receives Heart directly.
-        if runtime.sentinel43 is not None:
-            runtime.heart = runtime.sentinel43.heart
 
         # A store that is ALREADY at or over the ceiling keeps working and
         # keeps observing, but cannot stage. The new limit stops that state
