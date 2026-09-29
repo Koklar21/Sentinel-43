@@ -3,7 +3,7 @@
    websocket.js — Hardened WebSocket bridge
    v1.8.0
 
-   Changes from v1.7.0 (next-PR Phase C — real-browser + same-origin beta):
+   Current same-origin/browser behavior:
    - WS URL defaults to the /ws endpoint on the page's own origin (wss:// on
      an https page) instead of ws://localhost:8000/ws. An empty
      meta[name="sentinel-ws-url"] now falls through to that.
@@ -16,7 +16,7 @@
      dispatching a spurious auth_failed — which re-showed the login overlay
      immediately after a successful login. Caught by browser_tests/.
 
-   Changes from v1.6.0 (beta-execution Phase 3):
+   Session/WebSocket behavior:
    - The auth frame is {token} only when auth.js holds no in-memory password
      (the session-bound / refresh-on-reload path). {token,password} is still
      sent when a password IS held (legacy env-operator / dual contract). A
@@ -27,10 +27,6 @@
      classifies auth failures — the backend companion change this file's
      v1.6.0 changelog asked for has landed.
 
-   RECONSTRUCTION NOTE: this file was recovered from a paste that had
-   stripped the backticks from every template literal. Backticks have been
-   restored based on context. Diff against your real working copy and run
-   the linter/test suite before trusting this in production.
 
    Changes from v1.5.8:
    - Added: _isSecureOrLocalSocket() — refuses to send credentials over a
