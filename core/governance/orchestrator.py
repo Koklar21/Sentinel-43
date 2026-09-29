@@ -1448,6 +1448,32 @@ class SystemOrchestrator:
         if previous is not None and previous is not engine:
             previous.shutdown()
 
+    def verify_audit_integrity(self) -> Any:
+        """Verify the canonical audit ledger through the governance service."""
+        return self._audit_store.verify_integrity()
+
+    def get_audit_records(
+        self,
+        *,
+        component: str,
+        correlation_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Bounded read of authenticated audit records."""
+        return self._audit_store.get_records(
+            component=component,
+            correlation_id=correlation_id,
+            limit=limit,
+        )
+
+    def get_legacy_audit_records(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Bounded read of authenticated pre-component audit records."""
+        return self._audit_store.get_records_without_component(limit=limit)
+
     def record_denied_decision(
         self,
         decision_id: str,
