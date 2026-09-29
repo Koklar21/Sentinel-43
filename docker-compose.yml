@@ -144,6 +144,17 @@ services:
       SENTINEL_ENV: ${SENTINEL_ENV:-${S43_ENV:-production}}
       S43_LOG_LEVEL: ${S43_LOG_LEVEL:-INFO}
 
+      # Observational provenance only; never authentication or authority.
+      S43_RUNTIME_PLATFORM: ${S43_RUNTIME_PLATFORM:-compose}
+      S43_RUNTIME_ROLE: ${S43_RUNTIME_ROLE:-api}
+      S43_INSTANCE_ID: ${S43_INSTANCE_ID:-s43-api}
+      S43_K8S_WORKLOAD: ${S43_K8S_WORKLOAD:-}
+      S43_K8S_POD_NAME: ${S43_K8S_POD_NAME:-}
+      S43_K8S_NAMESPACE: ${S43_K8S_NAMESPACE:-}
+      S43_K8S_NODE_NAME: ${S43_K8S_NODE_NAME:-}
+      S43_K8S_POD_IP: ${S43_K8S_POD_IP:-}
+      S43_K8S_SERVICE_ACCOUNT: ${S43_K8S_SERVICE_ACCOUNT:-}
+
       # Transport / trusted proxy boundary
       S43_TRUSTED_PROXIES: ${S43_TRUSTED_PROXIES:-172.28.0.250/32}
       # s43-api is in this list because FenrirHunter reports its own findings

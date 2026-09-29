@@ -390,11 +390,11 @@ class Sentinel43RuntimeAuthority:
         self,
         action_id: str,
         *,
-        reason: str,
+        problem: str,
     ) -> bool:
         return self._orchestrator.expire_unverifiable_recommendation(
             action_id,
-            reason=reason,
+            problem=problem,
         )
 
     def list_incidents(self, limit: int = 200) -> tuple[Mapping[str, Any], ...]:
