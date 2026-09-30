@@ -59,12 +59,13 @@ def run_live_suite(database_url: str, *, api_port: int = 18000, watchtower_port:
     jwt_secret = secrets.token_urlsafe(32)
     pepper = secrets.token_urlsafe(32)
     service_token = secrets.token_urlsafe(32)
+    bootstrap_claim_token = secrets.token_urlsafe(32)
     # core.audit.store decodes this via bytes.fromhex and requires >= 32
     # decoded bytes -- hex, not urlsafe, and token_hex(32) is exactly that.
     audit_hmac_key = secrets.token_hex(32)
     sensitive = [
         database_url, jwt_secret, pepper, service_token,
-        audit_hmac_key,
+        bootstrap_claim_token, audit_hmac_key,
     ]
     for value in sensitive:
         print(f"::add-mask::{value}", flush=True)
@@ -94,6 +95,7 @@ def run_live_suite(database_url: str, *, api_port: int = 18000, watchtower_port:
         "S43_REJECT_LEGACY_AUTH": "true",
         "S43_WATCHTOWER_URL": f"http://127.0.0.1:{watchtower_port}",
         "S43_WATCHTOWER_SERVICE_TOKEN": service_token,
+        "S43_BOOTSTRAP_CLAIM_TOKEN": bootstrap_claim_token,
         # Mandatory outside development/local/test (core/api/main.py's
         # _start_audit_store()) -- the authoritative audit store cannot be
         # keyed without it.
@@ -178,6 +180,7 @@ def run_live_suite(database_url: str, *, api_port: int = 18000, watchtower_port:
                 # PASSWORD needed here: those name a pre-existing account on
                 # a real target, which this disposable stack never has.
                 "S43_LIVE_TEST_DB_DSN": database_url,
+                "S43_BOOTSTRAP_CLAIM_TOKEN": bootstrap_claim_token,
             })
             accept_out = os.environ.get("S43_ACCEPTANCE_OUT")
             if accept_out:
