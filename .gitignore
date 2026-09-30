@@ -10,6 +10,7 @@
 *.db
 *.db-wal
 *.db-shm
+db.sqlite3-journal
 sentinel_state/
 sentinel43_state/
 sentinel_secure.db
@@ -68,6 +69,7 @@ browser_tests/certs/*.srl
 __pycache__/
 *.py[codz]
 *$py.class
+*.so
 .pytest_cache/
 .mypy_cache/
 .dmypy.json
@@ -123,6 +125,9 @@ venv.bak/
 __pypackages__/
 
 # Tool / framework scratch
+*.mo
+*.pot
+local_settings.py
 .tox/
 .nox/
 .pdm-python
