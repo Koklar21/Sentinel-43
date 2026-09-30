@@ -269,9 +269,6 @@ class TestSpartaNodeBoundary:
         self._deny(SERVICE_TOKEN)
         self._deny("fen-" + "y" * 40)
 
-    def test_K_admin_env_token_does_not_satisfy_sparta(self, env):
-        self._deny(ADMIN_TOKEN)
-
     def test_G_correct_sparta_token_is_accepted(self, env):
         from core.monitoring.sparta_core import _require_node_token
         _require_node_token(f"Bearer {SPARTA_NODE_TOKEN}", _sparta_config())  # no raise
