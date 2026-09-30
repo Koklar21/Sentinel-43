@@ -287,7 +287,7 @@ identity/session mutation, and the shared monitoring/evidence boundary.
 
 The owner-designated sources under `Sentinel-43/` are live runtime sources,
 not historical examples. `Shadow_mode.py` is the single owner response
-engine; `Sentienal_Nexus.py`, `Sentienal_core.py`, and
+engine; `Sentinel_Nexus.py`, `Sentinel_core.py`, and
 `sentinel_AI_escalation.py` are subordinate components loaded beneath the
 same runtime authority.
 
