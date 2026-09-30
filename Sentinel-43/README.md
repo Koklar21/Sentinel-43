@@ -2,7 +2,7 @@
 
 This directory holds the owner-designated Sentinel-43 orchestration sources.
 All four are current runtime sources. Shadow_mode.py is the single response
-engine; Sentienal_Nexus.py, Sentienal_core.py, and sentinel_AI_escalation.py
+engine; Sentinel_Nexus.py, Sentinel_core.py, and sentinel_AI_escalation.py
 are loaded as subordinate runtime components owned by
 Sentinel43RuntimeAuthority.
 
@@ -136,10 +136,10 @@ at the boundary instead.
 
 ## Current owner-source runtime wiring
 
-- `Sentienal_Nexus.py` is the live Nexus entry contract. Public recommendation
+- `Sentinel_Nexus.py` is the live Nexus entry contract. Public recommendation
   staging and resolution enter `Sentinel43RuntimeAuthority`, cross the Nexus,
   and only then hand off to the subordinate `SystemOrchestrator`.
-- `Sentienal_core.py` is the live node/core contract. It owns no local worker,
+- `Sentinel_core.py` is the live node/core contract. It owns no local worker,
   scheduler, Watchtower, audit DB, approval queue, or executor; it reports into
   the same runtime authority.
 - `sentinel_AI_escalation.py` is the live AI/detection escalation contract.
