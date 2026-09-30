@@ -54,6 +54,12 @@ API_URL = os.getenv("S43_TEST_API_URL", "http://localhost:8000").rstrip("/")
 # harness by the address it is actually calling from; the deployment must
 # list it in S43_ALLOWED_ORIGINS (scripts/ci_live_tests.py does).
 _LOGIN_HEADERS = {"Origin": API_URL}
+_BOOTSTRAP_CLAIM_TOKEN = os.getenv("S43_BOOTSTRAP_CLAIM_TOKEN", "")
+_BOOTSTRAP_HEADERS = (
+    {"X-S43-Bootstrap-Token": _BOOTSTRAP_CLAIM_TOKEN}
+    if _BOOTSTRAP_CLAIM_TOKEN
+    else {}
+)
 
 
 def _live_target_reachable() -> bool:
@@ -225,6 +231,7 @@ def _live_session() -> str:
         create_response = requests.post(
             f"{API_URL}/bootstrap/admin",
             json={"username": username, "password": password},
+            headers=_BOOTSTRAP_HEADERS,
             timeout=5,
         )
         assert create_response.status_code == 201, (
