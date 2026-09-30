@@ -15,6 +15,7 @@ dashboard from drifting back to a login-only UI or bypassing the governed
 first-admin route.
 """
 
+import ast
 from pathlib import Path
 
 
@@ -28,7 +29,7 @@ def test_dashboard_discovers_first_run_before_showing_login():
 
     assert 'BOOTSTRAP_STATUS_ENDPOINT  = "/bootstrap/status"' in source
     assert "initialized = await fetchBootstrapStatus()" in source
-    assert "if (!initialized)" in source
+    assert "if (!initialized.initialized)" in source
     assert "showBootstrapOverlay" in source
 
 
@@ -36,7 +37,7 @@ def test_dashboard_uses_the_canonical_bootstrap_and_login_paths():
     source = AUTH_JS.read_text(encoding="utf-8")
 
     assert 'BOOTSTRAP_ADMIN_ENDPOINT   = "/bootstrap/admin"' in source
-    assert "await bootstrapFirstAdmin(username, password, email)" in source
+    assert "await bootstrapFirstAdmin(username, password, email, claimToken)" in source
     # Account creation establishes identity; normal session creation still
     # happens through the existing login endpoint immediately afterward.
     assert "const result = await attemptLogin(username, password)" in source
@@ -54,4 +55,13 @@ def test_bootstrap_admin_route_remains_under_runtime_authority():
 
     assert "get_runtime_authority" in source
     assert "authority.identity.bootstrap_first_admin" in source
-    assert "create_first_admin(" not in source
+
+    tree = ast.parse(source)
+    calls = {
+        node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, (ast.Attribute, ast.Name))
+    }
+    assert "bootstrap_first_admin" in calls
+    assert "create_first_admin" not in calls
