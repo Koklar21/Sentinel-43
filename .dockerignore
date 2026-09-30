@@ -123,10 +123,8 @@ Thumbs.db
 
 # -----------------------------------------------------------------------------
 # Owner-designated orchestration core (Sentinel-43/).
-# Ship the complete owner-designated runtime source set. Shadow_mode.py is the
-# live response engine today; Nexus, node/core, and AI-escalation are being
-# integrated under Sentinel43RuntimeAuthority and must be present in the image
-# when that wiring lands. This packaging change alone does not activate them.
+# Ship the complete live owner-designated runtime source set used by
+# Sentinel43RuntimeAuthority.
 # -----------------------------------------------------------------------------
 Sentinel-43/*
 !Sentinel-43/Shadow_mode.py
@@ -145,10 +143,7 @@ Sentinel-43/*
 .tools/
 
 # -----------------------------------------------------------------------------
-# Generated acceptance evidence (scripts/acceptance_*.py write here). It is build
-# OUTPUT, never an input to the image -- but a checkout that contains it (main
-# currently tracks a copy, including a Windows kubeconform.exe with an outdated Go
-# toolchain) would otherwise COPY it in, and Trivy then fails the image on that
-# binary's stdlib CVEs, none of which are in the application.
+# Generated acceptance evidence (scripts/acceptance_*.py write here).
+# It is build output, never an input to the runtime image.
 # -----------------------------------------------------------------------------
 acceptance_out/
