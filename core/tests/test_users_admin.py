@@ -63,6 +63,7 @@ os.environ.setdefault("S43_JWT_ISSUER", JWT_ISSUER)
 os.environ.setdefault("S43_JWT_AUDIENCE", JWT_AUDIENCE)
 
 import core.api.routers.users as users_router_module  # noqa: E402
+import core.api.deps as api_deps_module  # noqa: E402
 import core.auth.deps as auth_deps_module  # noqa: E402
 import core.auth.users as users_module  # noqa: E402
 import core.governance.identity as identity_module  # noqa: E402
