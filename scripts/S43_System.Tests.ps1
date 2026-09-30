@@ -263,7 +263,7 @@ function Convert-HttpErrorResponse {
         if ($response.PSObject.Methods.Name -contains "GetResponseStream") {
             $stream = $response.GetResponseStream()
             if ($null -ne $stream) {
-                $reader = New-Object System.IO.StreamReader($stream)
+                $reader = [System.IO.StreamReader]::new($stream)
                 try {
                     $content = $reader.ReadToEnd()
                 }
@@ -732,7 +732,7 @@ function Test-S43WebSocket {
     }
 
     $apiUri = [Uri]$ApiUrl
-    $builder = New-Object System.UriBuilder($apiUri)
+    $builder = [System.UriBuilder]::new($apiUri)
     $builder.Scheme = if ($apiUri.Scheme -eq "https") { "wss" } else { "ws" }
     $builder.Port = $apiUri.Port
     $builder.Path = "/ws"
