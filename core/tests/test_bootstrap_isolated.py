@@ -69,6 +69,7 @@ os.environ.setdefault("S43_JWT_ISSUER", "sentinel-43-test")
 os.environ.setdefault("S43_JWT_AUDIENCE", "sentinel-43-dashboard-test")
 
 import core.api.routers.bootstrap as bootstrap_module  # noqa: E402
+import core.api.deps as api_deps_module  # noqa: E402
 import core.auth.deps as auth_deps_module  # noqa: E402
 import core.auth.sessions as sessions_module  # noqa: E402
 import core.auth.users as users_module  # noqa: E402
