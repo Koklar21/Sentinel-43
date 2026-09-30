@@ -383,8 +383,9 @@ def test_identity_mutations_enter_the_runtime_authority():
         CORE / "api" / "routers" / "users.py"
     ).read_text(encoding="utf-8")
 
-    assert "authority.identity.bootstrap_first_admin(" in bootstrap
-    assert "create_first_admin(" not in bootstrap
+    bootstrap_calls = _calls_in(CORE / "api" / "routers" / "bootstrap.py")
+    assert "bootstrap_first_admin" in bootstrap_calls
+    assert "create_first_admin" not in bootstrap_calls
 
     for call in (
         "authority.identity.create_account(",

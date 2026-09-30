@@ -15,6 +15,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AUTHORITY = REPO_ROOT / "core" / "governance" / "runtime_authority.py"
 API_MAIN = REPO_ROOT / "core" / "api" / "main.py"
+NEXUS = REPO_ROOT / "Sentinel-43" / "Sentinel_Nexus.py"
 
 
 def test_authority_snapshot_exposes_provenance_not_subordinate_objects():
@@ -24,7 +25,11 @@ def test_authority_snapshot_exposes_provenance_not_subordinate_objects():
     assert '"owner_components": self.owner_component_identities' in source
     assert '"owner_engine": self.engine_identity' in source
     assert '"recommendation_store_attached": self.recommendation_store_attached' in source
-    assert '"external_execution_supported": False' in source
+    assert '"external_execution_supported": bool(' in source
+    assert 'integration.get("external_execution")' in source
+
+    nexus_source = NEXUS.read_text(encoding="utf-8")
+    assert '"external_execution": False' in nexus_source
 
     snapshot_block = source.split("def authority_snapshot(", 1)[1].split(
         "def attach_recommendation_store(", 1
