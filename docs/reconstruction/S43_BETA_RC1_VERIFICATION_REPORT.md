@@ -5,6 +5,8 @@ Scope: repository-level beta release-candidate acceptance. No real controlled-be
 target was deployed — see Section G. This is not a production or public-sector
 readiness statement.
 
+> **Historical report notice (2026-09-30):** This file preserves the point-in-time RC1 verification record from September 2026. References below to the README being **"Late Alpha"** describe the repository status at the time of that verification and are not the current project status. The authoritative current README classifies the repository as a **Controlled Beta Candidate**; a specific deployment still requires the target-evidence gates in `docs/BETA_RUNBOOK.md` before it is an accepted controlled-beta target.
+
 ## A. Release candidate identity
 
 - Source git SHA this branch is based on: `origin/main` at
