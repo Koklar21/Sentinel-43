@@ -381,7 +381,7 @@ function Get-EffectiveCredential {
 
     if ($env:S43_LIVE_TEST_USERNAME -and $env:S43_LIVE_TEST_PASSWORD) {
         $securePassword = ConvertTo-SecureString $env:S43_LIVE_TEST_PASSWORD -AsPlainText -Force
-        return New-Object System.Management.Automation.PSCredential(
+        return [System.Management.Automation.PSCredential]::new(
             $env:S43_LIVE_TEST_USERNAME,
             $securePassword
         )
@@ -669,7 +669,7 @@ function Receive-S43WebSocketText {
     $buffer = New-Object byte[] 8192
 
     while ($true) {
-        $segment = New-Object System.ArraySegment[byte] -ArgumentList @(,$buffer)
+        $segment = [System.ArraySegment[byte]]::new($buffer)
         $cts = New-Object System.Threading.CancellationTokenSource
         $cts.CancelAfter($TimeoutSec * 1000)
 
@@ -704,7 +704,7 @@ function Send-S43WebSocketJson {
 
     $json = $Body | ConvertTo-Json -Depth 8 -Compress
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-    $segment = New-Object System.ArraySegment[byte] -ArgumentList @(,$bytes)
+    $segment = [System.ArraySegment[byte]]::new($bytes)
     $cts = New-Object System.Threading.CancellationTokenSource
     $cts.CancelAfter($TimeoutSec * 1000)
 
