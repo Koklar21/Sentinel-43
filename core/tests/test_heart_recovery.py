@@ -1214,7 +1214,7 @@ def test_staging_records_the_orchestrator_the_operation_and_its_target():
     assert row["system_id"] == "SENTINEL-43-NEXUS-01"
 
     staged = audit.get_records(component="heart", correlation_id=action_id)[0]
-    assert staged["authority"] == "system_orchestrator"
+    assert staged["authority"] == "sentinel43_runtime_authority"
     assert staged["engine"]["class"] == "Sentinel43ResponseEngine"
     assert staged["operations"] == [
         {
@@ -1245,7 +1245,7 @@ def test_approval_is_bound_to_the_staged_operation_and_target(client):
     assert response.status_code == 200, response.text
 
     approved = audit.get_records(component="heart", correlation_id=action_id)[-1]
-    assert approved["authority"] == "system_orchestrator"
+    assert approved["authority"] == "sentinel43_runtime_authority"
     assert approved["identity_type"] == "operator"
     assert approved["decided_by"] == "Sentinel43ResponseEngine.approve_action"
     assert approved["enforcement"].startswith("not_performed")
@@ -1381,7 +1381,7 @@ def test_an_enabled_heart_without_its_authority_blocks_readiness(monkeypatch):
         assert main_module.runtime.sentinel43 is None
         assert main_module.runtime.heart is None
         status = main_module.runtime.subsystems.get(main_module.SUBSYS_HEART)
-        assert "governance orchestrator" in status.detail, status.detail
+        assert "runtime authority" in status.detail, status.detail
         ready = test_client.get("/ready")
         assert ready.status_code == 503, ready.text
         assert "heart" in ready.text
@@ -1914,14 +1914,15 @@ def test_an_unauditable_incident_decision_is_reverted_and_the_incident_retracted
     action_id = _stage_planned(heart, "203.0.113.192", ["RATE_LIMIT", "OPEN_INCIDENT"])
     authority = heart._authority
 
-    original = authority._append_audit
+    orchestrator = authority._orchestrator
+    original = orchestrator._append_audit
 
     def fail_on_decision(record):
         if record.get("decision") in ("APPROVED", "VETOED"):
             raise RuntimeError("audit ledger unavailable")
         return original(record)
 
-    authority._append_audit = fail_on_decision
+    orchestrator._append_audit = fail_on_decision
     try:
         with pytest.raises(RuntimeError, match="audit ledger unavailable"):
             authority.resolve_recommendation(
@@ -1932,7 +1933,7 @@ def test_an_unauditable_incident_decision_is_reverted_and_the_incident_retracted
                 principal=_principal(),
             )
     finally:
-        authority._append_audit = original
+        orchestrator._append_audit = original
 
     assert core.get_status(action_id) == ActionStatus.PENDING
     incident = core.get_incident(core.incident_id_for_action(action_id))
@@ -2296,7 +2297,7 @@ def test_the_action_budget_holds_a_repeatedly_targeted_subject(monkeypatch):
     against ONE target inside the window, a further recommendation for it is
     observed, not staged. Other subjects are unaffected."""
     _, audit, core, heart = _stack()
-    monkeypatch.setattr(heart._authority, "_budget_max_per_target", 2)
+    monkeypatch.setattr(heart._authority._orchestrator, "_budget_max_per_target", 2)
     now_ms = int(time.time() * 1000)
     _seed_action_for_target(core, "seed-1", "anonymous|203.0.113.210", now_ms)
     _seed_action_for_target(core, "seed-2", "anonymous|203.0.113.210", now_ms)
@@ -2331,8 +2332,8 @@ def test_the_action_budget_holds_a_repeatedly_targeted_subject(monkeypatch):
 def test_the_budget_counts_only_actions_inside_its_window(monkeypatch):
     """An action older than the window no longer holds the target."""
     _, _, core, heart = _stack()
-    monkeypatch.setattr(heart._authority, "_budget_max_per_target", 1)
-    monkeypatch.setattr(heart._authority, "_budget_window_seconds", 300)
+    monkeypatch.setattr(heart._authority._orchestrator, "_budget_max_per_target", 1)
+    monkeypatch.setattr(heart._authority._orchestrator, "_budget_window_seconds", 300)
     _seed_action_for_target(
         core,
         "seed-old",
@@ -2363,7 +2364,7 @@ def test_the_engine_events_reach_the_one_audit_ledger():
         and r["engine_context"].get("action_id") == action_id
     ]
     assert len(staged_events) == 1
-    assert staged_events[0]["engine_module"] == "OVERSIGHT"
+    assert staged_events[0]["engine_module"] == "STAGING"
     assert staged_events[0]["component"] == "sentinel43_engine"
 
     # The engine's refusal of an unauthenticated approval is recorded too.
