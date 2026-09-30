@@ -130,8 +130,8 @@ Thumbs.db
 # -----------------------------------------------------------------------------
 Sentinel-43/*
 !Sentinel-43/Shadow_mode.py
-!Sentinel-43/Sentienal_Nexus.py
-!Sentinel-43/Sentienal_core.py
+!Sentinel-43/Sentinel_Nexus.py
+!Sentinel-43/Sentinel_core.py
 !Sentinel-43/sentinel_AI_escalation.py
 !Sentinel-43/README.md
 
