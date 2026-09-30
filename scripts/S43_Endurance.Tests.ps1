@@ -276,8 +276,11 @@ $pulseEndpoints = @(
     "/health",
     "/ready",
     "/status",
+    "/audit/health",
+    "/bootstrap/status",
     "/watchtower/health",
-    "/watchtower/ready"
+    "/watchtower/ready",
+    "/openapi.json"
 )
 
 $rows = @()
