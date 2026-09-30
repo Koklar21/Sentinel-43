@@ -10,7 +10,7 @@ Sentinel-43 is designed around one rule:
 
 The system can analyze and recommend. A human remains the final authority for operational decisions.
 
-> **Current status:** Late Alpha. Sentinel-43 is intended for controlled development, validation, and beta preparation. It is not yet declared production-ready.
+> **Current status:** Controlled Beta Candidate. Repository-level source blockers for controlled beta are closed. A specific deployment becomes an accepted controlled-beta target only after the evidence gates in the [Beta Runbook](docs/BETA_RUNBOOK.md) pass. Production readiness is not established.
 
 For controlled-beta deployment requirements, use the authoritative [Beta Runbook](docs/BETA_RUNBOOK.md).
 
@@ -285,20 +285,13 @@ The current security and deployment requirements are documented in the [Beta Run
 
 ## Deployment Status
 
-Sentinel-43 is currently **Late Alpha**.
+Sentinel-43 is currently a **Controlled Beta Candidate**.
 
-The software has working Docker-based runtime components, PostgreSQL-backed identity/session state, an authenticated SPA dashboard, governed recommendation flow, monitoring integrations, audit persistence, and Kubernetes deployment definitions.
+The repository-level beta-closure work is complete: the runtime authority is consolidated, human and service identities are separated, session authentication and administrator recovery are closed, audit/readiness behavior is wired, the real dashboard is the only operator UI, deployment definitions are present, and live verification tooling exists for endpoint, browser, and endurance checks.
 
-Work before a formal beta declaration focuses primarily on deployment validation and real-target evidence, including:
+This status does **not** declare every deployment a controlled beta automatically. A specific target must still produce the required deployment evidence, including its real TLS/hostname and trusted-proxy posture, target browser/WSS acceptance, the strict `final-beta` acceptance verdict, and any deployment-path prerequisites in the [Beta Runbook](docs/BETA_RUNBOOK.md).
 
-- clean end-to-end Compose validation
-- deployment-specific TLS/hostname configuration
-- trusted-proxy configuration
-- real image registry/digest selection for Kubernetes
-- external target verification
-- remaining defects discovered by live deployment testing
-
-Current controlled-beta constraints and exact procedures live in [docs/BETA_RUNBOOK.md](docs/BETA_RUNBOOK.md).
+Production and public-sector readiness remain separate tiers and are not established by beta closure.
 
 ---
 
@@ -341,8 +334,8 @@ See [LICENSE](LICENSE) and [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md) for th
 
 ## Disclaimer
 
-Sentinel-43 is currently Late Alpha software.
+Sentinel-43 is currently Controlled Beta Candidate software.
 
-It is provided **AS IS**, without warranty of any kind. Interfaces, deployment behavior, and internal implementation may still change during beta preparation.
+It is provided **AS IS**, without warranty of any kind. Interfaces, deployment behavior, and internal implementation may still change during controlled-beta validation.
 
 Use it only on systems and environments you own or are explicitly authorized to operate.
