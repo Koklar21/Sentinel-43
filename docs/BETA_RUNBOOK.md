@@ -815,13 +815,116 @@ For each beta deployment, keep:
   phases, for both the Compose and/or Kubernetes path used.
 - The negative NetworkPolicy connectivity test's actual output (§20).
 - The `browser_tests/run_target.sh` acceptance run's output (§17).
+- The local live-system report from `scripts/S43_System.Tests.ps1` and the
+  endurance summary from `scripts/S43_Endurance.Tests.ps1` when those
+  checks were used as candidate evidence (§22).
+- The final `acceptance_gate.py --mode final-beta` verdict and its complete
+  evidence directory for the exact deployed revision (§22).
 - The date and value-source of the last secret rotation
   (`S43_SECRETS_ROTATED_AT`).
 - Backup timestamps and their storage location (§11, §12).
 
-## 22. What this runbook does not establish
+## 22. Final beta-closure gate
 
-Completing this runbook, and every check within it passing, demonstrates a
+Sentinel-43's repository can be a **Controlled Beta Candidate** without a
+specific deployment being accepted as a controlled-beta target. Treat those
+as two separate states.
+
+### 22.1 Local candidate verification
+
+For a local/dev stack, use the live harnesses to prove the running system is
+coherent before spending time on target deployment evidence:
+
+```powershell
+$cred = Get-Credential
+
+pwsh .\scripts\S43_System.Tests.ps1 `
+  -ApiUrl http://localhost:8000 `
+  -Credential $cred `
+  -ReportPath .\s43-system-report.json
+
+pwsh .\scripts\S43_Endurance.Tests.ps1 `
+  -ApiUrl http://localhost:8000 `
+  -Credential $cred `
+  -DurationMinutes 120 `
+  -IntervalSeconds 60 `
+  -FullSweepEvery 5
+```
+
+Run the disposable real-browser suite as a separate browser/TLS integration
+check:
+
+```powershell
+& "C:\Program Files\Git\bin\bash.exe" ./browser_tests/run.sh
+```
+
+On non-Windows systems, run `./browser_tests/run.sh` normally.
+
+These checks establish useful **local candidate evidence**: API/readiness,
+authenticated route behavior, WebSocket authentication, browser session
+behavior, repeated health, and runtime endurance. They do **not** establish
+that a real beta target has correct DNS, public/edge TLS, trusted-proxy
+configuration, CNI enforcement, or target-specific credentials.
+
+### 22.2 Repository acceptance campaign
+
+The repository's strict evidence gate is:
+
+```bash
+python scripts/acceptance_campaign.py --out acceptance_out
+```
+
+The campaign creates disposable resources, records test inventory before
+execution, runs the required local/disposable jobs, and finishes by invoking:
+
+```bash
+python scripts/acceptance_gate.py verify --out <evidence-directory> --mode final-beta
+```
+
+A local campaign is intentionally **not allowed to manufacture a final-beta
+PASS** when required evidence cannot legitimately be produced locally. In
+particular, `check-kind-smoke` is recorded as unmet locally because the
+required kind + Calico deployment belongs on the hosted runner, and
+`browser-target` is recorded as unmet unless an explicitly authorized
+target and credential files are supplied.
+
+That behavior is fail-closed by design. Do not convert an unmet job to a pass
+or delete it from the manifest simply to obtain a green verdict.
+
+### 22.3 Target acceptance
+
+Before declaring one specific deployment an accepted **controlled-beta
+target**, all target-specific prerequisites in this runbook must be satisfied,
+including:
+
+- real hostname/TLS and allowed-origin posture;
+- correct trusted-proxy configuration;
+- database migration/readiness success;
+- backup/restore evidence;
+- target browser/WSS acceptance via `browser_tests/run_target.sh`;
+- NetworkPolicy negative-connectivity evidence when using Kubernetes;
+- immutable image/source provenance for the deployed revision;
+- all required acceptance jobs reconciled for the same revision.
+
+The authoritative closure condition is a machine-readable verdict of:
+
+```text
+FINAL-BETA ACCEPTANCE PASS
+```
+
+from `scripts/acceptance_gate.py --mode final-beta`, with no skipped,
+unexecuted, unmet, stale-revision, missing, or failed required job.
+
+A clean local Docker run by itself is not that verdict. Conversely, once the
+strict gate passes for the deployed revision and the runbook's target
+prerequisites are satisfied, do not keep the project labeled "Late Alpha"
+merely out of habit: that target has met the repository's controlled-beta
+acceptance definition.
+
+## 23. What this runbook does not establish
+
+Completing this runbook, including the final closure gate in §22, and every
+check within it passing, demonstrates a
 **controlled beta** is correctly configured and operating as designed. It
 does **not** by itself establish:
 
