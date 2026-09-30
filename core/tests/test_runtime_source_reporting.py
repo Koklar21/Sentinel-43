@@ -15,7 +15,7 @@ from core.monitoring.event_types import normalize_event
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-OWNER_CORE = REPO_ROOT / "Sentinel-43" / "Sentienal_core.py"
+OWNER_CORE = REPO_ROOT / "Sentinel-43" / "Sentinel_core.py"
 AUTHORITY = REPO_ROOT / "core" / "governance" / "runtime_authority.py"
 API_MAIN = REPO_ROOT / "core" / "api" / "main.py"
 K8S_API = REPO_ROOT / "deploy" / "kubernetes" / "base" / "s43-api-deployment.yaml"
