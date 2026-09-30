@@ -161,8 +161,8 @@ def test_runtime_authority_loads_all_owner_components():
 
     assert "load_owner_runtime_components(self)" in source
     for filename, class_name in (
-        ("Sentienal_Nexus.py", "SentinelNexus"),
-        ("Sentienal_core.py", "SentinelNode"),
+        ("Sentinel_Nexus.py", "SentinelNexus"),
+        ("Sentinel_core.py", "SentinelNode"),
         ("sentinel_AI_escalation.py", "SentinelAIEscalation"),
     ):
         assert filename in loader
@@ -186,7 +186,7 @@ def test_public_recommendation_path_crosses_the_nexus():
         CORE / "governance" / "runtime_authority.py"
     ).read_text(encoding="utf-8")
     nexus_source = (
-        REPO_ROOT / "Sentinel-43" / "Sentienal_Nexus.py"
+        REPO_ROOT / "Sentinel-43" / "Sentinel_Nexus.py"
     ).read_text(encoding="utf-8")
 
     assert "self._owner_components.nexus.submit_recommendation" in authority_source
@@ -197,7 +197,7 @@ def test_public_recommendation_path_crosses_the_nexus():
 
 def test_nexus_owns_one_fail_closed_integration_boundary():
     nexus_source = (
-        REPO_ROOT / "Sentinel-43" / "Sentienal_Nexus.py"
+        REPO_ROOT / "Sentinel-43" / "Sentinel_Nexus.py"
     ).read_text(encoding="utf-8")
     authority_source = (
         CORE / "governance" / "runtime_authority.py"
@@ -224,8 +224,8 @@ def test_owner_components_cannot_reach_the_subordinate_orchestrator():
     assert "def governance_mode(" in authority_source
 
     for relative in (
-        "Sentinel-43/Sentienal_Nexus.py",
-        "Sentinel-43/Sentienal_core.py",
+        "Sentinel-43/Sentinel_Nexus.py",
+        "Sentinel-43/Sentinel_core.py",
         "Sentinel-43/sentinel_AI_escalation.py",
     ):
         source = (REPO_ROOT / relative).read_text(encoding="utf-8")
