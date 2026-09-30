@@ -127,7 +127,8 @@
       "ignore": [],
       "env": {},
       "requires_env": [
-        "S43_BROWSER_BASE_URL"
+        "S43_BROWSER_BASE_URL",
+        "S43_BROWSER_BOOTSTRAP_CLAIM_TOKEN"
       ]
     },
     "browser-target": {
