@@ -113,9 +113,8 @@
       "env": {},
       "requires_env": [
         "S43_TEST_API_URL",
-        "S43_LIVE_TEST_USERNAME",
-        "S43_LIVE_TEST_PASSWORD",
-        "S43_LIVE_TEST_DB_DSN"
+        "S43_LIVE_TEST_DB_DSN",
+        "S43_BOOTSTRAP_CLAIM_TOKEN"
       ]
     },
     "browser-disposable": {
