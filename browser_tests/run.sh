@@ -65,7 +65,8 @@ docker build -q -t "$HASH_HELPER_IMAGE" -f core/api/Dockerfile . >/dev/null
 # --- fresh disposable secrets for this stack only ---
 rm -f "$ENV_FILE"
 PYTHONPATH=. "$PY" core/scripts/generate_secrets.py --write "$ENV_FILE" >/dev/null
-PGPW=$(grep '^POSTGRES_PASSWORD=' "$ENV_FILE" | cut -d= -f2)
+PGPW=$(grep '^POSTGRES_PASSWORD=' "$ENV_FILE" | cut -d= -f2-)
+BOOTSTRAP_CLAIM_TOKEN=$(grep '^S43_BOOTSTRAP_CLAIM_TOKEN=' "$ENV_FILE" | cut -d= -f2-)
 cat >> "$ENV_FILE" <<EOF
 
 # --- browser-smoke stack (browser_tests/run.sh) ---
@@ -135,12 +136,15 @@ if [ -n "${S43_ACCEPTANCE_OUT:-}" ]; then
         echo "S43_ACCEPTANCE_OUT is set: extra pytest arguments are not allowed (they would narrow the accepted run)." >&2
         exit 2
     fi
-    S43_BROWSER_PYTHON="$PY" S43_BROWSER_BASE_URL="https://s43.beta.test:8443" \
+    S43_BROWSER_PYTHON="$PY" \
+      S43_BROWSER_BASE_URL="https://s43.beta.test:8443" \
+      S43_BROWSER_BOOTSTRAP_CLAIM_TOKEN="$BOOTSTRAP_CLAIM_TOKEN" \
       "$PY" scripts/acceptance_gate.py run-job browser-disposable --out "$S43_ACCEPTANCE_OUT"
 else
     # Developer run (no evidence recorded).
     # target/ is the real-target acceptance suite -- never part of the disposable run.
     S43_BROWSER_BASE_URL="https://s43.beta.test:8443" \
+      S43_BROWSER_BOOTSTRAP_CLAIM_TOKEN="$BOOTSTRAP_CLAIM_TOKEN" \
       "$PY" -m pytest browser_tests/ --ignore=browser_tests/target_acceptance \
       -q -p no:cacheprovider "$@"
 fi
