@@ -64,6 +64,12 @@ API_URL = os.getenv("S43_TEST_API_URL", "http://localhost:8000").rstrip("/")
 # harness by the address it is actually calling from; the deployment must
 # list it in S43_ALLOWED_ORIGINS (scripts/ci_live_tests.py does).
 _LOGIN_HEADERS = {"Origin": API_URL}
+_BOOTSTRAP_CLAIM_TOKEN = os.getenv("S43_BOOTSTRAP_CLAIM_TOKEN", "")
+_BOOTSTRAP_HEADERS = (
+    {"X-S43-Bootstrap-Token": _BOOTSTRAP_CLAIM_TOKEN}
+    if _BOOTSTRAP_CLAIM_TOKEN
+    else {}
+)
 
 
 def _live_target_reachable() -> bool:
@@ -147,6 +153,7 @@ def initialized_deployment() -> None:
     response = requests.post(
         f"{API_URL}/bootstrap/admin",
         json={"username": f"seed-{uuid.uuid4().hex[:8]}", "password": "a-perfectly-long-enough-password-123"},
+        headers=_BOOTSTRAP_HEADERS,
         timeout=5,
     )
     assert response.status_code == 201, (
@@ -203,6 +210,7 @@ def test_bootstrap_admin_rejects_when_already_initialized(initialized_deployment
             "username": f"should-not-be-created-{uuid.uuid4().hex[:8]}",
             "password": "a-perfectly-long-enough-password",
         },
+        headers=_BOOTSTRAP_HEADERS,
         timeout=5,
     )
     assert response.status_code == 409, (
@@ -227,6 +235,7 @@ def test_first_run_bootstrap_flow_creates_admin(fresh_deployment) -> None:
     create_response = requests.post(
         f"{API_URL}/bootstrap/admin",
         json={"username": username, "password": password},
+        headers=_BOOTSTRAP_HEADERS,
         timeout=5,
     )
     assert create_response.status_code == 201, (
@@ -242,6 +251,7 @@ def test_first_run_bootstrap_flow_creates_admin(fresh_deployment) -> None:
     second_response = requests.post(
         f"{API_URL}/bootstrap/admin",
         json={"username": f"second-{uuid.uuid4().hex[:8]}", "password": password},
+        headers=_BOOTSTRAP_HEADERS,
         timeout=5,
     )
     assert second_response.status_code == 409
