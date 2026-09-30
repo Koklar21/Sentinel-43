@@ -303,7 +303,7 @@ def test_status_reports_uninitialized_with_no_admins(client, fresh_user_store):
     response = client.get("/bootstrap/status")
 
     assert response.status_code == 200
-    assert response.json() == {"initialized": False}
+    assert response.json() == {"initialized": False, "claim_token_required": False}
 
 
 def test_admin_rejects_short_password(client, fresh_user_store):
