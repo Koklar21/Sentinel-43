@@ -36,8 +36,8 @@ from typing import Any, Final
 
 _OWNER_DIR: Final[Path] = Path("Sentinel-43")
 _OWNER_SOURCES: Final[dict[str, tuple[str, str]]] = {
-    "nexus": ("Sentienal_Nexus.py", "SentinelNexus"),
-    "node": ("Sentienal_core.py", "SentinelNode"),
+    "nexus": ("Sentinel_Nexus.py", "SentinelNexus"),
+    "node": ("Sentinel_core.py", "SentinelNode"),
     "ai_escalation": ("sentinel_AI_escalation.py", "SentinelAIEscalation"),
 }
 _MODULE_PREFIX: Final[str] = "sentinel43_owner_component"
