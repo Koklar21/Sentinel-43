@@ -40,6 +40,7 @@ ADMIN_USERNAME = "browser-admin"
 ADMIN_PASSWORD = "browser-admin-" + secrets.token_urlsafe(12)
 OPERATOR_USERNAME = "browser-operator"
 OPERATOR_PASSWORD = "browser-operator-" + secrets.token_urlsafe(12)
+_BOOTSTRAP_CLAIM_TOKEN = os.getenv("S43_BROWSER_BOOTSTRAP_CLAIM_TOKEN", "").strip()
 
 
 def _spki_pin() -> str:
@@ -98,9 +99,20 @@ def stack():
 
     status, body = _request("GET", "/bootstrap/status")
     if status == 200 and not body.get("initialized"):
+        if body.get("claim_token_required") and not _BOOTSTRAP_CLAIM_TOKEN:
+            raise RuntimeError(
+                "browser stack requires a bootstrap claim token, but "
+                "S43_BROWSER_BOOTSTRAP_CLAIM_TOKEN is not set"
+            )
+        bootstrap_headers = (
+            {"X-S43-Bootstrap-Token": _BOOTSTRAP_CLAIM_TOKEN}
+            if _BOOTSTRAP_CLAIM_TOKEN
+            else {}
+        )
         s, b = _request(
             "POST", "/bootstrap/admin",
             {"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD},
+            headers=bootstrap_headers,
         )
         assert s in (200, 201), (s, b)
 
