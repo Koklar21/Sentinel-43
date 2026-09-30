@@ -126,6 +126,35 @@ EOF
 echo "== building + starting the s43browser stack =="
 "${COMPOSE[@]}" up -d --build
 
+# Docker Desktop / hosted runners may still be settling the newly-created
+# bridge and proxy path for a moment after compose reports the containers
+# started. Chromium treats a host-route change during its first navigation
+# as net::ERR_NETWORK_CHANGED. Prove the real HTTPS edge is stable before
+# launching Playwright instead of retrying browser assertions afterward.
+echo "== waiting for stable HTTPS edge =="
+S43_EDGE_PROBE_URL="https://127.0.0.1:8443/health"
+S43_EDGE_STABLE_SUCCESSES=0
+S43_EDGE_DEADLINE=$((SECONDS + 60))
+while [ "$SECONDS" -lt "$S43_EDGE_DEADLINE" ]; do
+    if curl --silent --show-error --fail \
+        --cacert browser_tests/certs/ca.crt \
+        --resolve "s43.beta.test:8443:127.0.0.1" \
+        "https://s43.beta.test:8443/health" >/dev/null 2>&1; then
+        S43_EDGE_STABLE_SUCCESSES=$((S43_EDGE_STABLE_SUCCESSES + 1))
+        if [ "$S43_EDGE_STABLE_SUCCESSES" -ge 3 ]; then
+            break
+        fi
+    else
+        S43_EDGE_STABLE_SUCCESSES=0
+    fi
+    sleep 1
+done
+if [ "$S43_EDGE_STABLE_SUCCESSES" -lt 3 ]; then
+    echo "browser smoke HTTPS edge did not become stable within 60 seconds" >&2
+    "${COMPOSE[@]}" ps >&2 || true
+    exit 1
+fi
+
 echo "== running browser tests =="
 if [ -n "${S43_ACCEPTANCE_OUT:-}" ]; then
     # Acceptance run: the ONE canonical execution path is the gate's run-job, which
