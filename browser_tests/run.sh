@@ -132,7 +132,6 @@ echo "== building + starting the s43browser stack =="
 # as net::ERR_NETWORK_CHANGED. Prove the real HTTPS edge is stable before
 # launching Playwright instead of retrying browser assertions afterward.
 echo "== waiting for stable HTTPS edge =="
-S43_EDGE_PROBE_URL="https://127.0.0.1:8443/health"
 S43_EDGE_STABLE_SUCCESSES=0
 S43_EDGE_DEADLINE=$((SECONDS + 60))
 while [ "$SECONDS" -lt "$S43_EDGE_DEADLINE" ]; do
