@@ -83,6 +83,12 @@ def run_live_suite(database_url: str, *, api_port: int = 18000, watchtower_port:
         "S43_AUTH_PEPPER": pepper,
         "S43_WS_REQUIRE_AUTH": "true",
         "S43_ENABLE_TEST_INJECTION": "false",
+        # The controlled-beta profile requires governance to be enabled.
+        # Bootstrap/user administration now delegates through the single
+        # Sentinel43RuntimeAuthority, so a production-mode live harness that
+        # disables governance cannot exercise those routes legitimately.
+        "S43_GOVERNANCE_ENABLED": "true",
+        "S43_GOVERNANCE_REQUIRED": "true",
         "S43_SECRETS_ROTATED_AT": datetime.now(timezone.utc).isoformat(),
         # No S43_OPERATOR_USERNAME / S43_OPERATOR_PASSWORD_HASH /
         # S43_BREAK_GLASS_ARMED: the env-operator break-glass login is
