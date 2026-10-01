@@ -348,11 +348,13 @@ kubectl exec -n sentinel43 netpol-test -- timeout 5 nc -zv s43-core 9100 # must 
 kubectl delete pod netpol-test -n sentinel43
 ```
 
-This sequence was run against a kind cluster with Calico installed during
-development (see "Integration testing evidence" below) — the connections
-hung until the 5s timeout killed them (exit 143), confirming real
-enforcement, not just object presence. That run also probed `s43-redis:6379`,
-which no longer exists (see "No Redis").
+The hosted `kind smoke deploy` workflow now automates this enforcement
+class on every relevant CI revision using Calico: it proves the authorized
+`s43-api` client can reach PostgreSQL and `s43-core`, then requires a
+PSS-restricted unlabeled pod to fail direct TCP connection attempts to both
+Services. The resulting probe output is retained in the
+`acceptance-kind-smoke` artifact. A real beta cluster must still repeat the
+negative probe because NetworkPolicy enforcement is CNI-specific.
 
 ## Relationship to Docker Compose
 
@@ -462,11 +464,12 @@ which no longer exists (see "No Redis").
   still reports what it can, but adding real Docker Hub credentials as
   repo secrets (an operator decision) would give it full policy evaluation
   instead of just local CVE listing.
-- **The CI workflow's syntax was validated but not executed against a real
-  GitHub Actions runner** in this pass (no `act` or equivalent available
-  locally) — the equivalent steps were run manually against a local kind
-  cluster instead (see "Integration testing evidence"), which is the same
-  underlying command sequence the workflow automates.
+- **Hosted CI uses disposable kind + Calico, not the target cluster.** The
+  workflow now executes the manifest, posture, positive-connectivity, and
+  negative-NetworkPolicy smoke on GitHub Actions and retains exact-revision
+  evidence. That is repository evidence only; a beta deployment still needs
+  the target-specific preflight and NetworkPolicy probe because its ingress,
+  CNI, addresses, certificates, and credentials are different.
 
 ## Integration testing evidence
 
