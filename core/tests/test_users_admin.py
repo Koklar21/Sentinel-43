@@ -126,7 +126,7 @@ class _FakeUserStore:
         return sorted(self.users.values(), key=lambda u: u.created_at)
 
     async def create_user(
-        self, session, *, username: str, password: str, role: str = "operator", email: str | None = None
+        self, session, *, username: str, password: str, role: str = "observer", email: str | None = None
     ) -> _FakeUser:
         user = _FakeUser(username=username, password=password, role=role, email=email)
         self.users[username] = user
@@ -269,7 +269,6 @@ def store(monkeypatch) -> Generator[_FakeUserStore, None, None]:
     monkeypatch.setattr(identity_module, "create_user", s.create_user)
     monkeypatch.setattr(identity_module, "get_user_by_id", s.get_user_by_id)
     monkeypatch.setattr(identity_module, "set_user_active", s.set_user_active)
-    monkeypatch.setattr(identity_module, "set_user_role", s.set_user_role)
     monkeypatch.setattr(identity_module, "set_user_password", s.set_user_password)
 
     async def _fake_lock(_session, _key):
@@ -371,20 +370,20 @@ def test_create_rejects_valid_token_without_password_header(client: TestClient, 
 
 
 def test_operator_cannot_create_users(client: TestClient, store: _FakeUserStore):
-    store.seed(username="operator-1", password="operator-1-pw-1234", role="operator")
+    store.seed(username="operator-1", password="operator-1-pw-1234", role="observer")
     response = client.post(
         USERS_URL,
         json={"username": "x", "password": "x-password-1234"},
-        headers=_auth_headers("operator-1", "operator-1-pw-1234", "operator"),
+        headers=_auth_headers("operator-1", "operator-1-pw-1234", "observer"),
     )
     assert response.status_code == 403
 
 
 def test_operator_cannot_list_users(client: TestClient, store: _FakeUserStore):
-    store.seed(username="operator-1", password="operator-1-pw-1234", role="operator")
+    store.seed(username="operator-1", password="operator-1-pw-1234", role="observer")
     response = client.get(
         USERS_URL,
-        headers=_auth_headers("operator-1", "operator-1-pw-1234", "operator"),
+        headers=_auth_headers("operator-1", "operator-1-pw-1234", "observer"),
     )
     assert response.status_code == 403
 
@@ -413,26 +412,26 @@ def test_admin_creates_operator_account(client: TestClient, store: _FakeUserStor
     assert response.status_code == 201, response.text
     body = response.json()
     assert body["username"] == "analyst-1"
-    assert body["role"] == "operator"
+    assert body["role"] == "observer"
     assert body["is_active"] is True
     assert "analyst-1" in store.users
     assert "password" not in body and "password_hash" not in body
 
 
-def test_admin_creates_admin_account(client: TestClient, store: _FakeUserStore):
+def test_admin_cannot_create_second_admin_account(client: TestClient, store: _FakeUserStore):
     _seed_admin(store)
     response = client.post(
         USERS_URL,
         json={"username": "second-admin", "password": "second-admin-pw-1234", "role": "admin"},
         headers=_admin_headers(),
     )
-    assert response.status_code == 201, response.text
-    assert response.json()["role"] == "admin"
+    assert response.status_code == 422
+    assert "second-admin" not in store.users
 
 
 def test_create_rejects_duplicate_username(client: TestClient, store: _FakeUserStore):
     _seed_admin(store)
-    store.seed(username="taken", password="taken-pw-1234", role="operator")
+    store.seed(username="taken", password="taken-pw-1234", role="observer")
     response = client.post(
         USERS_URL,
         json={"username": "taken", "password": "different-pw-1234"},
@@ -491,8 +490,8 @@ def test_new_operator_can_log_in(client: TestClient, store: _FakeUserStore):
 
 def test_list_returns_every_account(client: TestClient, store: _FakeUserStore):
     _seed_admin(store)
-    store.seed(username="op-a", password="op-a-pw-1234", role="operator")
-    store.seed(username="op-b", password="op-b-pw-1234", role="operator", is_active=False)
+    store.seed(username="op-a", password="op-a-pw-1234", role="observer")
+    store.seed(username="op-b", password="op-b-pw-1234", role="observer", is_active=False)
 
     response = client.get(USERS_URL, headers=_admin_headers())
     assert response.status_code == 200, response.text
@@ -509,7 +508,7 @@ def test_list_returns_every_account(client: TestClient, store: _FakeUserStore):
 
 def test_deactivate_account_blocks_login(client: TestClient, store: _FakeUserStore):
     _seed_admin(store)
-    target = store.seed(username="revoke-me", password="revoke-me-pw-1234", role="operator")
+    target = store.seed(username="revoke-me", password="revoke-me-pw-1234", role="observer")
 
     assert client.post(
         "/auth/login", json={"username": "revoke-me", "password": "revoke-me-pw-1234"}
@@ -531,7 +530,7 @@ def test_deactivate_account_blocks_login(client: TestClient, store: _FakeUserSto
 def test_reactivate_account_restores_login(client: TestClient, store: _FakeUserStore):
     _seed_admin(store)
     target = store.seed(
-        username="back-again", password="back-again-pw-1234", role="operator", is_active=False
+        username="back-again", password="back-again-pw-1234", role="observer", is_active=False
     )
 
     patch = client.patch(
@@ -547,17 +546,17 @@ def test_reactivate_account_restores_login(client: TestClient, store: _FakeUserS
     ).status_code == 200
 
 
-def test_change_role_operator_to_admin(client: TestClient, store: _FakeUserStore):
+def test_observer_cannot_be_promoted_to_admin(client: TestClient, store: _FakeUserStore):
     _seed_admin(store)
-    target = store.seed(username="promote-me", password="promote-me-pw-1234", role="operator")
+    target = store.seed(username="promote-me", password="promote-me-pw-1234", role="observer")
 
     patch = client.patch(
         f"{USERS_URL}/{target.user_id}",
         json={"role": "admin"},
         headers=_admin_headers(),
     )
-    assert patch.status_code == 200, patch.text
-    assert patch.json()["role"] == "admin"
+    assert patch.status_code == 422
+    assert store.users["promote-me"].role == "observer"
 
 
 def test_patch_unknown_user_id_returns_404(client: TestClient, store: _FakeUserStore):
@@ -582,7 +581,7 @@ def test_patch_malformed_user_id_returns_422(client: TestClient, store: _FakeUse
 
 def test_patch_empty_body_returns_422(client: TestClient, store: _FakeUserStore):
     _seed_admin(store)
-    target = store.seed(username="op", password="op-password-1234", role="operator")
+    target = store.seed(username="op", password="op-password-1234", role="observer")
     response = client.patch(
         f"{USERS_URL}/{target.user_id}", json={}, headers=_admin_headers()
     )
@@ -610,11 +609,11 @@ def test_cannot_demote_the_last_admin(client: TestClient, store: _FakeUserStore)
         json={"role": "operator"},
         headers=_admin_headers(),
     )
-    assert response.status_code == 409
+    assert response.status_code == 422
     assert store.users[ADMIN_NAME].role == "admin"
 
 
-def test_self_demotion_allowed_when_another_admin_exists(client: TestClient, store: _FakeUserStore):
+def test_self_demotion_refused_even_when_store_has_another_admin(client: TestClient, store: _FakeUserStore):
     admin = _seed_admin(store)
     store.seed(username="co-admin", password="co-admin-pw-1234", role="admin")
 
@@ -623,8 +622,8 @@ def test_self_demotion_allowed_when_another_admin_exists(client: TestClient, sto
         json={"role": "operator"},
         headers=_admin_headers(),
     )
-    assert response.status_code == 200, response.text
-    assert response.json()["role"] == "operator"
+    assert response.status_code == 422
+    assert store.users[ADMIN_NAME].role == "admin"
 
 
 # ---------------------------------------------------------------------------
@@ -633,7 +632,7 @@ def test_self_demotion_allowed_when_another_admin_exists(client: TestClient, sto
 
 def test_admin_resets_account_password(client: TestClient, store: _FakeUserStore):
     _seed_admin(store)
-    target = store.seed(username="forgot", password="old-password-1234", role="operator")
+    target = store.seed(username="forgot", password="old-password-1234", role="observer")
 
     response = client.post(
         f"{USERS_URL}/{target.user_id}/password",
@@ -652,7 +651,7 @@ def test_admin_resets_account_password(client: TestClient, store: _FakeUserStore
 
 def test_password_reset_rejects_short_password(client: TestClient, store: _FakeUserStore):
     _seed_admin(store)
-    target = store.seed(username="forgot", password="old-password-1234", role="operator")
+    target = store.seed(username="forgot", password="old-password-1234", role="observer")
 
     response = client.post(
         f"{USERS_URL}/{target.user_id}/password",
