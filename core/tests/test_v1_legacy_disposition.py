@@ -65,13 +65,13 @@ JWT_AUDIENCE = os.environ["S43_JWT_AUDIENCE"]
 PASSWORD = "v1-disposition-test-password"
 
 
-def _token(role: str = "operator") -> str:
+def _token(role: str = "observer") -> str:
     from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc)
     return jwt.encode(
         {
-            "sub": "v1-disposition-operator",
+            "sub": "v1-disposition-observer",
             "role": role,
             "iss": JWT_ISSUER,
             "aud": JWT_AUDIENCE,
@@ -84,7 +84,7 @@ def _token(role: str = "operator") -> str:
     )
 
 
-def _headers(role: str = "operator") -> dict[str, str]:
+def _headers(role: str = "observer") -> dict[str, str]:
     return {
         "Authorization": f"Bearer {_token(role)}",
         "X-S43-Password": PASSWORD,
@@ -184,7 +184,7 @@ def test_v1_approve_is_refused_when_no_governance_backend_is_configured(
 
     response = client.post(
         f"/v1/actions/{staged_action['id']}/approve",
-        json={"operator_id": "v1-disposition-operator", "reason": "approved via v1 disposition test"},
+        json={"operator_id": "v1-disposition-observer", "reason": "approved via v1 disposition test"},
         headers=_headers(),
     )
     assert response.status_code == 409, response.text
@@ -205,7 +205,7 @@ def test_v1_veto_is_refused_when_no_governance_backend_is_configured(
 
     response = client.post(
         f"/v1/actions/{staged_action['id']}/veto",
-        json={"operator_id": "v1-disposition-operator", "reason": "vetoed via v1 disposition test"},
+        json={"operator_id": "v1-disposition-observer", "reason": "vetoed via v1 disposition test"},
         headers=_headers(),
     )
     assert response.status_code == 409, response.text
@@ -237,7 +237,7 @@ def test_v1_approve_rejects_an_action_id_mismatch_without_touching_the_ledger(cl
         f"/v1/actions/{staged_action['id']}/approve",
         json={
             "action_id": "a-completely-different-id",
-            "operator_id": "v1-disposition-operator",
+            "operator_id": "v1-disposition-observer",
             "reason": "should never commit",
         },
         headers=_headers(),
@@ -252,7 +252,7 @@ def test_v1_approve_rejects_an_action_id_mismatch_without_touching_the_ledger(cl
 def test_v1_approve_of_an_unknown_action_is_404_not_500(client):
     response = client.post(
         "/v1/actions/ACT-DOES-NOT-EXIST/approve",
-        json={"operator_id": "v1-disposition-operator", "reason": "no such action to approve"},
+        json={"operator_id": "v1-disposition-observer", "reason": "no such action to approve"},
         headers=_headers(),
     )
     assert response.status_code == 404
