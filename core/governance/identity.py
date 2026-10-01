@@ -15,8 +15,9 @@
 
 Credential verification and password hashing remain auth primitives. This
 service owns the consequential account lifecycle operations that change
-Sentinel-43 authority: first-admin claim, account creation, role/active
-changes, password reset, and the session revocation coupled to those changes.
+Sentinel-43 authority: the one-time first-admin claim, observer creation and
+activation state, password reset, and session revocation. Administrator role
+is immutable after bootstrap.
 
 Every mutation is authorized/audited through the single runtime authority
 before the account store is changed. Persistence remains in core.auth users
@@ -289,11 +290,12 @@ class IdentityGovernanceService:
         username: str,
         new_password: str,
     ) -> User:
-        """Recover one existing account as an active administrator.
+        """Recover the existing sole administrator.
 
         This is intended for deployment-exec recovery tooling, not an HTTP
-        endpoint. PostgreSQL advisory locking is mandatory so concurrent
-        recovery attempts cannot race account authority changes.
+        endpoint. It never promotes an observer. PostgreSQL advisory locking
+        is mandatory so concurrent recovery attempts cannot race account
+        authority changes.
         """
         try:
             locked = await _pg_advisory_xact_lock(
