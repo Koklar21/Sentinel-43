@@ -48,10 +48,12 @@ class Sentinel43RuntimeAuthority:
         orchestrator: SystemOrchestrator,
         *,
         monitoring_manager: Any | None = None,
+        governance_enabled: bool = True,
     ) -> None:
         if orchestrator is None:
             raise ValueError("Sentinel43RuntimeAuthority requires an orchestrator")
         self._orchestrator = orchestrator
+        self._governance_enabled = bool(governance_enabled)
         self._engine: Any | None = None
         self._monitoring_manager = monitoring_manager
         self._heart: Any | None = None
@@ -68,6 +70,15 @@ class Sentinel43RuntimeAuthority:
         from .owner_components import load_owner_runtime_components
 
         self._owner_components = load_owner_runtime_components(self)
+
+    @property
+    def governance_enabled(self) -> bool:
+        """Whether recommendation/decision governance is enabled.
+
+        The runtime authority itself remains live even when this is false
+        because identity/session mutations are also owned by Sentinel-43.
+        """
+        return self._governance_enabled
 
     @property
     def governance_mode(self) -> str:
@@ -153,6 +164,7 @@ class Sentinel43RuntimeAuthority:
         integration = self._owner_components.nexus.describe_integration_boundary()
         return {
             "authority": type(self).__name__,
+            "governance_enabled": self._governance_enabled,
             "mode": str(getattr(mode, "value", mode)).strip().upper(),
             "owner_components": self.owner_component_identities,
             "owner_engine": self.engine_identity,
