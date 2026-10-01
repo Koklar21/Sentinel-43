@@ -114,3 +114,37 @@ def test_missing_evidence_sequence_is_not_treated_as_observation() -> None:
     assert stats["fresh_updates"] == 0
     assert stats["missing_evidence_seq_skipped"] == 1
     assert stats["active_keys"] == 0
+
+def _zscore_layer() -> FenrirAnomalyLayer:
+    return FenrirAnomalyLayer(
+        zscore_threshold=2.5,
+        pressure_threshold=1_000_000.0,
+        decay_rate=0.000001,
+        min_observations=5,
+        max_keys=100,
+        stale_seconds=3600.0,
+    )
+
+
+def _prime_score_baseline(layer: FenrirAnomalyLayer) -> None:
+    for seq, score in enumerate((50.0, 52.0, 48.0, 51.0, 49.0), start=1):
+        assert layer.update(_assessment(seq, score=score)) is None
+
+
+def test_downward_score_deviation_does_not_escalate() -> None:
+    layer = _zscore_layer()
+    _prime_score_baseline(layer)
+
+    assert layer.update(_assessment(6, score=5.0)) is None
+    assert layer.stats()["zscore_fires"] == 0
+
+
+def test_upward_score_deviation_still_escalates() -> None:
+    layer = _zscore_layer()
+    _prime_score_baseline(layer)
+
+    anomaly = layer.update(_assessment(6, score=90.0))
+    assert anomaly is not None
+    assert anomaly["zscore"] >= 2.5
+    assert anomaly["evidence_seq"] == 6
+    assert layer.stats()["zscore_fires"] == 1
