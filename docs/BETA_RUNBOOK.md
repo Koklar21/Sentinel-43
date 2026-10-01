@@ -839,17 +839,26 @@ coherent before spending time on target deployment evidence:
 $cred = Get-Credential
 
 pwsh .\scripts\S43_System.Tests.ps1 `
-  -ApiUrl http://localhost:8000 `
+  -ApiUrl https://localhost `
   -Credential $cred `
+  -SkipCertificateCheck `
   -ReportPath .\s43-system-report.json
 
 pwsh .\scripts\S43_Endurance.Tests.ps1 `
-  -ApiUrl http://localhost:8000 `
+  -ApiUrl https://localhost `
   -Credential $cred `
+  -SkipCertificateCheck `
   -DurationMinutes 120 `
   -IntervalSeconds 60 `
   -FullSweepEvery 5
 ```
+
+Base Compose publishes only the nginx front door on host ports 80/443; the
+API's port 8000 is internal to the Compose network. The commands above therefore
+use the real local HTTPS proxy path. `-SkipCertificateCheck` is appropriate
+only for this local candidate check when using the repository's self-signed
+development certificate. Do not use it against a real beta target; supply and
+validate the target's real CA/TLS chain there.
 
 Run the disposable real-browser suite as a separate browser/TLS integration
 check:
@@ -868,28 +877,50 @@ configuration, CNI enforcement, or target-specific credentials.
 
 ### 22.2 Repository acceptance campaign
 
-The repository's strict evidence gate is:
+The repository's strict evidence gate combines local/disposable work,
+target acceptance, and the hosted kind + Calico smoke for the **same exact
+revision**. Hosted CI now uploads an `acceptance-kind-smoke` artifact containing
+`check-kind-smoke.meta.json`; that record carries the checkout revision and
+tree fingerprint used by the strict gate.
 
-```bash
-python scripts/acceptance_campaign.py --out acceptance_out
+First, obtain a successful `acceptance-kind-smoke` artifact from the hosted
+Kubernetes workflow for the exact commit you are accepting and extract it
+locally. Do not reuse evidence from another commit. Then provide the authorized
+target variables required by `browser-target`:
+
+```text
+S43_TARGET_BASE_URL
+S43_TARGET_OPERATOR_CRED_FILE
+S43_TARGET_ADMIN_SCOPE
+S43_TARGET_ADMIN_CRED_FILE
+S43_TARGET_MUTATION_OPERATOR_CRED_FILE
 ```
 
-The campaign creates disposable resources, records test inventory before
-execution, runs the required local/disposable jobs, and finishes by invoking:
+Run the campaign with the extracted hosted evidence:
+
+```bash
+python scripts/acceptance_campaign.py --out acceptance_out \
+  --kind-smoke-evidence <path-to-extracted-acceptance-kind-smoke>
+```
+
+The campaign creates a fresh timestamped evidence directory, records test
+inventory before execution, runs every local/disposable required job, runs
+`browser-target` against the explicitly authorized target, copies only the
+hosted `check-kind-smoke` evidence record into that fresh directory, and
+finishes by invoking the strict gate:
 
 ```bash
 python scripts/acceptance_gate.py verify --out <evidence-directory> --mode final-beta
 ```
 
-A local campaign is intentionally **not allowed to manufacture a final-beta
-PASS** when required evidence cannot legitimately be produced locally. In
-particular, `check-kind-smoke` is recorded as unmet locally because the
-required kind + Calico deployment belongs on the hosted runner, and
-`browser-target` is recorded as unmet unless an explicitly authorized
-target and credential files are supplied.
+The verifier rejects mixed revisions/tree states, so a kind artifact from a
+different checkout cannot satisfy the final gate. If
+`--kind-smoke-evidence` is omitted, `check-kind-smoke` is recorded as unmet.
+If the complete `S43_TARGET_*` credential set is absent, `browser-target`
+is unmet. Both cases deliberately produce `FINAL-BETA ACCEPTANCE FAIL`.
 
-That behavior is fail-closed by design. Do not convert an unmet job to a pass
-or delete it from the manifest simply to obtain a green verdict.
+Do not hand-edit an unmet job into a pass or delete it from the manifest simply
+to obtain a green verdict.
 
 ### 22.3 Target acceptance
 
