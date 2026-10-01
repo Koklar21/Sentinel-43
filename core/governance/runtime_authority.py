@@ -82,16 +82,15 @@ class Sentinel43RuntimeAuthority:
 
     @property
     def decision_governance_enabled(self) -> bool:
-        """Whether staging/resolution governance is explicitly enabled.
+        """Compatibility alias for the canonical governance switch.
 
-        The authority itself may remain live while this is false because
-        identity/session mutations are also owned by Sentinel-43 and must not
-        bypass the authority boundary.
+        Identity/session ownership keeps the authority live when governance is
+        disabled; decision staging/resolution reads the same single flag.
         """
-        return self._decision_governance_enabled
+        return self._governance_enabled
 
     def _require_decision_governance(self) -> None:
-        if not self._decision_governance_enabled:
+        if not self._governance_enabled:
             raise RuntimeError("Sentinel-43 decision governance is disabled")
 
     @property
