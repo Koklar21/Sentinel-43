@@ -43,7 +43,6 @@ from core.auth.users import (
     get_user_by_id,
     set_user_active,
     set_user_password,
-    set_user_role,
 )
 
 
@@ -63,7 +62,11 @@ class IdentitySelfDeactivationRefused(IdentityGovernanceError):
 
 
 class IdentityLastAdminRefused(IdentityGovernanceError):
-    """The change would remove the final active administrator."""
+    """The change would remove or replace the sole administrator."""
+
+
+class IdentityRoleMutationRefused(IdentityGovernanceError):
+    """Normal account management may not create, promote, or demote admins."""
 
 
 class IdentityRecoveryUnavailable(IdentityGovernanceError):
@@ -129,27 +132,11 @@ class IdentityGovernanceService:
         target: User,
         *,
         new_is_active: bool | None,
-        new_role: str | None,
     ) -> bool:
-        if not (
-            bool(target.is_active)
-            and str(target.role).lower() == "admin"
-        ):
+        if str(target.role).lower() != "admin":
             return False
-
-        effective_is_active = (
-            bool(target.is_active)
-            if new_is_active is None
-            else bool(new_is_active)
-        )
-        effective_role = (
-            str(target.role).lower()
-            if new_role is None
-            else str(new_role).lower()
-        )
-        if effective_is_active and effective_role == "admin":
+        if new_is_active is not False:
             return False
-
         return await count_active_admins(session) <= 1
 
     async def bootstrap_first_admin(
@@ -186,21 +173,26 @@ class IdentityGovernanceService:
         actor: str,
         username: str,
         password: str,
-        role: str,
+        role: str = "observer",
         email: str | None,
     ) -> User:
+        normalized_role = str(role).strip().lower()
+        if normalized_role != "observer":
+            raise IdentityRoleMutationRefused(
+                "all accounts created after bootstrap must be observers"
+            )
         self._authorize(
             operation="create_account",
             actor=actor,
             target=username,
-            metadata={"role": role},
+            metadata={"role": "observer"},
         )
         try:
             user = await create_user(
                 session,
                 username=username,
                 password=password,
-                role=role,
+                role="observer",
                 email=email,
             )
             await session.commit()
@@ -216,27 +208,25 @@ class IdentityGovernanceService:
         actor: str,
         user_id: uuid.UUID,
         new_is_active: bool | None,
-        new_role: str | None,
+        new_role: str | None = None,
     ) -> User:
         target = await get_user_by_id(session, user_id)
         if target is None:
             raise IdentityTargetNotFound(str(user_id))
 
+        if new_role is not None:
+            normalized_role = str(new_role).strip().lower()
+            if normalized_role != str(target.role).strip().lower():
+                raise IdentityRoleMutationRefused(
+                    "account roles are fixed: one bootstrap admin, all others observers"
+                )
+
         if target.username == actor and new_is_active is False:
             raise IdentitySelfDeactivationRefused(target.username)
 
         touches_admin_count = (
-            (
-                new_is_active is not None
-                and str(target.role).lower() == "admin"
-            )
-            or (
-                new_role is not None
-                and (
-                    str(target.role).lower() == "admin"
-                    or str(new_role).lower() == "admin"
-                )
-            )
+            new_is_active is not None
+            and str(target.role).lower() == "admin"
         )
 
         self._authorize(
@@ -245,7 +235,7 @@ class IdentityGovernanceService:
             target=target.username,
             metadata={
                 "new_is_active": new_is_active,
-                "new_role": new_role,
+                "role": str(target.role).lower(),
             },
         )
 
@@ -260,25 +250,13 @@ class IdentityGovernanceService:
                 session,
                 target,
                 new_is_active=new_is_active,
-                new_role=new_role,
             ):
                 raise IdentityLastAdminRefused(target.username)
 
-            role_changed = (
-                new_role is not None
-                and str(new_role).lower() != str(target.role).lower()
-            )
             deactivated = (
                 new_is_active is False
                 and bool(target.is_active)
             )
-
-            if role_changed:
-                target = await set_user_role(
-                    session,
-                    target,
-                    role=str(new_role).lower(),
-                )
 
             if (
                 new_is_active is not None
@@ -295,12 +273,6 @@ class IdentityGovernanceService:
                     session,
                     target.user_id,
                     reason="account_disabled",
-                )
-            elif role_changed:
-                await self._revoke_sessions(
-                    session,
-                    target.user_id,
-                    reason="role_changed",
                 )
 
             await session.commit()
@@ -348,10 +320,8 @@ class IdentityGovernanceService:
             )
 
             if str(target.role).lower() != "admin":
-                target = await set_user_role(
-                    session,
-                    target,
-                    role="admin",
+                raise IdentityRecoveryUnavailable(
+                    "administrator recovery may only target the existing administrator"
                 )
 
             if not bool(target.is_active):
