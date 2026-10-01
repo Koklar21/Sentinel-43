@@ -58,6 +58,7 @@ _MAX_SIGMA_MATCHES_PER_ASSESSMENT: Final[int] = 32
 _SUSPICIOUS_EVENT_TYPES: Final[frozenset[str]] = frozenset(
     {
         "brute_force",
+        "ebpf_suspicious_exec",
         "credential_stuffing",
         "login_failure",
         "auth_failure",
