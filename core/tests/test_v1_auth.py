@@ -184,17 +184,14 @@ def test_v1_rejects_unapproved_role(client: TestClient):
     assert response.status_code == 403
 
 
-def test_v1_accepts_valid_token_and_password(client: TestClient):
-    """A properly authenticated caller reaches the route handler itself --
-    proven by getting the route's own deliberate 501 (POST /v1/assess is
-    disposed as DEPRECATED, see core/api/routers/routers.py's module
-    docstring and S43_BASELINE_VERIFICATION_REPORT.md Section I Defect 4),
-    not an auth rejection. This file only owns the auth boundary; it does
-    not assert anything about /v1/assess's own (deprecated) behavior."""
+def test_v1_accepts_observer_as_authenticated_human(client: TestClient):
+    """Observer is the normal post-bootstrap human role. It must cross the
+    same human route gate used by approval/veto surfaces; account-management
+    authority remains separately admin-only."""
     response = client.post(
         ASSESS_URL,
         json={},
-        headers=_bearer(_build_token(), TEST_PASSWORD),
+        headers=_bearer(_build_token(role="observer"), TEST_PASSWORD),
     )
 
     assert response.status_code == 501, response.text
