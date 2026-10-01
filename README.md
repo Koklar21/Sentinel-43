@@ -90,7 +90,7 @@ It helps answer:
 
 > **Does this activity deserve attention?**
 
-Fenrir produces evidence and threat observations. It does not own governance or enforcement.
+Fenrir produces evidence and threat observations. It combines deterministic threshold scoring with a bounded statistical anomaly baseline; that baseline advances only on newer detector evidence, so repeated polling or retries cannot manufacture anomaly pressure. It does not own governance or enforcement.
 
 ### Heart
 
