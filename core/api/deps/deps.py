@@ -305,7 +305,7 @@ async def _authenticate_request(
 
 
 async def require_operator(request: Request) -> str:
-    """Require a valid Sentinel-43 operator/admin authentication context."""
+    """Require a valid Sentinel-43 observer/admin human authentication context."""
     subject, _claims = await _authenticate_request(
         request,
         legacy_metric_route="/v1",
