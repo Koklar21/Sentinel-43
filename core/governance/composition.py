@@ -137,6 +137,7 @@ def build_runtime_authority_from_settings(
     return Sentinel43RuntimeAuthority(
         orchestrator,
         monitoring_manager=monitoring_manager,
+        governance_enabled=bool(_get(settings, "governance_enabled", True)),
     )
 
 
