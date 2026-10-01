@@ -102,6 +102,7 @@ from ..security_context import (
 from .routers.audit import router as audit_router
 from .routers.auth import router as auth_router
 from .routers.bootstrap import router as bootstrap_router
+from .routers.ebpf import router as ebpf_router
 from .routers.remote_gateway import router as remote_gateway_router
 from .routers.routers import router as watchgate_router
 from .routers.users import router as users_router
@@ -1717,6 +1718,7 @@ async def _start_fenrir() -> None:
             attach(
                 runtime.fenrir_instance.detector,
                 producers={
+                    "ebpf": "sentinel-ebpf",
                     "firewall": (
                         os.getenv(
                             "S43_FIREWALL_MONITORING_SOURCE",
@@ -5072,6 +5074,7 @@ app.include_router(root_router)
 app.include_router(auth_router)
 app.include_router(users_router)
 app.include_router(bootstrap_router)
+app.include_router(ebpf_router)
 app.include_router(remote_gateway_router)
 
 # IMPORTANT:
