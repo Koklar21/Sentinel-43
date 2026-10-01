@@ -82,7 +82,7 @@ def _request(method: str, path: str, body: dict | None = None, headers: dict | N
 @pytest.fixture(scope="session")
 def stack():
     """Wait for the browser stack to be serving, then bootstrap a fresh admin
-    + a non-admin operator through the real API. Assumes run.sh (or CI) has
+    + a non-admin observer through the real API. Assumes run.sh (or CI) has
     already `compose up`-ed the s43browser project."""
     deadline = time.monotonic() + 120
     last = None
@@ -116,7 +116,7 @@ def stack():
         )
         assert s in (200, 201), (s, b)
 
-    # An admin session to create the operator account.
+    # An admin session to create the observer account.
     s, b = _request(
         "POST", "/auth/login",
         {"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD},
@@ -129,7 +129,7 @@ def stack():
     if OPERATOR_USERNAME not in existing:
         s, b = _request(
             "POST", "/users",
-            {"username": OPERATOR_USERNAME, "password": OPERATOR_PASSWORD, "role": "operator"},
+            {"username": OPERATOR_USERNAME, "password": OPERATOR_PASSWORD},
             headers={"Authorization": f"Bearer {admin_token}"},
         )
         assert s in (200, 201), (s, b)
