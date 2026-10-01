@@ -59,6 +59,20 @@ _SUSPICIOUS_EVENT_TYPES: Final[frozenset[str]] = frozenset(
     }
 )
 
+# Existing detector thresholds for identity/IP spray were previously inert.
+# Keep the correlation narrow: only authentication-shaped failures may
+# contribute, so normal traffic fan-out (NAT, shared proxies, service meshes)
+# does not become credential-attack evidence merely because it is diverse.
+_AUTH_CORRELATION_EVENT_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "brute_force",
+        "credential_stuffing",
+        "login_failure",
+        "auth_failure",
+        "failed_login",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class EventContext:
@@ -206,6 +220,16 @@ class DetectorConfig:
                 "failure thresholds must be ordered and positive"
             )
 
+        if self.identity_spray_threshold < 2:
+            raise ValueError(
+                "identity_spray_threshold must be >= 2"
+            )
+
+        if self.ip_spray_threshold < 2:
+            raise ValueError(
+                "ip_spray_threshold must be >= 2"
+            )
+
         if not (
             0
             < self.suspicious_payload_bytes
@@ -285,6 +309,15 @@ class SequenceWindow:
             None,
         ] = OrderedDict()
 
+        # Arrival-time evidence for rejected out-of-order events. The rejected
+        # payload itself is not inserted into the sequence window, but repeated
+        # attempts are still useful timestamp-abuse evidence. Arrival time is
+        # used rather than the untrusted event timestamp so stale timestamps
+        # cannot keep themselves alive indefinitely.
+        self._out_of_order_observed_at: deque[float] = deque(
+            maxlen=self.max_events * 2
+        )
+
     def has_event_id(
         self,
         event_id: str,
@@ -305,19 +338,40 @@ class SequenceWindow:
     def add_event(
         self,
         event: EventContext,
+        *,
+        observed_at: float | None = None,
     ) -> bool:
-        """Append event if it is not older than the current newest event."""
+        """Append an event unless it moves the sequence clock backwards."""
         if (
             self._events
             and event.timestamp
             < self._events[-1].timestamp
         ):
+            self._out_of_order_observed_at.append(
+                time.time()
+                if observed_at is None
+                else float(observed_at)
+            )
             return False
 
         self._events.append(
             event
         )
         return True
+
+    def out_of_order_count(
+        self,
+        *,
+        now: float,
+        window_seconds: float,
+    ) -> int:
+        cutoff = float(now) - float(window_seconds)
+        while (
+            self._out_of_order_observed_at
+            and self._out_of_order_observed_at[0] < cutoff
+        ):
+            self._out_of_order_observed_at.popleft()
+        return len(self._out_of_order_observed_at)
 
     def extend(
         self,
@@ -374,6 +428,12 @@ class SequenceWindow:
         ):
             self._events.popleft()
 
+        while (
+            self._out_of_order_observed_at
+            and self._out_of_order_observed_at[0] < cutoff
+        ):
+            self._out_of_order_observed_at.popleft()
+
 
 class SentinelThreatDetector:
     """Scores event sequences and returns structured assessments."""
@@ -397,6 +457,13 @@ class SentinelThreatDetector:
         # Monotonic across window pruning/recreation, so an "evidence_seq"
         # indicator never goes backwards for the same source.
         self._ingest_seq = 0
+
+        # Cross-window authentication-failure correlation. These indexes are
+        # not a second detector: they make the existing identity/ip spray
+        # thresholds actually participate in SentinelThreatDetector scoring.
+        # Values are last-seen event timestamps inside the detector window.
+        self._auth_identities_by_ip: dict[str, dict[str, float]] = {}
+        self._auth_ips_by_identity: dict[str, dict[str, float]] = {}
 
     def ingest(
         self,
@@ -430,8 +497,12 @@ class SentinelThreatDetector:
                 and len(self._windows)
                 >= self.cfg.max_keys_hint
             ):
-                self._windows.popitem(
+                evicted_key, _ = self._windows.popitem(
                     last=False
+                )
+                self._remove_auth_correlation_pair(
+                    identity=evicted_key[0],
+                    source_ip=evicted_key[1],
                 )
 
             window = self._windows.get(
@@ -467,7 +538,8 @@ class SentinelThreatDetector:
                     event_id
                 )
             ) and window.add_event(
-                event
+                event,
+                observed_at=now,
             ):
                 if event_id:
                     window.mark_event_id(
@@ -475,6 +547,12 @@ class SentinelThreatDetector:
                     )
                 self._ingest_seq += 1
                 window.last_seq = self._ingest_seq
+                if _is_auth_correlation_event(event):
+                    self._record_auth_correlation(
+                        identity=key[0],
+                        source_ip=key[1],
+                        timestamp=float(event.timestamp),
+                    )
 
             window.prune(
                 now=now,
@@ -589,6 +667,18 @@ class SentinelThreatDetector:
                 window_size=0,
             )
 
+        distinct_identities_from_ip, distinct_ips_for_identity = (
+            self._auth_correlation_counts(
+                identity=identity,
+                source_ip=source_ip,
+                now=current,
+            )
+        )
+        out_of_order_events = window.out_of_order_count(
+            now=current,
+            window_seconds=self.cfg.window_seconds,
+        )
+
         indicators: dict[
             str,
             Any,
@@ -604,6 +694,13 @@ class SentinelThreatDetector:
             "subject_principals": sorted(principals),
             "event_count": event_count,
             "failure_count": failure_count,
+            "distinct_auth_identities_from_source_ip": (
+                distinct_identities_from_ip
+            ),
+            "distinct_auth_source_ips_for_identity": (
+                distinct_ips_for_identity
+            ),
+            "out_of_order_events": out_of_order_events,
             "max_payload_bytes": payload_max,
             "top_event_types": dict(
                 type_counter.most_common(
@@ -758,6 +855,47 @@ class SentinelThreatDetector:
                 "server_error_cluster"
             )
 
+        if out_of_order_events:
+            timestamp_score = min(
+                20.0,
+                float(out_of_order_events)
+                * self.cfg.out_of_order_penalty,
+            )
+            score += timestamp_score
+            tags.append("timestamp_out_of_order")
+            indicators["timestamp_out_of_order_score"] = round(
+                timestamp_score,
+                2,
+            )
+            if out_of_order_events >= 3:
+                tags.append("timestamp_out_of_order_repeated")
+
+        identity_spray = (
+            distinct_identities_from_ip
+            >= self.cfg.identity_spray_threshold
+        )
+        ip_spray = (
+            distinct_ips_for_identity
+            >= self.cfg.ip_spray_threshold
+        )
+
+        if identity_spray:
+            tags.append("credential_spray_ip_to_identities")
+            indicators["identity_spray_threshold"] = (
+                self.cfg.identity_spray_threshold
+            )
+
+        if ip_spray:
+            tags.append("credential_spray_identity_to_ips")
+            indicators["ip_spray_threshold"] = self.cfg.ip_spray_threshold
+
+        # Crossing either existing spray threshold is itself a HIGH-quality
+        # credential-attack pattern. Use a severity floor instead of stacking
+        # two large additive bonuses, which would turn overlapping evidence
+        # into artificial CRITICAL scores.
+        if identity_spray or ip_spray:
+            score = max(score, 65.0)
+
         source_kind = (
             self._classify_source(
                 event_count=event_count,
@@ -839,6 +977,10 @@ class SentinelThreatDetector:
                         ),
                         None,
                     )
+                    self._remove_auth_correlation_pair(
+                        identity=identity,
+                        source_ip=source_ip,
+                    )
                     continue
 
                 assessments.append(
@@ -905,6 +1047,92 @@ class SentinelThreatDetector:
     ) -> None:
         with self._lock:
             self._windows.clear()
+            self._auth_identities_by_ip.clear()
+            self._auth_ips_by_identity.clear()
+
+    def _record_auth_correlation(
+        self,
+        *,
+        identity: str,
+        source_ip: str,
+        timestamp: float,
+    ) -> None:
+        by_ip = self._auth_identities_by_ip.setdefault(
+            source_ip,
+            {},
+        )
+        by_ip[identity] = max(
+            float(timestamp),
+            by_ip.get(identity, float("-inf")),
+        )
+
+        by_identity = self._auth_ips_by_identity.setdefault(
+            identity,
+            {},
+        )
+        by_identity[source_ip] = max(
+            float(timestamp),
+            by_identity.get(source_ip, float("-inf")),
+        )
+
+    def _remove_auth_correlation_pair(
+        self,
+        *,
+        identity: str,
+        source_ip: str,
+    ) -> None:
+        by_ip = self._auth_identities_by_ip.get(source_ip)
+        if by_ip is not None:
+            by_ip.pop(identity, None)
+            if not by_ip:
+                self._auth_identities_by_ip.pop(source_ip, None)
+
+        by_identity = self._auth_ips_by_identity.get(identity)
+        if by_identity is not None:
+            by_identity.pop(source_ip, None)
+            if not by_identity:
+                self._auth_ips_by_identity.pop(identity, None)
+
+    @staticmethod
+    def _prune_auth_bucket(
+        bucket: dict[str, float],
+        *,
+        cutoff: float,
+    ) -> None:
+        for key in [
+            key
+            for key, timestamp in bucket.items()
+            if timestamp < cutoff
+        ]:
+            bucket.pop(key, None)
+
+    def _auth_correlation_counts(
+        self,
+        *,
+        identity: str,
+        source_ip: str,
+        now: float,
+    ) -> tuple[int, int]:
+        cutoff = float(now) - self.cfg.window_seconds
+
+        by_ip = self._auth_identities_by_ip.get(source_ip)
+        if by_ip is not None:
+            self._prune_auth_bucket(by_ip, cutoff=cutoff)
+            if not by_ip:
+                self._auth_identities_by_ip.pop(source_ip, None)
+                by_ip = None
+
+        by_identity = self._auth_ips_by_identity.get(identity)
+        if by_identity is not None:
+            self._prune_auth_bucket(by_identity, cutoff=cutoff)
+            if not by_identity:
+                self._auth_ips_by_identity.pop(identity, None)
+                by_identity = None
+
+        return (
+            len(by_ip or {}),
+            len(by_identity or {}),
+        )
 
     def _validate_event_time(
         self,
@@ -961,6 +1189,12 @@ class SentinelThreatDetector:
             type_counter
         )
 
+        if (
+            "credential_spray_ip_to_identities" in tags
+            or "credential_spray_identity_to_ips" in tags
+        ):
+            return ThreatKind.CREDENTIAL_ATTACK
+
         if {
             "credential_stuffing",
             "brute_force",
@@ -1002,6 +1236,9 @@ class SentinelThreatDetector:
                 ThreatKind.PAYLOAD_ABUSE
             )
 
+        if "timestamp_out_of_order_repeated" in tags:
+            return ThreatKind.TIMESTAMP_ABUSE
+
         if (
             event_count
             >= self.cfg.medium_events_per_window
@@ -1040,6 +1277,26 @@ def _normalize_ip(
         raise ValueError(
             f"source_ip is not a valid IP address: {value!r}"
         ) from exc
+
+
+def _is_auth_correlation_event(
+    event: EventContext,
+) -> bool:
+    normalized_type = _event_type_norm(event.event_type)
+
+    if normalized_type in _AUTH_CORRELATION_EVENT_TYPES:
+        return True
+
+    if event.status_code in {401, 403}:
+        return True
+
+    if event.success is False and (
+        "login" in normalized_type
+        or "auth" in normalized_type
+    ):
+        return True
+
+    return False
 
 
 def _event_type_norm(
