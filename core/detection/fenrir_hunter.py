@@ -276,6 +276,12 @@ class _WelfordStream:
         self,
         value: float,
     ) -> float:
+        """Return the upper-tail z-score for a threat score.
+
+        Fenrir is looking for suspicious increases above an established
+        baseline. A large downward deviation may be statistically unusual,
+        but it is not evidence of increased threat and must not escalate.
+        """
         standard_deviation = self.std
 
         if (
@@ -284,12 +290,13 @@ class _WelfordStream:
         ):
             return 0.0
 
-        return abs(
+        return max(
+            0.0,
             (
                 value
                 - self.mean
             )
-            / standard_deviation
+            / standard_deviation,
         )
 
 
