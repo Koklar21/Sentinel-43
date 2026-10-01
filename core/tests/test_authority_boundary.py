@@ -258,6 +258,16 @@ def test_the_only_engine_class_loaded_is_the_owner_response_engine():
     assert ENGINE_CLASS_NAME == "Sentinel43ResponseEngine"
 
 
+def test_runtime_authority_has_one_canonical_governance_flag():
+    source = (
+        CORE / "governance" / "runtime_authority.py"
+    ).read_text(encoding="utf-8")
+
+    assert "self._governance_enabled = bool(governance_enabled)" in source
+    assert "return self._governance_enabled" in source
+    assert "if not self._governance_enabled:" in source
+    assert "self._decision_governance_enabled" not in source
+
 def test_runtime_authority_owns_the_monitoring_manager():
     authority_source = (
         CORE / "governance" / "runtime_authority.py"
