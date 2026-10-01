@@ -936,7 +936,10 @@ async def _resolve_governance_and_commit_action(
         # configured, and the decision was committed to the in-memory
         # store with no governance and no durable audit -- the default
         # path, since S43_GOVERNANCE_ENABLED defaults false.
-        if runtime.sentinel43 is None:
+        if (
+            runtime.sentinel43 is None
+            or not runtime.sentinel43.governance_enabled
+        ):
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -1897,15 +1900,26 @@ def _report_runtime_identity_to_sentinel43() -> None:
 
 
 async def _start_governance() -> None:
-    if not _env_bool("S43_GOVERNANCE_ENABLED", False):
-        runtime.subsystems.mark_disabled(SUBSYS_GOVERNANCE)
-        return
+    governance_enabled = _env_bool("S43_GOVERNANCE_ENABLED", False)
 
+    # Sentinel43RuntimeAuthority owns more than recommendation governance:
+    # identity/session mutations (bootstrap, users, refresh rotation) also
+    # cross this boundary. Therefore the authority must exist even when
+    # decision governance is disabled. The feature flag controls governed
+    # recommendation/decision behavior, not whether Sentinel-43 itself exists.
     if runtime.audit_store is None:
-        raise RuntimeError(
-            "Governance requires an initialized authoritative audit store. "
-            "Refusing to start Sentinel-43 runtime authority without one."
+        if governance_enabled or not IS_LOCAL_ENV:
+            raise RuntimeError(
+                "Sentinel-43 runtime authority requires an initialized "
+                "authoritative audit store."
+            )
+        runtime.sentinel43 = None
+        runtime.subsystems.mark_disabled(SUBSYS_GOVERNANCE)
+        logger.warning(
+            "Sentinel43RuntimeAuthority identity ownership is unavailable "
+            "because the local audit store is not configured."
         )
+        return
 
     try:
         from core.governance import build_runtime_authority_from_settings
@@ -1920,6 +1934,7 @@ async def _start_governance() -> None:
 
         class Settings:
             environment = SENTINEL_ENV
+            governance_enabled = governance_enabled
             default_mode = resolved_default_mode
             hash_device_ids = _env_bool(
                 "S43_GOVERNANCE_HASH_DEVICE_IDS",
@@ -1969,14 +1984,22 @@ async def _start_governance() -> None:
                 "Sentinel-43 runtime identity reporting failed",
                 exc_info=True,
             )
-        runtime.subsystems.mark_active(
-            SUBSYS_GOVERNANCE,
-            f"Human-gated orchestrator active (mode={resolved_default_mode}).",
-        )
-        logger.info(
-            "Sentinel43RuntimeAuthority started (mode=%s)",
-            resolved_default_mode,
-        )
+        if governance_enabled:
+            runtime.subsystems.mark_active(
+                SUBSYS_GOVERNANCE,
+                f"Human-gated orchestrator active (mode={resolved_default_mode}).",
+            )
+            logger.info(
+                "Sentinel43RuntimeAuthority started with decision governance "
+                "enabled (mode=%s)",
+                resolved_default_mode,
+            )
+        else:
+            runtime.subsystems.mark_disabled(SUBSYS_GOVERNANCE)
+            logger.info(
+                "Sentinel43RuntimeAuthority started for identity/session "
+                "ownership; decision governance is disabled."
+            )
     except Exception as exc:
         runtime.sentinel43 = None
         runtime.subsystems.mark_failed(
@@ -2764,8 +2787,9 @@ async def lifespan(api: FastAPI):
         await _start_reliability()
         await _start_governance()
         # Heart recovery must finish before Fenrir can submit a live finding
-        # into the governed path. With governance disabled, Fenrir still
-        # starts observational-only with authority=None.
+        # into the governed path. The Sentinel-43 authority remains present
+        # for identity/session ownership even when decision governance is
+        # disabled; without an attached Heart, Fenrir remains observational.
         await _start_heart()
         await _start_fenrir()
 
@@ -3229,7 +3253,10 @@ async def governance_pending_reviews(
 ) -> dict[str, Any]:
     await _require_operator(request)
 
-    if runtime.sentinel43 is None:
+    if (
+        runtime.sentinel43 is None
+        or not runtime.sentinel43.governance_enabled
+    ):
         return {
             "enabled": False,
             "pending": [],
