@@ -249,6 +249,13 @@ services:
       S43_FENRIR_ANOMALY_DECAY: ${S43_FENRIR_ANOMALY_DECAY:-0.002}
       S43_FENRIR_MAX_HONEYPOT_EVENTS: ${S43_FENRIR_MAX_HONEYPOT_EVENTS:-500}
 
+      # Sigma-compatible deterministic detection. Rules are read-only source
+      # files baked into or mounted under the configured path.
+      S43_SIGMA_ENABLED: ${S43_SIGMA_ENABLED:-false}
+      S43_SIGMA_RULES_PATH: ${S43_SIGMA_RULES_PATH:-/app/rules/sigma}
+      S43_SIGMA_MAX_RULES: ${S43_SIGMA_MAX_RULES:-256}
+      S43_SIGMA_MAX_MATCHES_PER_EVENT: ${S43_SIGMA_MAX_MATCHES_PER_EVENT:-8}
+
       # FenrirHunter runs embedded in this container and reports back through
       # the API bridge under its OWN service identity (never the Watchtower
       # service token). Without these it reaches HUNTING but has no report
