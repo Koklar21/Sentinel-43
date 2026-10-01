@@ -464,6 +464,22 @@ jobs:
           curl -fsS -H "Host: s43-api" http://localhost:18000/health
           curl -fsS -H "Host: s43-api" http://localhost:18000/bootstrap/status
 
+      - name: Record exact-revision kind acceptance evidence
+        run: |
+          set -euo pipefail
+          mkdir -p acceptance_out
+          python scripts/acceptance_gate.py revision --out acceptance_out
+          python scripts/acceptance_gate.py record-ci check-kind-smoke --out acceptance_out --result success
+
+      - name: Upload kind acceptance evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-kind-smoke
+          path: |
+            acceptance_out/jobs/check-kind-smoke.meta.json
+            acceptance_out/revision.json
+          if-no-files-found: error
+
       - name: Teardown
         if: always()
         run: kind delete cluster --name $(kind get clusters | head -1) || true
