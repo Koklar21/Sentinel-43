@@ -121,7 +121,7 @@ def _mk_user(eng, username="wsop", password="wsop-password-1234"):
         c.execute(
             text(
                 "INSERT INTO users (user_id, username, password_hash, role, is_active, created_at) "
-                "VALUES (:i, :u, :h, 'operator', true, now())"
+                "VALUES (:i, :u, :h, 'observer', true, now())"
             ),
             {"i": uid, "u": username, "h": PasswordHasher().hash(password)},
         )
