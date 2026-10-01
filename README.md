@@ -90,7 +90,7 @@ It helps answer:
 
 > **Does this activity deserve attention?**
 
-Fenrir produces evidence and threat observations. It combines deterministic threshold scoring with a bounded statistical anomaly baseline; that baseline advances only on newer detector evidence, so repeated polling or retries cannot manufacture anomaly pressure. It does not own governance or enforcement.
+Fenrir produces evidence and threat observations. It combines deterministic threshold scoring, an optional bounded Sigma-compatible rule matcher, and a bounded statistical anomaly baseline; that baseline advances only on newer detector evidence, so repeated polling or retries cannot manufacture anomaly pressure. Sigma rules are parsed with pySigma and limited to the event-local S43 telemetry subset documented in [docs/SIGMA_DETECTION.md](docs/SIGMA_DETECTION.md). Fenrir and Sigma do not own governance or enforcement.
 
 ### Heart
 
