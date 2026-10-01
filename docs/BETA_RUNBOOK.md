@@ -793,17 +793,19 @@ kubectl exec -n sentinel43 netpol-test -- timeout 5 nc -zv s43-db 5432    # must
 kubectl exec -n sentinel43 netpol-test -- timeout 5 nc -zv s43-core 9100  # must hang/fail
 kubectl delete pod netpol-test -n sentinel43
 ```
-This is a **manual** procedure — it is not run in CI today.
-`scripts/k8s_policy_check.py` only statically checks that NetworkPolicy
-objects exist and reference real selectors, and the hosted `kind smoke deploy`
-job installs Calico and runs a *positive* smoke (rollout, `/ready`, posture
-assertions, health/bootstrap over the Host header) with the policies applied.
-Installing Calico and seeing the workload come up is **not** proof that
-forbidden connections are refused; no CI job runs the negative connectivity
-test above. (A one-time development run against a kind cluster with Calico is
-recorded in `deploy/kubernetes/README.md`, not in CI.) Run it against your actual cluster's CNI before trusting the
-policies are doing anything — enforcement depends on the CNI, not just the
-manifest.
+The hosted `kind smoke deploy` CI job now runs the same enforcement class
+against a disposable kind cluster with Calico. It first proves the labeled
+`s43-api` pod can reach PostgreSQL and `s43-core`, then launches a
+PSS-restricted, deliberately unlabeled pod and requires direct TCP connections
+to both Services to fail. The job retains that output in
+`acceptance-kind-smoke` alongside the exact-revision acceptance metadata.
+
+That hosted result proves the committed policies are actually enforced by the
+Calico CI environment; it does **not** prove your real target's CNI behaves the
+same way. Run the commands above against the actual beta cluster as target
+evidence before trusting its isolation. `scripts/k8s_policy_check.py` remains
+the static selector/object check; the live negative probe is the enforcement
+check.
 
 ## 21. Evidence to retain
 
