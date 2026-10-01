@@ -573,7 +573,7 @@
          API, which is governed by Sentinel43RuntimeAuthority server-side. -->
     <div class="panel">
       <div class="panel-hdr">
-        <div class="panel-title"><span>//</span>ADMIN ACCOUNTS</div>
+        <div class="panel-title"><span>//</span>ACCOUNT GOVERNANCE</div>
         <div class="toolbar">
           <span id="userCountChip" class="chip">USERS&nbsp;<strong id="userCount">—</strong></span>
           <button id="usersRefreshBtn" class="btn ghost" type="button" title="Refresh accounts" aria-label="Refresh accounts" disabled>↻</button>
@@ -673,8 +673,8 @@
 <div id="userModal" class="modal-overlay" hidden aria-hidden="true" role="dialog" aria-modal="true">
   <div class="modal-bd" data-close-user></div>
   <div class="modal-card">
-    <h3>Create Sentinel-43 User</h3>
-    <p>Creates a governed database account. Only an authenticated administrator can complete this action.</p>
+    <h3>Create Sentinel-43 Observer</h3>
+    <p>Creates an observer account. The first-run administrator is the deployment's only administrator; observer accounts can participate in approval/veto decisions but cannot become administrators.</p>
     <div class="form-grid">
       <div class="form-field full">
         <label for="userUsername">Username</label>
@@ -685,11 +685,8 @@
         <input type="email" id="userEmail" maxlength="255" autocomplete="off" />
       </div>
       <div class="form-field">
-        <label for="userRole">Role</label>
-        <select id="userRole">
-          <option value="operator" selected>operator</option>
-          <option value="admin">admin</option>
-        </select>
+        <label>Role</label>
+        <input type="text" value="observer" readonly aria-label="Role: observer" />
       </div>
       <div class="form-field">
         <label for="userPassword">Password</label>
@@ -703,7 +700,7 @@
     <div id="userModalError" class="modal-err"></div>
     <div class="modal-actions">
       <button id="userCancel" class="btn" type="button">Cancel</button>
-      <button id="userConfirm" class="btn cyan" type="button">Create User</button>
+      <button id="userConfirm" class="btn cyan" type="button">Create Observer</button>
     </div>
   </div>
 </div>
