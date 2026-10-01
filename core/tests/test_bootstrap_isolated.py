@@ -121,7 +121,7 @@ class _FakeUserStore:
         *,
         username: str,
         password: str,
-        role: str = "operator",
+        role: str = "observer",
         email: str | None = None,
     ) -> _FakeUser:
         user = _FakeUser(
@@ -144,9 +144,14 @@ class _FakeUserStore:
             raise users_module.FirstAdminExistsError()
         if await self.get_user_by_username(session, username) is not None:
             raise users_module.UsernameTakenError(username)
-        return await self.create_user(
-            session, username=username, password=password, role="admin", email=email
+        user = _FakeUser(
+            username=username,
+            password_hash=users_module.hash_password(password),
+            role="admin",
+            email=email,
         )
+        self.users[username] = user
+        return user
 
     async def authenticate_user(
         self, session, username: str, password: str
