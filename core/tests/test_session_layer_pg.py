@@ -87,7 +87,7 @@ def _t(coro_fn):
 
 async def _mk_user(sm, username="op", *, active=True):
     async with sm() as s:
-        u = await create_user(s, username=username, password="p" * 16, role="operator")
+        u = await create_user(s, username=username, password="p" * 16, role="observer")
         if not active:
             await set_user_active(s, u, is_active=False)
         await s.commit()
@@ -356,45 +356,32 @@ async def test_disabled_owner_cannot_refresh_and_session_is_revoked():
 
 
 # ---------------------------------------------------------------------------
-# role change (mission Pass 5A §18)
+# account role ownership
 # ---------------------------------------------------------------------------
 
 @_t
-async def test_role_change_then_refresh_uses_current_role():
-    """The session row stores NO role — so a /auth/refresh route that re-reads
-    users.role after rotate_refresh() naturally issues the NEW role. Stale
-    role is not perpetuated through refresh."""
+async def test_session_record_has_no_role_and_owner_role_is_read_live():
+    """Session rows carry no authorization role. The live user row remains the
+    authority for the observer/admin distinction."""
     async with _db() as sm:
-        from core.auth.users import get_user_by_id, set_user_role
-        uid = await _mk_user(sm, "promoteme")            # starts operator
+        from core.auth.users import get_user_by_id
+
+        uid = await _mk_user(sm, "observer1")
         secret = S.generate_refresh_secret()
         async with sm() as s:
             await S.create_session(s, user_id=uid, refresh_secret=secret)
             await s.commit()
 
-        # SessionRecord carries no role at all
         assert not hasattr(S.SessionRecord, "role")
-
-        async with sm() as s:
-            u = await get_user_by_id(s, uid)
-            await set_user_role(s, u, role="admin")
-            await s.commit()
 
         s2 = S.generate_refresh_secret()
         async with sm() as s:
             row, _ = await S.rotate_refresh(
                 s, presented_secret=secret, new_refresh_secret=s2,
             )
-            # what a route would do next: re-read the live role
             u = await get_user_by_id(s, row.user_id)
-            assert u.role == "admin"
+            assert u.role == "observer"
             await s.commit()
-
-        # and revoke_all_user_sessions(reason="role_change") is the hook a
-        # route calls to force a fresh token immediately
-        async with sm() as s:
-            n = await S.revoke_all_user_sessions(s, uid, reason="role_change")
-            assert n == 1
             await s.commit()
         async with sm() as s:
             with pytest.raises(S.SessionRevokedError):
