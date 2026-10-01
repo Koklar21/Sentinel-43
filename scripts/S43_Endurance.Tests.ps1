@@ -140,11 +140,34 @@ function Invoke-PulseRequest {
     try {
         $response = Invoke-WebRequest @params
         $sw.Stop()
+
+        $statusCode = [int]$response.StatusCode
+        $healthy = ($statusCode -eq 200)
+        $errorText = ""
+
+        if ($healthy -and $Path -in @("/watchtower/health", "/watchtower/ready")) {
+            try {
+                $body = [string]$response.Content | ConvertFrom-Json -ErrorAction Stop
+                if ($body.reachable -ne $true) {
+                    $healthy = $false
+                    $errorText = "Watchtower bridge returned HTTP 200 but reachable was not true."
+                }
+            }
+            catch {
+                $healthy = $false
+                $errorText = "Watchtower bridge returned HTTP 200 without valid reachable=true JSON: $($_.Exception.Message)"
+            }
+        }
+        elseif (-not $healthy) {
+            $errorText = "Expected HTTP 200."
+        }
+
         return [pscustomobject]@{
             Path       = $Path
-            StatusCode = [int]$response.StatusCode
+            StatusCode = $statusCode
             DurationMs = [int]$sw.ElapsedMilliseconds
-            Error      = ""
+            Healthy    = $healthy
+            Error      = $errorText
         }
     }
     catch {
@@ -163,6 +186,7 @@ function Invoke-PulseRequest {
             Path       = $Path
             StatusCode = $status
             DurationMs = [int]$sw.ElapsedMilliseconds
+            Healthy    = $false
             Error      = $_.Exception.Message
         }
     }
@@ -315,7 +339,7 @@ try {
             $result = Invoke-PulseRequest -Path $path
             $pulseResults += $result
 
-            if ($result.StatusCode -eq 200) {
+            if ($result.Healthy) {
                 Write-Host ("  [PASS] GET {0,-24} HTTP {1}  {2} ms" -f $path, $result.StatusCode, $result.DurationMs) -ForegroundColor Green
             }
             else {
