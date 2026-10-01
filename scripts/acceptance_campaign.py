@@ -246,6 +246,13 @@ def main() -> int:
                     help="campaign scheduling default: defer heavyweight jobs until this much RAM (MB) is free. "
                          "Never affects PASS/FAIL/SKIP; not a Sentinel-43 policy")
     ap.add_argument("--skip-browser", action="store_true", help="record the browser job as unmet instead of running it")
+    ap.add_argument(
+        "--kind-smoke-evidence",
+        help=(
+            "path to exact-revision hosted kind evidence: either "
+            "check-kind-smoke.meta.json itself or the extracted acceptance-kind-smoke artifact directory"
+        ),
+    )
     args = ap.parse_args()
     if args.cmd == "check":
         return do_check(args.name)
@@ -291,8 +298,28 @@ def main() -> int:
         if job == "check-image-scan":
             wait_memory(job, args.min_free_mb)
         gate("run-check", "--out", out, job, "--", *check_command(name))
-    gate("mark-unmet", "check-kind-smoke", "--out", out,
-         "--reason", "kind + Calico smoke deploy needs a hosted CI runner / kind binary; none available locally")
+    if args.kind_smoke_evidence:
+        supplied = Path(args.kind_smoke_evidence).resolve()
+        candidates = (
+            [supplied] if supplied.is_file()
+            else [
+                supplied / "jobs" / "check-kind-smoke.meta.json",
+                supplied / "check-kind-smoke.meta.json",
+            ]
+        )
+        source = next((p for p in candidates if p.is_file()), None)
+        if source is None:
+            raise SystemExit(
+                "--kind-smoke-evidence did not contain check-kind-smoke.meta.json"
+            )
+        destination = Path(out) / "jobs" / "check-kind-smoke.meta.json"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        print(f"seeded hosted kind evidence: {source}", flush=True)
+    else:
+        gate("mark-unmet", "check-kind-smoke", "--out", out,
+             "--reason", "kind + Calico smoke deploy needs hosted exact-revision evidence; "
+                         "supply --kind-smoke-evidence to reconcile it")
     return gate("verify", "--out", out, "--mode", "final-beta")
 
 
