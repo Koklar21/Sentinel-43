@@ -109,7 +109,7 @@ def test_no_credentials_persisted_in_web_storage_or_url(stack, page):
 def test_reload_restores_the_session_without_a_fresh_login(stack, page):
     do_login(page, stack["base_url"], *stack["admin"])
     page.reload()
-    page.wait_for_function("!!window.SentinelAuth && window.SentinelAuth.hasToken()")
+    wait_until_true(page, "!!window.SentinelAuth && window.SentinelAuth.hasToken()")
     overlay = page.locator("#s43-login-overlay")
     assert overlay.count() == 0 or overlay.evaluate("el => el.style.display === 'none'")
 
@@ -118,9 +118,9 @@ def test_two_tabs_and_a_reload_do_not_wedge_the_ui(stack, page, context):
     do_login(page, stack["base_url"], *stack["admin"])
     second = context.new_page()
     second.goto(stack["base_url"] + "/dashboard")
-    second.wait_for_function("!!window.SentinelAuth && window.SentinelAuth.hasToken()")
+    wait_until_true(second, "!!window.SentinelAuth && window.SentinelAuth.hasToken()")
     page.reload()
-    page.wait_for_function("window.SentinelAuth.hasToken()")
+    wait_until_true(page, "window.SentinelAuth.hasToken()")
     assert page.evaluate("window.SentinelAuth.hasToken()")
     assert second.evaluate("window.SentinelAuth.hasToken()")
     second.close()
@@ -199,17 +199,19 @@ def test_admin_disable_invalidates_the_targets_live_session(stack, page):
 def test_real_wss_connects_and_authenticates_then_logout_drops_it(stack, page):
     do_login(page, stack["base_url"], *stack["admin"])
 
-    page.wait_for_function(
+    wait_until_true(
+        page,
         "window.SentinelWS && window.SentinelWS.connected && window.SentinelWS.authenticated",
-        timeout=20_000,
+        timeout_ms=20_000,
     )
     # secure page => wss:// socket
     assert page.evaluate("window.SentinelWS.connected")
 
     page.evaluate("window.SentinelAuth.logout()")
-    page.wait_for_function(
+    wait_until_true(
+        page,
         "!(window.SentinelWS && window.SentinelWS.authenticated)",
-        timeout=30_000,
+        timeout_ms=30_000,
     )
 
 
@@ -229,9 +231,10 @@ def test_reconnect_backoff_survives_repeated_pre_auth_closes(stack, page):
     test is untouched.
     """
     do_login(page, stack["base_url"], *stack["admin"])
-    page.wait_for_function(
+    wait_until_true(
+        page,
         "window.SentinelWS && window.SentinelWS.connected && window.SentinelWS.authenticated",
-        timeout=20_000,
+        timeout_ms=20_000,
     )
 
     # Simulate an auth-backend outage: every new transport opens, then the
