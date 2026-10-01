@@ -299,6 +299,7 @@ class _IdentityBaseline:
         default_factory=_WelfordStream
     )
     pressure: float = 0.0
+    last_evidence_seq: int = 0
     last_seen_monotonic: float = field(
         default_factory=time.monotonic
     )
@@ -363,6 +364,10 @@ class FenrirAnomalyLayer:
 
         self._stats: dict[str, int] = {
             "updates": 0,
+            "fresh_updates": 0,
+            "duplicate_updates_skipped": 0,
+            "sequence_regressions_skipped": 0,
+            "missing_evidence_seq_skipped": 0,
             "zscore_fires": 0,
             "pressure_fires": 0,
             "keys_evicted": 0,
@@ -378,6 +383,17 @@ class FenrirAnomalyLayer:
             str(assessment.source_ip),
         )
 
+        raw_evidence_seq = assessment.indicators.get(
+            "evidence_seq"
+        )
+        evidence_seq = (
+            raw_evidence_seq
+            if isinstance(raw_evidence_seq, int)
+            and not isinstance(raw_evidence_seq, bool)
+            and raw_evidence_seq > 0
+            else None
+        )
+
         now = time.monotonic()
         score = float(
             assessment.score
@@ -387,6 +403,32 @@ class FenrirAnomalyLayer:
             self._stats[
                 "updates"
             ] += 1
+
+            # Fenrir's statistical layer is allowed to learn only from fresh
+            # detector evidence. assess_all() is polled repeatedly even when
+            # nothing new arrived; treating each poll as a new observation
+            # would inflate cumulative pressure and contaminate the baseline.
+            if evidence_seq is None:
+                self._stats[
+                    "missing_evidence_seq_skipped"
+                ] += 1
+                return None
+
+            existing = self._baselines.get(
+                key
+            )
+            if existing is not None:
+                if evidence_seq < existing.last_evidence_seq:
+                    self._stats[
+                        "sequence_regressions_skipped"
+                    ] += 1
+                    return None
+
+                if evidence_seq == existing.last_evidence_seq:
+                    self._stats[
+                        "duplicate_updates_skipped"
+                    ] += 1
+                    return None
 
             if (
                 key not in self._baselines
@@ -414,6 +456,10 @@ class FenrirAnomalyLayer:
                 self._baselines.move_to_end(
                     key
                 )
+
+            self._stats[
+                "fresh_updates"
+            ] += 1
 
             previous_count = (
                 baseline.stream.count
@@ -456,6 +502,7 @@ class FenrirAnomalyLayer:
             baseline.pressure = (
                 projected_pressure
             )
+            baseline.last_evidence_seq = evidence_seq
             baseline.last_seen_monotonic = (
                 now
             )
@@ -515,6 +562,9 @@ class FenrirAnomalyLayer:
             anomaly[
                 "observations"
             ] = previous_count
+            anomaly[
+                "evidence_seq"
+            ] = evidence_seq
 
             return anomaly
 
