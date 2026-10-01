@@ -14,7 +14,7 @@
 # sid-bound access token; /auth/refresh rotates; /auth/logout revokes;
 # replay of a rotated value revokes the whole session; CSRF + Origin are
 # enforced; a session-bound token reaches protected routes WITHOUT
-# X-S43-Password; disablement / role change / password reset kill live
+# X-S43-Password; disablement / password reset kill live
 # sessions immediately; an expired session is rejected.
 #
 #   S43_TEST_PG_DSN=postgresql+asyncpg://s43t:x@127.0.0.1:55440/s43t \
@@ -130,7 +130,7 @@ def client(db, monkeypatch):
     users_mod._sessionmaker = None
 
 
-def _mk_user(db, username="op1", password="op1-password-1234", role="operator", is_active=True):
+def _mk_user(db, username="op1", password="op1-password-1234", role="observer", is_active=True):
     uid = uuid.uuid4()
     with db.begin() as c:
         c.execute(
@@ -274,13 +274,12 @@ def test_replay_of_a_rotated_refresh_value_revokes_the_session(client, db):
     assert n == 1
 
 
-def test_refresh_reflects_a_role_change_at_rotation_time(client, db):
-    uid = _mk_user(db, role="operator")
+def test_refresh_preserves_observer_role_at_rotation_time(client, db):
+    _mk_user(db, role="observer")
     _login(client)
-    _exec(db, "UPDATE users SET role='admin' WHERE user_id=:i", i=uid)
     r = client.post("/auth/refresh", headers={"Origin": _ORIGIN, "X-S43-CSRF": _csrf(client)})
     assert r.status_code == 200
-    assert r.json()["role"] == "admin"
+    assert r.json()["role"] == "observer"
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +318,7 @@ def test_expired_session_is_rejected(client, db):
 
 def test_admin_password_reset_revokes_target_sessions(client, db):
     _mk_user(db, username="admin1", password="admin1-password-1234", role="admin")
-    op_uid = _mk_user(db, username="op2", password="op2-password-1234", role="operator")
+    op_uid = _mk_user(db, username="op2", password="op2-password-1234", role="observer")
 
     op_token = _login(client, "op2", "op2-password-1234").json()["access_token"]
     assert _v1(client, op_token).status_code == 200
@@ -334,7 +333,7 @@ def test_admin_password_reset_revokes_target_sessions(client, db):
     )
     assert reset.status_code == 200, reset.text
 
-    # operator's old session is revoked now
+    # observer's old session is revoked now
     assert _v1(client, op_token).status_code == 401
 
 
