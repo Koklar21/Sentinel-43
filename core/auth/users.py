@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 APPROVED_ROLES: Final[frozenset[str]] = frozenset(
-    {"operator", "admin"}
+    {"observer", "admin"}
 )
 
 ADMIN_INVARIANT_LOCK_KEY: Final[int] = 0x5334334200000001
@@ -135,7 +135,11 @@ class UsernameTakenError(AccountError):
 
 
 class LastAdminError(AccountError):
-    """Raised when a mutation would remove the final active administrator."""
+    """Raised when a mutation would remove the sole administrator."""
+
+
+class AdminRoleImmutableError(AccountError):
+    """Raised when normal account code attempts to create/change admin role."""
 
 
 # =============================================================================
@@ -162,7 +166,7 @@ class User(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "role IN ('operator', 'admin')",
+            "role IN ('observer', 'admin')",
             name="role",
         ),
     )
@@ -194,7 +198,7 @@ class User(Base):
     role: Mapped[str] = mapped_column(
         String(32),
         nullable=False,
-        default="operator",
+        default="observer",
     )
 
     is_active: Mapped[bool] = mapped_column(
@@ -698,12 +702,16 @@ async def create_user(
     *,
     username: str,
     password: str,
-    role: str = "operator",
+    role: str = "observer",
     email: str | None = None,
 ) -> User:
     normalized_role = _validate_role(
         role
     )
+    if normalized_role != "observer":
+        raise AdminRoleImmutableError(
+            "administrator role may only be created by first-run bootstrap"
+        )
 
     user = User(
         username=username,
@@ -711,7 +719,7 @@ async def create_user(
         password_hash=await hash_password_async(
             password
         ),
-        role=normalized_role,
+        role="observer",
     )
 
     session.add(
@@ -752,13 +760,17 @@ async def create_first_admin(
             username
         )
 
-    return await create_user(
-        session,
+    user = User(
         username=username,
-        password=password,
-        role="admin",
         email=email,
+        password_hash=await hash_password_async(
+            password
+        ),
+        role="admin",
     )
+    session.add(user)
+    await session.flush()
+    return user
 
 
 async def authenticate_user(
@@ -823,10 +835,15 @@ async def set_user_role(
     *,
     role: str,
 ) -> User:
-    user.role = _validate_role(
-        role
-    )
-
+    normalized = _validate_role(role)
+    current = str(user.role).strip().lower()
+    if normalized == current:
+        return user
+    if "admin" in {current, normalized}:
+        raise AdminRoleImmutableError(
+            "administrator role is immutable after first-run bootstrap"
+        )
+    user.role = normalized
     await session.flush()
     return user
 
@@ -851,6 +868,7 @@ __all__ = [
     "ADMIN_INVARIANT_LOCK_KEY",
     "APPROVED_ROLES",
     "AccountError",
+    "AdminRoleImmutableError",
     "Base",
     "BootstrapClaimUnavailableError",
     "FirstAdminExistsError",
