@@ -102,7 +102,7 @@ def test_pg_dump_restore_preserves_users_and_revoked_sessions(_clean):
             text(
                 "INSERT INTO users (user_id, username, email, password_hash, role, is_active, created_at, last_login_at) "
                 "VALUES (:i, 'admin1', 'a@x.test', '$argon2id$fake', 'admin', true, :now, :now), "
-                "       (:d, 'ops_disabled', NULL, '$argon2id$fake2', 'operator', false, :now, NULL)"
+                "       (:d, 'observer_disabled', NULL, '$argon2id$fake2', 'observer', false, :now, NULL)"
             ),
             {"i": admin_id, "d": disabled_id, "now": now},
         )
@@ -145,7 +145,7 @@ def test_pg_dump_restore_preserves_users_and_revoked_sessions(_clean):
             rows = c.execute(
                 text("SELECT username, role, is_active FROM users ORDER BY username")
             ).all()
-            assert rows == [("admin1", "admin", True), ("ops_disabled", "operator", False)]
+            assert rows == [("admin1", "admin", True), ("observer_disabled", "observer", False)]
 
             srows = {
                 r.sid: r
