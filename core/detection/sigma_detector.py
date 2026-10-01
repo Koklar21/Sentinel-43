@@ -416,6 +416,19 @@ class SigmaDetector:
                     )
                     continue
 
+                rule_errors = tuple(getattr(rule, "errors", ()) or ())
+                if rule_errors:
+                    _append_issue(
+                        issues,
+                        SigmaRuleIssue(
+                            display_source,
+                            "invalid",
+                            "rule rejected after pySigma validation: "
+                            + "; ".join(str(error) for error in rule_errors[:5]),
+                        ),
+                    )
+                    continue
+
                 try:
                     compiled = _compile_rule(
                         rule,
