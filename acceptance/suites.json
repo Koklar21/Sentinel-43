@@ -198,7 +198,7 @@
     },
     "check-kind-smoke": {
       "kind": "check",
-      "description": "ephemeral kind + Calico smoke deploy (CI workflow job kind-smoke-deploy)",
+      "description": "ephemeral kind + Calico smoke deploy with positive service reachability and negative NetworkPolicy enforcement (CI workflow job kind-smoke-deploy)",
       "evidence": {
         "cmd_contains": [],
         "ci_job": "kind-smoke-deploy"
