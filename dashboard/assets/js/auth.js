@@ -72,11 +72,39 @@ window.SentinelAuth = (() => {
    Config
    ========================================================================= */
 
-const LOGIN_ENDPOINT             = "/auth/login";
-const REFRESH_ENDPOINT           = "/auth/refresh";
-const LOGOUT_ENDPOINT            = "/auth/logout";
-const BOOTSTRAP_STATUS_ENDPOINT  = "/bootstrap/status";
-const BOOTSTRAP_ADMIN_ENDPOINT   = "/bootstrap/admin";
+const _readMeta = name =>
+    document.querySelector(`meta[name="${name}"]`)?.content?.trim() ?? "";
+
+const _runtime = window.SENTINEL_RUNTIME_CONFIG ?? {};
+const _explicitApiBase = String(
+    _runtime.apiBase
+    || window.SENTINEL_API_BASE_URL
+    || _readMeta("sentinel-api-base")
+    || ""
+).trim();
+
+const API_BASE = (
+    _explicitApiBase
+    || (location.origin && location.origin !== "null" ? location.origin : "")
+).replace(/\/+$/, "");
+
+const _apiEndpoint = path => `${API_BASE}${path}`;
+const _apiOrigin = (() => {
+    try {
+        return new URL(API_BASE || location.href, location.href).origin;
+    } catch {
+        return location.origin;
+    }
+})();
+
+const API_CREDENTIALS =
+    _apiOrigin === location.origin ? "same-origin" : "include";
+
+const LOGIN_ENDPOINT             = _apiEndpoint("/auth/login");
+const REFRESH_ENDPOINT           = _apiEndpoint("/auth/refresh");
+const LOGOUT_ENDPOINT            = _apiEndpoint("/auth/logout");
+const BOOTSTRAP_STATUS_ENDPOINT  = _apiEndpoint("/bootstrap/status");
+const BOOTSTRAP_ADMIN_ENDPOINT   = _apiEndpoint("/bootstrap/admin");
 const BOOTSTRAP_TOKEN_HEADER      = "X-S43-Bootstrap-Token";
 const CSRF_COOKIE       = "s43_csrf";
 const CSRF_HEADER       = "X-S43-CSRF";
@@ -94,6 +122,32 @@ const BOOTSTRAP_TIMEOUT_MS = 10_000;
 function _readCookie(name) {
     const m = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
     return m ? decodeURIComponent(m[1]) : null;
+}
+
+function _redirectStandaloneLocalPreview() {
+    // Opening dashboard/sentinel_43_dashboard.html directly (or through a
+    // static preview such as VS Code Live Server) serves the UI but not the
+    // Sentinel API. With no explicit split-origin API base, absolute
+    // /bootstrap/* and /auth/* requests would therefore hit the static server
+    // and fail with a misleading "initialization state" error.
+    //
+    // The supported local Compose path is the nginx TLS edge on :443. Redirect
+    // only the standalone dashboard file, never /dashboard itself, never demo
+    // mode, and never an explicitly configured split-origin setup.
+    if (_explicitApiBase) return false;
+    if (new URLSearchParams(location.search).get("demo") === "1") return false;
+
+    const localHost = ["localhost", "127.0.0.1", "::1"].includes(location.hostname);
+    const standaloneFile = /(?:^|\/)sentinel_43_dashboard\.html$/.test(location.pathname);
+    const directFile = location.protocol === "file:";
+
+    if (!directFile && !(localHost && standaloneFile)) return false;
+
+    const target = new URL("https://localhost/dashboard");
+    target.search = location.search;
+    target.hash = location.hash;
+    location.replace(target.href);
+    return true;
 }
 
 const JWT_SHAPE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
@@ -204,7 +258,7 @@ async function attemptLogin(username, password) {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ username, password }),
-            credentials: "same-origin",
+            credentials: API_CREDENTIALS,
             cache: "no-store",
             signal: controller.signal,
         });
@@ -251,16 +305,22 @@ async function fetchBootstrapStatus() {
     try {
         const res = await fetch(BOOTSTRAP_STATUS_ENDPOINT, {
             method: "GET",
-            credentials: "same-origin",
+            credentials: API_CREDENTIALS,
             cache: "no-store",
             signal: controller.signal,
         });
 
+        const body = await res.json().catch(() => ({}));
+
         if (!res.ok) {
-            throw new Error("Unable to determine Sentinel-43 initialization state.");
+            const detail = typeof body.detail === "string" ? body.detail.trim() : "";
+            const message = detail
+                || `Unable to determine Sentinel-43 initialization state (HTTP ${res.status}).`;
+            const err = new Error(message);
+            err.status = res.status;
+            throw err;
         }
 
-        const body = await res.json().catch(() => ({}));
         if (
             typeof body.initialized !== "boolean" ||
             typeof body.claim_token_required !== "boolean"
@@ -293,7 +353,7 @@ async function bootstrapFirstAdmin(username, password, email, claimToken) {
                 ...(claimToken ? { [BOOTSTRAP_TOKEN_HEADER]: claimToken } : {}),
             },
             body: JSON.stringify(payload),
-            credentials: "same-origin",
+            credentials: API_CREDENTIALS,
             cache: "no-store",
             signal: controller.signal,
         });
@@ -336,7 +396,7 @@ async function refreshSession() {
         const res = await fetch(REFRESH_ENDPOINT, {
             method: "POST",
             headers: { [CSRF_HEADER]: csrf },
-            credentials: "same-origin",
+            credentials: API_CREDENTIALS,
             cache: "no-store",
             signal: controller.signal,
         });
@@ -683,6 +743,10 @@ window.addEventListener("sentinel:ws:auth_failed", () => {
    ========================================================================= */
 
 async function init() {
+    if (_redirectStandaloneLocalPreview()) {
+        return;
+    }
+
     if (!_sessionStorageAvailable()) {
         const msg = "Session storage is unavailable. Enable cookies or disable "
                   + "private browsing to use this dashboard.";
@@ -769,7 +833,7 @@ return Object.freeze({
             await fetch(LOGOUT_ENDPOINT, {
                 method: "POST",
                 headers: csrf ? { [CSRF_HEADER]: csrf } : {},
-                credentials: "same-origin",
+                credentials: API_CREDENTIALS,
                 cache: "no-store",
             });
         } catch { /* clear locally anyway */ }
