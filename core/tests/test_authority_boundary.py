@@ -290,10 +290,40 @@ def test_runtime_authority_owns_the_monitoring_manager():
     [
         "core/governance/heart.py",
         "core/detection/sentinel_threat_detector.py",
+        "core/detection/sigma_detector.py",
         "core/detection/fenrir_hunter.py",
         "core/monitoring/manager.py",
     ],
 )
+def test_sigma_detector_has_no_authority_or_enforcement_dependency():
+    """Sigma is a deterministic evidence producer, never a control plane."""
+    source = (
+        CORE / "detection" / "sigma_detector.py"
+    ).read_text(encoding="utf-8")
+
+    forbidden_imports = (
+        "runtime_authority",
+        "governance.heart",
+        "governance.orchestrator",
+        "sentinel43_engine",
+        "monitoring.watchtower",
+        "subprocess",
+    )
+    assert all(name not in source for name in forbidden_imports)
+    for verb in (
+        "stage_recommendation",
+        "resolve_recommendation",
+        "approve",
+        "veto",
+        "quarantine",
+        "kill_process",
+        "terminate_container",
+        "execute_external_effect",
+        "transition_status",
+        "insert_pending",
+    ):
+        assert verb not in _calls_in(CORE / "detection" / "sigma_detector.py")
+
 def test_the_evidence_layers_hold_no_decision_verbs(module):
     """None of them creates, transitions, approves or vetoes a decision, and
     none of them evaluates policy: they report what they saw."""
