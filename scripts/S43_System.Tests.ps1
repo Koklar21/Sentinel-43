@@ -374,6 +374,13 @@ function New-BearerHeaders {
     }
 }
 
+function Get-S43OriginHeaders {
+    $uri = [Uri]$ApiUrl
+    return @{
+        Origin = "$($uri.Scheme)://$($uri.Authority)"
+    }
+}
+
 function Get-EffectiveCredential {
     if ($null -ne $Credential) {
         return $Credential
@@ -535,7 +542,8 @@ function Test-ReadRoute {
     param(
         [Parameter(Mandatory)][string]$Method,
         [Parameter(Mandatory)][string]$Template,
-        [Parameter(Mandatory)][string]$OperatorToken
+        [Parameter(Mandatory)][string]$OperatorToken,
+        [AllowNull()][string]$OperatorRole = $null
     )
 
     $path = Resolve-RoutePath $Template
@@ -580,6 +588,11 @@ function Test-ReadRoute {
         return
     }
 
+    if ($status -eq 403 -and $Template -like "/users*" -and $OperatorRole -ne "admin") {
+        Add-Result -Outcome "PASS" -Category "ROUTE" -Mode "role-boundary:operator" -Method $Method -Path $Template -StatusCode $status -DurationMs $response.DurationMs -Detail "authenticated non-admin correctly rejected by admin-only route"
+        return
+    }
+
     if ($status -eq 401 -or $status -eq 403) {
         Add-Result -Outcome "FAIL" -Category "ROUTE" -Mode "read:$($context.Identity)" -Method $Method -Path $Template -StatusCode $status -DurationMs $response.DurationMs -Detail ("supplied credential rejected: " + $preview)
         return
@@ -596,7 +609,10 @@ function Test-MutationGuard {
 
     $path = Resolve-RoutePath $Template
     $body = $null
-    $expected = @(401, 403, 404, 409, 422, 429)
+    # Only authentication/authorization rejections are authoritative proof
+    # that an anonymous mutation did not reach mutation logic. Validation,
+    # not-found, conflict, and throttling responses may occur before auth.
+    $expected = @(401, 403)
 
     switch ("$Method $Template") {
         "POST /auth/login" {
@@ -604,7 +620,7 @@ function Test-MutationGuard {
                 username = "s43-smoke-$([guid]::NewGuid().ToString('N').Substring(0, 10))"
                 password = "not-a-real-password-12345"
             }
-            $expected = @(401, 429)
+            $expected = @(401)
         }
         "POST /auth/refresh" {
             $expected = @(401, 403)
@@ -620,13 +636,13 @@ function Test-MutationGuard {
                 username = "s43-smoke"
                 password = "short"
             }
-            # local/uninitialized -> validation; initialized -> conflict;
-            # non-local without a presented deployment claim -> forbidden.
-            $expected = @(403, 409, 422)
+            # Only 403 proves the deployment-claim boundary. 409/422 can be
+            # produced before claim authorization and therefore are not proof.
+            $expected = @(403)
         }
     }
 
-    $response = Invoke-S43Request -Method $Method -Path $path -Body $body -Session $script:AnonymousSession
+    $response = Invoke-S43Request -Method $Method -Path $path -Headers (Get-S43OriginHeaders) -Body $body -Session $script:AnonymousSession
     $status = $response.StatusCode
     $preview = Get-BodyPreview $response.Content
 
@@ -640,10 +656,15 @@ function Test-MutationGuard {
             "safe anonymous/idempotent response"
         }
         else {
-            "mutation safely rejected without valid mutation authority/input"
+            "mutation rejected at the authentication/authorization boundary"
         }
 
         Add-Result -Outcome "PASS" -Category "ROUTE" -Mode "mutation-guard" -Method $Method -Path $Template -StatusCode $status -DurationMs $response.DurationMs -Detail $detail
+        return
+    }
+
+    if ($status -eq 404 -or $status -eq 409 -or $status -eq 422 -or $status -eq 429) {
+        Add-Result -Outcome "WARN" -Category "ROUTE" -Mode "mutation-guard-unproven" -Method $Method -Path $Template -StatusCode $status -DurationMs $response.DurationMs -Detail ("response can occur before authorization; mutation safety not proven by this probe: " + $preview)
         return
     }
 
@@ -765,23 +786,22 @@ function Test-S43WebSocket {
         $firstText = Receive-S43WebSocketText -Socket $socket
         $first = $firstText | ConvertFrom-Json -ErrorAction Stop
 
-        if ($first.type -eq "auth_required") {
-            Send-S43WebSocketJson -Socket $socket -Body @{
-                type = "auth"
-                payload = @{
-                    token = $OperatorToken
-                }
-            }
+        if ($first.type -ne "auth_required") {
+            throw "Expected auth_required before credentials; got: $(Get-BodyPreview $firstText)"
+        }
 
-            $connectedText = Receive-S43WebSocketText -Socket $socket
-            $connected = $connectedText | ConvertFrom-Json -ErrorAction Stop
-
-            if ($connected.type -ne "connected") {
-                throw "Expected connected frame after auth; got: $(Get-BodyPreview $connectedText)"
+        Send-S43WebSocketJson -Socket $socket -Body @{
+            type = "auth"
+            payload = @{
+                token = $OperatorToken
             }
         }
-        elseif ($first.type -ne "connected") {
-            throw "Expected auth_required or connected frame; got: $(Get-BodyPreview $firstText)"
+
+        $connectedText = Receive-S43WebSocketText -Socket $socket
+        $connected = $connectedText | ConvertFrom-Json -ErrorAction Stop
+
+        if ($connected.type -ne "connected") {
+            throw "Expected connected frame after auth; got: $(Get-BodyPreview $connectedText)"
         }
 
         Add-Result -Outcome "PASS" -Category "WS" -Mode "session" -Method "WS" -Path "/ws" -StatusCode 101 -Detail "real WebSocket authentication handshake completed"
@@ -978,7 +998,7 @@ try {
     $username = $effectiveCredential.UserName
     $password = $effectiveCredential.GetNetworkCredential().Password
 
-    $login = Invoke-S43Request -Method "POST" -Path "/auth/login" -Body @{
+    $login = Invoke-S43Request -Method "POST" -Path "/auth/login" -Headers (Get-S43OriginHeaders) -Body @{
         username = $username
         password = $password
     } -Session $script:AuthenticatedSession
@@ -1016,8 +1036,10 @@ try {
 
     $verify = Invoke-S43Request -Path "/auth/verify" -Headers $operatorHeaders -Session $script:AuthenticatedSession
 
+    $operatorRole = $null
     if ($verify.StatusCode -eq 200) {
         $verifyBody = ConvertFrom-S43Json -Response $verify -Context "/auth/verify"
+        $operatorRole = [string]$verifyBody.role
         if ($verifyBody.valid -eq $false) {
             Add-Result -Outcome "FAIL" -Category "AUTH" -Mode "session" -Method "GET" -Path "/auth/verify" -StatusCode 200 -DurationMs $verify.DurationMs -Detail "verify endpoint returned valid=false"
         }
@@ -1083,7 +1105,7 @@ try {
             $registeredMethodCount++
 
             if ($upperMethod -eq "GET" -or $upperMethod -eq "HEAD") {
-                Test-ReadRoute -Method $upperMethod -Template $template -OperatorToken $operatorToken
+                Test-ReadRoute -Method $upperMethod -Template $template -OperatorToken $operatorToken -OperatorRole $operatorRole
             }
             elseif ($upperMethod -in @("POST", "PUT", "PATCH", "DELETE")) {
                 Test-MutationGuard -Method $upperMethod -Template $template
