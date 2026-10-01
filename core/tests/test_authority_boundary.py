@@ -285,16 +285,6 @@ def test_runtime_authority_owns_the_monitoring_manager():
 # ---------------------------------------------------------------------------
 # 2 + 3. The Heart and the detection stack are evidence layers only
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize(
-    "module",
-    [
-        "core/governance/heart.py",
-        "core/detection/sentinel_threat_detector.py",
-        "core/detection/sigma_detector.py",
-        "core/detection/fenrir_hunter.py",
-        "core/monitoring/manager.py",
-    ],
-)
 def test_sigma_detector_has_no_authority_or_enforcement_dependency():
     """Sigma is a deterministic evidence producer, never a control plane."""
     source = (
@@ -324,6 +314,17 @@ def test_sigma_detector_has_no_authority_or_enforcement_dependency():
     ):
         assert verb not in _calls_in(CORE / "detection" / "sigma_detector.py")
 
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        "core/governance/heart.py",
+        "core/detection/sentinel_threat_detector.py",
+        "core/detection/sigma_detector.py",
+        "core/detection/fenrir_hunter.py",
+        "core/monitoring/manager.py",
+    ],
+)
 def test_the_evidence_layers_hold_no_decision_verbs(module):
     """None of them creates, transitions, approves or vetoes a decision, and
     none of them evaluates policy: they report what they saw."""
