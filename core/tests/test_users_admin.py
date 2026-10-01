@@ -136,10 +136,6 @@ class _FakeUserStore:
         user.is_active = is_active
         return user
 
-    async def set_user_role(self, session, user: _FakeUser, *, role: str) -> _FakeUser:
-        user.role = role
-        return user
-
     async def set_user_password(self, session, user: _FakeUser, *, password: str) -> _FakeUser:
         user.password = password
         return user
@@ -369,21 +365,21 @@ def test_create_rejects_valid_token_without_password_header(client: TestClient, 
     assert response.status_code == 401
 
 
-def test_operator_cannot_create_users(client: TestClient, store: _FakeUserStore):
-    store.seed(username="operator-1", password="operator-1-pw-1234", role="observer")
+def test_observer_cannot_create_users(client: TestClient, store: _FakeUserStore):
+    store.seed(username="observer-1", password="observer-1-pw-1234", role="observer")
     response = client.post(
         USERS_URL,
         json={"username": "x", "password": "x-password-1234"},
-        headers=_auth_headers("operator-1", "operator-1-pw-1234", "observer"),
+        headers=_auth_headers("observer-1", "observer-1-pw-1234", "observer"),
     )
     assert response.status_code == 403
 
 
-def test_operator_cannot_list_users(client: TestClient, store: _FakeUserStore):
-    store.seed(username="operator-1", password="operator-1-pw-1234", role="observer")
+def test_observer_cannot_list_users(client: TestClient, store: _FakeUserStore):
+    store.seed(username="observer-1", password="observer-1-pw-1234", role="observer")
     response = client.get(
         USERS_URL,
-        headers=_auth_headers("operator-1", "operator-1-pw-1234", "observer"),
+        headers=_auth_headers("observer-1", "observer-1-pw-1234", "observer"),
     )
     assert response.status_code == 403
 
@@ -393,7 +389,7 @@ def test_demoted_admin_loses_access_immediately(client: TestClient, store: _Fake
     token minted while the caller was an admin stops working the moment the
     account is demoted, without waiting for the token to expire."""
     admin = _seed_admin(store)
-    admin.role = "operator"  # demoted out of band; token still says "admin"
+    admin.role = "observer"  # corrupted/demoted out of band; token still says "admin"
     response = client.get(USERS_URL, headers=_admin_headers())
     assert response.status_code == 403
 
@@ -402,7 +398,7 @@ def test_demoted_admin_loses_access_immediately(client: TestClient, store: _Fake
 # Create
 # ---------------------------------------------------------------------------
 
-def test_admin_creates_operator_account(client: TestClient, store: _FakeUserStore):
+def test_admin_creates_observer_account(client: TestClient, store: _FakeUserStore):
     _seed_admin(store)
     response = client.post(
         USERS_URL,
@@ -470,7 +466,7 @@ def test_create_rejects_blank_username(client: TestClient, store: _FakeUserStore
     assert response.status_code == 422
 
 
-def test_new_operator_can_log_in(client: TestClient, store: _FakeUserStore):
+def test_new_observer_can_log_in(client: TestClient, store: _FakeUserStore):
     _seed_admin(store)
     create = client.post(
         USERS_URL,
@@ -606,7 +602,7 @@ def test_cannot_demote_the_last_admin(client: TestClient, store: _FakeUserStore)
     admin = _seed_admin(store)
     response = client.patch(
         f"{USERS_URL}/{admin.user_id}",
-        json={"role": "operator"},
+        json={"role": "observer"},
         headers=_admin_headers(),
     )
     assert response.status_code == 422
@@ -619,7 +615,7 @@ def test_self_demotion_refused_even_when_store_has_another_admin(client: TestCli
 
     response = client.patch(
         f"{USERS_URL}/{admin.user_id}",
-        json={"role": "operator"},
+        json={"role": "observer"},
         headers=_admin_headers(),
     )
     assert response.status_code == 422
