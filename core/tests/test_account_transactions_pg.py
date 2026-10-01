@@ -45,6 +45,7 @@ from core.auth.users import (
     ADMIN_INVARIANT_LOCK_KEY,
     Base,
     FirstAdminExistsError,
+    User,
     UsernameTakenError,
     _pg_advisory_xact_lock,
     count_active_admins,
@@ -53,7 +54,6 @@ from core.auth.users import (
     get_user_by_id,
     get_user_by_username,
     set_user_active,
-    set_user_role,
 )
 
 _DSN = os.getenv("S43_TEST_PG_DSN")
@@ -110,25 +110,25 @@ async def test_create_user_commit_persists():
 
 
 @_t
-async def test_role_and_active_change_is_one_atomic_transaction():
-    """PATCH /users: role AND is_active in one transaction; a failure after
-    the first mutation leaves NEITHER persisted."""
+async def test_observer_active_change_rolls_back_atomically():
+    """A failed observer activation mutation must not leak a partial write."""
     async with _db() as sm:
         async with sm() as s:
-            u = await create_user(s, username="patchme", password="p" * 16, role="operator")
+            u = await create_user(
+                s, username="patchme", password="p" * 16, role="observer"
+            )
             await s.commit()
             uid = u.user_id
 
         with pytest.raises(RuntimeError):
             async with sm() as s:
                 target = await get_user_by_id(s, uid)
-                await set_user_role(s, target, role="admin")
                 await set_user_active(s, target, is_active=False)
                 raise RuntimeError("boom before commit")
 
         async with sm() as s:
             got = await get_user_by_username(s, "patchme")
-            assert (got.role, got.is_active) == ("operator", True)
+            assert (got.role, got.is_active) == ("observer", True)
 
 
 @_t
@@ -190,41 +190,31 @@ async def test_first_admin_created_exactly_once_under_concurrency(contenders):
 
 
 # ---------------------------------------------------------------------------
-# last-admin invariant under concurrent demotion
+# sole-admin database invariant
 # ---------------------------------------------------------------------------
 
 @_t
-async def test_last_two_admins_cannot_both_be_demoted_concurrently():
+async def test_model_schema_rejects_second_admin_even_by_direct_insert():
+    """The ORM schema mirrors migration 0004's partial unique index, so a
+    second admin fails even when application role guards are bypassed."""
     async with _db() as sm:
         async with sm() as s:
-            a = await create_user(s, username="A", password="p" * 16, role="admin")
-            b = await create_user(s, username="B", password="p" * 16, role="admin")
+            await create_first_admin(s, username="admin", password="p" * 16)
             await s.commit()
-            aid, bid = a.user_id, b.user_id
 
-        gate = asyncio.Event()
-
-        async def demote(uid):
-            async with sm() as s:
-                await gate.wait()
-                await _pg_advisory_xact_lock(s, ADMIN_INVARIANT_LOCK_KEY)
-                target = await get_user_by_id(s, uid)
-                is_active_admin = target.is_active and target.role == "admin"
-                if is_active_admin and await count_active_admins(s) <= 1:
-                    return "blocked"
-                await set_user_role(s, target, role="operator")
-                await s.commit()
-                return "demoted"
-
-        tasks = [asyncio.create_task(demote(aid)), asyncio.create_task(demote(bid))]
-        await asyncio.sleep(0.15)
-        gate.set()
-        res = await asyncio.gather(*tasks)
         async with sm() as s:
-            n = await count_active_admins(s)
+            s.add(
+                User(
+                    username="rogue-admin",
+                    password_hash="not-used-in-this-constraint-test",
+                    role="admin",
+                )
+            )
+            with pytest.raises(IntegrityError):
+                await s.commit()
 
-    assert sorted(res) == ["blocked", "demoted"], res
-    assert n == 1
+        async with sm() as s:
+            assert await count_active_admins(s) == 1
 
 
 __all__: list[str] = []
