@@ -18,9 +18,10 @@ while the auth/users layer remains responsible for persistence primitives.
 
 Security invariants:
     - no public self-service registration
-    - caller cannot deactivate their own account
-    - deployment may never lose its final active admin
-    - role/active changes are committed atomically
+    - first-run bootstrap creates the deployment's sole administrator
+    - every later account is an observer
+    - administrator role cannot be created, promoted, demoted, or disabled
+    - observer activation changes are committed atomically
     - security-sensitive account changes revoke live sessions in the same
       transaction and fail closed if revocation cannot be completed
 """
@@ -313,7 +314,7 @@ async def update_account(
     except IdentityLastAdminRefused as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Cannot deactivate or demote the last active admin.",
+            detail="The sole administrator cannot be disabled or demoted.",
         ) from exc
 
     except IntegrityError as exc:
