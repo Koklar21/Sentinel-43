@@ -29,7 +29,7 @@ import math
 import time
 from collections import Counter, OrderedDict, deque
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from threading import RLock
 from typing import Any, Final
 
@@ -44,6 +44,16 @@ from .sentinel_threat_types import (
 _DEFAULT_FAILURE_STATUS_CODES: Final[frozenset[int]] = frozenset(
     {400, 401, 403, 404, 409, 429}
 )
+
+_SIGMA_LEVEL_SCORE_FLOORS: Final[dict[str, float]] = {
+    "informational": 10.0,
+    "low": 20.0,
+    "medium": 40.0,
+    "high": 65.0,
+    "critical": 85.0,
+    "unknown": 20.0,
+}
+_MAX_SIGMA_MATCHES_PER_ASSESSMENT: Final[int] = 32
 
 _SUSPICIOUS_EVENT_TYPES: Final[frozenset[str]] = frozenset(
     {
@@ -381,6 +391,8 @@ class SentinelThreatDetector:
     def __init__(
         self,
         cfg: DetectorConfig | None = None,
+        *,
+        sigma_detector: Any | None = None,
     ) -> None:
         self.cfg = (
             cfg
@@ -397,6 +409,11 @@ class SentinelThreatDetector:
         # Monotonic across window pruning/recreation, so an "evidence_seq"
         # indicator never goes backwards for the same source.
         self._ingest_seq = 0
+
+        # Optional deterministic Sigma matcher. It is evidence-only and is
+        # deliberately subordinate to this existing detector instance.
+        self._sigma_detector = sigma_detector
+        self._sigma_failures = 0
 
     def ingest(
         self,
@@ -461,13 +478,19 @@ class SentinelThreatDetector:
             # A retried/replayed event (same explicit id) or an out-of-order
             # one is not new evidence: it must not advance the evidence
             # sequence that Heart uses to tell independent observations apart.
-            if not (
+            is_replay = bool(
                 event_id
                 and window.has_event_id(
                     event_id
                 )
-            ) and window.add_event(
+            )
+            candidate = (
                 event
+                if is_replay
+                else self._with_sigma_matches(event)
+            )
+            if not is_replay and window.add_event(
+                candidate
             ):
                 if event_id:
                     window.mark_event_id(
@@ -515,6 +538,10 @@ class SentinelThreatDetector:
 
         status_counter: Counter[int] = Counter()
         type_counter: Counter[str] = Counter()
+        sigma_matches_by_key: OrderedDict[
+            tuple[str, str],
+            dict[str, Any],
+        ] = OrderedDict()
 
         for event in window:
             if event.timestamp < cutoff:
@@ -534,6 +561,24 @@ class SentinelThreatDetector:
             principal = (event.metadata or {}).get("principal_id")
             if isinstance(principal, str) and principal.strip():
                 principals.add(principal.strip())
+
+            raw_sigma_matches = (event.metadata or {}).get("sigma_matches")
+            if isinstance(raw_sigma_matches, (tuple, list)):
+                for raw_match in raw_sigma_matches:
+                    if not isinstance(raw_match, Mapping):
+                        continue
+                    rule_id = str(raw_match.get("rule_id") or "").strip()
+                    event_id = str(raw_match.get("event_id") or "").strip()
+                    if not rule_id:
+                        continue
+                    key = (rule_id, event_id)
+                    if key not in sigma_matches_by_key:
+                        sigma_matches_by_key[key] = dict(raw_match)
+                    if (
+                        len(sigma_matches_by_key)
+                        >= _MAX_SIGMA_MATCHES_PER_ASSESSMENT
+                    ):
+                        break
 
             if event.status_code is not None:
                 status_counter[
@@ -619,6 +664,25 @@ class SentinelThreatDetector:
 
         tags: list[str] = []
         score = 0.0
+        sigma_matches = list(sigma_matches_by_key.values())
+
+        if sigma_matches:
+            indicators["sigma_matches"] = sigma_matches
+            indicators["sigma_match_count"] = len(sigma_matches)
+            sigma_floor = max(
+                _SIGMA_LEVEL_SCORE_FLOORS.get(
+                    str(match.get("level") or "unknown").strip().lower(),
+                    _SIGMA_LEVEL_SCORE_FLOORS["unknown"],
+                )
+                for match in sigma_matches
+            )
+            indicators["sigma_score_floor"] = sigma_floor
+            tags.append("sigma_match")
+            tags.extend(
+                f"sigma:{str(match.get('rule_id') or '')}"
+                for match in sigma_matches
+                if str(match.get("rule_id") or "").strip()
+            )
 
         if (
             event_count
@@ -756,6 +820,12 @@ class SentinelThreatDetector:
             score += 5
             tags.append(
                 "server_error_cluster"
+            )
+
+        if sigma_matches:
+            score = max(
+                score,
+                float(indicators["sigma_score_floor"]),
             )
 
         source_kind = (
@@ -906,6 +976,72 @@ class SentinelThreatDetector:
         with self._lock:
             self._windows.clear()
 
+    def sigma_status(self) -> dict[str, Any]:
+        detector = self._sigma_detector
+        if detector is None:
+            return {
+                "configured": False,
+                "active": False,
+                "detector_failures": self._sigma_failures,
+            }
+
+        try:
+            status = detector.status()
+        except Exception as exc:
+            return {
+                "configured": True,
+                "active": False,
+                "detector_failures": self._sigma_failures + 1,
+                "status_error": type(exc).__name__,
+            }
+
+        return {
+            "configured": True,
+            **dict(status),
+            "detector_failures": self._sigma_failures,
+        }
+
+    def _with_sigma_matches(
+        self,
+        event: EventContext,
+    ) -> EventContext:
+        detector = self._sigma_detector
+        if detector is None:
+            return event
+
+        metadata = dict(event.metadata or {})
+        sigma_event = metadata.get("sigma_event")
+        if not isinstance(sigma_event, Mapping):
+            return event
+
+        try:
+            matches = detector.match(sigma_event)
+        except Exception:
+            self._sigma_failures += 1
+            return event
+
+        if not matches:
+            return event
+
+        event_id = str(metadata.get("event_id") or "").strip()
+        evidence: list[dict[str, Any]] = []
+        for match in matches:
+            to_evidence = getattr(match, "to_evidence", None)
+            if not callable(to_evidence):
+                continue
+            item = to_evidence(event_id=event_id)
+            if isinstance(item, Mapping):
+                evidence.append(dict(item))
+
+        if not evidence:
+            return event
+
+        metadata["sigma_matches"] = tuple(evidence)
+        return replace(
+            event,
+            metadata=metadata,
+        )
+
     def _validate_event_time(
         self,
         event: EventContext,
@@ -1017,6 +1153,9 @@ class SentinelThreatDetector:
             return (
                 ThreatKind.CREDENTIAL_ATTACK
             )
+
+        if "sigma_match" in tags:
+            return ThreatKind.GENERIC_INTRUSION
 
         return ThreatKind.UNKNOWN
 
