@@ -38,7 +38,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...auth.deps import get_db_session
 from ...auth.users import (
-    APPROVED_ROLES,
     User,
     get_user_by_username,
     list_users,
@@ -88,23 +87,10 @@ class CreateUserRequest(StrictRequestModel):
         min_length=MIN_PASSWORD_LEN,
         max_length=MAX_PASSWORD_LEN,
     )
-    role: str = Field(default="operator")
     email: str | None = Field(
         default=None,
         max_length=MAX_EMAIL_LEN,
     )
-
-    @field_validator("role")
-    @classmethod
-    def normalize_role(cls, value: str) -> str:
-        cleaned = value.strip().lower()
-
-        if cleaned not in APPROVED_ROLES:
-            raise ValueError(
-                f"role must be one of {sorted(APPROVED_ROLES)}"
-            )
-
-        return cleaned
 
     @field_validator("username")
     @classmethod
@@ -126,29 +112,11 @@ class CreateUserRequest(StrictRequestModel):
 
 class UpdateUserRequest(StrictRequestModel):
     is_active: bool | None = Field(default=None)
-    role: str | None = Field(default=None)
-
-    @field_validator("role")
-    @classmethod
-    def normalize_role(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-
-        cleaned = value.strip().lower()
-
-        if cleaned not in APPROVED_ROLES:
-            raise ValueError(
-                f"role must be one of {sorted(APPROVED_ROLES)}"
-            )
-
-        return cleaned
 
     @model_validator(mode="after")
     def require_change(self) -> "UpdateUserRequest":
-        if self.is_active is None and self.role is None:
-            raise ValueError(
-                "Provide at least one of: is_active, role"
-            )
+        if self.is_active is None:
+            raise ValueError("Provide is_active.")
 
         return self
 
@@ -236,7 +204,10 @@ async def create_account(
     session: AsyncSession = Depends(get_db_session),
     authority: Any = Depends(get_runtime_authority),
 ) -> UserResponse:
-    """Create a new operator/admin account."""
+    """Create a new observer account.
+
+    The sole administrator is created only by first-run bootstrap.
+    """
 
     # Friendly conflict pre-check. The DB uniqueness constraint remains the
     # authoritative race-safe enforcement.
@@ -255,7 +226,7 @@ async def create_account(
             actor=admin,
             username=body.username,
             password=body.password,
-            role=body.role,
+            role="observer",
             email=body.email,
         )
 
@@ -311,7 +282,10 @@ async def update_account(
     session: AsyncSession = Depends(get_db_session),
     authority: Any = Depends(get_runtime_authority),
 ) -> UserResponse:
-    """Update account activation state and/or role through Sentinel-43."""
+    """Update observer account activation state through Sentinel-43.
+
+    Roles are immutable after bootstrap: one administrator, all others observers.
+    """
 
     parsed_id = _parse_user_id(user_id)
 
@@ -321,7 +295,7 @@ async def update_account(
             actor=admin,
             user_id=parsed_id,
             new_is_active=body.is_active,
-            new_role=body.role,
+            new_role=None,
         )
 
     except IdentityTargetNotFound as exc:
