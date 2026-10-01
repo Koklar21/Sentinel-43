@@ -161,21 +161,20 @@ External effects must remain explicitly integrated and independently governed.
 
 Sentinel-43 distinguishes human identities from service identities.
 
-Human accounts support:
+Human accounts use a deliberately narrow authority model:
 
-- administrator and operator roles
-- authenticated sessions
-- refresh-session rotation
-- logout and revocation
-- password reset
-- account activation/deactivation
-- governed role changes
+- the one-time bootstrap claim creates the deployment's **sole administrator**
+- every later human account is an **observer**
+- observers may review staged actions and submit human approve/veto decisions
+- only the sole administrator may create/disable observer accounts or reset their passwords
+- administrator role is not promotable, demotable, or transferable through normal account-management APIs
+- authenticated sessions, refresh rotation, logout/revocation, and password reset remain governed
 
 Internal services use separate service credentials and cannot silently become human approvers.
 
 ### First Administrator
 
-An empty deployment supports a one-time first-administrator claim.
+An empty deployment supports a one-time first-administrator claim. That claim is the only normal path that creates an administrator account. The database also enforces at most one administrator row; initialized deployments are expected to retain exactly one.
 
 Outside local/dev/test, that claim must be authorized with the deployment-owned `S43_BOOTSTRAP_CLAIM_TOKEN`.
 
