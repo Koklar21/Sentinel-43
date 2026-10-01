@@ -107,6 +107,45 @@ _INGEST_RATE_KEYS_MAX = 10_000
 _INGEST_RATE_LIMIT = 600
 _INGEST_RATE_WINDOW_SECONDS = 60.0
 
+# Fields from the canonical typed monitoring event that Sigma may inspect.
+# Arbitrary producer keys never reach this projection. Phase 1 is deliberately
+# scalar/event-local; nested payloads and unbounded arrays stay outside Sigma.
+_SIGMA_TYPED_FIELDS = frozenset(
+    {
+        "status_code",
+        "latency_ms",
+        "failed_checks",
+        "config_age_seconds",
+        "drift_detected",
+        "unsafe_config",
+        "missing_required_fields",
+        "integrity_status",
+        "error_rate_percent",
+        "crash_loop",
+        "dependency_status",
+        "version_mismatch",
+        "cpu_percent",
+        "memory_percent",
+        "disk_percent",
+        "unsigned_artifact",
+        "secrets_exposed",
+        "debug_mode_enabled",
+        "severity",
+        "threat_kind",
+        "confidence",
+        "action",
+        "runtime_event",
+        "platform",
+        "runtime_role",
+        "instance_id",
+        "namespace",
+        "workload",
+        "node_name",
+        "pod_name",
+    }
+)
+_SIGMA_STRING_VALUE_MAX = 1024
+
 
 @runtime_checkable
 class WindowStore(Protocol):
@@ -244,6 +283,64 @@ class MonitoringManager:
             if producers is not None:
                 self._ingest_producers = dict(producers)
 
+    @staticmethod
+    def _sigma_event_projection(
+        raw: dict[str, Any] | BaseEvent,
+        normalized: BaseEvent,
+        *,
+        source_ip: str,
+        principal_id: str,
+        success: bool | None,
+    ) -> dict[str, Any]:
+        """Build the bounded event-local view consumed by Sigma.
+
+        The projection is made only after canonical normalization and producer
+        trust checks. It never forwards a raw payload wholesale.
+        """
+        typed = normalized.to_dict()
+        projected: dict[str, Any] = {
+            "product": "sentinel43",
+            "category": normalized.kind,
+            "kind": normalized.kind,
+            "service": normalized.source,
+            "source": normalized.source,
+            "source_identity": normalized.source_identity,
+            "source_ip": source_ip,
+            "principal_id": principal_id,
+        }
+
+        if success is not None:
+            projected["success"] = success
+
+        if isinstance(raw, dict):
+            event_type = raw.get("event_type")
+            if isinstance(event_type, str) and event_type.strip():
+                projected["event_type"] = event_type.strip()[
+                    :_SIGMA_STRING_VALUE_MAX
+                ]
+
+            status = raw.get("status")
+            if isinstance(status, str) and status.strip():
+                projected["status"] = status.strip()[
+                    :_SIGMA_STRING_VALUE_MAX
+                ]
+        else:
+            projected["event_type"] = normalized.kind
+
+        for field_name in _SIGMA_TYPED_FIELDS:
+            value = typed.get(field_name)
+            if isinstance(value, str):
+                cleaned = value.strip()[:_SIGMA_STRING_VALUE_MAX]
+                if cleaned:
+                    projected[field_name] = cleaned
+            elif isinstance(value, (int, float, bool)):
+                projected[field_name] = value
+            elif value is None:
+                projected[field_name] = None
+
+        projected.setdefault("event_type", normalized.kind)
+        return projected
+
     def _ingest_threat_event(
         self,
         raw: dict[str, Any] | BaseEvent,
@@ -342,16 +439,38 @@ class MonitoringManager:
             raw_type = (
                 raw.get("event_type") if isinstance(raw, dict) else None
             )
+            raw_success = (
+                raw.get("success") if isinstance(raw, dict) else None
+            )
+            success = (
+                raw_success
+                if isinstance(raw_success, bool)
+                else (
+                    False
+                    if isinstance(raw, dict)
+                    and str(raw.get("status") or "").strip().lower()
+                    == "blocked"
+                    else None
+                )
+            )
+            sigma_event = self._sigma_event_projection(
+                raw,
+                normalized,
+                source_ip=ip,
+                principal_id=principal_id,
+                success=success,
+            )
+            status_code = getattr(normalized, "status_code", None)
             ingestor.ingest(
                 EventContext(
                     source_identity=identity,
                     source_ip=ip,
                     event_type=str(raw_type or normalized.kind),
                     timestamp=now,
-                    success=(
-                        False
-                        if isinstance(raw, dict)
-                        and str(raw.get("status") or "") == "blocked"
+                    success=success,
+                    status_code=(
+                        int(status_code)
+                        if isinstance(status_code, int)
                         else None
                     ),
                     metadata={
@@ -363,6 +482,8 @@ class MonitoringManager:
                         # account an account-scoped response would act on, so
                         # it is never taken from an untrusted payload.
                         "principal_id": principal_id,
+                        # Bounded, normalized, scalar-only view for Sigma.
+                        "sigma_event": sigma_event,
                     },
                 )
             )
