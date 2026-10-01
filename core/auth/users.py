@@ -42,6 +42,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Index,
     MetaData,
     String,
     Uuid,
@@ -168,6 +169,13 @@ class User(Base):
         CheckConstraint(
             "role IN ('observer', 'admin')",
             name="role",
+        ),
+        Index(
+            "uq_users_single_admin",
+            "role",
+            unique=True,
+            postgresql_where=text("role = 'admin'"),
+            sqlite_where=text("role = 'admin'"),
         ),
     )
 
