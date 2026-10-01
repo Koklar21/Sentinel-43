@@ -179,7 +179,6 @@ const el = {
     userModal:       $("userModal"),
     userUsername:    $("userUsername"),
     userEmail:       $("userEmail"),
-    userRole:        $("userRole"),
     userPassword:    $("userPassword"),
     userPasswordConfirm: $("userPasswordConfirm"),
     userModalError:  $("userModalError"),
@@ -1710,7 +1709,7 @@ function normalizeUser(raw) {
         id: normalizeString(raw?.user_id, "").trim(),
         username: normalizeString(raw?.username, "").trim(),
         email: normalizeString(raw?.email, "").trim(),
-        role: normalizeString(raw?.role, "operator").trim().toLowerCase(),
+        role: normalizeString(raw?.role, "observer").trim().toLowerCase(),
         active: raw?.is_active === true,
         createdAt: normalizeString(raw?.created_at, ""),
         lastLoginAt: normalizeString(raw?.last_login_at, ""),
@@ -1760,11 +1759,8 @@ function renderUsers() {
                 `<div class="account-meta">${escHtml(user.email || "no email")} · created ${escHtml(created)} · last login ${escHtml(lastLogin)}</div>` +
               `</div>` +
               `<div class="account-actions">` +
-                `<select class="account-role" data-user-role="${escHtml(user.id)}" aria-label="Role for ${escHtml(user.username)}">` +
-                  `<option value="operator"${user.role === "operator" ? " selected" : ""}>operator</option>` +
-                  `<option value="admin"${user.role === "admin" ? " selected" : ""}>admin</option>` +
-                `</select>` +
-                `<button class="btn ${user.active ? "red" : "green"}" type="button" data-user-active="${escHtml(user.id)}" data-next-active="${user.active ? "false" : "true"}">${user.active ? "Disable" : "Enable"}</button>` +
+                `<span class="tag">${escHtml(user.role === "admin" ? "sole admin" : "observer")}</span>` +
+                `<button class="btn ${user.active ? "red" : "green"}" type="button" data-user-active="${escHtml(user.id)}" data-next-active="${user.active ? "false" : "true"}"${user.role === "admin" ? " disabled title=\"The sole administrator cannot be disabled\"" : ""}>${user.active ? "Disable" : "Enable"}</button>` +
                 `<button class="btn amber" type="button" data-user-password="${escHtml(user.id)}">Reset PW</button>` +
               `</div>` +
             `</div>`
@@ -1819,7 +1815,6 @@ function closeUserModal() {
     for (const node of [el.userUsername, el.userEmail, el.userPassword, el.userPasswordConfirm]) {
         if (node) node.value = "";
     }
-    if (el.userRole) el.userRole.value = "operator";
 }
 
 function openUserModal() {
@@ -1834,7 +1829,6 @@ async function createManagedUser() {
     if (userMutationInFlight) return;
     const username = el.userUsername?.value.trim() ?? "";
     const email = el.userEmail?.value.trim() ?? "";
-    const role = el.userRole?.value ?? "operator";
     const password = el.userPassword?.value ?? "";
     const confirmation = el.userPasswordConfirm?.value ?? "";
 
@@ -1842,7 +1836,6 @@ async function createManagedUser() {
     if (!username) error = "Username is required.";
     else if (password.length < 12) error = "Password must be at least 12 characters.";
     else if (password !== confirmation) error = "Passwords do not match.";
-    else if (!["operator", "admin"].includes(role)) error = "Invalid role.";
 
     if (error) {
         if (el.userModalError) el.userModalError.textContent = error;
@@ -1855,10 +1848,9 @@ async function createManagedUser() {
         const created = await api.createUser({
             username,
             password,
-            role,
             email: email || null,
         });
-        log(`Created ${normalizeString(created?.role, role)} account ${normalizeString(created?.username, username)}.`, "ok");
+        log(`Created observer account ${normalizeString(created?.username, username)}.`, "ok");
         closeUserModal();
         await refreshUsers({ quiet: true });
     } catch (err) {
@@ -1952,11 +1944,6 @@ el.passwordResetModal?.addEventListener("click", event => {
     if (event.target.hasAttribute("data-close-password-reset")) closePasswordResetModal();
 });
 
-el.usersList?.addEventListener("change", event => {
-    const select = event.target.closest?.("[data-user-role]");
-    if (!select) return;
-    updateManagedUser(select.dataset.userRole, { role: select.value });
-});
 
 el.usersList?.addEventListener("click", event => {
     const activeButton = event.target.closest?.("[data-user-active]");
