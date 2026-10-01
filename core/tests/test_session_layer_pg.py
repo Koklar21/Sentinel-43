@@ -381,14 +381,20 @@ async def test_session_record_has_no_role_and_owner_role_is_read_live():
             )
             u = await get_user_by_id(s, row.user_id)
             assert u.role == "observer"
+            assert row.refresh_generation == 1
             await s.commit()
-            await s.commit()
+
+        # The freshly rotated secret remains valid. Observer role is read from
+        # the live user row; it is not a reason to revoke an otherwise-valid
+        # session.
         async with sm() as s:
-            with pytest.raises(S.SessionRevokedError):
-                await S.rotate_refresh(
-                    s, presented_secret=s2,
-                    new_refresh_secret=S.generate_refresh_secret(),
-                )
+            row, _ = await S.rotate_refresh(
+                s,
+                presented_secret=s2,
+                new_refresh_secret=S.generate_refresh_secret(),
+            )
+            assert row.refresh_generation == 2
+            await s.commit()
 
 
 # ---------------------------------------------------------------------------
