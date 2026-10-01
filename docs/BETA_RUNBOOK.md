@@ -134,7 +134,7 @@ DB session, re-verified with a password, via `X-S43-Password`, on every
 request). The legacy fallback exists for local/dev/test break-glass access
 when no DB admin exists yet or when explicitly armed
 (`S43_BREAK_GLASS_ARMED=true`) — it is not something a normal
-operator/admin account needs, and it does not exist outside local.
+observer/admin account needs, and it does not exist outside local.
 
 **For beta, legacy authentication must be rejected.** The Kubernetes beta
 overlay now sets this:
@@ -181,7 +181,7 @@ Sentinel-43 keeps human and service identities cryptographically distinct
   the Fenrir token; neither can authenticate as the other.
 - `SENTINEL_REMOTE_TOKEN_OWNER` / `_ADMIN` / `_AUDITOR` — Remote Gateway
   role tokens (disabled by default; see §17).
-- None of these are ever accepted as a human operator/admin credential, and
+- None of these are ever accepted as a human observer/admin credential, and
   none of the human login flows accept a service token.
 
 A missing `S43_WATCHTOWER_SERVICE_TOKEN` on either `s43-api` or `s43-core`
@@ -679,16 +679,18 @@ unset S43_BOOTSTRAP_CLAIM_TOKEN
 | `503` | The deployment claim secret is not configured, the account store is not PostgreSQL (outside local/test), or the API/database is unavailable. Nothing was created. |
 | `422` | The username or password was rejected. Nothing was created. |
 
-Then, signed in as that admin, create the other accounts through `/users`,
-including a second active admin, so that one lost credential is not a
-lockout.
+Then, signed in as that admin, create any additional human accounts through
+`/users`. Every post-bootstrap account is an `observer`. Observer accounts
+can participate in human approval/veto decisions but cannot become
+administrators. The bootstrap administrator is the deployment's sole
+administrator.
 
 ### Emergency administrator recovery
 
-The normal API cannot orphan the deployment: `PATCH /users` refuses to
-deactivate or demote the last active admin, and no admin can deactivate
-their own account. A lockout can still happen if credentials are lost or
-identity rows are changed directly.
+The normal API preserves that invariant: it cannot create a second
+administrator, cannot promote an observer, and cannot demote or deactivate
+the sole administrator. A lockout can still happen if the administrator
+password is lost or identity rows are changed directly.
 
 Recovery is intentionally **not an HTTP endpoint**. The deployment operator
 uses the exec-only CLI from a trusted host/container context:
@@ -703,20 +705,23 @@ kubectl exec -n sentinel43 deployment/s43-api -c s43-api -- \
 ```
 
 The command prompts twice for a new password and never accepts it as a
-command-line argument. It targets an existing account only. Recovery:
+command-line argument. It may target **only the existing administrator**.
+Recovery never promotes an observer. It:
 
 - requires PostgreSQL advisory locking and refuses weaker backends;
 - goes through `Sentinel43RuntimeAuthority.identity`, not direct SQL;
 - writes the authoritative identity-governance audit record before mutation;
-- restores the selected account to `role=admin` and `is_active=true`;
+- refuses a target whose persisted role is not already `admin`;
+- restores the existing administrator to `is_active=true`;
 - replaces its password;
 - revokes all of its existing sessions;
 - fails closed if authoritative audit initialization/write fails.
 
 Container/host exec is the recovery authority because it already represents
-deployment-level control. No network-facing recovery credential or permanent
-admin bypass is added. Keep two active administrators anyway; emergency
-recovery should remain exceptional.
+deployment-level control. No network-facing recovery credential, second-admin
+path, or permanent admin bypass is added. Back up the sole administrator's
+credentials and deployment recovery material; emergency recovery should remain
+exceptional.
 
 ## 17. Browser and WSS acceptance
 
