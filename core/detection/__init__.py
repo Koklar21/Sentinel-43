@@ -17,6 +17,15 @@ from .sentinel_window_store import (
     SentinelWindowStore,
 )
 
+from .sigma_detector import (
+    SIGMA_DETECTOR_VERSION,
+    SigmaDetector,
+    SigmaMatch,
+    SigmaRuleIssue,
+    SigmaRuleLoadError,
+    SigmaUnsupportedRuleError,
+)
+
 __all__ = [
     "DetectorConfig",
     "EventContext",
@@ -24,6 +33,12 @@ __all__ = [
     "SentinelThreatDetector",
     "SentinelWindowConfig",
     "SentinelWindowStore",
+    "SIGMA_DETECTOR_VERSION",
+    "SigmaDetector",
+    "SigmaMatch",
+    "SigmaRuleIssue",
+    "SigmaRuleLoadError",
+    "SigmaUnsupportedRuleError",
     "ThreatAssessment",
     "ThreatKind",
     "ThreatSeverity",
