@@ -104,9 +104,11 @@ _MIN_SYMBOLS = {
     "core.detection": [
         "ThreatAssessment", "ThreatKind", "ThreatSeverity", "ThreatSourceKind",
         "SentinelThreatDetector", "DetectorConfig", "EventContext",
+        "SigmaDetector", "SigmaMatch",
     ],
     "core.detection.sentinel_threat_types": ["ThreatAssessment", "ThreatKind"],
     "core.detection.sentinel_threat_detector": ["SentinelThreatDetector", "EventContext"],
+    "core.detection.sigma_detector": ["SigmaDetector", "SigmaMatch"],
     "core.guards.exceptions.expectations": [
         "BaseExpectation", "get_default_expectations",
         "get_basic_expectations", "get_hardened_expectations", "get_sentinel43_expectations",
