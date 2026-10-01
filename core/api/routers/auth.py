@@ -71,8 +71,11 @@ CSRF_HEADER_NAME: Final[str] = "X-S43-CSRF"
 _REFRESH_COOKIE_PATH: Final[str] = "/auth"
 
 _ALLOWED_JWT_ALGORITHMS: Final[frozenset[str]] = APPROVED_JWT_ALGORITHMS
+# Human account roles are observer/admin. "operator" remains accepted only
+# for the local legacy env-operator token during the compatibility window; no
+# DB-backed account may be created with that role after migration 0004.
 _APPROVED_ROLES: Final[frozenset[str]] = frozenset(
-    {"operator", "admin"}
+    {"observer", "admin", "operator"}
 )
 
 JWT_SHAPE_RE: Final[re.Pattern[str]] = re.compile(
@@ -1036,7 +1039,7 @@ def verify_jwt_token(
     if role not in _APPROVED_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Operator role required.",
+            detail="Authenticated human account role required.",
         )
 
     sid = claims.get(
