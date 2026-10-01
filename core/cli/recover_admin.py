@@ -18,8 +18,9 @@ operator who already has host/container exec access and therefore already
 controls the deployment boundary.
 
 Recovery:
-- targets an existing account by username
-- restores role=admin and is_active=true
+- targets the existing sole administrator by username
+- refuses observer accounts; it never promotes an account to administrator
+- restores is_active=true
 - replaces the password
 - revokes all live sessions for that account
 - emits the authoritative identity-governance audit record before mutation
@@ -121,11 +122,12 @@ async def _recover(username: str, password: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Recover an existing Sentinel-43 account as an active admin. "
+            "Recover the existing Sentinel-43 sole administrator. "
+            "Observer accounts cannot be promoted by this command. "
             "Run only from a trusted host/container exec context."
         )
     )
-    parser.add_argument("username", help="existing account username to recover")
+    parser.add_argument("username", help="existing administrator username to recover")
     args = parser.parse_args()
 
     username = args.username.strip()
