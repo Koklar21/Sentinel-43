@@ -14,10 +14,10 @@
 #   3. image build + vulnerability scan (Trivy)
 #   4. the full pytest suite
 #   5. an ephemeral kind cluster smoke-deploy (Calico for real NetworkPolicy
-#      enforcement — kind's default CNI does not enforce it) exercising the
-#      same checks done manually during development: pods Ready and
-#      non-root, migration Job completes, /health and an authenticated
-#      route respond correctly, then unconditional cluster teardown.
+#      enforcement — kind's default CNI does not enforce it) exercising pods
+#      Ready/non-root, migration completion, API health/bootstrap, explicit
+#      allowed API->DB/core connectivity, and forbidden unlabeled-pod->DB/core
+#      connectivity before unconditional cluster teardown.
 #
 # Does not touch Docker Compose — that path has its own tests
 # (core/tests/) and isn't gated by anything in this file.
@@ -464,6 +464,50 @@ jobs:
           curl -fsS -H "Host: s43-api" http://localhost:18000/health
           curl -fsS -H "Host: s43-api" http://localhost:18000/bootstrap/status
 
+      - name: Verify NetworkPolicy enforcement
+        run: |
+          set -euo pipefail
+          mkdir -p acceptance_out/jobs
+          log="acceptance_out/jobs/check-kind-smoke.log"
+          exec > >(tee -a "$log") 2>&1
+
+          # First prove the allowed client path is alive. A later denied probe
+          # is not useful evidence if the destination itself is unavailable.
+          kubectl exec -n sentinel43 deployment/s43-api -c s43-api -- python -c             "import socket; s=socket.create_connection(('s43-db',5432),5); s.close(); print('ALLOW api -> db: PASS')"
+          kubectl exec -n sentinel43 deployment/s43-api -c s43-api -- python -c             "import socket; s=socket.create_connection(('s43-core',9100),5); s.close(); print('ALLOW api -> core: PASS')"
+
+          # PSS-restricted, deliberately UNLABELED client. Base default-deny
+          # plus the DB/core allow policies must refuse both connections.
+          cleanup() {
+            kubectl delete pod netpol-test -n sentinel43 --ignore-not-found=true --wait=false >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          kubectl run netpol-test -n sentinel43 --image=busybox:1.36 --restart=Never             --overrides='{"spec":{"automountServiceAccountToken":false,"securityContext":{"runAsNonRoot":true,"runAsUser":65532,"runAsGroup":65532,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"netpol-test","image":"busybox:1.36","command":["sleep","3600"],"securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"privileged":false,"capabilities":{"drop":["ALL"]},"seccompProfile":{"type":"RuntimeDefault"}}}]}}'             --command -- sleep 3600
+          kubectl wait --for=condition=Ready pod/netpol-test -n sentinel43 --timeout=60s
+
+          DB_IP=$(kubectl get svc s43-db -n sentinel43 -o jsonpath='{.spec.clusterIP}')
+          CORE_IP=$(kubectl get svc s43-core -n sentinel43 -o jsonpath='{.spec.clusterIP}')
+          test -n "$DB_IP"
+          test -n "$CORE_IP"
+
+          if kubectl exec -n sentinel43 netpol-test -- timeout 5 nc -zv "$DB_IP" 5432; then
+            echo "DENY unlabeled -> db: FAIL (connection unexpectedly succeeded)"
+            exit 1
+          else
+            echo "DENY unlabeled -> db: PASS"
+          fi
+
+          if kubectl exec -n sentinel43 netpol-test -- timeout 5 nc -zv "$CORE_IP" 9100; then
+            echo "DENY unlabeled -> core: FAIL (connection unexpectedly succeeded)"
+            exit 1
+          else
+            echo "DENY unlabeled -> core: PASS"
+          fi
+
+          cleanup
+          trap - EXIT
+
       - name: Record exact-revision kind acceptance evidence
         run: |
           set -euo pipefail
@@ -472,13 +516,15 @@ jobs:
           python scripts/acceptance_gate.py record-ci check-kind-smoke --out acceptance_out --result success
 
       - name: Upload kind acceptance evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: acceptance-kind-smoke
           path: |
             acceptance_out/jobs/check-kind-smoke.meta.json
+            acceptance_out/jobs/check-kind-smoke.log
             acceptance_out/revision.json
-          if-no-files-found: error
+          if-no-files-found: warn
 
       - name: Teardown
         if: always()
