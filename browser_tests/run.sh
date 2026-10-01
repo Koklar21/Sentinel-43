@@ -112,9 +112,10 @@ S43_ALLOWED_ORIGINS=https://s43.beta.test:8443
 S43_TRUSTED_HOSTS=s43.beta.test
 S43_ENABLE_TEST_INJECTION=false
 # The disposable browser stack intentionally runs the beta profile. The real
-# dashboard's bootstrap and account-management mutations delegate through the
-# single Sentinel43RuntimeAuthority, so governance must be active here just as
-# it is for a supported controlled-beta target.
+# The controlled-beta browser profile exercises recommendation governance as
+# well as identity/session flows, so enable it here. Bootstrap and account
+# management still delegate through Sentinel43RuntimeAuthority even when this
+# decision-governance feature flag is false.
 S43_GOVERNANCE_ENABLED=true
 S43_GOVERNANCE_REQUIRED=true
 S43_FENRIR_ENABLED=false
