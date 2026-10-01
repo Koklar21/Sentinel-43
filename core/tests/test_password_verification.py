@@ -94,7 +94,7 @@ class _RecordingSession:
 
 
 class _U:
-    def __init__(self, username, password, *, is_active=True, role="operator"):
+    def __init__(self, username, password, *, is_active=True, role="observer"):
         self.username = username
         self.password_hash = U.hash_password(password)
         self.is_active = is_active
@@ -171,7 +171,7 @@ def test_authenticate_user_timing_miss_vs_wrong_password(store):
 
 def test_create_user_flushes_not_commits(store):
     s = _RecordingSession()
-    _run(U.create_user(s, username="dave", password="pw-dave-123456", role="operator"))
+    _run(U.create_user(s, username="dave", password="pw-dave-123456", role="observer"))
     assert s.commits == 0
     assert s.flushes == 1
 
@@ -183,15 +183,16 @@ def test_create_user_rejects_bad_role():
     assert s.commits == 0
 
 
-def test_set_user_role_flushes_not_commits():
+def test_set_user_role_rejects_observer_to_admin_transition():
     s = _RecordingSession()
-    u = _U("erin", "pw-erin-123456", role="operator")
-    _run(U.set_user_role(s, u, role="admin"))
-    assert u.role == "admin"
-    assert (s.commits, s.flushes) == (0, 1)
+    u = _U("erin", "pw-erin-123456", role="observer")
+    with pytest.raises(U.AdminRoleImmutableError):
+        _run(U.set_user_role(s, u, role="admin"))
+    assert u.role == "observer"
+    assert (s.commits, s.flushes) == (0, 0)
 
 
-@pytest.mark.parametrize("bad", ["", "root", "superuser", "guest", "admin,operator"])
+@pytest.mark.parametrize("bad", ["", "root", "superuser", "guest", "admin,observer"])
 def test_set_user_role_rejects_genuinely_unknown_roles(bad):
     s = _RecordingSession()
     u = _U("f", "pw-f-1234567890")
@@ -199,15 +200,13 @@ def test_set_user_role_rejects_genuinely_unknown_roles(bad):
         _run(U.set_user_role(s, u, role=bad))
 
 
-@pytest.mark.parametrize("variant,canonical", [
-    ("Admin", "admin"), (" admin", "admin"), ("operator ", "operator"),
-    ("OPERATOR", "operator"),
-])
-def test_set_user_role_normalises_case_and_whitespace(variant, canonical):
+@pytest.mark.parametrize("variant", ["Observer", " observer", "OBSERVER "])
+def test_set_user_role_normalises_observer_noop(variant):
     s = _RecordingSession()
-    u = _U("f", "pw-f-1234567890")
+    u = _U("f", "pw-f-1234567890", role="observer")
     _run(U.set_user_role(s, u, role=variant))
-    assert u.role == canonical
+    assert u.role == "observer"
+    assert (s.commits, s.flushes) == (0, 0)
 
 
 def test_set_user_password_flushes_not_commits():
