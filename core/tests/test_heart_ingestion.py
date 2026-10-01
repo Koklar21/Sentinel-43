@@ -44,6 +44,7 @@ from core.detection.sentinel_threat_types import (  # noqa: E402
     ThreatSeverity,
     ThreatSourceKind,
 )
+from core.detection.sigma_detector import SigmaDetector  # noqa: E402
 from core.governance import (  # noqa: E402
     HeartConfig,
     build_heart_from_settings,
@@ -432,6 +433,84 @@ def test_shadow_mode_observes_but_never_stages(tmp_path):
     assert decision.status == "OBSERVED" and decision.reason == "POLICY_OBSERVED"
     assert staged == [] and heart.list_pending() == ()
 
+
+# ---------------------------------------------------------------------------
+# Sigma provenance uses real producer corroboration
+# ---------------------------------------------------------------------------
+def test_sigma_match_does_not_counterfeit_an_independent_producer(tmp_path):
+    rule_path = tmp_path / "sigma"
+    rule_path.mkdir()
+    (rule_path / "firewall.yml").write_text(
+        """
+title: S43 Firewall Block
+id: 12345678-1234-4234-8234-123456789abc
+status: test
+logsource:
+  product: sentinel43
+  category: security
+detection:
+  selection:
+    EventType: firewall_block
+    Status: blocked
+  condition: selection
+level: high
+""".strip(),
+        encoding="utf-8",
+    )
+
+    sigma = SigmaDetector.from_path(rule_path)
+    detector = SentinelThreatDetector(sigma_detector=sigma)
+    staged: list = []
+    _, _, heart = _stores(tmp_path, staged=staged)
+
+    sigma_event = {
+        "product": "sentinel43",
+        "category": "security",
+        "event_type": "firewall_block",
+        "status": "blocked",
+    }
+    first = detector.ingest(
+        EventContext(
+            source_identity="anonymous",
+            source_ip="203.0.113.9",
+            event_type="firewall_block",
+            success=False,
+            metadata={
+                "event_id": "sigma-firewall-1",
+                "trusted_producer": "firewall",
+                "sigma_event": sigma_event,
+            },
+        )
+    )
+
+    assert first.indicators["sigma_match_count"] == 1
+    assert first.indicators["evidence_sources"] == ["firewall"]
+    decision = heart.observe(first)
+    assert decision.reason == "AWAITING_CORROBORATION"
+    assert staged == []
+
+    second = detector.ingest(
+        EventContext(
+            source_identity="anonymous",
+            source_ip="203.0.113.9",
+            event_type="integrity_signal",
+            success=False,
+            metadata={
+                "event_id": "sparta-2",
+                "trusted_producer": "sparta",
+                "sigma_event": {
+                    "product": "sentinel43",
+                    "category": "log",
+                    "event_type": "integrity_signal",
+                },
+            },
+        )
+    )
+
+    assert second.indicators["evidence_sources"] == ["firewall", "sparta"]
+    decision = heart.observe(second)
+    assert decision.status == "STAGED"
+    assert len(staged) == 1
 
 # ---------------------------------------------------------------------------
 # Fenrir hand-off and the full pipeline
