@@ -113,6 +113,13 @@ data:
   S43_FENRIR_BROADCAST_URL: "http://s43-api:8000/internal/events/broadcast"
   S43_FENRIR_REPORT_TIMEOUT: "2.0"
 
+  # Sigma-compatible deterministic detection is optional in base. Enable it
+  # only when the image/mount contains a validated rule set at this path.
+  S43_SIGMA_ENABLED: "false"
+  S43_SIGMA_RULES_PATH: "/app/rules/sigma"
+  S43_SIGMA_MAX_RULES: "256"
+  S43_SIGMA_MAX_MATCHES_PER_EVENT: "8"
+
   # Event delivery reliability (core/reliability.py)
   # Bounded retry with a hard total deadline, then dead-letter. Raising
   # attempts/delays past the deadline does not buy more retries; the
