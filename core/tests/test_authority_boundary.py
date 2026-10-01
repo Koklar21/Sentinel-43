@@ -151,6 +151,25 @@ def test_api_composition_root_has_only_the_sentinel43_authority_handle():
     assert "orchestrator: Any | None" not in source
 
 
+def test_identity_authority_survives_decision_governance_disablement():
+    """Disabling recommendation governance must not remove the authority that
+    owns first-admin, user-management, and session mutations."""
+    api_source = (CORE / "api" / "main.py").read_text(encoding="utf-8")
+    authority_source = (
+        CORE / "governance" / "runtime_authority.py"
+    ).read_text(encoding="utf-8")
+    composition_source = (
+        CORE / "governance" / "composition.py"
+    ).read_text(encoding="utf-8")
+
+    assert "governance_enabled = _env_bool" in api_source
+    assert "governance_enabled = governance_enabled" in api_source
+    assert "runtime.subsystems.mark_disabled(SUBSYS_GOVERNANCE)" in api_source
+    assert "def governance_enabled(self) -> bool" in authority_source
+    assert "governance_enabled=bool(_get(settings, \"governance_enabled\", True))" in composition_source
+    assert "or not runtime.sentinel43.governance_enabled" in api_source
+
+
 def test_runtime_authority_loads_all_owner_components():
     source = (
         CORE / "governance" / "runtime_authority.py"
