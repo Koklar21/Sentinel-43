@@ -40,6 +40,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any, Final
 
 import aiohttp
@@ -49,6 +50,7 @@ from core.detection.sentinel_threat_detector import (
     DetectorConfig,
     SentinelThreatDetector,
 )
+from core.detection.sigma_detector import SigmaDetector
 from core.detection.sentinel_threat_types import (
     ThreatAssessment,
     ThreatSeverity,
@@ -651,6 +653,10 @@ class FenrirConfig:
     detector_window_seconds: float
     detector_max_keys: int
     detector_pool_workers: int
+    sigma_enabled: bool
+    sigma_rules_path: str
+    sigma_max_rules: int
+    sigma_max_matches_per_event: int
     anomaly_zscore_threshold: float
     anomaly_pressure_threshold: float
     anomaly_decay_rate: float
@@ -779,6 +785,29 @@ class FenrirConfig:
                 minimum=1,
                 maximum=32,
             ),
+            sigma_enabled=_env_bool(
+                "S43_SIGMA_ENABLED",
+                False,
+            ),
+            sigma_rules_path=(
+                os.getenv(
+                    "S43_SIGMA_RULES_PATH",
+                    "/app/rules/sigma",
+                ).strip()
+                or "/app/rules/sigma"
+            ),
+            sigma_max_rules=_env_int(
+                "S43_SIGMA_MAX_RULES",
+                256,
+                minimum=1,
+                maximum=10_000,
+            ),
+            sigma_max_matches_per_event=_env_int(
+                "S43_SIGMA_MAX_MATCHES_PER_EVENT",
+                8,
+                minimum=1,
+                maximum=128,
+            ),
             anomaly_zscore_threshold=_env_float(
                 "S43_FENRIR_ANOMALY_ZSCORE",
                 3.5,
@@ -878,11 +907,34 @@ class FenrirHunter:
             tuple[str, str, str], int
         ] = OrderedDict()
 
+        self._sigma_load_error: str | None = None
+        sigma_detector: SigmaDetector | None = None
+        if self.config.sigma_enabled:
+            try:
+                sigma_detector = SigmaDetector.from_path(
+                    Path(self.config.sigma_rules_path),
+                    max_rules=self.config.sigma_max_rules,
+                    max_matches_per_event=(
+                        self.config.sigma_max_matches_per_event
+                    ),
+                )
+            except Exception as exc:
+                # Sigma is an optional evidence producer. A bad rule source
+                # degrades Sigma coverage but must not stop Fenrir or S43.
+                self._sigma_load_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )[:512]
+                logger.warning(
+                    "Sigma detector unavailable; continuing without Sigma",
+                    exc_info=True,
+                )
+
         self.detector = SentinelThreatDetector(
             cfg=DetectorConfig(
                 window_seconds=self.config.detector_window_seconds,
                 max_keys_hint=self.config.detector_max_keys,
-            )
+            ),
+            sigma_detector=sigma_detector,
         )
 
         self.anomaly_layer = FenrirAnomalyLayer(
@@ -983,6 +1035,27 @@ class FenrirHunter:
     def snapshot(
         self,
     ) -> dict[str, Any]:
+        sigma = self.detector.sigma_status()
+        sigma["enabled"] = self.config.sigma_enabled
+        if self._sigma_load_error:
+            sigma["coverage"] = "degraded"
+            sigma["load_error"] = self._sigma_load_error
+        elif self.config.sigma_enabled and not sigma.get("active"):
+            sigma["coverage"] = "inactive"
+        elif self.config.sigma_enabled:
+            sigma["coverage"] = "active"
+        else:
+            sigma["coverage"] = "disabled"
+
+        capabilities = [
+            "threat_detection",
+            "statistical_anomaly_detection",
+            "watchtower_reporting",
+            "dashboard_broadcast",
+        ]
+        if self.config.sigma_enabled:
+            capabilities.append("sigma_deterministic_detection")
+
         return {
             "node_id": self.config.node_id,
             "node_type": "fenrir_hunter",
@@ -1008,13 +1081,9 @@ class FenrirHunter:
             "metrics": dict(
                 self.metrics
             ),
+            "sigma_detection": sigma,
             "anomaly_layer": self.anomaly_layer.stats(),
-            "capabilities": [
-                "threat_detection",
-                "statistical_anomaly_detection",
-                "watchtower_reporting",
-                "dashboard_broadcast",
-            ],
+            "capabilities": capabilities,
         }
 
     async def health(
