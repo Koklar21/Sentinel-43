@@ -81,6 +81,20 @@ class Sentinel43RuntimeAuthority:
         return self._governance_enabled
 
     @property
+    def decision_governance_enabled(self) -> bool:
+        """Whether staging/resolution governance is explicitly enabled.
+
+        The authority itself may remain live while this is false because
+        identity/session mutations are also owned by Sentinel-43 and must not
+        bypass the authority boundary.
+        """
+        return self._decision_governance_enabled
+
+    def _require_decision_governance(self) -> None:
+        if not self._decision_governance_enabled:
+            raise RuntimeError("Sentinel-43 decision governance is disabled")
+
+    @property
     def governance_mode(self) -> str:
         """Effective governance posture exposed by the authority itself.
 
@@ -225,6 +239,7 @@ class Sentinel43RuntimeAuthority:
         max_pending_actions: int,
     ) -> None:
         """Create the ONE owner engine and bind it beneath this authority."""
+        self._require_decision_governance()
         from .sentinel43_engine import GovernedEngine
 
         authenticator = (
@@ -293,10 +308,12 @@ class Sentinel43RuntimeAuthority:
 
     def stage_recommendation(self, recommendation: Any) -> Any:
         """Public governed entry: every recommendation crosses the Nexus."""
+        self._require_decision_governance()
         return self._owner_components.nexus.submit_recommendation(recommendation)
 
     def _stage_recommendation_from_nexus(self, recommendation: Any) -> Any:
         """Nexus-only handoff into the subordinate governance service."""
+        self._require_decision_governance()
         return self._orchestrator.stage_recommendation(recommendation)
 
     def resolve_recommendation(
@@ -309,6 +326,7 @@ class Sentinel43RuntimeAuthority:
         principal: DecisionPrincipal | None = None,
     ) -> dict[str, Any]:
         """Public governed decision entry: resolution crosses the Nexus."""
+        self._require_decision_governance()
         return self._owner_components.nexus.resolve_recommendation(
             action_id,
             approved=approved,
@@ -327,6 +345,7 @@ class Sentinel43RuntimeAuthority:
         principal: DecisionPrincipal | None = None,
     ) -> dict[str, Any]:
         """Nexus-only handoff into the subordinate governance service."""
+        self._require_decision_governance()
         return self._orchestrator.resolve_recommendation(
             action_id,
             approved=approved,
@@ -391,6 +410,7 @@ class Sentinel43RuntimeAuthority:
         operator_id: str,
         reason: str,
     ) -> Any:
+        self._require_decision_governance()
         return self._orchestrator.resolve_human_decision(
             decision_id,
             approved=approved,
