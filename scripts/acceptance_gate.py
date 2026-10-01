@@ -120,17 +120,32 @@ def option_like(entries) -> list[str]:
     return [e for e in entries if not isinstance(e, str) or e.startswith("-")]
 
 
-def pytest_cmd(name: str, job: dict, report: Path, *, collect_only: bool) -> list[str]:
+def pytest_args(name: str, job: dict, report: Path, *, collect_only: bool) -> list[str]:
+    """Manifest-owned pytest arguments, independent of the interpreter profile.
+
+    Verification compares already-recorded commands/evidence and must not require
+    the interpreter that originally produced them to exist on the verifier host.
+    Execution still resolves the real profile through python_for() in pytest_cmd().
+    """
     bad = option_like([*job["paths"], *job.get("ignore", [])])
     if bad:
         raise SystemExit(f"{name}: manifest path/ignore entries must be paths, not options: {bad}")
-    cmd = [python_for(job), "-m", "pytest", "-p", "acceptance_recorder", "-p", "no:cacheprovider",
-           "--acc-report", str(report), "--acc-job", name, "-q", "-rA", *job["paths"]]
+    args = ["-p", "acceptance_recorder", "-p", "no:cacheprovider",
+            "--acc-report", str(report), "--acc-job", name, "-q", "-rA", *job["paths"]]
     for ignored in job.get("ignore", []):
-        cmd += ["--ignore", ignored]
+        args += ["--ignore", ignored]
     if collect_only:
-        cmd.append("--collect-only")
-    return cmd
+        args.append("--collect-only")
+    return args
+
+
+def pytest_cmd(name: str, job: dict, report: Path, *, collect_only: bool) -> list[str]:
+    return [
+        python_for(job),
+        "-m",
+        "pytest",
+        *pytest_args(name, job, report, collect_only=collect_only),
+    ]
 
 
 def missing_env(job: dict, env: dict) -> list[str]:
@@ -409,14 +424,17 @@ def check_pytest_job(name, job, out, meta, manifest_sha, bad, now):
         bad("job ran against a different acceptance/suites.json")
     if res.get("job") != name or inv.get("job") != name or res.get("collect_only") or not inv.get("collect_only"):
         bad("report is not from a real execution of this job (job/mode mismatch)")
-    # Exactly the command the manifest prescribes: no -k/-m/--deselect/--lf/-x, no narrowed paths.
-    expected = normalized_args(pytest_cmd(name, job, Path("x"), collect_only=False)[3:])
+    # Exactly the manifest-owned pytest arguments: no -k/-m/--deselect/--lf/-x,
+    # no narrowed paths. Do not resolve python_for(job) here: verify inspects
+    # already-recorded evidence and may run on a host that does not have the
+    # producer profile (for example Playwright's browser venv).
+    expected = normalized_args(pytest_args(name, job, Path("x"), collect_only=False))
     if normalized_args(list(res.get("args", []))) != expected:
         bad("pytest was not invoked with the manifest's exact arguments")
     if normalized_args(list(meta.get("cmd", []))[3:]) != expected:
         bad("recorded process command differs from the manifest's")
     if normalized_args(list(inv.get("args", []))) != normalized_args(
-            pytest_cmd(name, job, Path("x"), collect_only=True)[3:]):
+            pytest_args(name, job, Path("x"), collect_only=True)):
         bad("inventory was not collected with the manifest's exact arguments")
     # Timing: inventory before execution; report inside the job's own window; not stale.
     if not (isinstance(inv.get("finished"), (int, float)) and inv["finished"] <= meta["started"] + CLOCK_SLACK):
