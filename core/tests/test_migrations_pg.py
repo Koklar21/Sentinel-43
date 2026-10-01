@@ -274,7 +274,7 @@ def test_existing_compatible_stamp_then_upgrade(_clean):
         assert c.exec_driver_sql("SELECT count(*) FROM sessions").scalar() == 0
 
 
-def test_user_data_preserved_through_baseline_adoption(_clean):
+def test_user_data_preserved_through_baseline_adoption_except_role_rename(_clean):
     _seed_pre_alembic(_clean)
     with _clean.connect() as c:
         before = c.exec_driver_sql(
@@ -288,7 +288,12 @@ def test_user_data_preserved_through_baseline_adoption(_clean):
             "SELECT username,email,password_hash,role,is_active,created_at,last_login_at"
             " FROM users ORDER BY username"
         ).all()
-    assert before == after, "baseline adoption must not alter any user record"
+
+    assert len(before) == len(after)
+    for old, new in zip(before, after, strict=True):
+        assert new[:3] == old[:3]
+        assert new[3] == ("observer" if old[3] == "operator" else old[3])
+        assert new[4:] == old[4:]
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +389,67 @@ def test_0003_downgrade_removes_the_check(_clean):
 
 
 # ---------------------------------------------------------------------------
+# 0004 — sole administrator + observer roles
+# ---------------------------------------------------------------------------
+
+def test_0004_migrates_operator_rows_and_enforces_single_admin(_clean):
+    command.upgrade(_cfg(), "0003_users_role_check")
+    import uuid as _u
+
+    with _clean.begin() as c:
+        c.exec_driver_sql(
+            "INSERT INTO users (user_id, username, password_hash, role, is_active, created_at) VALUES "
+            f"('{_u.uuid4()}', 'admin1', 'x', 'admin', true, now()), "
+            f"('{_u.uuid4()}', 'legacy-op', 'x', 'operator', true, now())"
+        )
+
+    command.upgrade(_cfg(), "head")
+    with _clean.connect() as c:
+        roles = dict(c.exec_driver_sql(
+            "SELECT username, role FROM users ORDER BY username"
+        ).all())
+        assert roles == {"admin1": "admin", "legacy-op": "observer"}
+
+    with pytest.raises(IntegrityError):
+        with _clean.begin() as c:
+            c.exec_driver_sql(
+                "INSERT INTO users (user_id, username, password_hash, role, is_active, created_at) "
+                f"VALUES ('{_u.uuid4()}', 'admin2', 'x', 'admin', true, now())"
+            )
+
+
+def test_0004_refuses_multiple_existing_admins(_clean):
+    command.upgrade(_cfg(), "0003_users_role_check")
+    import uuid as _u
+
+    with _clean.begin() as c:
+        for name in ("admin-a", "admin-b"):
+            c.exec_driver_sql(
+                "INSERT INTO users (user_id, username, password_hash, role, is_active, created_at) "
+                f"VALUES ('{_u.uuid4()}', '{name}', 'x', 'admin', true, now())"
+            )
+
+    with pytest.raises(RuntimeError, match="multiple administrator"):
+        command.upgrade(_cfg(), "head")
+    assert _version(_clean) == "0003_users_role_check"
+
+
+def test_0004_refuses_populated_store_without_admin(_clean):
+    command.upgrade(_cfg(), "0003_users_role_check")
+    import uuid as _u
+
+    with _clean.begin() as c:
+        c.exec_driver_sql(
+            "INSERT INTO users (user_id, username, password_hash, role, is_active, created_at) "
+            f"VALUES ('{_u.uuid4()}', 'orphan-op', 'x', 'operator', true, now())"
+        )
+
+    with pytest.raises(RuntimeError, match="has no administrator"):
+        command.upgrade(_cfg(), "head")
+    assert _version(_clean) == "0003_users_role_check"
+
+
+# ---------------------------------------------------------------------------
 # downgrade  (§12, §18)
 # ---------------------------------------------------------------------------
 
@@ -423,7 +489,7 @@ def test_baseline_downgrade_to_base_refused_and_rolls_back(_clean):
 # sessions constraints / indexes / FK  (§14, §15, §16, §33)
 # ---------------------------------------------------------------------------
 
-def _mk_user(eng, username="op", role="operator", active=True) -> uuid.UUID:
+def _mk_user(eng, username="observer", role="observer", active=True) -> uuid.UUID:
     uid = uuid.uuid4()
     with eng.begin() as c:
         c.exec_driver_sql(
@@ -582,7 +648,7 @@ async def _sm_from(dsn):
         await eng.dispose()
 
 
-async def _mk_user_async(sm, username="op", *, role="operator", active=True):
+async def _mk_user_async(sm, username="observer", *, role="observer", active=True):
     async with sm() as s:
         u = User(user_id=uuid.uuid4(), username=username, email=None,
                  password_hash="h", role=role, is_active=active,
