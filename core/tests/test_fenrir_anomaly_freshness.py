@@ -30,10 +30,13 @@ def _assessment(
     seq: int | None,
     *,
     score: float = 10.0,
+    failure_ratio: float | None = None,
 ) -> ThreatAssessment:
     indicators = {}
     if seq is not None:
         indicators["evidence_seq"] = seq
+    if failure_ratio is not None:
+        indicators["failure_ratio"] = failure_ratio
 
     return ThreatAssessment(
         identity="anonymous",
@@ -199,3 +202,50 @@ def test_stable_baseline_does_not_treat_downward_departure_as_threat() -> None:
         assert layer.update(_assessment(seq, score=10.0)) is None
 
     assert layer.update(_assessment(7, score=5.0)) is None
+
+
+def test_failure_ratio_shift_detected_without_score_shift() -> None:
+    layer = _zscore_layer()
+
+    for seq in range(1, 7):
+        assert layer.update(
+            _assessment(seq, score=10.0, failure_ratio=0.05)
+        ) is None
+
+    anomaly = layer.update(
+        _assessment(7, score=10.0, failure_ratio=0.80)
+    )
+    assert anomaly is not None
+    shift = anomaly["behavioral_shift"]
+    assert shift["dimension"] == "failure_ratio"
+    assert shift["value"] == 0.8
+    assert shift["zscore"] == float("inf")
+    assert layer.stats()["behavioral_fires"] == 1
+    assert layer.stats()["zscore_fires"] == 0
+
+
+def test_failure_ratio_anomaly_does_not_poison_behavior_baseline() -> None:
+    layer = _zscore_layer()
+
+    for seq in range(1, 7):
+        assert layer.update(
+            _assessment(seq, score=10.0, failure_ratio=0.05)
+        ) is None
+
+    first = layer.update(
+        _assessment(7, score=10.0, failure_ratio=0.80)
+    )
+    second = layer.update(
+        _assessment(8, score=10.0, failure_ratio=0.75)
+    )
+    assert first is not None
+    assert second is not None
+    assert second["behavioral_shift"]["zscore"] == float("inf")
+
+
+def test_missing_failure_ratio_preserves_score_only_behavior() -> None:
+    layer = _zscore_layer()
+    _prime_score_baseline(layer)
+
+    assert layer.update(_assessment(6, score=50.0)) is None
+    assert layer.stats()["behavioral_fires"] == 0
