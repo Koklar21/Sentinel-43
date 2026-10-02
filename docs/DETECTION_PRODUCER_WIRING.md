@@ -26,6 +26,7 @@ fixed source label, while the caller supplies the in-process
 - `firewall` -> configured SentinelFirewall monitoring source
 - `ebpf` -> `sentinel-ebpf`
 - `sparta` -> `sentinel-sparta`
+- `remote_gateway` -> `sentinel-remote-gateway` (security observations only)
 
 SpartaCore converts its internal integrity event names to canonical detection
 event types before ingestion:
@@ -52,3 +53,16 @@ remain owned by `Sentinel43RuntimeAuthority`.
 
 Additional existing producers should be wired by the same contract rather than
 adding parallel detector instances, queues, or enforcement paths.
+
+## Remote Gateway boundary
+
+The Remote Gateway contributes only originating boundary-security observations:
+authentication failure, rate limiting, and authenticated-role mismatch. Successful
+activation telemetry remains operational/audit data and is not trusted as threat
+evidence. This prevents governance/action activity from corroborating its own
+threat path.
+
+Remote Gateway events enter through MonitoringManager, whose embedded Watchtower
+scanner already analyzes them. The older second POST to /watchtower/analyze was
+removed so one observation is scanned once rather than duplicated across two
+paths.
