@@ -18,8 +18,9 @@ eBPF coverage.
 ## Scope
 
 Phase 2 observes process execution through the stable
-`sched:sched_process_exec` tracepoint. Events contain only event id, host IP,
-PID, UID, bounded command name, bounded executable path, severity and reason.
+`sched:sched_process_exec` tracepoint. Events contain only event id, host IP, PID, UID, bounded command name, and
+bounded executable path. The API derives event type, severity, and reason from
+those observation facts; the sensor cannot self-label its evidence.
 No argv, environment, file contents, credentials, packet payloads, or arbitrary
 kernel memory are collected.
 
@@ -34,6 +35,10 @@ execs are informational telemetry.
 * sensor cap: 200 events/second by default, hard-clamped to 1000
 * BPF perf buffer is bounded
 * request body is a strict Pydantic schema; extra fields are rejected
+* host IP must parse as IPv4 or IPv6 before it can become a threat subject
+* classification is server-owned; sensor payloads cannot select threat labels
+* sensor delivery uses a bounded 1024-event userspace queue and one delivery
+  worker, so HTTP latency cannot block the BPF perf callback
 * endpoint assigns `source=sentinel-ebpf` and trusted producer `ebpf`;
   payloads cannot self-assert producer trust
 * sensor delivery errors are dropped locally and never stop Sentinel-43
