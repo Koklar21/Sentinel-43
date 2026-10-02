@@ -31,6 +31,7 @@ import inspect
 
 import pytest
 
+from core.api.routers import remote_gateway
 from core.monitoring.event_types import _EVENT_TYPE_MAP, normalize_event
 from core.monitoring.manager import MonitoringManager
 from core.monitoring.rules import sparta_core_rule
@@ -222,7 +223,77 @@ def test_monitoring_failure_never_breaks_the_integrity_path():
 
 
 # --------------------------------------------------------------------------- #
-# 3. SpartaCore.get_status() is the sparta_core_rule contract
+# 3. Remote Gateway -> trusted threat evidence, exactly once
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_remote_gateway_security_observation_is_trusted(monkeypatch):
+    class _RecordingManager:
+        def __init__(self):
+            self.calls = []
+
+        def analyze_event(self, event, **kwargs):
+            self.calls.append((event, kwargs))
+            return []
+
+    manager = _RecordingManager()
+    monkeypatch.setattr(
+        remote_gateway,
+        "_resolve_monitoring_manager",
+        lambda: manager,
+    )
+
+    await remote_gateway._notify_monitoring_pipeline(
+        {
+            "kind": "security",
+            "event_category": "remote_gateway_auth_failure",
+            "source": "payload-cannot-claim-trust",
+        },
+        source_ip="203.0.113.44",
+    )
+
+    assert len(manager.calls) == 1
+    event, kwargs = manager.calls[0]
+    assert event["source"] == "sentinel-remote-gateway"
+    assert event["source_identity"] == "service:remote-gateway"
+    assert event["event_type"] == "remote_gateway_auth_failure"
+    assert kwargs["source_ip"] == "203.0.113.44"
+    assert kwargs["source_identity"] == "service:remote-gateway"
+    assert kwargs["trusted_producer"] == "remote_gateway"
+
+
+@pytest.mark.asyncio
+async def test_remote_gateway_activation_telemetry_is_not_trusted(monkeypatch):
+    class _RecordingManager:
+        def __init__(self):
+            self.calls = []
+
+        def analyze_event(self, event, **kwargs):
+            self.calls.append((event, kwargs))
+            return []
+
+    manager = _RecordingManager()
+    monkeypatch.setattr(
+        remote_gateway,
+        "_resolve_monitoring_manager",
+        lambda: manager,
+    )
+
+    await remote_gateway._notify_monitoring_pipeline(
+        {
+            "kind": "log",
+            "event_category": "remote_gateway_event_activation",
+        },
+        source_ip="203.0.113.44",
+    )
+
+    assert len(manager.calls) == 1
+    _, kwargs = manager.calls[0]
+    assert kwargs["trusted_producer"] is None
+
+
+# --------------------------------------------------------------------------- #
+# 4. SpartaCore.get_status() is the sparta_core_rule contract
 # --------------------------------------------------------------------------- #
 
 def test_get_status_satisfies_sparta_core_rule_contract():
