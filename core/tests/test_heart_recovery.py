@@ -1323,6 +1323,7 @@ def test_unavailable_recommendation_store_releases_stage_dedupe(tmp_path):
     authority.attach_recommendation_store(
         core,
         operator_authenticator=main_module._heart_operator_authenticator,
+        max_pending_actions=500,
     )
     recovered = heart.observe(assessment)
     assert recovered.status == "STAGED"
