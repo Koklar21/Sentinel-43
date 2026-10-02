@@ -200,6 +200,28 @@ def test_ai_escalation_uses_the_canonical_threat_types():
     assert "class ThreatSourceKind" not in source
 
 
+def test_ai_escalation_preserves_provenance_without_owning_state_or_execution():
+    source = (
+        REPO_ROOT / "Sentinel-43" / "sentinel_AI_escalation.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'AI_ESCALATION_PROVENANCE_KEY = "ai_escalation"' in source
+    assert "assessment_fingerprint" in source
+    assert "replace(" in source
+    assert "MappingProxyType" in source
+
+    # The owner escalation contract enriches evidence only. Re-introducing
+    # its historical private store/executor would create a second authority.
+    for forbidden in (
+        "import sqlite3",
+        "SqliteActionStore",
+        "threading.Thread",
+        "ExecutorThread",
+        "execute_at_ms",
+    ):
+        assert forbidden not in source
+
+
 def test_public_recommendation_path_crosses_the_nexus():
     authority_source = (
         CORE / "governance" / "runtime_authority.py"
