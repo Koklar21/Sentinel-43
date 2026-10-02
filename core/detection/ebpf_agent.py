@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ctypes as ct
 import json
+import logging
 import os
 import queue
 import threading
@@ -21,6 +22,8 @@ from dataclasses import dataclass
 MAX_EVENTS_PER_SECOND = 200
 MAX_DELIVERY_QUEUE = 1024
 SUSPICIOUS_PREFIXES = ("/tmp/", "/var/tmp/", "/dev/shm/")
+LOSS_WARNING_INTERVAL_SECONDS = 30.0
+logger = logging.getLogger("sentinel43.ebpf_sensor")
 
 _BPF = r"""
 #include <uapi/linux/ptrace.h>
@@ -119,18 +122,39 @@ def run(config: SensorConfig) -> None:
     bpf = BPF(text=_BPF)
     window_started = time.monotonic()
     emitted = 0
+    delivery_failures = 0
+    queue_drops = 0
+    last_loss_warning = 0.0
     delivery_queue: queue.Queue[dict[str, object]] = queue.Queue(
         maxsize=MAX_DELIVERY_QUEUE
     )
 
+    def warn_loss(reason: str) -> None:
+        nonlocal last_loss_warning
+        now = time.monotonic()
+        if now - last_loss_warning < LOSS_WARNING_INTERVAL_SECONDS:
+            return
+        last_loss_warning = now
+        logger.warning(
+            "eBPF telemetry loss: reason=%s delivery_failures=%d queue_drops=%d",
+            reason,
+            delivery_failures,
+            queue_drops,
+        )
+
     def deliver() -> None:
+        nonlocal delivery_failures
         while True:
             payload = delivery_queue.get()
             try:
                 post_event(config, payload)
             except Exception:
-                # Coverage degrades; delivery failure is not runtime failure.
-                pass
+                # Do not block kernel-event consumption or blindly retry an
+                # event whose delivery outcome may be uncertain. Make the
+                # resulting coverage loss explicit instead of silently
+                # pretending the sensor is healthy.
+                delivery_failures += 1
+                warn_loss("delivery_failed")
             finally:
                 delivery_queue.task_done()
 
@@ -141,7 +165,7 @@ def run(config: SensorConfig) -> None:
     ).start()
 
     def on_exec(_cpu: int, data: int, _size: int) -> None:
-        nonlocal window_started, emitted
+        nonlocal window_started, emitted, queue_drops
         now = time.monotonic()
         if now - window_started >= 1.0:
             window_started, emitted = now, 0
@@ -152,7 +176,10 @@ def run(config: SensorConfig) -> None:
         try:
             delivery_queue.put_nowait(build_payload(event, config.host_ip))
         except queue.Full:
-            # Bounded loss is preferable to blocking kernel-event consumption.
+            # Bounded loss is preferable to blocking kernel-event consumption,
+            # but silent loss would make degraded coverage invisible.
+            queue_drops += 1
+            warn_loss("delivery_queue_full")
             return
 
     bpf["events"].open_perf_buffer(on_exec, page_cnt=8)
