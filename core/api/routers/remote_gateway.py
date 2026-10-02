@@ -59,7 +59,6 @@ from uuid import uuid4
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from ...monitoring.watchtower_client import watchtower_request
 from ...security_context import IdentityType, client_ip_of, set_identity
 
 logger = logging.getLogger(__name__)
@@ -959,9 +958,31 @@ async def _notify_monitoring_pipeline(
     if manager is None:
         return
 
+    # Only security observations are originating detection evidence.
+    # Successful activation telemetry is operational/audit data and must not
+    # corroborate threats or manufacture a second signal.
+    is_security_observation = event.get("kind") == "security"
+    normalized_event = dict(event)
+    if is_security_observation:
+        normalized_event["source"] = "sentinel-remote-gateway"
+        normalized_event["source_identity"] = (
+            IdentityType.SERVICE_REMOTE_GATEWAY.value
+        )
+        normalized_event["event_type"] = str(
+            normalized_event.get("event_category") or "remote_gateway_security"
+        )
+
     result = manager.analyze_event(
-        event,
+        normalized_event,
         source_ip=source_ip,
+        source_identity=(
+            IdentityType.SERVICE_REMOTE_GATEWAY.value
+            if is_security_observation
+            else None
+        ),
+        trusted_producer=(
+            "remote_gateway" if is_security_observation else None
+        ),
     )
 
     if inspect.isawaitable(result):
@@ -977,6 +998,9 @@ async def _report_security_event(
 
     async def report() -> None:
         try:
+            # MonitoringManager already owns the embedded Watchtower scan.
+            # Sending the same event to /watchtower/analyze again duplicated
+            # scanning and could make one observation look like two.
             await _notify_monitoring_pipeline(
                 event,
                 source_ip=source_ip,
@@ -984,19 +1008,6 @@ async def _report_security_event(
         except Exception:
             logger.debug(
                 "RemoteGateway monitoring notification failed",
-                exc_info=True,
-            )
-
-        try:
-            await asyncio.to_thread(
-                watchtower_request,
-                "POST",
-                "/watchtower/analyze",
-                {"event": event},
-            )
-        except Exception:
-            logger.debug(
-                "RemoteGateway Watchtower notification failed",
                 exc_info=True,
             )
 
