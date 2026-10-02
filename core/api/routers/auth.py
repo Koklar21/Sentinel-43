@@ -46,6 +46,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from ...security.jwt_constants import APPROVED_JWT_ALGORITHMS
 from ...security_context import client_ip_of
 from ..deps import get_optional_runtime_authority, get_runtime_authority
+from ..origin_policy import require_state_change_origin
 
 logger = logging.getLogger(__name__)
 
@@ -1235,102 +1236,6 @@ def _cookie_secure() -> bool:
     return True
 
 
-def _allowed_origins() -> frozenset[str]:
-    raw = _e(
-        "S43_ALLOWED_ORIGINS",
-        (
-            "http://127.0.0.1:5500,"
-            "http://localhost:5500,"
-            "http://127.0.0.1:8000,"
-            "http://localhost:8000"
-        ),
-    )
-
-    origins = frozenset(
-        origin.strip()
-        for origin in raw.split(",")
-        if origin.strip()
-    )
-
-    if not _is_local():
-        if not origins:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Allowed origins are not configured.",
-            )
-
-        if "*" in origins:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Wildcard origin is not permitted.",
-            )
-
-    return origins
-
-
-def _check_state_change_origin(
-    request: Request,
-) -> None:
-    from urllib.parse import (
-        urlsplit,
-    )
-
-    allowed = _allowed_origins()
-
-    origin = request.headers.get(
-        "origin",
-        "",
-    ).strip()
-
-    if origin:
-        if origin not in allowed:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Origin not allowed.",
-            )
-        return
-
-    referer = request.headers.get(
-        "referer",
-        "",
-    ).strip()
-
-    if referer:
-        parsed = urlsplit(
-            referer
-        )
-
-        if not (
-            parsed.scheme
-            and parsed.netloc
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Referer not allowed.",
-            )
-
-        base = (
-            f"{parsed.scheme}://"
-            f"{parsed.netloc}"
-        )
-
-        if base not in allowed:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Referer not allowed.",
-            )
-
-        return
-
-    # Browser cookie-authenticated state changes should provide Origin/Referer.
-    # Non-browser clients can use the Authorization API instead.
-    if not _is_local():
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Origin validation required.",
-        )
-
-
 def _set_session_cookies(
     response: Response,
     refresh_secret: str,
@@ -1540,7 +1445,7 @@ async def login(
     response: Response,
     authority: Any | None = Depends(get_optional_runtime_authority),
 ) -> LoginResponse:
-    _check_state_change_origin(
+    require_state_change_origin(
         request
     )
 
@@ -1650,7 +1555,7 @@ async def refresh(
     response: Response,
     authority: Any = Depends(get_runtime_authority),
 ) -> RefreshResponse:
-    _check_state_change_origin(
+    require_state_change_origin(
         request
     )
 
@@ -1792,7 +1697,7 @@ async def logout(
     response: Response,
     authority: Any = Depends(get_runtime_authority),
 ) -> dict[str, bool]:
-    _check_state_change_origin(
+    require_state_change_origin(
         request
     )
 
