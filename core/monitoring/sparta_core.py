@@ -464,6 +464,12 @@ class SpartaCore:
             return
 
         compromised = event.state_at_event is SpartaState.COMPROMISED
+        canonical_event_type = {
+            "TamperDetected": "sparta_tamper_detected",
+            "IntegrityCompromised": "sparta_integrity_compromised",
+            "FileUnavailable": "sparta_file_unavailable",
+            "RecoveryAcknowledged": "sparta_recovery_acknowledged",
+        }.get(event.event_type, "sparta_integrity_event")
         monitoring_event = {
             "kind": "log",
             "integrity_status": (
@@ -472,17 +478,23 @@ class SpartaCore:
                 else INTEGRITY_STATUS_OK
             ),
             "missing_required_fields": False,
-            # Normalized envelope provenance.
-            "source": event.source or "SpartaCore",
+            # Producer provenance is assigned here, inside the composition
+            # boundary. Event payload text cannot promote itself to Sparta.
+            "source": "sentinel-sparta",
             "source_identity": IdentityType.SERVICE_SPARTA_NODE.value,
             "created_at": event.timestamp,
             "node": self._config.node_signature or "sparta-core",
-            "event_type": event.event_type,
+            "event_type": canonical_event_type,
             "details": payload,
         }
 
         try:
-            analyze(monitoring_event)
+            analyze(
+                monitoring_event,
+                source_ip="127.0.0.1",
+                source_identity=IdentityType.SERVICE_SPARTA_NODE.value,
+                trusted_producer="sparta",
+            )
         except Exception:
             logger.debug(
                 "MonitoringManager notification failed", exc_info=True
