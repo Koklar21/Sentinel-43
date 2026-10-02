@@ -957,6 +957,40 @@ def test_production_staging_is_decided_by_the_policy_authority(client, monkeypat
     )
 
 
+def test_policy_refusal_is_a_conflict_not_heart_outage(client, monkeypatch):
+    """A normal governance refusal must never be reported as a Heart crash."""
+    from core.governance import PolicyRefused
+
+    action_id = "heart-policy-refusal"
+    main_module.runtime.action_store[action_id] = {
+        "action_id": action_id,
+        "action_type": "HEART_RECOMMENDATION",
+        "status": "STAGED",
+        "payload": {},
+    }
+
+    authority = main_module.runtime.sentinel43
+
+    class _RefusingAuthority:
+        recommendation_store_attached = True
+
+        def resolve_recommendation(self, *args, **kwargs):
+            raise PolicyRefused("approval is unavailable for this recommendation")
+
+    monkeypatch.setattr(main_module.runtime, "sentinel43", _RefusingAuthority())
+
+    response = client.post(
+        f"/actions/{action_id}/approve",
+        headers=_headers(),
+        json={"reason": "reviewed by operator"},
+    )
+    assert response.status_code == 409, response.text
+    assert "approval is unavailable" in response.text
+    assert main_module.runtime.action_store[action_id]["status"] == "STAGED"
+
+    monkeypatch.setattr(main_module.runtime, "sentinel43", authority)
+
+
 def test_production_recommendation_states_why_it_cannot_be_approved(client, monkeypatch):
     """Through the production composition, the real engine's plan for real
     detector evidence includes operations the policy vocabulary cannot state.
