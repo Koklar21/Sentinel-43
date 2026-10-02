@@ -162,8 +162,8 @@ def test_identity_authority_survives_decision_governance_disablement():
         CORE / "governance" / "composition.py"
     ).read_text(encoding="utf-8")
 
-    assert "governance_enabled = _env_bool" in api_source
-    assert "governance_enabled = governance_enabled" in api_source
+    assert "decision_governance_enabled = _env_bool" in api_source
+    assert "governance_enabled = decision_governance_enabled" in api_source
     assert "runtime.subsystems.mark_disabled(SUBSYS_GOVERNANCE)" in api_source
     assert "def governance_enabled(self) -> bool" in authority_source
     assert "governance_enabled=bool(_get(settings, \"governance_enabled\", True))" in composition_source
