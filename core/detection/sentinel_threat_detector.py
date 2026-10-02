@@ -56,25 +56,58 @@ _SIGMA_LEVEL_SCORE_FLOORS: Final[dict[str, float]] = {
 }
 _MAX_SIGMA_MATCHES_PER_ASSESSMENT: Final[int] = 32
 
-_SUSPICIOUS_EVENT_TYPES: Final[frozenset[str]] = frozenset(
+# Explicit malware/spyware vocabulary retained from the original AI-threat
+# design. These are event labels from already-trusted producers, not magic
+# payload keywords: an untrusted caller cannot self-declare itself malware and
+# gain corroboration or authority.
+_MALWARE_EVENT_TYPES: Final[frozenset[str]] = frozenset(
     {
-        "brute_force",
-        "ebpf_suspicious_exec",
-        "sparta_tamper_detected",
-        "sparta_integrity_compromised",
-        "sparta_file_unavailable",
-        "credential_stuffing",
-        "login_failure",
-        "remote_gateway_auth_failure",
-        "remote_gateway_rate_limited",
-        "remote_gateway_role_mismatch",
-        "auth_failure",
         "malware_beacon",
-        "exfiltration",
-        "port_scan",
-        "payload_rejected",
-        "waf_block",
+        "malware_activity",
+        "malware_delivery",
+        "malware_detected",
+        "virus_activity",
+        "virus_detected",
     }
+)
+_SPYWARE_EVENT_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "spyware",
+        "spyware_activity",
+        "spyware_detected",
+    }
+)
+
+_AI_PATTERN_CLASSIFICATION: Final[dict[ThreatKind, str]] = {
+    ThreatKind.MALWARE_DELIVERY: "AI_AUTOMATION_MALWARE_LIKELY",
+    ThreatKind.SPYWARE_ACTIVITY: "AI_AUTOMATION_SPYWARE_LIKELY",
+    ThreatKind.DATA_EXFILTRATION: "AI_AUTOMATION_EXFILTRATION_LIKELY",
+    ThreatKind.CREDENTIAL_ATTACK: "AI_AUTOMATION_CREDENTIAL_ABUSE_LIKELY",
+    ThreatKind.GENERIC_INTRUSION: "AI_AUTOMATION_INTRUSION_LIKELY",
+}
+
+_SUSPICIOUS_EVENT_TYPES: Final[frozenset[str]] = (
+    frozenset(
+        {
+            "brute_force",
+            "ebpf_suspicious_exec",
+            "sparta_tamper_detected",
+            "sparta_integrity_compromised",
+            "sparta_file_unavailable",
+            "credential_stuffing",
+            "login_failure",
+            "remote_gateway_auth_failure",
+            "remote_gateway_rate_limited",
+            "remote_gateway_role_mismatch",
+            "auth_failure",
+            "exfiltration",
+            "port_scan",
+            "payload_rejected",
+            "waf_block",
+        }
+    )
+    | _MALWARE_EVENT_TYPES
+    | _SPYWARE_EVENT_TYPES
 )
 
 
@@ -892,6 +925,7 @@ class SentinelThreatDetector:
             self._classify_source(
                 event_count=event_count,
                 failure_count=failure_count,
+                deterministic_agent_pattern=bool(agent_sequence_matches),
             )
         )
 
@@ -918,6 +952,49 @@ class SentinelThreatDetector:
             failure_count=failure_count,
             event_count=event_count,
         )
+
+        if source_kind is ThreatSourceKind.AI_AUTOMATION_LIKELY:
+            pattern_classification = _AI_PATTERN_CLASSIFICATION.get(
+                kind,
+                "AI_AUTOMATION_PATTERN_LIKELY",
+            )
+            deterministic_signals = sorted(
+                {
+                    tag
+                    for tag in tags
+                    if (
+                        tag.startswith("type:")
+                        or tag.startswith("sigma:")
+                        or tag.startswith("agent_sequence:")
+                        or tag
+                        in {
+                            "sigma_match",
+                            "agent_sequence_match",
+                            "critical_rate",
+                            "high_rate",
+                            "medium_rate",
+                            "critical_failure_volume",
+                            "high_failure_volume",
+                            "medium_failure_volume",
+                            "auth_status_errors",
+                            "rate_limited_repeatedly",
+                            "abusive_payload_size",
+                            "suspicious_payload_size",
+                        }
+                    )
+                }
+            )[:32]
+            indicators["ai_pattern_profile"] = {
+                "classification": pattern_classification,
+                "automation_likely": True,
+                "threat_kind": kind.value,
+                "deterministic": bool(deterministic_signals),
+                "deterministic_signals": deterministic_signals,
+            }
+            tags.append(
+                "ai_pattern:"
+                + pattern_classification.casefold()
+            )
 
         severity = _severity_from_score(
             score
@@ -1122,7 +1199,11 @@ class SentinelThreatDetector:
         *,
         event_count: int,
         failure_count: int,
+        deterministic_agent_pattern: bool = False,
     ) -> ThreatSourceKind:
+        if deterministic_agent_pattern:
+            return ThreatSourceKind.AI_AUTOMATION_LIKELY
+
         if (
             event_count
             >= self.cfg.automation_event_rate
@@ -1167,15 +1248,12 @@ class SentinelThreatDetector:
                 ThreatKind.CREDENTIAL_ATTACK
             )
 
-        if "malware_beacon" in event_types:
+        if _MALWARE_EVENT_TYPES & event_types:
             return (
                 ThreatKind.MALWARE_DELIVERY
             )
 
-        if {
-            "spyware",
-            "spyware_activity",
-        } & event_types:
+        if _SPYWARE_EVENT_TYPES & event_types:
             return (
                 ThreatKind.SPYWARE_ACTIVITY
             )
