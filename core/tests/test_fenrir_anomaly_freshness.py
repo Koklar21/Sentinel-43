@@ -177,3 +177,25 @@ def test_pressure_fire_does_not_ratchet_pressure_with_flagged_observation() -> N
     # ratcheted pressure that included the prior anomaly.
     later = layer.update(_assessment(4, score=1.0))
     assert later is None
+
+
+def test_stable_baseline_detects_first_upward_departure() -> None:
+    layer = _zscore_layer()
+
+    for seq in range(1, 7):
+        assert layer.update(_assessment(seq, score=10.0)) is None
+
+    anomaly = layer.update(_assessment(7, score=20.0))
+    assert anomaly is not None
+    assert anomaly["zscore"] == float("inf")
+    assert anomaly["baseline_mean"] == 10.0
+    assert anomaly["baseline_std"] == 0.0
+
+
+def test_stable_baseline_does_not_treat_downward_departure_as_threat() -> None:
+    layer = _zscore_layer()
+
+    for seq in range(1, 7):
+        assert layer.update(_assessment(seq, score=10.0)) is None
+
+    assert layer.update(_assessment(7, score=5.0)) is None
