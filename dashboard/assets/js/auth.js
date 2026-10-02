@@ -720,8 +720,13 @@ function showOverlay(message, locked = false) {
     if (pEl) pEl.disabled = locked;
     if (tokenEl) tokenEl.disabled = locked;
     if (btn) {
-        btn.disabled    = locked;
-        btn.textContent = locked ? "UNAVAILABLE" : "AUTHENTICATE";
+        btn.disabled = locked;
+        const bootstrapMode = form?.dataset.mode === "bootstrap";
+        btn.textContent = locked
+            ? "UNAVAILABLE"
+            : bootstrapMode
+                ? "CREATE INITIAL ADMIN"
+                : "AUTHENTICATE";
     }
     if (foot) foot.textContent = "";
 
