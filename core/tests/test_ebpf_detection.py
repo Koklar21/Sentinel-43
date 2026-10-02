@@ -60,3 +60,15 @@ def test_ebpf_sensor_payload_cannot_choose_detection_semantics():
     assert "event_type" not in payload
     assert "severity" not in payload
     assert "reason" not in payload
+
+
+
+def test_ebpf_sensor_does_not_silently_drop_delivery_failures():
+    import inspect
+    import core.detection.ebpf_agent as module
+
+    source = inspect.getsource(module)
+    assert "delivery_failures += 1" in source
+    assert "queue_drops += 1" in source
+    assert 'warn_loss("delivery_failed")' in source
+    assert 'warn_loss("delivery_queue_full")' in source
