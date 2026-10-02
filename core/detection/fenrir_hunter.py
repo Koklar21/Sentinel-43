@@ -1289,6 +1289,39 @@ class FenrirHunter:
             anomaly_map,
         )
 
+    @staticmethod
+    def _with_anomaly_evidence(
+        assessment: ThreatAssessment,
+        anomaly: dict[str, Any] | None,
+    ) -> ThreatAssessment:
+        if anomaly is None:
+            return assessment
+
+        indicators = dict(assessment.indicators)
+        indicators["fenrir_anomaly"] = dict(anomaly)
+
+        tags = list(assessment.supporting_tags)
+        if "statistical_anomaly" not in tags:
+            tags.append("statistical_anomaly")
+        if (
+            "behavioral_shift" in anomaly
+            and "behavioral_anomaly" not in tags
+        ):
+            tags.append("behavioral_anomaly")
+
+        return ThreatAssessment(
+            identity=assessment.identity,
+            source_ip=assessment.source_ip,
+            threat_kind=assessment.threat_kind,
+            severity=assessment.severity,
+            source_kind=assessment.source_kind,
+            score=assessment.score,
+            indicators=indicators,
+            supporting_tags=tags,
+            window_size=assessment.window_size,
+            generated_at=assessment.generated_at,
+        )
+
     async def _observe_with_heart(
         self,
         assessment: ThreatAssessment,
@@ -1411,7 +1444,12 @@ class FenrirHunter:
                 ] += 1
 
             if rank >= self._min_severity_rank:
-                await self._observe_with_heart(assessment)
+                await self._observe_with_heart(
+                    self._with_anomaly_evidence(
+                        assessment,
+                        anomaly,
+                    )
+                )
 
                 findings.append(
                     self._assessment_to_finding(
@@ -1426,7 +1464,12 @@ class FenrirHunter:
                     "anomaly_escalations"
                 ] += 1
 
-                await self._observe_with_heart(assessment)
+                await self._observe_with_heart(
+                    self._with_anomaly_evidence(
+                        assessment,
+                        anomaly,
+                    )
+                )
 
                 findings.append(
                     self._assessment_to_finding(
