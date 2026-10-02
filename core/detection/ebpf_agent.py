@@ -11,12 +11,15 @@ import argparse
 import ctypes as ct
 import json
 import os
+import queue
+import threading
 import time
 import urllib.request
 import uuid
 from dataclasses import dataclass
 
 MAX_EVENTS_PER_SECOND = 200
+MAX_DELIVERY_QUEUE = 1024
 SUSPICIOUS_PREFIXES = ("/tmp/", "/var/tmp/", "/dev/shm/")
 
 _BPF = r"""
@@ -80,17 +83,13 @@ def build_payload(event: _ExecEvent, host_ip: str) -> dict[str, object]:
     filename = (
         bytes(event.filename).split(b"\0", 1)[0].decode("utf-8", "replace")[:512]
     )
-    event_type, severity, reason = classify_exec(filename)
     return {
         "event_id": str(uuid.uuid4()),
-        "event_type": event_type,
         "host_ip": host_ip,
         "pid": int(event.pid),
         "uid": int(event.uid),
         "comm": comm,
         "filename": filename,
-        "severity": severity,
-        "reason": reason,
     }
 
 
@@ -120,6 +119,26 @@ def run(config: SensorConfig) -> None:
     bpf = BPF(text=_BPF)
     window_started = time.monotonic()
     emitted = 0
+    delivery_queue: queue.Queue[dict[str, object]] = queue.Queue(
+        maxsize=MAX_DELIVERY_QUEUE
+    )
+
+    def deliver() -> None:
+        while True:
+            payload = delivery_queue.get()
+            try:
+                post_event(config, payload)
+            except Exception:
+                # Coverage degrades; delivery failure is not runtime failure.
+                pass
+            finally:
+                delivery_queue.task_done()
+
+    threading.Thread(
+        target=deliver,
+        name="s43-ebpf-delivery",
+        daemon=True,
+    ).start()
 
     def on_exec(_cpu: int, data: int, _size: int) -> None:
         nonlocal window_started, emitted
@@ -131,10 +150,9 @@ def run(config: SensorConfig) -> None:
         emitted += 1
         event = ct.cast(data, ct.POINTER(_ExecEvent)).contents
         try:
-            post_event(config, build_payload(event, config.host_ip))
-        except Exception:
-            # Coverage degrades; kernel observation failure must never become
-            # a Sentinel-43 runtime failure or an enforcement path.
+            delivery_queue.put_nowait(build_payload(event, config.host_ip))
+        except queue.Full:
+            # Bounded loss is preferable to blocking kernel-event consumption.
             return
 
     bpf["events"].open_perf_buffer(on_exec, page_cnt=8)
