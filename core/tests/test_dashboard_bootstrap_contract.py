@@ -93,3 +93,17 @@ def test_split_origin_dashboard_auth_headers_are_cors_allowed():
 
     assert '"X-S43-CSRF"' in source
     assert '"X-S43-Bootstrap-Token"' in source
+
+def test_dashboard_distinguishes_auth_failures_from_bad_credentials():
+    source = AUTH_JS.read_text(encoding="utf-8")
+
+    assert "if (res.status === 401)" in source
+    assert "Invalid username or password." in source
+    assert "else if (res.status === 403)" in source
+    assert "Authentication request rejected by security policy." in source
+    assert "else if (res.status === 429)" in source
+    assert "Too many failed login attempts. Try again later." in source
+    assert "else if (res.status === 503)" in source
+    assert "Authentication service is temporarily unavailable." in source
+    assert "typeof body.detail === \"string\" ? body.detail.trim() : \"\"" in source
+
