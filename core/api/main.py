@@ -1719,6 +1719,7 @@ async def _start_fenrir() -> None:
                 runtime.fenrir_instance.detector,
                 producers={
                     "ebpf": "sentinel-ebpf",
+                    "sparta": "sentinel-sparta",
                     "firewall": (
                         os.getenv(
                             "S43_FIREWALL_MONITORING_SOURCE",
