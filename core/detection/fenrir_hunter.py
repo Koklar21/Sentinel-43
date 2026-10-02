@@ -505,12 +505,6 @@ class FenrirAnomalyLayer:
                 + score
             )
 
-            baseline.stream.update(
-                score
-            )
-            baseline.pressure = (
-                projected_pressure
-            )
             baseline.last_evidence_seq = evidence_seq
             baseline.last_seen_monotonic = (
                 now
@@ -520,6 +514,12 @@ class FenrirAnomalyLayer:
                 previous_count
                 < self.min_observations
             ):
+                baseline.stream.update(
+                    score
+                )
+                baseline.pressure = (
+                    projected_pressure
+                )
                 return None
 
             anomaly: dict[str, Any] = {}
@@ -566,6 +566,16 @@ class FenrirAnomalyLayer:
                 )
 
             if not anomaly:
+                # Learn only normal observations once the baseline is mature.
+                # An observation that already crossed an anomaly threshold
+                # must not drag the baseline toward itself or inflate future
+                # cumulative pressure.
+                baseline.stream.update(
+                    score
+                )
+                baseline.pressure = (
+                    projected_pressure
+                )
                 return None
 
             anomaly[
