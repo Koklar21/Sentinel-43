@@ -616,6 +616,71 @@ def test_full_pipeline_firewall_only_stays_pending_second_producer_stages(tmp_pa
     assert staged[0]["payload"]["source_ip"] == "203.0.113.9"
 
 
+
+
+
+def test_anomaly_evidence_crosses_the_authority_boundary_without_severity_inflation():
+    captured: list[ThreatAssessment] = []
+
+    class RecordingAuthority:
+        threat_ingress_available = True
+
+        def observe_threat(self, assessment):
+            captured.append(assessment)
+
+    assessment = ThreatAssessment(
+        identity="anonymous",
+        source_ip="203.0.113.77",
+        threat_kind=ThreatKind.UNKNOWN,
+        severity=ThreatSeverity.LOW,
+        source_kind=ThreatSourceKind.MIXED_OR_UNKNOWN,
+        score=10.0,
+        indicators={
+            "evidence_seq": 7,
+            "evidence_sources": ["firewall"],
+            "failure_ratio": 0.8,
+        },
+        supporting_tags=[],
+        window_size=10,
+    )
+    anomaly = {
+        "behavioral_shift": {
+            "dimension": "failure_ratio",
+            "value": 0.8,
+            "zscore": float("inf"),
+            "baseline_mean": 0.05,
+            "baseline_std": 0.0,
+        },
+        "observations": 6,
+        "evidence_seq": 7,
+    }
+
+    async def scenario():
+        fenrir = FenrirHunter(authority=RecordingAuthority())
+        fenrir._run_detection = lambda: (
+            [assessment],
+            {
+                (
+                    assessment.identity,
+                    assessment.source_ip,
+                    assessment.threat_kind.value,
+                    assessment.source_kind.value,
+                ): anomaly
+            },
+        )
+        return await fenrir.observe_signals()
+
+    findings = asyncio.run(scenario())
+
+    assert len(captured) == 1
+    observed = captured[0]
+    assert observed.score == 10.0
+    assert observed.severity is ThreatSeverity.LOW
+    assert observed.indicators["fenrir_anomaly"] == anomaly
+    assert "statistical_anomaly" in observed.supporting_tags
+    assert "behavioral_anomaly" in observed.supporting_tags
+    assert findings[0]["anomaly"] == anomaly
+
 # ---------------------------------------------------------------------------
 # Staging back-pressure (restored historical max_pending_or_gated)
 # ---------------------------------------------------------------------------
