@@ -28,3 +28,12 @@ Fenrir finding -> Sentinel43RuntimeAuthority -> Heart / existing human gates`
 
 The anomaly layer cannot quarantine, terminate processes or containers, block
 users, mutate policy, approve actions, or bypass human gates.
+
+
+## Stable baselines
+
+A mature baseline with zero variance is not treated as absence of information.
+If repeated accepted observations establish the same score, the first upward
+departure is considered statistically anomalous even though a finite z-score
+cannot be calculated. Downward departures remain non-escalating because this
+layer models increases in threat behavior, not arbitrary statistical novelty.
