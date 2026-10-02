@@ -253,8 +253,7 @@ def test_monitoring_failure_never_breaks_the_integrity_path():
 # 3. Remote Gateway -> trusted threat evidence, exactly once
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.asyncio
-async def test_remote_gateway_security_observation_is_trusted(monkeypatch):
+def test_remote_gateway_security_observation_is_trusted(monkeypatch):
     class _RecordingManager:
         def __init__(self):
             self.calls = []
@@ -270,13 +269,15 @@ async def test_remote_gateway_security_observation_is_trusted(monkeypatch):
         lambda: manager,
     )
 
-    await remote_gateway._notify_monitoring_pipeline(
-        {
-            "kind": "security",
-            "event_category": "remote_gateway_auth_failure",
-            "source": "payload-cannot-claim-trust",
-        },
-        source_ip="203.0.113.44",
+    asyncio.run(
+        remote_gateway._notify_monitoring_pipeline(
+            {
+                "kind": "security",
+                "event_category": "remote_gateway_auth_failure",
+                "source": "payload-cannot-claim-trust",
+            },
+            source_ip="203.0.113.44",
+        )
     )
 
     assert len(manager.calls) == 1
@@ -289,8 +290,7 @@ async def test_remote_gateway_security_observation_is_trusted(monkeypatch):
     assert kwargs["trusted_producer"] == "remote_gateway"
 
 
-@pytest.mark.asyncio
-async def test_remote_gateway_activation_telemetry_is_not_trusted(monkeypatch):
+def test_remote_gateway_activation_telemetry_is_not_trusted(monkeypatch):
     class _RecordingManager:
         def __init__(self):
             self.calls = []
@@ -306,12 +306,14 @@ async def test_remote_gateway_activation_telemetry_is_not_trusted(monkeypatch):
         lambda: manager,
     )
 
-    await remote_gateway._notify_monitoring_pipeline(
-        {
-            "kind": "log",
-            "event_category": "remote_gateway_event_activation",
-        },
-        source_ip="203.0.113.44",
+    asyncio.run(
+        remote_gateway._notify_monitoring_pipeline(
+            {
+                "kind": "log",
+                "event_category": "remote_gateway_event_activation",
+            },
+            source_ip="203.0.113.44",
+        )
     )
 
     assert len(manager.calls) == 1
