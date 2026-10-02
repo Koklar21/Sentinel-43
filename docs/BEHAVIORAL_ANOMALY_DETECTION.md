@@ -54,3 +54,17 @@ bounded-key, stale-pruning, and anomaly-poisoning rules as score baselining.
 Missing behavioral metadata falls back to score-only anomaly handling. A
 behavioral shift is evidence only; it does not independently enforce or change
 policy.
+
+
+## Authority-bound anomaly evidence
+
+Fenrir carries anomaly details across the existing Sentinel43RuntimeAuthority
+ingress instead of keeping them only in its reporting payload. When an
+assessment has statistical anomaly evidence, the authority-bound assessment
+includes a `fenrir_anomaly` indicator and the `statistical_anomaly` tag.
+Behavioral shifts additionally carry `behavioral_anomaly`.
+
+This does not raise the detector score or severity. Heart corroboration,
+owner-engine planning, policy evaluation, and human gates continue to use
+their existing rules; they simply receive the same anomaly evidence Fenrir
+reported externally.
