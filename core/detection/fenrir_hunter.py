@@ -286,11 +286,19 @@ class _WelfordStream:
         """
         standard_deviation = self.std
 
-        if (
-            standard_deviation == 0.0
-            or self.count < 2
-        ):
+        if self.count < 2:
             return 0.0
+
+        if standard_deviation == 0.0:
+            # A perfectly stable mature baseline still has information.
+            # Treat an upward departure as maximally unusual rather than
+            # silently declaring it non-anomalous because division by zero
+            # is unavailable.
+            return (
+                math.inf
+                if value > self.mean
+                else 0.0
+            )
 
         return max(
             0.0,
