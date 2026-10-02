@@ -145,6 +145,15 @@ at the boundary instead.
 - `sentinel_AI_escalation.py` is the live AI/detection escalation contract.
   It carries evidence and recommendation vocabulary but does not plan or
   execute responses; the owner engine remains authoritative for planning.
+  The existing detector retains the original AI-threat distinction as the
+  composition of `ThreatSourceKind.AI_AUTOMATION_LIKELY` with the canonical
+  threat kind. Deterministic malware/virus, spyware, exfiltration, credential,
+  Sigma, and agent-sequence evidence is summarized in the assessment's bounded
+  `ai_pattern_profile`. The owner escalation layer then adds its own stable
+  assessment fingerprint under the reserved `ai_escalation` indicator before
+  the assessment reaches Heart. That provenance therefore enters the existing
+  authoritative audit path instead of terminating inside the escalation
+  facade.
 - `Shadow_mode.py` is the one live response engine. It requires an injected
   governed `ActionStore`, supports only SHADOW/HUMAN_GATED, and contains no
   standalone SQLite runtime or autonomous executor.
@@ -154,6 +163,24 @@ at the boundary instead.
 
 All four owner sources ship in the runtime image. None creates a second
 authority, store, approval queue, scheduler, Watchtower, or executor.
+
+
+### AI evidence persistence
+
+No additional AI-specific database or schema is used.
+
+The durable recommendation row in `SentinelCoreStore` remains intentionally
+small and decision-bound: target, action set, threat kind, severity,
+`source_kind`, score, principal, and status. The full detector indicators,
+including `ai_pattern_profile` and owner `ai_escalation` fingerprint
+provenance, are already carried by Heart into the canonical authenticated
+`AuditStore` record.
+
+Duplicating those indicators into another table/column would create two
+sources of truth for the same evidence. If future response authorization ever
+requires a new field to survive independently of the audit record, that field
+must be added deliberately to the existing governed store and bound into the
+staging-integrity checks; this preservation pass does not invent one.
 
 ## Rules
 
