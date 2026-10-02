@@ -494,19 +494,19 @@ function buildOverlay() {
                 No Sentinel-43 account exists yet. Create the first administrator.
                 This one-time claim closes after the account is created.
             </div>
-            <form id="s43-login-form" autocomplete="off" novalidate data-mode="login">
+            <form id="s43-login-form" autocomplete="on" novalidate data-mode="login">
                 <div class="s43lf">
                     <label for="s43-username">USERNAME</label>
-                    <input id="s43-username" type="text"
+                    <input id="s43-username" name="username" type="text"
                            autocomplete="username" spellcheck="false" autocapitalize="none" />
                 </div>
                 <div class="s43lf">
                     <label for="s43-password">PASSWORD</label>
-                    <input id="s43-password" type="password" autocomplete="current-password" />
+                    <input id="s43-password" name="password" type="password" autocomplete="current-password" />
                 </div>
                 <div id="s43-email-wrap" class="s43lf">
                     <label for="s43-email">EMAIL <span style="opacity:.55">(OPTIONAL)</span></label>
-                    <input id="s43-email" type="email" autocomplete="email" />
+                    <input id="s43-email" name="email" type="email" autocomplete="email" />
                 </div>
                 <div id="s43-bootstrap-token-wrap" class="s43lf">
                     <label for="s43-bootstrap-token">DEPLOYMENT CLAIM TOKEN</label>
