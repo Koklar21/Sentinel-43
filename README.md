@@ -90,7 +90,7 @@ It helps answer:
 
 > **Does this activity deserve attention?**
 
-Fenrir produces evidence and threat observations. It combines deterministic threshold scoring, an optional bounded Sigma-compatible rule matcher, and a bounded statistical anomaly baseline; that baseline advances only on newer detector evidence, so repeated polling or retries cannot manufacture anomaly pressure. Sigma rules are parsed with pySigma and limited to the event-local S43 telemetry subset documented in [docs/SIGMA_DETECTION.md](docs/SIGMA_DETECTION.md). Fenrir and Sigma do not own governance or enforcement.
+Fenrir produces evidence and threat observations. It combines deterministic threshold scoring, an optional bounded Sigma-compatible rule matcher, agent-sequence correlation, and a bounded statistical anomaly baseline; that baseline advances only on newer detector evidence, so repeated polling or retries cannot manufacture anomaly pressure. The deterministic detector preserves the original AI-threat distinction by pairing `AI_AUTOMATION_LIKELY` source classification with malware/virus, spyware, exfiltration, credential, or intrusion kinds and records the explainable basis in `ai_pattern_profile`. The owner AI-escalation component fingerprints that canonical assessment before Heart/audit. Sigma rules are parsed with pySigma and limited to the event-local S43 telemetry subset documented in [docs/SIGMA_DETECTION.md](docs/SIGMA_DETECTION.md). Detection and AI escalation do not own governance or enforcement.
 
 ### Heart
 
