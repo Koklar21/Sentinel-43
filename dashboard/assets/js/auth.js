@@ -276,7 +276,26 @@ async function attemptLogin(username, password) {
 
     if (!res.ok) {
         console.warn("[S43 Auth] Login rejected:", res.status);
-        throw new Error("Invalid username or password.");
+
+        const detail =
+            typeof body.detail === "string" ? body.detail.trim() : "";
+
+        let message;
+        if (res.status === 401) {
+            message = "Invalid username or password.";
+        } else if (res.status === 429) {
+            message = detail || "Too many failed login attempts. Try again later.";
+        } else if (res.status === 403) {
+            message = detail || "Authentication request rejected by security policy.";
+        } else if (res.status === 503) {
+            message = detail || "Authentication service is temporarily unavailable.";
+        } else {
+            message = detail || `Authentication failed (HTTP ${res.status}).`;
+        }
+
+        const err = new Error(message);
+        err.status = res.status;
+        throw err;
     }
 
     const token = typeof (body.access_token || body.token) === "string"
