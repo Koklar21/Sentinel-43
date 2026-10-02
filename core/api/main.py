@@ -2885,6 +2885,8 @@ app.add_middleware(
         "Authorization",
         "Content-Type",
         "X-S43-Password",
+        "X-S43-CSRF",
+        "X-S43-Bootstrap-Token",
         "X-Request-ID",
     ],
 )
