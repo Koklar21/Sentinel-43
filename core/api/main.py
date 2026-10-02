@@ -64,6 +64,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .origin_policy import (
+    LOCAL_ENVIRONMENTS,
+    LOOPBACK_HTTP_ORIGIN_RE,
+    configured_allowed_origins,
+)
+
 from ..bootstrap import bootstrap_expectations
 from ..lifecycle import (
     Reason as SubsystemReason,
@@ -195,11 +201,6 @@ def _env_float(
     return value
 
 
-def _env_frozenset(name: str, default: str = "") -> frozenset[str]:
-    raw = os.getenv(name, default)
-    return frozenset(item.strip() for item in raw.split(",") if item.strip())
-
-
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -213,7 +214,7 @@ SENTINEL_ENV = (
     _env_str("SENTINEL_ENV") or _env_str("S43_ENV", "production")
 ).lower()
 
-LOCAL_TEST_ENVIRONMENTS = frozenset({"development", "dev", "local", "test"})
+LOCAL_TEST_ENVIRONMENTS = LOCAL_ENVIRONMENTS
 IS_LOCAL_ENV = SENTINEL_ENV in LOCAL_TEST_ENVIRONMENTS
 
 WATCHTOWER_HEARTBEAT_SECONDS = _env_int(
@@ -281,11 +282,7 @@ JWT_SECRET = _env_str("S43_JWT_SECRET")
 JWT_ALGORITHM = _env_str("S43_JWT_ALGORITHM", "HS256")
 _APPROVED_ALGORITHMS = APPROVED_JWT_ALGORITHMS
 
-_ALLOWED_ORIGINS: frozenset[str] = _env_frozenset(
-    "S43_ALLOWED_ORIGINS",
-    "http://127.0.0.1:5500,http://localhost:5500,"
-    "http://127.0.0.1:8000,http://localhost:8000",
-)
+_ALLOWED_ORIGINS: frozenset[str] = configured_allowed_origins()
 
 _TRUSTED_HOSTS = [
     item.strip()
@@ -303,10 +300,6 @@ MAX_DASHBOARD_ACTIONS = _env_int(
 ACTION_ID_RE = re.compile(r"^[A-Z0-9_-]{1,64}$")
 EVENT_TYPE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 CHANNEL_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
-LOOPBACK_HTTP_ORIGIN_RE = re.compile(
-    r"^http://(localhost|127\.0\.0\.1)(:\d+)?$"
-)
-
 START_TIME = time.time()
 
 # This composition root still has an in-process action cache and in-process
@@ -557,6 +550,17 @@ def _validate_security_config() -> None:
                 "Non-local Sentinel-43 API requires S43_TRUSTED_HOSTS, or an "
                 "explicit S43_TRUST_PROXY_HOST_VALIDATION=true assertion when "
                 "a trusted upstream proxy validates Host."
+            )
+
+        if not _ALLOWED_ORIGINS:
+            raise RuntimeError(
+                "Non-local Sentinel-43 API requires S43_ALLOWED_ORIGINS. "
+                "No browser origin is trusted until an explicit set is configured."
+            )
+        if "*" in _ALLOWED_ORIGINS:
+            raise RuntimeError(
+                "S43_ALLOWED_ORIGINS may not contain '*' outside "
+                "development/local/test environments."
             )
 
         if not _env_bool("S43_ALLOW_INSECURE_ORIGINS", False):
