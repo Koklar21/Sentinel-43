@@ -1720,6 +1720,7 @@ async def _start_fenrir() -> None:
                 producers={
                     "ebpf": "sentinel-ebpf",
                     "sparta": "sentinel-sparta",
+                    "remote_gateway": "sentinel-remote-gateway",
                     "firewall": (
                         os.getenv(
                             "S43_FIREWALL_MONITORING_SOURCE",
