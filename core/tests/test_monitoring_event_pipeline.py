@@ -116,6 +116,33 @@ def test_unknown_event_kind_is_rejected_not_coerced():
         normalize_event({"kind": "definitely-not-a-real-kind"})
 
 
+def test_monitoring_accounts_for_rejected_malformed_event():
+    class _Telemetry:
+        def __init__(self):
+            self.events = []
+
+        def emit(self, event):
+            self.events.append(event)
+
+    scanner = _RecordingScanner()
+    telemetry = _Telemetry()
+    manager = MonitoringManager(scanner, telemetry_sink=telemetry)
+    manager.start()
+
+    with pytest.raises(ValueError):
+        manager.analyze_event(
+            {"kind": "request", "status_code": 999}
+        )
+
+    status = manager.get_status()["manager"]
+    assert status["failure_count"] == 1
+    assert scanner.seen == []
+    assert any(
+        event.get("status") == "normalization_failed"
+        for event in telemetry.events
+    )
+
+
 # --------------------------------------------------------------------------- #
 # 2. Sparta -> MonitoringManager provenance
 # --------------------------------------------------------------------------- #
