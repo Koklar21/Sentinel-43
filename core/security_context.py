@@ -110,6 +110,7 @@ class IdentityType(StrEnum):
     SERVICE_WATCHTOWER = "service:watchtower"
     SERVICE_FENRIR = "service:fenrir"
     SERVICE_EBPF = "service:ebpf"
+    SERVICE_AGENT_RUNTIME = "service:agent-runtime"
     SERVICE_SPARTA_NODE = "service:sparta-node"
     SERVICE_REMOTE_GATEWAY = "service:remote-gateway"
 
