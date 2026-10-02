@@ -100,6 +100,7 @@ from ..security_context import (
     set_identity as _set_identity,
 )
 from .routers.audit import router as audit_router
+from .routers.agent_runtime import router as agent_runtime_router
 from .routers.auth import router as auth_router
 from .routers.bootstrap import router as bootstrap_router
 from .routers.ebpf import router as ebpf_router
@@ -1719,6 +1720,7 @@ async def _start_fenrir() -> None:
                 runtime.fenrir_instance.detector,
                 producers={
                     "ebpf": "sentinel-ebpf",
+                    "agent_runtime": "sentinel-agent-runtime",
                     "sparta": "sentinel-sparta",
                     "remote_gateway": "sentinel-remote-gateway",
                     "firewall": (
@@ -5077,6 +5079,7 @@ app.include_router(auth_router)
 app.include_router(users_router)
 app.include_router(bootstrap_router)
 app.include_router(ebpf_router)
+app.include_router(agent_runtime_router)
 app.include_router(remote_gateway_router)
 
 # IMPORTANT:
