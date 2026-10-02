@@ -34,6 +34,17 @@ def test_dashboard_discovers_first_run_before_showing_login():
     assert "showBootstrapOverlay" in source
 
 
+def test_dashboard_login_form_is_password_manager_compatible():
+    source = AUTH_JS.read_text(encoding="utf-8")
+
+    assert '<form id="s43-login-form" autocomplete="on"' in source
+    assert 'id="s43-username" name="username"' in source
+    assert 'autocomplete="username"' in source
+    assert 'id="s43-password" name="password"' in source
+    assert 'autocomplete="current-password"' in source
+    assert 'password.autocomplete = bootstrapMode ? "new-password" : "current-password"' in source
+
+
 def test_dashboard_auth_honors_the_documented_api_base_override():
     source = AUTH_JS.read_text(encoding="utf-8")
 
