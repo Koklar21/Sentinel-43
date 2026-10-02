@@ -659,9 +659,21 @@ class MonitoringManager:
                 "MonitoringManager is not started"
             )
 
-        normalized_result = self._normalize(
-            event
-        )
+        try:
+            normalized_result = self._normalize(
+                event
+            )
+        except Exception:
+            with self._lock:
+                self._failure_count += 1
+
+            self._emit(
+                {
+                    "kind": "monitoring",
+                    "status": "normalization_failed",
+                }
+            )
+            raise
 
         normalized = normalized_result.event
 
