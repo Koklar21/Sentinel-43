@@ -1,0 +1,149 @@
+# =============================================================================
+# Sentinel-43
+#
+# Copyright (c) 2026 Justin Armstrong
+# All Rights Reserved.
+#
+# Sentinel-43 is dual-licensed:
+#   (1) AGPL-3.0-or-later, or
+#   (2) a commercial license (see COMMERCIAL_LICENSE.md).
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
+# =============================================================================
+
+"""Canonical browser-origin policy for Sentinel-43.
+
+The dashboard, login/bootstrap state changes, WebSocket handshake, and CORS
+configuration must agree on the same origin set. Keep the supported local
+Compose origins here so separate modules cannot silently drift apart.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from urllib.parse import urlsplit
+
+from fastapi import HTTPException, Request, status
+
+
+LOCAL_ENVIRONMENTS = frozenset(
+    {"development", "dev", "local", "test", "testing"}
+)
+
+DEFAULT_LOCAL_ALLOWED_ORIGINS = (
+    "https://localhost",
+    "https://127.0.0.1",
+    "http://localhost:5500",
+    "http://127.0.0.1:5500",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+)
+
+DEFAULT_LOCAL_ALLOWED_ORIGINS_CSV = ",".join(
+    DEFAULT_LOCAL_ALLOWED_ORIGINS
+)
+
+LOOPBACK_HTTP_ORIGIN_RE = re.compile(
+    r"^http://(localhost|127\.0\.0\.1)(:\d+)?$"
+)
+
+
+def environment_name() -> str:
+    raw = (
+        os.getenv("SENTINEL_ENV")
+        or os.getenv("S43_ENV")
+        or "production"
+    )
+    return raw.strip().lower()
+
+
+def is_local_environment() -> bool:
+    return environment_name() in LOCAL_ENVIRONMENTS
+
+
+def configured_allowed_origins() -> frozenset[str]:
+    """Return the configured browser-origin set.
+
+    Local/dev/test may use the canonical loopback defaults when the variable
+    is absent or blank. Non-local environments remain fail-closed: absent or
+    blank configuration yields an empty set which startup/request validation
+    rejects explicitly.
+    """
+    raw = os.getenv("S43_ALLOWED_ORIGINS")
+
+    if raw is None or not raw.strip():
+        if is_local_environment():
+            raw = DEFAULT_LOCAL_ALLOWED_ORIGINS_CSV
+        else:
+            return frozenset()
+
+    return frozenset(
+        origin.strip()
+        for origin in raw.split(",")
+        if origin.strip()
+    )
+
+
+def require_state_change_origin(request: Request) -> None:
+    """Require an allowed Origin/Referer before browser state changes."""
+    allowed = configured_allowed_origins()
+    local = is_local_environment()
+
+    if not local:
+        if not allowed:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Allowed origins are not configured.",
+            )
+        if "*" in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Wildcard origin is not permitted.",
+            )
+
+    origin = request.headers.get("origin", "").strip()
+
+    if origin:
+        if origin not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Origin not allowed.",
+            )
+        return
+
+    referer = request.headers.get("referer", "").strip()
+
+    if referer:
+        parsed = urlsplit(referer)
+        if not (parsed.scheme and parsed.netloc):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Referer not allowed.",
+            )
+
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        if base not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Referer not allowed.",
+            )
+        return
+
+    if not local:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Origin validation required.",
+        )
+
+
+__all__ = [
+    "DEFAULT_LOCAL_ALLOWED_ORIGINS",
+    "DEFAULT_LOCAL_ALLOWED_ORIGINS_CSV",
+    "LOCAL_ENVIRONMENTS",
+    "LOOPBACK_HTTP_ORIGIN_RE",
+    "configured_allowed_origins",
+    "environment_name",
+    "is_local_environment",
+    "require_state_change_origin",
+]
