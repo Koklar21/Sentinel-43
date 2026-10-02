@@ -385,7 +385,7 @@ def test_v1_records_the_authenticated_subject_not_the_request_body(
 
     modern = client.get("/actions", headers=_headers())
     committed = next(a for a in modern.json() if a["id"] == action["id"])
-    assert committed["operator"] == "v1-disposition-operator"
+    assert committed["operator"] == "v1-disposition-observer"
     assert committed["operator"] != "somebody-else-entirely"
 
 
