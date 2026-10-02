@@ -10,7 +10,7 @@ Sentinel-43 is designed around one rule:
 
 The system can analyze and recommend. A human remains the final authority for operational decisions.
 
-> **Current status:** Controlled Beta Candidate. Repository-level source blockers for controlled beta are closed. A specific deployment becomes an accepted controlled-beta target only after the evidence gates in the [Beta Runbook](docs/BETA_RUNBOOK.md) pass. Production readiness is not established.
+> **Current status:** Controlled Beta Candidate. Repository closure is revision-scoped: a revision is repository-cleared only when its required PR-CI acceptance gate passes. A specific deployment becomes an accepted controlled-beta target only after the exact deployed revision also passes the evidence gates in the [Beta Runbook](docs/BETA_RUNBOOK.md). Production readiness is not established.
 
 For controlled-beta deployment requirements, use the authoritative [Beta Runbook](docs/BETA_RUNBOOK.md).
 
