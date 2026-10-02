@@ -148,3 +148,32 @@ def test_upward_score_deviation_still_escalates() -> None:
     assert anomaly["zscore"] >= 2.5
     assert anomaly["evidence_seq"] == 6
     assert layer.stats()["zscore_fires"] == 1
+
+
+def test_zscore_anomaly_does_not_poison_learned_baseline() -> None:
+    layer = _zscore_layer()
+    _prime_score_baseline(layer)
+
+    anomaly = layer.update(_assessment(6, score=90.0))
+    assert anomaly is not None
+
+    # If the anomalous 90 were learned, it would drag mean/std toward the
+    # outlier and weaken the next independent high observation.
+    second = layer.update(_assessment(7, score=88.0))
+    assert second is not None
+    assert second["zscore"] >= 2.5
+
+
+def test_pressure_fire_does_not_ratchet_pressure_with_flagged_observation() -> None:
+    layer = _layer()
+
+    assert layer.update(_assessment(1)) is None
+    assert layer.update(_assessment(2)) is None
+    first = layer.update(_assessment(3))
+    assert first is not None
+
+    # The fired observation is evidence, not training data. A later low score
+    # is evaluated from the last accepted normal pressure rather than a
+    # ratcheted pressure that included the prior anomaly.
+    later = layer.update(_assessment(4, score=1.0))
+    assert later is None
