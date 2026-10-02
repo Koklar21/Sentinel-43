@@ -161,6 +161,9 @@ def _stores(
         authority=authority,
         action_sink=Sink(),
     )
+    # Match the production composition root: Heart is subordinate to the
+    # already-built Sentinel43RuntimeAuthority before authority ingress is used.
+    authority.attach_heart(heart)
     return audit, core, heart
 
 
