@@ -37,3 +37,20 @@ If repeated accepted observations establish the same score, the first upward
 departure is considered statistically anomalous even though a finite z-score
 cannot be calculated. Downward departures remain non-escalating because this
 layer models increases in threat behavior, not arbitrary statistical novelty.
+
+
+## Behavioral dimension: failure ratio
+
+Phase 4 also baselines the detector-derived failure ratio for each existing
+identity/IP subject. The ratio is computed inside SentinelThreatDetector from
+the same bounded event window used for scoring, so the anomaly layer does not
+create another raw-event store.
+
+A mature subject whose failure ratio rises sharply above its learned behavior
+can therefore produce anomaly evidence even when its aggregate threat score is
+unchanged. The behavioral baseline follows the same freshness, replay,
+bounded-key, stale-pruning, and anomaly-poisoning rules as score baselining.
+
+Missing behavioral metadata falls back to score-only anomaly handling. A
+behavioral shift is evidence only; it does not independently enforce or change
+policy.
