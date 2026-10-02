@@ -476,6 +476,12 @@ class MonitoringManager:
                     metadata={
                         "event_id": event_id,
                         "trusted_producer": trusted_producer,
+                        # Correlation is observational producer metadata.
+                        # Consumers must only assign trust semantics to it for
+                        # producers whose ingress owns the value server-side.
+                        "producer_correlation_id": str(
+                            normalized.correlation_id or ""
+                        ).strip()[:256],
                         # In-process provenance from the request pipeline
                         # (SecurityContext.principal_id), carried only for a
                         # producer already proven trusted above. It is the
