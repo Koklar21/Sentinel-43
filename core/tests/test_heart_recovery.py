@@ -1239,6 +1239,97 @@ def test_a_heart_without_an_authority_stages_and_resolves_nothing(tmp_path):
         )
 
 
+def test_no_authority_does_not_poison_stage_dedupe_for_recovery(tmp_path):
+    audit = AuditStore(
+        AuditConfig(
+            sqlite_path=tmp_path / "a-recover.sqlite3",
+            signing_key="k" * 48,
+        )
+    )
+    audit.initialize()
+    core = SentinelCoreStore(
+        CoreStoreConfig(db_path=tmp_path / "h-recover.sqlite3")
+    )
+    core.initialize()
+
+    class Settings:
+        default_mode = "HUMAN_GATED"
+        velocity_window_seconds = 60
+        velocity_limit = 100_000
+        dedupe_ttl_seconds = 300
+        corroboration_window_seconds = 300
+        corroboration_min_signals_for_high = 2
+
+    assessment = _assessment("203.0.113.230")
+    unavailable = build_heart_from_settings(
+        Settings(),
+        audit_store=audit,
+        core_store=core,
+    )
+    first = unavailable.observe(assessment)
+    assert first.status == "OBSERVED"
+    assert first.reason == "NO_GOVERNANCE_AUTHORITY"
+
+    recovered = build_heart_from_settings(
+        Settings(),
+        audit_store=audit,
+        core_store=core,
+        authority=_authority(audit),
+        operator_authenticator=main_module._heart_operator_authenticator,
+    )
+    second = recovered.observe(assessment)
+    assert second.status == "STAGED"
+    assert second.action_id
+    assert core.count_actions() == 1
+
+
+def test_unavailable_recommendation_store_releases_stage_dedupe(tmp_path):
+    audit = AuditStore(
+        AuditConfig(
+            sqlite_path=tmp_path / "a-store-recover.sqlite3",
+            signing_key="k" * 48,
+        )
+    )
+    audit.initialize()
+    core = SentinelCoreStore(
+        CoreStoreConfig(db_path=tmp_path / "h-store-recover.sqlite3")
+    )
+    core.initialize()
+
+    class Settings:
+        default_mode = "HUMAN_GATED"
+        velocity_window_seconds = 60
+        velocity_limit = 100_000
+        dedupe_ttl_seconds = 300
+        corroboration_window_seconds = 300
+        corroboration_min_signals_for_high = 2
+
+    authority = _authority(audit)
+    heart = build_heart_from_settings(
+        Settings(),
+        audit_store=audit,
+        core_store=core,
+        authority=authority,
+        operator_authenticator=main_module._heart_operator_authenticator,
+    )
+    authority.detach_recommendation_store()
+    assessment = _assessment("203.0.113.231")
+
+    from core.governance.orchestrator import RecommendationAuthorityUnavailable
+
+    with pytest.raises(RecommendationAuthorityUnavailable):
+        heart.observe(assessment)
+
+    authority.attach_recommendation_store(
+        core,
+        operator_authenticator=main_module._heart_operator_authenticator,
+    )
+    recovered = heart.observe(assessment)
+    assert recovered.status == "STAGED"
+    assert recovered.action_id
+    assert core.count_actions() == 1
+
+
 def test_staging_records_the_orchestrator_the_operation_and_its_target():
     _, audit, core, heart = _stack()
     action_id = _stage(heart, "203.0.113.131")
