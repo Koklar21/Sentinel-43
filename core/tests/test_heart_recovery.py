@@ -961,13 +961,16 @@ def test_policy_refusal_is_a_conflict_not_heart_outage(client, monkeypatch):
     """A normal governance refusal must never be reported as a Heart crash."""
     from core.governance import PolicyRefused
 
-    action_id = "heart-policy-refusal"
-    main_module.runtime.action_store[action_id] = {
-        "action_id": action_id,
-        "action_type": "HEART_RECOMMENDATION",
-        "status": "STAGED",
-        "payload": {},
-    }
+    action_id = "HEART-POLICY-REFUSAL"
+    client.portal.call(
+        main_module._store_action,
+        {
+            "id": action_id,
+            "action_type": "HEART_RECOMMENDATION",
+            "status": "STAGED",
+            "payload": {},
+        },
+    )
 
     authority = main_module.runtime.sentinel43
 
