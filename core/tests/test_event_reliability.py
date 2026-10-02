@@ -363,11 +363,55 @@ def test_successful_retry_updates_ledger_and_dead_letter_state():
 
     manager.deliver(_ENVELOPE, lambda: {"status_code": 200})
 
-    # A third delivery is now a TRUE duplicate of the successful retry.
+    recovered = store.get("ev-1")
+    assert recovered.replay_status == "replayed_ok"
+    assert recovered.replay_attempts == 0
+
+    # A third producer delivery is now a TRUE duplicate of the successful
+    # retry, and the stale dead-letter row may not invite operator replay.
     calls = {"n": 0}
-    third = manager.deliver(_ENVELOPE, lambda: (calls.__setitem__("n", calls["n"] + 1), {"status_code": 200})[1])
+    third = manager.deliver(
+        _ENVELOPE,
+        lambda: (
+            calls.__setitem__("n", calls["n"] + 1),
+            {"status_code": 200},
+        )[1],
+    )
     assert third.state is DeliveryState.DUPLICATE
     assert calls["n"] == 0
+
+    replay_calls = {"n": 0}
+    replay = manager.replay(
+        "ev-1",
+        lambda _env: (
+            replay_calls.__setitem__("n", replay_calls["n"] + 1),
+            {"status_code": 200},
+        )[1],
+        operator="alice",
+    )
+    assert replay.reason == "already_replayed"
+    assert replay_calls["n"] == 0
+
+
+def test_dead_letter_resolution_failure_is_observable_without_lying_about_delivery():
+    store = _store()
+    manager, audits = _manager(store)
+    manager.deliver(_ENVELOPE, lambda: {"error": "watchtower_unreachable"})
+
+    def _boom(_event_id):
+        raise RuntimeError("disk unavailable")
+
+    store.mark_recovered_delivery = _boom  # type: ignore[method-assign]
+
+    outcome = manager.deliver(_ENVELOPE, lambda: {"status_code": 200})
+
+    assert outcome.state is DeliveryState.DELIVERED
+    assert manager.metrics.snapshot()["delivery_reconciliation_required"] == 1
+    assert any(
+        item.get("dead_letter_resolution_failed") is True
+        and item.get("reconciliation_required") is True
+        for item in audits
+    )
 
 
 def test_failed_retry_remains_dead_lettered_not_falsely_successful():
