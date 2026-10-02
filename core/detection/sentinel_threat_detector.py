@@ -673,10 +673,26 @@ class SentinelThreatDetector:
         tags: list[str] = []
         score = 0.0
         sigma_matches = list(sigma_matches_by_key.values())
-        agent_sequence_matches = match_agent_sequences(
-            event.event_type
-            for event in window
-            if event.timestamp >= cutoff
+        agent_events_by_correlation: OrderedDict[str, list[str]] = OrderedDict()
+        for event in window:
+            if event.timestamp < cutoff:
+                continue
+            metadata = event.metadata or {}
+            if metadata.get("trusted_producer") != "agent_runtime":
+                continue
+            correlation_id = str(
+                metadata.get("producer_correlation_id") or ""
+            ).strip()
+            if not correlation_id:
+                continue
+            agent_events_by_correlation.setdefault(
+                correlation_id, []
+            ).append(event.event_type)
+
+        agent_sequence_matches = tuple(
+            match
+            for event_types in agent_events_by_correlation.values()
+            for match in match_agent_sequences(event_types)
         )
 
         if agent_sequence_matches:
