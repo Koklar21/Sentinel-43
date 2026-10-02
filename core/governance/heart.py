@@ -498,6 +498,11 @@ class ThreatGovernor:
 
         authority = self._authority
         if authority is None:
+            # No durable staging can begin without an authority. Release this
+            # attempt's dedupe reservation so a later recovered authority may
+            # evaluate the same still-valid finding instead of suppressing it
+            # for the full dedupe TTL.
+            self.core_store.dedupe_release(stage_dedupe_key)
             # The Heart holds no decision authority of its own: without the
             # orchestrator it records the finding and stages nothing.
             self._append_audit(
@@ -512,7 +517,15 @@ class ThreatGovernor:
             )
             return HeartDecision(status="OBSERVED", reason="NO_GOVERNANCE_AUTHORITY")
 
-        outcome = authority.stage_recommendation(recommendation)
+        try:
+            outcome = authority.stage_recommendation(recommendation)
+        except RecommendationAuthorityUnavailable:
+            # _require_recommendation_store() fails before engine staging, so
+            # there is no durable action whose duplicate must be suppressed.
+            # Other exceptions are deliberately NOT released here because a
+            # late failure can have an uncertain/partially durable outcome.
+            self.core_store.dedupe_release(stage_dedupe_key)
+            raise
 
         if outcome.status == "STAGED" and outcome.action_id:
             self._mirror_staged(
