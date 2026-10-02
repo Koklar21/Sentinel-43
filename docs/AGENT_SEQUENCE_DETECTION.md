@@ -49,3 +49,16 @@ an agent behavioral sequence.
 
 Existing MonitoringManager and detector event-id replay suppression remain the
 replay boundary. Phase 3 does not create a second replay cache or state store.
+
+
+## Integration verification
+
+The Phase 3 focused integration contract exercises the real evidence path from
+the authenticated agent-runtime ingress through `MonitoringManager` into the
+same `SentinelThreatDetector` used by Fenrir. It verifies that one observation
+does not create a sequence, the second ordered observation does, the resulting
+assessment carries `agent_runtime` evidence provenance, and a replayed event
+id is stopped by MonitoringManager before it can advance detector state.
+
+This is intentionally a narrow integration test rather than a parallel test
+harness or another runtime pipeline.
