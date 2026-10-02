@@ -713,6 +713,7 @@ function showOverlay(message, locked = false) {
     const uEl = document.getElementById("s43-username");
     const pEl = document.getElementById("s43-password");
     const tokenEl = document.getElementById("s43-bootstrap-token");
+    const form = document.getElementById("s43-login-form");
     const btn = document.getElementById("s43-login-btn");
     const foot = document.getElementById("s43-login-foot");
 
