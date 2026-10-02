@@ -1911,7 +1911,7 @@ def _report_runtime_identity_to_sentinel43() -> None:
 
 
 async def _start_governance() -> None:
-    governance_enabled = _env_bool("S43_GOVERNANCE_ENABLED", False)
+    decision_governance_enabled = _env_bool("S43_GOVERNANCE_ENABLED", False)
 
     # Sentinel43RuntimeAuthority owns more than recommendation governance:
     # identity/session mutations (bootstrap, users, refresh rotation) also
@@ -1919,7 +1919,7 @@ async def _start_governance() -> None:
     # decision governance is disabled. The feature flag controls governed
     # recommendation/decision behavior, not whether Sentinel-43 itself exists.
     if runtime.audit_store is None:
-        if governance_enabled or not IS_LOCAL_ENV:
+        if decision_governance_enabled or not IS_LOCAL_ENV:
             raise RuntimeError(
                 "Sentinel-43 runtime authority requires an initialized "
                 "authoritative audit store."
@@ -1945,7 +1945,7 @@ async def _start_governance() -> None:
 
         class Settings:
             environment = SENTINEL_ENV
-            governance_enabled = governance_enabled
+            governance_enabled = decision_governance_enabled
             default_mode = resolved_default_mode
             hash_device_ids = _env_bool(
                 "S43_GOVERNANCE_HASH_DEVICE_IDS",
@@ -1995,7 +1995,7 @@ async def _start_governance() -> None:
                 "Sentinel-43 runtime identity reporting failed",
                 exc_info=True,
             )
-        if governance_enabled:
+        if decision_governance_enabled:
             runtime.subsystems.mark_active(
                 SUBSYS_GOVERNANCE,
                 f"Human-gated orchestrator active (mode={resolved_default_mode}).",
