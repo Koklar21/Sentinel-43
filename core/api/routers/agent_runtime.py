@@ -84,6 +84,7 @@ def ingest_agent_activity(
         "event_id": event.event_id,
         "source": "sentinel-agent-runtime",
         "source_identity": IdentityType.SERVICE_AGENT_RUNTIME.value,
+        "correlation_id": event.agent_id,
         "event_type": event.activity,
         "runtime_event": event.activity,
         "runtime_role": "agent-observer",
