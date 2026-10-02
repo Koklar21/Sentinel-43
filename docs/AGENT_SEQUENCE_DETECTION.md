@@ -32,3 +32,20 @@ Canonical response authority remains:
 
 `trusted evidence -> MonitoringManager -> Fenrir/SentinelThreatDetector ->
 ThreatAssessment -> Sentinel43RuntimeAuthority -> Heart / existing human gates`
+
+
+## Correlation boundary
+
+Agent sequence steps must come from the trusted `agent_runtime` producer and
+share the same server-carried agent correlation id. The surrounding detector
+window remains bounded by source identity and host IP, but host co-location
+alone cannot combine activity from two different agents into one sequence.
+
+The agent ingress assigns its normalized `correlation_id` from the validated,
+bounded `agent_id` field. Monitoring carries that value as observational
+producer correlation metadata. Sequence detection uses it only when provenance
+is `agent_runtime`; another producer using agent-like event names cannot form
+an agent behavioral sequence.
+
+Existing MonitoringManager and detector event-id replay suppression remain the
+replay boundary. Phase 3 does not create a second replay cache or state store.
