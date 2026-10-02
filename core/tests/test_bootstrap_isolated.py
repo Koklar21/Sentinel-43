@@ -59,6 +59,7 @@ from datetime import datetime, timezone
 from typing import AsyncIterator, Generator
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 os.environ.setdefault("SENTINEL_ENV", "test")
@@ -327,6 +328,31 @@ def test_admin_rejects_missing_username(client, fresh_user_store):
     )
 
     assert response.status_code == 422
+
+
+def test_bootstrap_uses_same_origin_gate_before_creating_admin(
+    client, fresh_user_store, monkeypatch
+):
+    def _reject(_request):
+        raise HTTPException(status_code=403, detail="Origin not allowed.")
+
+    monkeypatch.setattr(
+        bootstrap_module,
+        "require_state_change_origin",
+        _reject,
+    )
+
+    response = client.post(
+        "/bootstrap/admin",
+        json={
+            "username": "blocked-bootstrap",
+            "password": "a-perfectly-long-enough-password",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Origin not allowed."
+    assert fresh_user_store.users == {}
 
 
 def test_first_run_flow_creates_admin_logs_in_and_reaches_protected_route(
