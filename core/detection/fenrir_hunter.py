@@ -315,6 +315,9 @@ class _IdentityBaseline:
     stream: _WelfordStream = field(
         default_factory=_WelfordStream
     )
+    failure_ratio_stream: _WelfordStream = field(
+        default_factory=_WelfordStream
+    )
     pressure: float = 0.0
     last_evidence_seq: int = 0
     last_seen_monotonic: float = field(
@@ -387,6 +390,7 @@ class FenrirAnomalyLayer:
             "missing_evidence_seq_skipped": 0,
             "zscore_fires": 0,
             "pressure_fires": 0,
+            "behavioral_fires": 0,
             "keys_evicted": 0,
             "keys_pruned": 0,
         }
@@ -414,6 +418,17 @@ class FenrirAnomalyLayer:
         now = time.monotonic()
         score = float(
             assessment.score
+        )
+        raw_failure_ratio = assessment.indicators.get(
+            "failure_ratio"
+        )
+        failure_ratio = (
+            float(raw_failure_ratio)
+            if isinstance(raw_failure_ratio, (int, float))
+            and not isinstance(raw_failure_ratio, bool)
+            and math.isfinite(float(raw_failure_ratio))
+            and 0.0 <= float(raw_failure_ratio) <= 1.0
+            else None
         )
 
         with self._lock:
@@ -493,6 +508,13 @@ class FenrirAnomalyLayer:
             zscore = baseline.stream.zscore(
                 score
             )
+            failure_ratio_zscore = (
+                baseline.failure_ratio_stream.zscore(
+                    failure_ratio
+                )
+                if failure_ratio is not None
+                else 0.0
+            )
 
             elapsed = max(
                 0.0,
@@ -525,6 +547,10 @@ class FenrirAnomalyLayer:
                 baseline.stream.update(
                     score
                 )
+                if failure_ratio is not None:
+                    baseline.failure_ratio_stream.update(
+                        failure_ratio
+                    )
                 baseline.pressure = (
                     projected_pressure
                 )
@@ -556,6 +582,30 @@ class FenrirAnomalyLayer:
                 )
 
             if (
+                failure_ratio is not None
+                and baseline.failure_ratio_stream.count
+                >= self.min_observations
+                and failure_ratio_zscore
+                >= self.zscore_threshold
+            ):
+                self._stats[
+                    "behavioral_fires"
+                ] += 1
+                anomaly["behavioral_shift"] = {
+                    "dimension": "failure_ratio",
+                    "value": round(failure_ratio, 6),
+                    "zscore": round(failure_ratio_zscore, 3),
+                    "baseline_mean": round(
+                        baseline.failure_ratio_stream.mean,
+                        6,
+                    ),
+                    "baseline_std": round(
+                        baseline.failure_ratio_stream.std,
+                        6,
+                    ),
+                }
+
+            if (
                 projected_pressure
                 >= self.pressure_threshold
             ):
@@ -581,6 +631,10 @@ class FenrirAnomalyLayer:
                 baseline.stream.update(
                     score
                 )
+                if failure_ratio is not None:
+                    baseline.failure_ratio_stream.update(
+                        failure_ratio
+                    )
                 baseline.pressure = (
                     projected_pressure
                 )
