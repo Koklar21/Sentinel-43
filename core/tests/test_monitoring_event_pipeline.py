@@ -144,6 +144,43 @@ def test_sparta_integrity_event_reaches_monitoring_with_provenance():
     assert scanner.seen[0]["integrity_status"] == "compromised"
 
 
+def test_sparta_tamper_is_trusted_threat_evidence():
+    class _RecordingIngestor:
+        def __init__(self):
+            self.events = []
+
+        def ingest(self, event):
+            self.events.append(event)
+
+    scanner = _RecordingScanner()
+    manager = MonitoringManager(scanner)
+    ingestor = _RecordingIngestor()
+    manager.attach_threat_ingestor(
+        ingestor,
+        producers={"sparta": "sentinel-sparta"},
+    )
+    manager.start()
+
+    core = _sparta(monitoring_manager=manager)
+    core._emit(
+        IntegrityEvent(
+            event_type="TamperDetected",
+            file_path="/watched/file",
+            state_at_event=SpartaState.COMPROMISED,
+            source="untrusted-payload-label",
+        )
+    )
+    core.close()
+
+    assert len(ingestor.events) == 1
+    evidence = ingestor.events[0]
+    assert evidence.source_identity == "service:sparta-node"
+    assert evidence.source_ip == "127.0.0.1"
+    assert evidence.event_type == "sparta_tamper_detected"
+    assert evidence.metadata["trusted_producer"] == "sparta"
+    assert scanner.seen[0]["source"] == "sentinel-sparta"
+
+
 def test_sparta_clean_event_reports_ok_integrity_status():
     scanner = _RecordingScanner()
     manager = MonitoringManager(scanner)
