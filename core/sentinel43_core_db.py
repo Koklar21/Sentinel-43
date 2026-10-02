@@ -343,6 +343,22 @@ class SentinelCoreStore:
         finally:
             connection.close()
 
+    def dedupe_release(self, dedupe_key: str) -> bool:
+        """Release a dedupe reservation when no durable action could begin.
+
+        Callers must only use this after a failure path that is known to have
+        produced no durable staged action. It is not a rollback primitive for
+        uncertain or partially completed staging.
+        """
+        key = self._normalize_dedupe_key(dedupe_key)
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM action_dedupe WHERE dedupe_key = ?",
+                (key,),
+            )
+            return bool(cursor.rowcount)
+
     def dedupe_cleanup(self, *, now_ms: int | None = None) -> int:
         effective_now_ms = (
             int(time.time() * 1000)
