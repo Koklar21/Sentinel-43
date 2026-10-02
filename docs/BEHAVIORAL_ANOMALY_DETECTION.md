@@ -68,3 +68,15 @@ This does not raise the detector score or severity. Heart corroboration,
 owner-engine planning, policy evaluation, and human gates continue to use
 their existing rules; they simply receive the same anomaly evidence Fenrir
 reported externally.
+
+
+## Dimension freshness
+
+Behavioral dimensions expire independently from the subject's aggregate score
+baseline. Fresh score-only observations may keep an identity/IP subject active,
+but they do not keep an absent failure-ratio baseline fresh. If failure-ratio
+evidence has been absent for the configured anomaly stale interval, Fenrir
+resets that dimension before learning the returning observation.
+
+This prevents a currently active subject from being compared against ancient
+behavior merely because another dimension continued to produce evidence.
