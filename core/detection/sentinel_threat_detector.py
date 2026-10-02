@@ -33,6 +33,7 @@ from dataclasses import dataclass, field, replace
 from threading import RLock
 from typing import Any, Final
 
+from .agent_sequence_detector import match_agent_sequences
 from .sentinel_threat_types import (
     ThreatAssessment,
     ThreatKind,
@@ -672,6 +673,30 @@ class SentinelThreatDetector:
         tags: list[str] = []
         score = 0.0
         sigma_matches = list(sigma_matches_by_key.values())
+        agent_sequence_matches = match_agent_sequences(
+            event.event_type
+            for event in window
+            if event.timestamp >= cutoff
+        )
+
+        if agent_sequence_matches:
+            indicators["agent_sequence_matches"] = [
+                {
+                    "sequence_id": match.sequence_id,
+                    "level": match.level,
+                    "event_types": list(match.event_types),
+                    "reason": match.reason,
+                }
+                for match in agent_sequence_matches
+            ]
+            indicators["agent_sequence_match_count"] = len(
+                agent_sequence_matches
+            )
+            tags.append("agent_sequence_match")
+            tags.extend(
+                f"agent_sequence:{match.sequence_id}"
+                for match in agent_sequence_matches
+            )
 
         if sigma_matches:
             indicators["sigma_matches"] = sigma_matches
@@ -834,6 +859,14 @@ class SentinelThreatDetector:
                 score,
                 float(indicators["sigma_score_floor"]),
             )
+
+        if agent_sequence_matches:
+            sequence_floor = max(
+                85.0 if match.level == "critical" else 65.0
+                for match in agent_sequence_matches
+            )
+            indicators["agent_sequence_score_floor"] = sequence_floor
+            score = max(score, sequence_floor)
 
         source_kind = (
             self._classify_source(
@@ -1160,6 +1193,9 @@ class SentinelThreatDetector:
             return (
                 ThreatKind.CREDENTIAL_ATTACK
             )
+
+        if "agent_sequence_match" in tags:
+            return ThreatKind.GENERIC_INTRUSION
 
         if "sigma_match" in tags:
             return ThreatKind.GENERIC_INTRUSION
