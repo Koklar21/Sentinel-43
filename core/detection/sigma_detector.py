@@ -179,7 +179,7 @@ class _FieldPredicate:
     value_kind: str
     expected: Any
 
-    def evaluate(self, event: Mapping[str, Any]) -> bool:
+    def matches(self, event: Mapping[str, Any]) -> bool:
         actual = event.get(self.field, _MISSING)
 
         if self.value_kind == "null":
@@ -209,24 +209,24 @@ class _FieldPredicate:
 class _All:
     args: tuple["_Expression", ...]
 
-    def evaluate(self, event: Mapping[str, Any]) -> bool:
-        return all(arg.evaluate(event) for arg in self.args)
+    def matches(self, event: Mapping[str, Any]) -> bool:
+        return all(arg.matches(event) for arg in self.args)
 
 
 @dataclass(frozen=True, slots=True)
 class _Any:
     args: tuple["_Expression", ...]
 
-    def evaluate(self, event: Mapping[str, Any]) -> bool:
-        return any(arg.evaluate(event) for arg in self.args)
+    def matches(self, event: Mapping[str, Any]) -> bool:
+        return any(arg.matches(event) for arg in self.args)
 
 
 @dataclass(frozen=True, slots=True)
 class _Not:
     arg: "_Expression"
 
-    def evaluate(self, event: Mapping[str, Any]) -> bool:
-        return not self.arg.evaluate(event)
+    def matches(self, event: Mapping[str, Any]) -> bool:
+        return not self.arg.matches(event)
 
 
 _Expression = _FieldPredicate | _All | _Any | _Not
@@ -262,7 +262,7 @@ class _CompiledRule:
 
     def matches(self, event: Mapping[str, Any]) -> bool:
         return self.applies_to(event) and any(
-            condition.evaluate(event) for condition in self.conditions
+            condition.matches(event) for condition in self.conditions
         )
 
     def public_match(self) -> SigmaMatch:
