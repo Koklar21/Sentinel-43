@@ -318,6 +318,7 @@ class _IdentityBaseline:
     failure_ratio_stream: _WelfordStream = field(
         default_factory=_WelfordStream
     )
+    failure_ratio_last_seen_monotonic: float | None = None
     pressure: float = 0.0
     last_evidence_seq: int = 0
     last_seen_monotonic: float = field(
@@ -391,6 +392,7 @@ class FenrirAnomalyLayer:
             "zscore_fires": 0,
             "pressure_fires": 0,
             "behavioral_fires": 0,
+            "behavioral_baselines_reset": 0,
             "keys_evicted": 0,
             "keys_pruned": 0,
         }
@@ -508,6 +510,26 @@ class FenrirAnomalyLayer:
             zscore = baseline.stream.zscore(
                 score
             )
+            if (
+                failure_ratio is not None
+                and baseline.failure_ratio_last_seen_monotonic
+                is not None
+                and (
+                    now
+                    - baseline.failure_ratio_last_seen_monotonic
+                )
+                >= self.stale_seconds
+            ):
+                # Subject-level score traffic may remain active while this
+                # optional behavioral dimension disappears. Do not compare
+                # newly returned behavior against an ancient dimension
+                # baseline merely because the subject itself stayed active.
+                baseline.failure_ratio_stream = _WelfordStream()
+                baseline.failure_ratio_last_seen_monotonic = None
+                self._stats[
+                    "behavioral_baselines_reset"
+                ] += 1
+
             failure_ratio_zscore = (
                 baseline.failure_ratio_stream.zscore(
                     failure_ratio
@@ -551,6 +573,7 @@ class FenrirAnomalyLayer:
                     baseline.failure_ratio_stream.update(
                         failure_ratio
                     )
+                    baseline.failure_ratio_last_seen_monotonic = now
                 baseline.pressure = (
                     projected_pressure
                 )
@@ -635,6 +658,7 @@ class FenrirAnomalyLayer:
                     baseline.failure_ratio_stream.update(
                         failure_ratio
                     )
+                    baseline.failure_ratio_last_seen_monotonic = now
                 baseline.pressure = (
                     projected_pressure
                 )
