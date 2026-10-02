@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
-from core.detection.ebpf_agent import classify_exec
+import pytest
+from pydantic import ValidationError
+
+from core.api.routers.ebpf import EbpfEvent
+from core.detection.ebpf_agent import _ExecEvent, build_payload, classify_exec
 
 
 def test_ebpf_transient_exec_is_evidence_only():
@@ -29,3 +33,30 @@ def test_ebpf_detector_source_has_no_enforcement_dependencies():
         "approve_action",
     )
     assert not any(name in source for name in forbidden)
+
+
+def test_ebpf_ingress_rejects_non_ip_host():
+    with pytest.raises(ValidationError):
+        EbpfEvent(
+            event_id="evt-1",
+            host_ip="not-an-ip",
+            pid=1,
+            uid=1,
+            filename="/tmp/dropper",
+        )
+
+
+def test_ebpf_sensor_payload_cannot_choose_detection_semantics():
+    event = _ExecEvent()
+    event.pid = 42
+    event.uid = 1000
+    event.comm = b"dropper"
+    event.filename = b"/tmp/dropper"
+
+    payload = build_payload(event, "192.0.2.10")
+
+    assert payload["filename"] == "/tmp/dropper"
+    assert payload["host_ip"] == "192.0.2.10"
+    assert "event_type" not in payload
+    assert "severity" not in payload
+    assert "reason" not in payload
