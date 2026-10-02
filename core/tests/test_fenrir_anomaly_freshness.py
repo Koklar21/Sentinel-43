@@ -17,6 +17,7 @@ evidence_seq advances.
 
 from __future__ import annotations
 
+import core.detection.fenrir_hunter as fenrir_hunter
 from core.detection.fenrir_hunter import FenrirAnomalyLayer
 from core.detection.sentinel_threat_types import (
     ThreatAssessment,
@@ -249,3 +250,79 @@ def test_missing_failure_ratio_preserves_score_only_behavior() -> None:
 
     assert layer.update(_assessment(6, score=50.0)) is None
     assert layer.stats()["behavioral_fires"] == 0
+
+
+
+def test_stale_behavior_dimension_resets_while_score_subject_stays_active(
+    monkeypatch,
+) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(
+        fenrir_hunter.time,
+        "monotonic",
+        lambda: now[0],
+    )
+    layer = FenrirAnomalyLayer(
+        zscore_threshold=2.5,
+        pressure_threshold=1_000_000.0,
+        decay_rate=0.000001,
+        min_observations=5,
+        max_keys=100,
+        stale_seconds=60.0,
+    )
+
+    for seq in range(1, 7):
+        assert layer.update(
+            _assessment(seq, score=10.0, failure_ratio=0.05)
+        ) is None
+        now[0] += 1.0
+
+    # Keep the subject itself fresh with score-only evidence while the
+    # optional behavioral dimension is absent for longer than stale_seconds.
+    for seq in range(7, 10):
+        now[0] += 25.0
+        assert layer.update(
+            _assessment(seq, score=10.0)
+        ) is None
+
+    # A returning dimension starts a new behavioral baseline instead of being
+    # compared against behavior that has been absent beyond the stale window.
+    assert layer.update(
+        _assessment(10, score=10.0, failure_ratio=0.80)
+    ) is None
+
+    stats = layer.stats()
+    assert stats["active_keys"] == 1
+    assert stats["behavioral_baselines_reset"] == 1
+    assert stats["behavioral_fires"] == 0
+
+
+def test_fresh_behavior_dimension_still_detects_shift(monkeypatch) -> None:
+    now = [2000.0]
+    monkeypatch.setattr(
+        fenrir_hunter.time,
+        "monotonic",
+        lambda: now[0],
+    )
+    layer = FenrirAnomalyLayer(
+        zscore_threshold=2.5,
+        pressure_threshold=1_000_000.0,
+        decay_rate=0.000001,
+        min_observations=5,
+        max_keys=100,
+        stale_seconds=60.0,
+    )
+
+    for seq in range(1, 7):
+        assert layer.update(
+            _assessment(seq, score=10.0, failure_ratio=0.05)
+        ) is None
+        now[0] += 1.0
+
+    now[0] += 10.0
+    anomaly = layer.update(
+        _assessment(7, score=10.0, failure_ratio=0.80)
+    )
+    assert anomaly is not None
+    assert anomaly["behavioral_shift"]["dimension"] == "failure_ratio"
+    assert layer.stats()["behavioral_baselines_reset"] == 0
