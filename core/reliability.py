@@ -560,6 +560,9 @@ class ReplayStatus(StrEnum):
     #: succeeded. It deliberately does not guess: the record stays here,
     #: ineligible for ordinary replay, until a human reconciles it.
     REPLAY_IN_PROGRESS = "replay_in_progress"
+    # Historical name retained for storage/API compatibility. This terminal
+    # state means the dead-lettered logical event was successfully redelivered,
+    # either by explicit operator replay or by a later ordinary producer retry.
     REPLAYED_OK = "replayed_ok"
     REPLAY_FAILED = "replay_failed"
 
@@ -1022,6 +1025,38 @@ class DeadLetterStore:
 
         return decoded if isinstance(decoded, dict) else None
 
+    def mark_recovered_delivery(self, event_id: str) -> bool:
+        """Make an old dead-letter row ineligible after producer recovery.
+
+        Ordinary producer retries use the normal delivery path rather than
+        replay(). If one succeeds, the historical dead-letter record must no
+        longer remain operator-replayable. The replay_attempts counter is left
+        unchanged because this was not an operator-initiated replay.
+        """
+        self._require_ready()
+        with self._lock:
+            connection = self._connect()
+            try:
+                cursor = connection.execute(
+                    """
+                    UPDATE dead_letter_events
+                    SET replay_status = ?,
+                        last_attempt_at = ?
+                    WHERE event_id = ?
+                      AND replay_status IN (?, ?)
+                    """,
+                    (
+                        ReplayStatus.REPLAYED_OK.value,
+                        _utc_now(),
+                        str(event_id),
+                        ReplayStatus.PENDING.value,
+                        ReplayStatus.REPLAY_FAILED.value,
+                    ),
+                )
+                return cursor.rowcount == 1
+            finally:
+                connection.close()
+
     def mark_replay_result(
         self,
         event_id: str,
@@ -1129,6 +1164,7 @@ class ReliabilityMetrics:
         "delivery_retry",
         "delivery_failed_terminal",
         "delivery_dead_lettered",
+        "delivery_reconciliation_required",
         "replay_requested",
         "replay_success",
         "replay_failed",
@@ -1397,6 +1433,35 @@ class EventReliabilityManager:
                 self.idempotency.update_state(
                     event_id, DeliveryState.DELIVERED
                 )
+
+                store = self.dead_letter_store
+                if store is not None:
+                    try:
+                        store.mark_recovered_delivery(event_id)
+                    except Exception:
+                        # The delivery itself succeeded, so never lie and
+                        # classify it as failed. The stale durable replay row
+                        # is an operational reconciliation problem that must
+                        # be visible before an operator considers replay.
+                        self.metrics.increment(
+                            "delivery_reconciliation_required"
+                        )
+                        logger.error(
+                            "Delivered event_id=%s but failed to retire its "
+                            "dead-letter replay eligibility; operator "
+                            "reconciliation is required before replay.",
+                            event_id,
+                            exc_info=True,
+                        )
+                        self._audit(
+                            event_id=event_id,
+                            correlation_id=correlation_id,
+                            delivery_state=DeliveryState.DELIVERED.value,
+                            attempts=attempts,
+                            reconciliation_required=True,
+                            dead_letter_resolution_failed=True,
+                        )
+
                 self._audit(
                     event_id=event_id,
                     correlation_id=correlation_id,
