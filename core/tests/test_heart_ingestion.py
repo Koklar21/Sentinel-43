@@ -251,10 +251,8 @@ def test_deterministic_agent_sequence_marks_ai_automation_without_rate_burst():
 
     for index, event_type in enumerate(
         (
-            "agent_authorization_denied",
-            "agent_alternate_tool_attempted",
-            "agent_privilege_request",
-            "agent_authorization_denied",
+            "agent_policy_probe",
+            "agent_privileged_action",
         ),
         start=1,
     ):
@@ -271,7 +269,7 @@ def test_deterministic_agent_sequence_marks_ai_automation_without_rate_burst():
             )
         )
 
-    assert assessment.window_size == 4
+    assert assessment.window_size == 2
     assert assessment.source_kind is ThreatSourceKind.AI_AUTOMATION_LIKELY
     assert assessment.indicators["agent_sequence_match_count"] >= 1
     profile = assessment.indicators["ai_pattern_profile"]
