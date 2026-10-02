@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import secrets
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from core.detection.ebpf_agent import classify_exec
 
 from core.monitoring import get_monitoring_manager
 
@@ -20,14 +23,18 @@ class EbpfEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     event_id: str = Field(min_length=1, max_length=128)
-    event_type: str = Field(min_length=1, max_length=64)
     host_ip: str = Field(min_length=1, max_length=64)
     pid: int = Field(ge=0, le=2_147_483_647)
     uid: int = Field(ge=0, le=4_294_967_295)
     comm: str = Field(default="", max_length=64)
     filename: str = Field(default="", max_length=_MAX_TEXT)
-    severity: str = Field(default="informational", max_length=32)
-    reason: str = Field(default="", max_length=256)
+    @field_validator("host_ip")
+    @classmethod
+    def validate_host_ip(cls, value: str) -> str:
+        try:
+            return str(ipaddress.ip_address(value.strip()))
+        except ValueError as exc:
+            raise ValueError("host_ip must be an IPv4 or IPv6 address") from exc
 
 
 def _expected_token() -> str:
@@ -61,23 +68,27 @@ def ingest_ebpf_event(
     if manager is None:
         raise HTTPException(status_code=503, detail="monitoring unavailable")
 
+    # Detection semantics are server-owned. The authenticated sensor reports
+    # observation facts; it cannot choose its own threat label or severity.
+    event_type, severity, reason = classify_exec(event.filename)
+
     payload = {
         "kind": "runtime",
         "event_id": event.event_id,
         "source": "sentinel-ebpf",
         "source_identity": "service:ebpf",
-        "event_type": event.event_type,
-        "runtime_event": event.event_type,
+        "event_type": event_type,
+        "runtime_event": event_type,
         "platform": "linux-ebpf",
         "runtime_role": "sensor",
-        "instance_id": event.comm[:256],
+        "instance_id": event.host_ip,
         "runtime_metadata": {
             "pid": event.pid,
             "uid": event.uid,
             "comm": event.comm,
             "filename": event.filename,
-            "severity": event.severity,
-            "reason": event.reason,
+            "severity": severity,
+            "reason": reason,
         },
     }
     manager.analyze_event(
