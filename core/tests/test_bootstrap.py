@@ -53,23 +53,20 @@ import requests
 
 API_URL = os.getenv("S43_TEST_API_URL", "http://localhost:8000").rstrip("/")
 
-# /auth/login is a state-changing route and enforces Origin/Referer
-# validation outside a local environment (core/api/routers/auth.py's
-# _check_state_change_origin) so a browser's ambient, cookie-carrying
-# cross-origin request can't silently log in as someone else. A plain
-# `requests` client sends neither header by default, which the check
-# correctly treats as unproven origin, not as "no browser, so exempt" --
-# there is no separate bearer-only login path, since logging in is
-# precisely the step before a bearer token exists. This self-identifies the
-# harness by the address it is actually calling from; the deployment must
-# list it in S43_ALLOWED_ORIGINS (scripts/ci_live_tests.py does).
+# /auth/login and /bootstrap/admin are state-changing routes and enforce the
+# same canonical Origin/Referer policy. A plain `requests` client sends
+# neither header by default, so the live harness must identify itself with
+# the exact Origin already allow-listed by scripts/ci_live_tests.py.
 _LOGIN_HEADERS = {"Origin": API_URL}
 _BOOTSTRAP_CLAIM_TOKEN = os.getenv("S43_BOOTSTRAP_CLAIM_TOKEN", "")
-_BOOTSTRAP_HEADERS = (
-    {"X-S43-Bootstrap-Token": _BOOTSTRAP_CLAIM_TOKEN}
-    if _BOOTSTRAP_CLAIM_TOKEN
-    else {}
-)
+_BOOTSTRAP_HEADERS = {
+    **_LOGIN_HEADERS,
+    **(
+        {"X-S43-Bootstrap-Token": _BOOTSTRAP_CLAIM_TOKEN}
+        if _BOOTSTRAP_CLAIM_TOKEN
+        else {}
+    ),
+}
 
 
 def _live_target_reachable() -> bool:
