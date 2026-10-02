@@ -657,6 +657,10 @@ class SentinelThreatDetector:
             "subject_principals": sorted(principals),
             "event_count": event_count,
             "failure_count": failure_count,
+            "failure_ratio": round(
+                failure_count / event_count,
+                6,
+            ),
             "max_payload_bytes": payload_max,
             "top_event_types": dict(
                 type_counter.most_common(
