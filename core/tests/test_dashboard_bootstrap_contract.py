@@ -94,6 +94,16 @@ def test_split_origin_dashboard_auth_headers_are_cors_allowed():
     assert '"X-S43-CSRF"' in source
     assert '"X-S43-Bootstrap-Token"' in source
 
+def test_show_overlay_reads_bootstrap_mode_from_its_own_form_lookup():
+    source = AUTH_JS.read_text(encoding="utf-8")
+    show_overlay = source.split("function showOverlay(", 1)[1].split(
+        "function hideOverlay(", 1
+    )[0]
+
+    assert 'const form = document.getElementById("s43-login-form");' in show_overlay
+    assert 'const bootstrapMode = form?.dataset.mode === "bootstrap";' in show_overlay
+
+
 def test_dashboard_distinguishes_auth_failures_from_bad_credentials():
     source = AUTH_JS.read_text(encoding="utf-8")
 
