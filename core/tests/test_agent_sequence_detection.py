@@ -26,7 +26,7 @@ def test_agent_sequence_uses_existing_subject_window():
             source_identity="service:agent-runtime",
             source_ip="192.0.2.20",
             event_type="agent_secret_access",
-            metadata={"event_id": "agent-1", "trusted_producer": "agent_runtime"},
+            metadata={"event_id": "agent-1", "trusted_producer": "agent_runtime", "producer_correlation_id": "agent-7"},
         )
     )
     assert "agent_sequence_match" not in first.supporting_tags
@@ -36,7 +36,7 @@ def test_agent_sequence_uses_existing_subject_window():
             source_identity="service:agent-runtime",
             source_ip="192.0.2.20",
             event_type="agent_external_transfer",
-            metadata={"event_id": "agent-2", "trusted_producer": "agent_runtime"},
+            metadata={"event_id": "agent-2", "trusted_producer": "agent_runtime", "producer_correlation_id": "agent-7"},
         )
     )
     assert "agent_sequence_match" in second.supporting_tags
@@ -62,4 +62,53 @@ def test_agent_sequence_does_not_cross_subjects():
             metadata={"event_id": "agent-b"},
         )
     )
+    assert "agent_sequence_match" not in assessment.supporting_tags
+
+
+def test_agent_sequence_does_not_cross_agent_correlations_on_same_host():
+    detector = SentinelThreatDetector()
+    detector.ingest(
+        EventContext(
+            source_identity="service:agent-runtime",
+            source_ip="192.0.2.20",
+            event_type="agent_secret_access",
+            metadata={
+                "event_id": "agent-a-1",
+                "trusted_producer": "agent_runtime",
+                "producer_correlation_id": "agent-a",
+            },
+        )
+    )
+    assessment = detector.ingest(
+        EventContext(
+            source_identity="service:agent-runtime",
+            source_ip="192.0.2.20",
+            event_type="agent_external_transfer",
+            metadata={
+                "event_id": "agent-b-1",
+                "trusted_producer": "agent_runtime",
+                "producer_correlation_id": "agent-b",
+            },
+        )
+    )
+    assert "agent_sequence_match" not in assessment.supporting_tags
+
+
+def test_untrusted_agent_named_events_do_not_form_agent_sequence():
+    detector = SentinelThreatDetector()
+    for index, event_type in enumerate(
+        ("agent_secret_access", "agent_external_transfer"), start=1
+    ):
+        assessment = detector.ingest(
+            EventContext(
+                source_identity="service:remote-gateway",
+                source_ip="192.0.2.20",
+                event_type=event_type,
+                metadata={
+                    "event_id": f"spoof-{index}",
+                    "trusted_producer": "remote_gateway",
+                    "producer_correlation_id": "agent-7",
+                },
+            )
+        )
     assert "agent_sequence_match" not in assessment.supporting_tags
