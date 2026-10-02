@@ -882,7 +882,7 @@ async def _resolve_governance_and_commit_action(
                 status_code=409,
                 detail="The Heart is not enabled",
             )
-        from core.governance import UnauthorizedDecision
+        from core.governance import PolicyRefused, UnauthorizedDecision
 
         try:
             resolution = await asyncio.to_thread(
@@ -910,6 +910,11 @@ async def _resolve_governance_and_commit_action(
             raise HTTPException(
                 status_code=403,
                 detail="operator is not authorized to resolve this action",
+            ) from exc
+        except PolicyRefused as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=str(exc),
             ) from exc
         except ValueError as exc:
             raise HTTPException(
