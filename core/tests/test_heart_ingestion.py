@@ -35,6 +35,7 @@ from core.api.middleware.sentinel_firewall_middleware import (  # noqa: E402
 from core.audit import AuditConfig, AuditStore  # noqa: E402
 from core.detection.fenrir_hunter import FenrirHunter  # noqa: E402
 from core.detection.sentinel_threat_detector import (  # noqa: E402
+    DetectorConfig,
     EventContext,
     SentinelThreatDetector,
 )
@@ -180,6 +181,155 @@ def _assessment(seq: int, sources, ip: str = "203.0.113.9") -> ThreatAssessment:
         supporting_tags=["t"],
         window_size=5,
     )
+
+
+# ---------------------------------------------------------------------------
+# Original AI/pattern detection + escalation preservation
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("event_type", "expected_kind", "expected_classification"),
+    [
+        (
+            "virus_detected",
+            ThreatKind.MALWARE_DELIVERY,
+            "AI_AUTOMATION_MALWARE_LIKELY",
+        ),
+        (
+            "spyware_detected",
+            ThreatKind.SPYWARE_ACTIVITY,
+            "AI_AUTOMATION_SPYWARE_LIKELY",
+        ),
+    ],
+)
+def test_ai_malware_and_spyware_patterns_remain_explicit(
+    event_type,
+    expected_kind,
+    expected_classification,
+):
+    detector = SentinelThreatDetector(
+        DetectorConfig(automation_event_rate=2)
+    )
+
+    detector.ingest(
+        EventContext(
+            source_identity="service",
+            source_ip="203.0.113.44",
+            event_type=event_type,
+            metadata={
+                "event_id": "ai-pattern-1",
+                "trusted_producer": "agent_runtime",
+            },
+        )
+    )
+    assessment = detector.ingest(
+        EventContext(
+            source_identity="service",
+            source_ip="203.0.113.44",
+            event_type=event_type,
+            metadata={
+                "event_id": "ai-pattern-2",
+                "trusted_producer": "agent_runtime",
+            },
+        )
+    )
+
+    assert assessment.threat_kind is expected_kind
+    assert assessment.source_kind is ThreatSourceKind.AI_AUTOMATION_LIKELY
+    profile = assessment.indicators["ai_pattern_profile"]
+    assert profile["classification"] == expected_classification
+    assert profile["automation_likely"] is True
+    assert profile["deterministic"] is True
+    assert f"type:{event_type}" in profile["deterministic_signals"]
+    assert (
+        f"ai_pattern:{expected_classification.casefold()}"
+        in assessment.supporting_tags
+    )
+
+
+def test_deterministic_agent_sequence_marks_ai_automation_without_rate_burst():
+    detector = SentinelThreatDetector()
+
+    for index, event_type in enumerate(
+        (
+            "agent_authorization_denied",
+            "agent_alternate_tool_attempted",
+            "agent_privilege_request",
+            "agent_authorization_denied",
+        ),
+        start=1,
+    ):
+        assessment = detector.ingest(
+            EventContext(
+                source_identity="service",
+                source_ip="203.0.113.45",
+                event_type=event_type,
+                metadata={
+                    "event_id": f"agent-pattern-{index}",
+                    "trusted_producer": "agent_runtime",
+                    "producer_correlation_id": "agent-session-1",
+                },
+            )
+        )
+
+    assert assessment.window_size == 4
+    assert assessment.source_kind is ThreatSourceKind.AI_AUTOMATION_LIKELY
+    assert assessment.indicators["agent_sequence_match_count"] >= 1
+    profile = assessment.indicators["ai_pattern_profile"]
+    assert profile["automation_likely"] is True
+    assert profile["deterministic"] is True
+    assert any(
+        item.startswith("agent_sequence:")
+        for item in profile["deterministic_signals"]
+    )
+
+
+def test_owner_ai_escalation_provenance_reaches_authoritative_audit(tmp_path):
+    audit, _core, heart = _stores(tmp_path)
+    authority = heart._authority
+
+    assessment = ThreatAssessment(
+        identity="service",
+        source_ip="203.0.113.46",
+        threat_kind=ThreatKind.MALWARE_DELIVERY,
+        severity=ThreatSeverity.HIGH,
+        source_kind=ThreatSourceKind.AI_AUTOMATION_LIKELY,
+        score=80.0,
+        indicators={
+            "evidence_seq": 1,
+            "evidence_sources": ["firewall"],
+            "ai_pattern_profile": {
+                "classification": "AI_AUTOMATION_MALWARE_LIKELY",
+                "automation_likely": True,
+                "threat_kind": ThreatKind.MALWARE_DELIVERY.value,
+                "deterministic": True,
+                "deterministic_signals": ["type:virus_detected"],
+            },
+            # Upstream input is not allowed to impersonate owner provenance.
+            "ai_escalation": {"system_id": "forged"},
+        },
+        supporting_tags=[
+            "automation_likely",
+            "type:virus_detected",
+            "ai_pattern:ai_automation_malware_likely",
+        ],
+        window_size=2,
+    )
+
+    decision = authority.observe_threat(assessment)
+    assert decision.reason == "AWAITING_CORROBORATION"
+
+    records = audit.get_records(component="heart", limit=50)
+    record = records[-1]
+    provenance = record["indicators"]["ai_escalation"]
+
+    assert provenance["system_id"] == "SENTINEL-43-AI-ESCALATION-01"
+    assert provenance["threat_kind"] == ThreatKind.MALWARE_DELIVERY.value
+    assert provenance["source_kind"] == ThreatSourceKind.AI_AUTOMATION_LIKELY.value
+    assert provenance["automation_likely"] is True
+    assert provenance["pattern_classification"] == "AI_AUTOMATION_MALWARE_LIKELY"
+    assert provenance["pattern_deterministic"] is True
+    assert provenance["deterministic_signals"] == ["type:virus_detected"]
+    assert len(provenance["assessment_fingerprint"]) == 64
 
 
 # ---------------------------------------------------------------------------
