@@ -59,6 +59,9 @@ _SUSPICIOUS_EVENT_TYPES: Final[frozenset[str]] = frozenset(
     {
         "brute_force",
         "ebpf_suspicious_exec",
+        "sparta_tamper_detected",
+        "sparta_integrity_compromised",
+        "sparta_file_unavailable",
         "credential_stuffing",
         "login_failure",
         "auth_failure",
