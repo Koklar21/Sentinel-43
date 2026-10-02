@@ -494,6 +494,10 @@ _EVENT_TYPE_MAP: Final[
     "config": ConfigEvent,
     "log": LogEvent,
     "runtime": RuntimeEvent,
+    # Agent-runtime ingress uses the bounded RuntimeEvent envelope; the
+    # distinct kind preserves producer identity while runtime_event and
+    # runtime_metadata carry its already-bounded observation fields.
+    "agent_runtime": RuntimeEvent,
     "dependency": DependencyEvent,
     "resource": ResourceEvent,
     "security": SecurityEvent,
