@@ -57,7 +57,7 @@ import hashlib
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
@@ -76,6 +76,7 @@ from core.governance.runtime_authority import Sentinel43RuntimeAuthority
 
 logger = logging.getLogger(__name__)
 SYSTEM_ID = "SENTINEL-43-AI-ESCALATION-01"
+AI_ESCALATION_PROVENANCE_KEY = "ai_escalation"
 
 
 # =============================================================================
@@ -229,6 +230,47 @@ def stable_assessment_fingerprint(assessment: ThreatAssessment) -> str:
     ).hexdigest()
 
 
+def _escalation_provenance(
+    assessment: ThreatAssessment,
+    *,
+    fingerprint: str,
+) -> dict[str, Any]:
+    """Bounded provenance attached to the canonical assessment.
+
+    The detector owns threat classification. Escalation records what it
+    received and the stable fingerprint it validated; it does not invent a
+    second AI classifier or a second source of authority.
+    """
+    raw_profile = assessment.indicators.get("ai_pattern_profile")
+    profile = dict(raw_profile) if isinstance(raw_profile, Mapping) else {}
+
+    deterministic_signals = profile.get("deterministic_signals")
+    if not isinstance(deterministic_signals, (list, tuple)):
+        deterministic_signals = ()
+
+    classification = str(
+        profile.get("classification") or "UNCLASSIFIED"
+    ).strip()[:128]
+
+    return {
+        "system_id": SYSTEM_ID,
+        "assessment_fingerprint": fingerprint,
+        "threat_kind": assessment.threat_kind.value,
+        "source_kind": assessment.source_kind.value,
+        "automation_likely": (
+            assessment.source_kind
+            is ThreatSourceKind.AI_AUTOMATION_LIKELY
+        ),
+        "pattern_classification": classification,
+        "pattern_deterministic": bool(profile.get("deterministic")),
+        "deterministic_signals": [
+            str(item).strip()[:128]
+            for item in list(deterministic_signals)[:32]
+            if str(item).strip()
+        ],
+    }
+
+
 # =============================================================================
 # Escalation facade
 # =============================================================================
@@ -319,12 +361,34 @@ class SentinelAIEscalation:
         if "|" == subject_key or subject_key.startswith("|") or subject_key.endswith("|"):
             raise ValueError("assessment does not contain a valid governed subject")
 
+        fingerprint = stable_assessment_fingerprint(assessment)
+        provenance = _escalation_provenance(
+            assessment,
+            fingerprint=fingerprint,
+        )
+
+        # The owner escalation fingerprint used to terminate here: the runtime
+        # forwarded only envelope.assessment to Heart, so the provenance never
+        # reached the authoritative audit path. Keep one canonical assessment
+        # and attach the owner escalation proof to its bounded indicators.
+        # The key is reserved and overwritten here so upstream evidence cannot
+        # impersonate Sentinel-43's escalation provenance.
+        indicators = dict(assessment.indicators)
+        indicators[AI_ESCALATION_PROVENANCE_KEY] = provenance
+        enriched_assessment = replace(
+            assessment,
+            indicators=MappingProxyType(indicators),
+        )
+
+        envelope_evidence = dict(evidence or {})
+        envelope_evidence[AI_ESCALATION_PROVENANCE_KEY] = provenance
+
         envelope = EscalationEnvelope(
-            assessment=assessment,
+            assessment=enriched_assessment,
             requested_mode=mode,
-            evidence=MappingProxyType(dict(evidence or {})),
+            evidence=MappingProxyType(envelope_evidence),
             subject_key=subject_key,
-            fingerprint=stable_assessment_fingerprint(assessment),
+            fingerprint=fingerprint,
             created_at=time.time(),
         )
         self.metrics.envelopes_built += 1
@@ -454,6 +518,7 @@ ESCALATION_RESPONSIBILITY_MAP: Mapping[str, str] = MappingProxyType(
 
 
 __all__ = [
+    "AI_ESCALATION_PROVENANCE_KEY",
     "ESCALATION_RESPONSIBILITY_MAP",
     "EscalationEnvelope",
     "EscalationStatus",
