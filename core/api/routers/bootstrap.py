@@ -54,6 +54,7 @@ from ...auth.users import (
     bootstrap_claimed,
 )
 from ..deps import get_runtime_authority
+from ..origin_policy import is_local_environment, require_state_change_origin
 
 router = APIRouter(
     prefix="/bootstrap",
@@ -67,10 +68,6 @@ MAX_EMAIL_LEN: Final[int] = 255
 BOOTSTRAP_TOKEN_HEADER: Final[str] = "X-S43-Bootstrap-Token"
 BOOTSTRAP_TOKEN_ENV: Final[str] = "S43_BOOTSTRAP_CLAIM_TOKEN"
 _MIN_BOOTSTRAP_TOKEN_LEN: Final[int] = 32
-_LOCAL_ENVS: Final[frozenset[str]] = frozenset(
-    {"development", "dev", "local", "test", "testing"}
-)
-
 
 # =============================================================================
 # Models
@@ -142,18 +139,9 @@ class BootstrapAdminResponse(StrictModel):
 # Helpers
 # =============================================================================
 
-def _is_local_environment() -> bool:
-    raw = (
-        os.getenv("SENTINEL_ENV")
-        or os.getenv("S43_ENV")
-        or ""
-    )
-    return raw.strip().lower() in _LOCAL_ENVS
-
-
 def _require_bootstrap_claim(request: Request) -> None:
     """Authorize the first-admin claim without creating a pre-admin identity."""
-    if _is_local_environment():
+    if is_local_environment():
         return
 
     expected = os.getenv(BOOTSTRAP_TOKEN_ENV, "")
@@ -204,7 +192,7 @@ async def bootstrap_status(
         initialized=await bootstrap_claimed(
             session
         ),
-        claim_token_required=not _is_local_environment(),
+        claim_token_required=not is_local_environment(),
     )
 
 
@@ -225,6 +213,10 @@ async def bootstrap_admin(
 ) -> BootstrapAdminResponse:
     """Create the single first-run administrator account."""
 
+    # Bootstrap is a state-changing browser operation just like login. Apply
+    # the exact same Origin/Referer policy first so a deployment cannot create
+    # the sole admin successfully and then reject that same browser at login.
+    require_state_change_origin(request)
     _require_bootstrap_claim(request)
 
     try:
