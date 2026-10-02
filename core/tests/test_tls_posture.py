@@ -62,6 +62,18 @@ def test_nonlocal_https_origin_is_fine(monkeypatch):
     m._validate_security_config()  # no raise
 
 
+def test_nonlocal_empty_origin_set_refuses_startup(monkeypatch):
+    _cfg(monkeypatch, env="production", origins=set())
+    with pytest.raises(RuntimeError, match="requires S43_ALLOWED_ORIGINS"):
+        m._validate_security_config()
+
+
+def test_nonlocal_wildcard_origin_refuses_startup(monkeypatch):
+    _cfg(monkeypatch, env="production", origins={"*"})
+    with pytest.raises(RuntimeError, match="may not contain"):
+        m._validate_security_config()
+
+
 def test_loopback_http_origin_is_exempt(monkeypatch):
     _cfg(
         monkeypatch,
@@ -89,6 +101,16 @@ def test_local_env_never_checks_origins(monkeypatch):
 # ---------------------------------------------------------------------------
 # Compose reverse proxy wiring
 # ---------------------------------------------------------------------------
+
+def test_compose_defaults_include_https_loopback_dashboard_origins():
+    yaml = pytest.importorskip("yaml")
+    compose = yaml.safe_load((_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+    origins = str(
+        compose["services"]["s43-api"]["environment"]["S43_ALLOWED_ORIGINS"]
+    )
+    assert "https://localhost" in origins
+    assert "https://127.0.0.1" in origins
+
 
 def test_compose_backend_is_not_host_published():
     yaml = pytest.importorskip("yaml")
