@@ -22,6 +22,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AUTH_JS = REPO_ROOT / "dashboard" / "assets" / "js" / "auth.js"
 BOOTSTRAP_ROUTER = REPO_ROOT / "core" / "api" / "routers" / "bootstrap.py"
+API_MAIN = REPO_ROOT / "core" / "api" / "main.py"
 
 
 def test_dashboard_discovers_first_run_before_showing_login():
@@ -84,3 +85,11 @@ def test_bootstrap_admin_route_remains_under_runtime_authority():
     }
     assert "bootstrap_first_admin" in calls
     assert "create_first_admin" not in calls
+
+
+
+def test_split_origin_dashboard_auth_headers_are_cors_allowed():
+    source = API_MAIN.read_text(encoding="utf-8")
+
+    assert '"X-S43-CSRF"' in source
+    assert '"X-S43-Bootstrap-Token"' in source
