@@ -4312,7 +4312,8 @@ reliability_router = APIRouter(
 #: used for a refused analysis loop (see ``_reject_analysis_loop``).
 _REPLAY_CONFLICT_DETAIL: Final[dict[str, str]] = {
     "already_replayed": (
-        "This event was already successfully replayed; it will not be "
+        "This event was already successfully redelivered, either by an "
+        "operator replay or a recovered producer retry; it will not be "
         "redelivered again through this route."
     ),
     "replay_in_progress": (
