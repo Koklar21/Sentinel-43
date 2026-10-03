@@ -179,6 +179,9 @@ services:
       # it and a missing value fails at startup instead of being filled in.
       S43_REJECT_LEGACY_AUTH: ${S43_REJECT_LEGACY_AUTH:-}
 
+      # Public/client enrollment is fail-closed and creates only role=client.
+      S43_OPEN_BETA_ENROLLMENT: ${S43_OPEN_BETA_ENROLLMENT:-false}
+
       # Internal services
       S43_WATCHTOWER_URL: http://s43-core:9100
       S43_WATCHTOWER_SERVICE_TOKEN: ${S43_WATCHTOWER_SERVICE_TOKEN}
