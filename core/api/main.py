@@ -110,6 +110,7 @@ from .routers.agent_runtime import router as agent_runtime_router
 from .routers.auth import router as auth_router
 from .routers.bootstrap import router as bootstrap_router
 from .routers.ebpf import router as ebpf_router
+from .routers.enrollment import router as enrollment_router
 from .routers.remote_gateway import router as remote_gateway_router
 from .routers.routers import router as watchgate_router
 from .routers.users import router as users_router
@@ -5134,6 +5135,7 @@ async def compat_api_watchtower_ready() -> dict[str, Any]:
 
 app.include_router(root_router)
 app.include_router(auth_router)
+app.include_router(enrollment_router)
 app.include_router(users_router)
 app.include_router(bootstrap_router)
 app.include_router(ebpf_router)
