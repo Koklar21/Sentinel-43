@@ -450,6 +450,35 @@ def test_0004_refuses_populated_store_without_admin(_clean):
 
 
 # ---------------------------------------------------------------------------
+# 0005 — permanent non-governance client role
+# ---------------------------------------------------------------------------
+
+def test_0005_adds_client_without_reclassifying_existing_accounts(_clean):
+    command.upgrade(_cfg(), "0004_single_admin_observer_roles")
+    import uuid as _u
+
+    with _clean.begin() as c:
+        c.exec_driver_sql(
+            "INSERT INTO users (user_id, username, password_hash, role, is_active, created_at) "
+            f"VALUES ('{_u.uuid4()}', 'existing-observer', 'x', 'observer', true, now())"
+        )
+
+    command.upgrade(_cfg(), "head")
+
+    with _clean.begin() as c:
+        roles = dict(
+            c.exec_driver_sql(
+                "SELECT username, role FROM users WHERE username = 'existing-observer'"
+            ).all()
+        )
+        assert roles["existing-observer"] == "observer"
+        c.exec_driver_sql(
+            "INSERT INTO users (user_id, username, password_hash, role, is_active, created_at) "
+            f"VALUES ('{_u.uuid4()}', 'new-client', 'x', 'client', true, now())"
+        )
+
+
+# ---------------------------------------------------------------------------
 # downgrade  (§12, §18)
 # ---------------------------------------------------------------------------
 
