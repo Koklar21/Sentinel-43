@@ -67,7 +67,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 APPROVED_ROLES: Final[frozenset[str]] = frozenset(
-    {"observer", "admin"}
+    {"client", "observer", "admin"}
 )
 
 ADMIN_INVARIANT_LOCK_KEY: Final[int] = 0x5334334200000001
@@ -167,7 +167,7 @@ class User(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "role IN ('observer', 'admin')",
+            "role IN ('client', 'observer', 'admin')",
             name="role",
         ),
         Index(
@@ -716,7 +716,7 @@ async def create_user(
     normalized_role = _validate_role(
         role
     )
-    if normalized_role != "observer":
+    if normalized_role == "admin":
         raise AdminRoleImmutableError(
             "administrator role may only be created by first-run bootstrap"
         )
@@ -727,7 +727,7 @@ async def create_user(
         password_hash=await hash_password_async(
             password
         ),
-        role="observer",
+        role=normalized_role,
     )
 
     session.add(
