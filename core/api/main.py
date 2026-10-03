@@ -663,6 +663,13 @@ async def _get_operator(
                     detail="Token subject is missing",
                 )
 
+            role = str(claims.get("role") or "").strip().lower()
+            if role not in {"observer", "admin", "operator"}:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Observer or administrator role required",
+                )
+
             resolved = await resolve_session_subject(claims)
             if resolved is not None:
                 resolved_subject, resolved_role = resolved
@@ -3449,6 +3456,22 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 await _ws_safe_close(
                     websocket,
                     reason="invalid_token",
+                )
+                return
+
+            role = str(claims.get("role") or "").strip().lower()
+            if role not in {"observer", "admin", "operator"}:
+                await websocket.send_json(
+                    {
+                        "type": "error",
+                        "payload": {
+                            "error": "Observer or administrator role required"
+                        },
+                    }
+                )
+                await _ws_safe_close(
+                    websocket,
+                    reason="role_forbidden",
                 )
                 return
 
