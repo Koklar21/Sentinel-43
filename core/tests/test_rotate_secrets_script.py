@@ -7,6 +7,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -97,3 +100,130 @@ def test_duplicate_env_assignments_are_rejected(tmp_path: Path):
 
     with pytest.raises(rotate.RotationError, match="Duplicate"):
         rotate._read_env(env_path)
+
+
+def _write_env(path: Path, values: dict[str, str]) -> None:
+    path.write_text(
+        "\n".join(f"{key}={value}" for key, value in values.items()) + "\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission semantics required")
+def test_atomic_env_replacement_is_owner_only_even_under_common_umask(tmp_path: Path):
+    env_path = tmp_path / ".env"
+    env_path.write_text("EXAMPLE=old\n", encoding="utf-8")
+    os.chmod(env_path, 0o600)
+
+    previous_umask = os.umask(0o022)
+    try:
+        rotate._atomic_update_env(env_path, {"EXAMPLE": "new"})
+    finally:
+        os.umask(previous_umask)
+
+    assert env_path.read_text(encoding="utf-8") == "EXAMPLE=new\n"
+    assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+    assert env_path.stat().st_mode & 0o077 == 0
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission semantics required")
+def test_rotation_backup_is_created_owner_only(tmp_path: Path):
+    env_path = tmp_path / ".env"
+    env_path.write_text("SECRET=value\n", encoding="utf-8")
+    os.chmod(env_path, 0o644)
+
+    backup = rotate._backup_env(env_path)
+
+    assert backup.read_bytes() == env_path.read_bytes()
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+    assert backup.stat().st_mode & 0o077 == 0
+
+
+def test_compose_forwards_selected_env_file(monkeypatch, tmp_path: Path):
+    env_path = tmp_path / "config" / "local.env"
+    captured: list[str] = []
+
+    def fake_run(args, **kwargs):
+        _ = kwargs
+        captured.extend(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(rotate, "_run", fake_run)
+
+    rotate._compose(env_path, "config", "--quiet")
+
+    assert captured == [
+        "docker",
+        "compose",
+        "--env-file",
+        str(env_path),
+        "config",
+        "--quiet",
+    ]
+
+
+def test_stop_callers_rejects_any_service_left_running(monkeypatch, tmp_path: Path):
+    env_path = tmp_path / ".env"
+    calls: list[tuple[str, ...]] = []
+
+    def fake_compose(selected_env, *args, **kwargs):
+        assert selected_env == env_path
+        calls.append(tuple(args))
+        if args[0] == "stop":
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[0] == "ps":
+            return subprocess.CompletedProcess(args, 0, "s43-api\n", "")
+        raise AssertionError(f"unexpected compose call: {args}")
+
+    monkeypatch.setattr(rotate, "_compose", fake_compose)
+
+    with pytest.raises(rotate.RotationError, match="still running"):
+        rotate._stop_callers(env_path)
+
+    assert calls[0] == ("stop", *rotate.CALLER_SERVICES)
+    assert calls[1][:4] == ("ps", "--status", "running", "--services")
+
+
+def test_stop_failure_aborts_before_postgres_password_change(monkeypatch, tmp_path: Path):
+    env_path = tmp_path / ".env"
+    existing = _base_env()
+    _write_env(env_path, existing)
+
+    replacements = dict(existing)
+    replacements["POSTGRES_PASSWORD"] = "9" * 64
+    replacements["DATABASE_URL"] = rotate._database_url_with_password(
+        existing["DATABASE_URL"],
+        replacements["POSTGRES_PASSWORD"],
+    )
+    replacements[rotate.ROTATION_TIMESTAMP_KEY] = "2026-10-03T00:00:00+00:00"
+
+    monkeypatch.setattr(
+        rotate,
+        "_build_replacements",
+        lambda current, *, full_reset: (replacements, ["POSTGRES_PASSWORD"]),
+    )
+    monkeypatch.setattr(rotate, "_print_plan", lambda **kwargs: None)
+
+    def stop_fails(selected_env):
+        assert selected_env == env_path
+        raise rotate.RotationError("caller shutdown failed")
+
+    postgres_changed = False
+
+    def record_postgres_change(selected_env, password):
+        nonlocal postgres_changed
+        _ = selected_env, password
+        postgres_changed = True
+
+    monkeypatch.setattr(rotate, "_stop_callers", stop_fails)
+    monkeypatch.setattr(rotate, "_alter_postgres_role", record_postgres_change)
+
+    with pytest.raises(rotate.RotationError, match="caller shutdown failed"):
+        rotate._state_preserving_rotation(
+            env_path,
+            dry_run=False,
+            no_restart=False,
+        )
+
+    assert postgres_changed is False
+    assert env_path.read_text(encoding="utf-8").startswith("S43_JWT_SECRET=")
