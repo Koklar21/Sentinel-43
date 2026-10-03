@@ -628,6 +628,12 @@ def check_app_flag_invariants(rep: Report, env: Mapping[str, str]) -> None:
                "env-operator only; real dashboard/API consumers never need "
                "it) must be rejected outside local/dev")
 
+    enrollment = str(env.get("S43_OPEN_BETA_ENROLLMENT", ""))
+    rep.record(PASS if _is_explicitly_true(enrollment) else FAIL,
+               "S43_OPEN_BETA_ENROLLMENT is true for this beta target",
+               "open-beta enrollment must be an explicit deployment choice; "
+               "the endpoint creates only non-governance client identities")
+
     heart = str(env.get("S43_HEART_ENABLED", ""))
     rep.record(PASS if _is_explicitly_true(heart) else FAIL,
                "S43_HEART_ENABLED is true for this non-local target",
