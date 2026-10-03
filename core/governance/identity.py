@@ -15,9 +15,9 @@
 
 Credential verification and password hashing remain auth primitives. This
 service owns the consequential account lifecycle operations that change
-Sentinel-43 authority: the one-time first-admin claim, observer creation and
-activation state, password reset, and session revocation. Administrator role
-is immutable after bootstrap.
+Sentinel-43 authority: the one-time first-admin claim, trusted observer
+creation, untrusted client creation, activation state, password reset, and
+session revocation. Administrator role is immutable after bootstrap.
 
 Every mutation is authorized/audited through the single runtime authority
 before the account store is changed. Persistence remains in core.auth users
