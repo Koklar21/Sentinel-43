@@ -96,6 +96,47 @@ way, applied as a Secret instead of an `.env` file.
 `S43_SECRETS_ROTATED_AT` should be updated (ISO-8601 timestamp) whenever
 you rotate; `deploy_preflight.py` checks it isn't more than 90 days stale.
 
+### Local Compose coordinated rotation
+
+For a local Docker Compose instance, do not rotate `POSTGRES_PASSWORD` with
+the primitive generator and then restart the stack by hand. Use the
+coordinated workflow beside the generator:
+
+```powershell
+# Preview a state-preserving rotation. No secrets are printed.
+python core/scripts/rotate_secrets.py --dry-run
+
+# Rotate operational credentials while preserving PostgreSQL data and
+# durable audit/Jormungandr integrity roots.
+python core/scripts/rotate_secrets.py
+
+# Deliberately rotate every generated/configured secret, including durable
+# integrity roots, and start with fresh Compose volumes.
+python core/scripts/rotate_secrets.py --full-reset --yes
+```
+
+The state-preserving path stops API callers, brings PostgreSQL up under the
+current environment, changes the live `s43` database role to the newly
+generated password, atomically rewrites `.env` (including `DATABASE_URL`
+and `S43_SECRETS_ROTATED_AT`), validates the managed secret set and Compose
+configuration, and only then recreates services. If the file/validation phase
+fails before services consume the new values, it restores both the previous
+`.env` and the previous PostgreSQL role password.
+
+The full-reset path is intentionally destructive. It rotates
+`S43_AUDIT_HMAC_KEY` and any configured `S43_JORM_ROOT_KEY`, then removes
+the Compose volumes so no persisted ledger/database is left expecting the old
+integrity or database credentials. It requires the explicit `--yes` flag.
+
+`S43_OPERATOR_PASSWORD_HASH` is not a random deployment secret and is not
+changed by either mode. For the local/dev/test break-glass operator, generate a
+new human-selected Argon2id verifier separately with:
+
+```powershell
+docker compose --profile setup run --rm -it s43-setup --password-hash
+```
+
+
 ## 5. The Argon2id operator hash (local/dev/test only) — and Compose's `$` escaping trap
 
 **Not for beta.** This hash belongs to the break-glass env operator, whose
