@@ -17,11 +17,11 @@ All routes are admin-gated. This module owns account-management guard rails,
 while the auth/users layer remains responsible for persistence primitives.
 
 Security invariants:
-    - no public self-service registration
+    - open-beta self-service registration is isolated in the enrollment router
     - first-run bootstrap creates the deployment's sole administrator
-    - every later account is an observer
+    - admin-managed account creation creates trusted observers only
     - administrator role cannot be created, promoted, demoted, or disabled
-    - observer activation changes are committed atomically
+    - client/observer activation changes are committed atomically
     - security-sensitive account changes revoke live sessions in the same
       transaction and fail closed if revocation cannot be completed
 """
