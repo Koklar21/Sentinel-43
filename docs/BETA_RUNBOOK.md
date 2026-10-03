@@ -115,13 +115,28 @@ python core/scripts/rotate_secrets.py
 python core/scripts/rotate_secrets.py --full-reset --yes
 ```
 
-The state-preserving path stops API callers, brings PostgreSQL up under the
-current environment, changes the live `s43` database role to the newly
-generated password, atomically rewrites `.env` (including `DATABASE_URL`
-and `S43_SECRETS_ROTATED_AT`), validates the managed secret set and Compose
-configuration, and only then recreates services. If the file/validation phase
+The state-preserving path stops API callers **and verifies that none remain
+running** before PostgreSQL credentials may change. A failed stop is a hard
+abort, not a best-effort warning. It then brings PostgreSQL up under the
+selected environment, changes the live `s43` database role to the newly
+generated password, atomically rewrites the environment file (including
+`DATABASE_URL` and `S43_SECRETS_ROTATED_AT`), validates the managed secret
+set and Compose configuration, and only then recreates services. On POSIX,
+the replacement environment file and its rotation backup are created
+owner-only (`0600`) before any secret bytes are written; the replacement is
+flushed and `fsync`ed before the atomic rename. If the file/validation phase
 fails before services consume the new values, it restores both the previous
-`.env` and the previous PostgreSQL role password.
+environment file and the previous PostgreSQL role password.
+
+A non-default environment file is authoritative for the entire transaction,
+including every Docker Compose command:
+
+```powershell
+python core/scripts/rotate_secrets.py --env-file config/local.env
+```
+
+The tool passes that same path to Compose with `--env-file`; it must never
+rotate one file while recreating containers from another.
 
 The full-reset path is intentionally destructive. It rotates
 `S43_AUDIT_HMAC_KEY` and any configured `S43_JORM_ROOT_KEY`, then removes
