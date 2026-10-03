@@ -202,6 +202,36 @@ class IdentityGovernanceService:
             await self._rollback_safely(session)
             raise
 
+    async def create_client_account(
+        self,
+        session: AsyncSession,
+        *,
+        actor: str,
+        username: str,
+        password: str,
+        email: str | None,
+    ) -> User:
+        """Create an untrusted client identity without governance authority."""
+        self._authorize(
+            operation="create_client_account",
+            actor=actor,
+            target=username,
+            metadata={"role": "client"},
+        )
+        try:
+            user = await create_user(
+                session,
+                username=username,
+                password=password,
+                role="client",
+                email=email,
+            )
+            await session.commit()
+            return user
+        except Exception:
+            await self._rollback_safely(session)
+            raise
+
     async def update_account(
         self,
         session: AsyncSession,
