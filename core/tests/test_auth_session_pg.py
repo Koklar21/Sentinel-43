@@ -274,6 +274,26 @@ def test_replay_of_a_rotated_refresh_value_revokes_the_session(client, db):
     assert n == 1
 
 
+def test_client_login_and_refresh_preserve_client_role(client, db):
+    _mk_user(db, username="client1", password="client1-password-1234", role="client")
+    login = _login(client, "client1", "client1-password-1234")
+    assert login.status_code == 200, login.text
+    assert login.json()["role"] == "client"
+
+    refreshed = client.post(
+        "/auth/refresh",
+        headers={"Origin": _ORIGIN, "X-S43-CSRF": _csrf(client)},
+    )
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["role"] == "client"
+
+
+def test_client_session_cannot_reach_operator_v1(client, db):
+    _mk_user(db, username="client2", password="client2-password-1234", role="client")
+    token = _login(client, "client2", "client2-password-1234").json()["access_token"]
+    assert _v1(client, token).status_code == 403
+
+
 def test_refresh_preserves_observer_role_at_rotation_time(client, db):
     _mk_user(db, role="observer")
     _login(client)
