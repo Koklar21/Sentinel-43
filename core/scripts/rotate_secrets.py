@@ -69,6 +69,7 @@ from core.cli.generate_secrets import (  # noqa: E402
 
 LOCAL_ENVIRONMENTS = frozenset({"development", "dev", "local", "test", "testing"})
 ROTATION_TIMESTAMP_KEY = "S43_SECRETS_ROTATED_AT"
+CALLER_SERVICES = ("s43-proxy", "s43-api", "s43-core")
 
 # These roots protect persisted material and cannot be changed in-place without
 # invalidating that material. Routine rotation therefore preserves them.
@@ -124,8 +125,22 @@ def _run(
     return result
 
 
-def _compose(*args: str, **kwargs) -> subprocess.CompletedProcess[str]:
-    return _run(["docker", "compose", *args], **kwargs)
+def _compose(
+    env_path: Path,
+    *args: str,
+    **kwargs,
+) -> subprocess.CompletedProcess[str]:
+    """Run Compose against the exact environment file selected by the CLI."""
+    return _run(
+        [
+            "docker",
+            "compose",
+            "--env-file",
+            str(env_path),
+            *args,
+        ],
+        **kwargs,
+    )
 
 
 def _read_env(path: Path) -> dict[str, str]:
@@ -193,6 +208,53 @@ def _database_url_with_password(database_url: str, password: str) -> str:
     )
 
 
+def _assert_owner_only(path: Path) -> None:
+    """Fail closed if a POSIX secret file is readable by group/other users."""
+    if os.name != "posix":
+        return
+
+    mode = path.stat().st_mode & 0o777
+    if mode & 0o077:
+        raise RotationError(
+            f"Secret file permissions are too broad for {path}: {mode:04o}"
+        )
+
+
+def _atomic_replace_owner_only(path: Path, payload: bytes) -> None:
+    """Durably replace a secret file without ever creating a broad-permission inode."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.rotate.{os.getpid()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    fd: int | None = None
+    try:
+        fd = os.open(temp, flags, 0o600)
+        if os.name == "posix":
+            os.fchmod(fd, 0o600)
+
+        with os.fdopen(fd, "wb") as handle:
+            fd = None
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        if os.name == "posix":
+            os.chmod(temp, 0o600)
+            _assert_owner_only(temp)
+
+        os.replace(temp, path)
+
+        if os.name == "posix":
+            os.chmod(path, 0o600)
+            _assert_owner_only(path)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        temp.unlink(missing_ok=True)
+
+
 def _atomic_update_env(path: Path, replacements: dict[str, str]) -> None:
     original = path.read_text(encoding="utf-8-sig").splitlines()
     seen: set[str] = set()
@@ -224,23 +286,19 @@ def _atomic_update_env(path: Path, replacements: dict[str, str]) -> None:
         for key in missing:
             output.append(f"{key}={replacements[key]}")
 
-    temp = path.with_name(f".{path.name}.rotate.tmp")
-    try:
-        temp.write_text(
-            "\n".join(output).rstrip() + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-        os.replace(temp, path)
-    finally:
-        temp.unlink(missing_ok=True)
+    payload = ("\n".join(output).rstrip() + "\n").encode("utf-8")
+    _atomic_replace_owner_only(path, payload)
 
 
 def _backup_env(path: Path) -> Path:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup = path.with_name(f"{path.name}.rotation-backup.{stamp}")
-    shutil.copy2(path, backup)
+    _atomic_replace_owner_only(backup, path.read_bytes())
     return backup
+
+
+def _restore_env(backup: Path, path: Path) -> None:
+    _atomic_replace_owner_only(path, backup.read_bytes())
 
 
 def _configured_optional_secret(
@@ -316,11 +374,12 @@ def _validate_env(path: Path) -> None:
         )
 
 
-def _wait_for_postgres(timeout_seconds: int = 60) -> None:
+def _wait_for_postgres(env_path: Path, timeout_seconds: int = 60) -> None:
     deadline = time.monotonic() + timeout_seconds
 
     while time.monotonic() < deadline:
         result = _compose(
+            env_path,
             "exec",
             "-T",
             "s43-db",
@@ -341,13 +400,14 @@ def _wait_for_postgres(timeout_seconds: int = 60) -> None:
     raise RotationError("PostgreSQL did not become ready within 60 seconds.")
 
 
-def _alter_postgres_role(password: str) -> None:
+def _alter_postgres_role(env_path: Path, password: str) -> None:
     # Generated POSTGRES_PASSWORD values are hexadecimal today, but escape
     # single quotes defensively so this remains safe if the generator changes.
     escaped = password.replace("'", "''")
     sql = f"ALTER ROLE s43 WITH PASSWORD '{escaped}';\n"
 
     _compose(
+        env_path,
         "exec",
         "-T",
         "s43-db",
@@ -360,6 +420,31 @@ def _alter_postgres_role(password: str) -> None:
         "ON_ERROR_STOP=1",
         input_text=sql,
     )
+
+
+def _stop_callers(env_path: Path) -> None:
+    """Stop credential consumers and verify none remain running."""
+    _compose(env_path, "stop", *CALLER_SERVICES)
+
+    result = _compose(
+        env_path,
+        "ps",
+        "--status",
+        "running",
+        "--services",
+        *CALLER_SERVICES,
+        capture=True,
+    )
+    still_running = [
+        line.strip()
+        for line in (result.stdout or "").splitlines()
+        if line.strip()
+    ]
+    if still_running:
+        raise RotationError(
+            "Credential consumers are still running after stop: "
+            + ", ".join(sorted(set(still_running)))
+        )
 
 
 def _print_plan(
@@ -415,34 +500,34 @@ def _state_preserving_rotation(
     backup = _backup_env(env_path)
     print(f"Environment backup: {backup}")
 
-    # Keep the database available but stop callers before changing shared
-    # credentials. These services may not exist/running yet; that is harmless.
-    _compose("stop", "s43-proxy", "s43-api", "s43-core", check=False)
-    _compose("up", "-d", "s43-db")
-    _wait_for_postgres()
+    # Keep the database available but fail closed unless every credential
+    # consumer is stopped before the shared PostgreSQL password changes.
+    _stop_callers(env_path)
+    _compose(env_path, "up", "-d", "s43-db")
+    _wait_for_postgres(env_path)
 
     db_role_changed = False
     env_changed = False
 
     try:
-        _alter_postgres_role(replacements["POSTGRES_PASSWORD"])
+        _alter_postgres_role(env_path, replacements["POSTGRES_PASSWORD"])
         db_role_changed = True
 
         _atomic_update_env(env_path, replacements)
         env_changed = True
 
         _validate_env(env_path)
-        _compose("config", "--quiet")
+        _compose(env_path, "config", "--quiet")
 
     except Exception:
         # Before services consume the new values, restore the two coupled
         # credential stores together.
         if env_changed:
-            shutil.copy2(backup, env_path)
+            _restore_env(backup, env_path)
 
         if db_role_changed:
             try:
-                _alter_postgres_role(old_pg_password)
+                _alter_postgres_role(env_path, old_pg_password)
             except Exception as rollback_exc:
                 print(
                     "WARNING: PostgreSQL credential rollback also failed: "
@@ -459,7 +544,7 @@ def _state_preserving_rotation(
         )
         return
 
-    _compose("up", "-d", "--force-recreate")
+    _compose(env_path, "up", "-d", "--force-recreate")
     print("Rotation complete. Compose services recreated with the new credentials.")
 
 
@@ -501,12 +586,12 @@ def _full_reset_rotation(
     try:
         _atomic_update_env(env_path, replacements)
         _validate_env(env_path)
-        _compose("config", "--quiet")
+        _compose(env_path, "config", "--quiet")
     except Exception:
-        shutil.copy2(backup, env_path)
+        _restore_env(backup, env_path)
         raise
 
-    _compose("down", "-v", "--remove-orphans")
+    _compose(env_path, "down", "-v", "--remove-orphans")
 
     if no_restart:
         print(
@@ -515,7 +600,7 @@ def _full_reset_rotation(
         )
         return
 
-    _compose("up", "-d", "--force-recreate")
+    _compose(env_path, "up", "-d", "--force-recreate")
     print(
         "Full rotation complete. Fresh persistent state was created under the "
         "new credential and integrity roots."
@@ -574,7 +659,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        _run(["docker", "compose", "version"], capture=True)
+        _compose(env_path, "version", capture=True)
 
         if args.full_reset:
             _full_reset_rotation(
@@ -600,8 +685,9 @@ def main(argv: list[str] | None = None) -> int:
         "For local break-glass rotation use:"
     )
     print(
-        "  docker compose --profile setup run --rm -it "
-        "s43-setup --password-hash"
+        '  docker compose --env-file "'
+        + str(env_path)
+        + '" --profile setup run --rm -it s43-setup --password-hash'
     )
     return 0
 
