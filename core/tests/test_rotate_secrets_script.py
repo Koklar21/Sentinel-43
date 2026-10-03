@@ -141,6 +141,8 @@ def test_rotation_backup_is_created_owner_only(tmp_path: Path):
 
 def test_compose_forwards_selected_env_file(monkeypatch, tmp_path: Path):
     env_path = tmp_path / "config" / "local.env"
+    env_path.parent.mkdir(parents=True)
+    env_path.write_text("S43_ENV=development\n", encoding="utf-8")
     captured: list[str] = []
 
     def fake_run(args, **kwargs):
