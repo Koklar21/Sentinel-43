@@ -665,7 +665,13 @@ async def _get_operator(
 
             resolved = await resolve_session_subject(claims)
             if resolved is not None:
-                return resolved[0]
+                resolved_subject, resolved_role = resolved
+                if str(resolved_role).strip().lower() not in {"observer", "admin"}:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Observer or administrator role required",
+                    )
+                return resolved_subject
 
             if legacy_auth_is_rejected():
                 raise HTTPException(
@@ -3505,6 +3511,23 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 return
 
             if resolved is not None:
+                resolved_subject, resolved_role = resolved
+                if str(resolved_role).strip().lower() not in {"observer", "admin"}:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "payload": {
+                                "error": "Observer or administrator role required"
+                            },
+                        }
+                    )
+                    await _ws_safe_close(
+                        websocket,
+                        reason="role_forbidden",
+                    )
+                    return
+                client.subject = resolved_subject
+                client.role = resolved_role
                 sid = str(claims.get("sid") or "").strip()
                 if not sid:
                     await _ws_safe_close(
