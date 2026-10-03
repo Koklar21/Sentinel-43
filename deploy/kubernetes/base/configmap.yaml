@@ -59,6 +59,10 @@ data:
   S43_SESSION_REFRESH_TTL_SECONDS: "604800"
   S43_WS_SESSION_RECHECK_SECONDS: "60"
 
+  # Permanent client enrollment. Base is closed; a public/open-beta overlay
+  # must explicitly opt in. The endpoint always creates role=client.
+  S43_OPEN_BETA_ENROLLMENT: "false"
+
   # Trusted proxy handling
   # Empty means trust no proxy-provided forwarding headers.
   # Production overlays must explicitly set the ingress-controller network.
