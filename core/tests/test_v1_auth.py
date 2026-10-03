@@ -184,6 +184,18 @@ def test_v1_rejects_unapproved_role(client: TestClient):
     assert response.status_code == 403
 
 
+def test_v1_rejects_client_from_operator_surface(client: TestClient):
+    """Clients authenticate as humans but never inherit operator authority."""
+    response = client.post(
+        ASSESS_URL,
+        json={},
+        headers=_bearer(_build_token(role="client"), TEST_PASSWORD),
+    )
+
+    assert response.status_code == 403
+    assert "observer or administrator" in response.json()["detail"].lower()
+
+
 def test_v1_accepts_observer_as_authenticated_human(client: TestClient):
     """Observer is the normal post-bootstrap human role. It must cross the
     same human route gate used by approval/veto surfaces; account-management
