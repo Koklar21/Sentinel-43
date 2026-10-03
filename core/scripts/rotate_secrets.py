@@ -68,7 +68,7 @@ from core.cli.generate_secrets import (  # noqa: E402
 
 LOCAL_ENVIRONMENTS = frozenset({"development", "dev", "local", "test", "testing"})
 ROTATION_TIMESTAMP_KEY = "S43_SECRETS_ROTATED_AT"
-CALLER_SERVICES = ("s43-proxy", "s43-api", "s43-core")
+CALLER_SERVICES = ("s43-proxy", "s43-api", "s43-core", "s43-migrate")
 
 # These roots protect persisted material and cannot be changed in-place without
 # invalidating that material. Routine rotation therefore preserves them.
@@ -106,6 +106,7 @@ def _run(
     input_text: str | None = None,
     check: bool = True,
     capture: bool = False,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         args,
@@ -114,6 +115,7 @@ def _run(
         text=True,
         capture_output=capture,
         check=False,
+        env=env,
     )
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
@@ -129,7 +131,14 @@ def _compose(
     *args: str,
     **kwargs,
 ) -> subprocess.CompletedProcess[str]:
-    """Run Compose against the exact environment file selected by the CLI."""
+    """Run Compose with the selected env file authoritative over the caller shell."""
+    compose_env = os.environ.copy()
+    # Compose gives exported shell variables precedence over --env-file. Remove
+    # every key owned by the selected file from the child process environment so
+    # stale shell exports cannot silently override a just-rotated credential.
+    for key in _read_env(env_path):
+        compose_env.pop(key, None)
+
     return _run(
         [
             "docker",
@@ -138,6 +147,7 @@ def _compose(
             str(env_path),
             *args,
         ],
+        env=compose_env,
         **kwargs,
     )
 
