@@ -190,13 +190,15 @@ Sentinel-43 supports Docker Compose for local and controlled-beta work, with Kub
 
 ### Configuration
 
-Start from the example environment file:
+For local Docker Compose work on Windows/PowerShell, use the canonical local startup wrapper:
 
-```bash
-cp .env.example .env
+```powershell
+.\scripts\start-local.ps1
 ```
 
-Generate real secrets with the repository's secret-generation tool rather than reusing example values.
+On the first run, the wrapper creates `.env` from `.env.example`, generates the managed secrets before Compose evaluates the file, derives `DATABASE_URL` from `POSTGRES_PASSWORD`, validates the resulting environment, and then starts the stack. On later runs it preserves existing secrets and only adds managed secrets that are missing. Ordinary startup never rotates existing credentials.
+
+Use the explicit secret-generator `--force` mode only for an intentional rotation. A rotation of `POSTGRES_PASSWORD`, the audit HMAC key, JWT secret, or session/auth peppers has state consequences and is deliberately separate from startup.
 
 Do not commit your real `.env`, credentials, certificates, or generated secrets.
 
@@ -206,6 +208,8 @@ The base stack is defined in:
 
 - `docker-compose.yml`
 - `docker-compose.beta.yml` for controlled-beta overrides
+
+Direct `docker compose up` assumes that a valid environment already exists. For normal local Windows startup, prefer `.\scripts\start-local.ps1` so secret generation and environment validation happen before Compose interpolation.
 
 For the controlled-beta Compose procedure, secret requirements, migration order, health checks, and verification steps, follow [docs/BETA_RUNBOOK.md](docs/BETA_RUNBOOK.md).
 
