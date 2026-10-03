@@ -162,6 +162,39 @@ def test_compose_forwards_selected_env_file(monkeypatch, tmp_path: Path):
     ]
 
 
+def test_compose_selected_env_file_overrides_exported_shell_values(monkeypatch, tmp_path: Path):
+    env_path = tmp_path / ".env"
+    _write_env(
+        env_path,
+        {
+            "POSTGRES_PASSWORD": "file-password",
+            "DATABASE_URL": "postgresql+asyncpg://s43:file-password@s43-db/s43",
+        },
+    )
+    monkeypatch.setenv("POSTGRES_PASSWORD", "stale-shell-password")
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://s43:stale-shell-password@s43-db/s43",
+    )
+    captured_env: dict[str, str] = {}
+
+    def fake_run(args, **kwargs):
+        _ = args
+        captured_env.update(kwargs["env"])
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(rotate, "_run", fake_run)
+
+    rotate._compose(env_path, "config", "--quiet")
+
+    assert "POSTGRES_PASSWORD" not in captured_env
+    assert "DATABASE_URL" not in captured_env
+
+
+def test_rotation_caller_set_includes_migration_consumer():
+    assert "s43-migrate" in rotate.CALLER_SERVICES
+
+
 def test_stop_callers_rejects_any_service_left_running(monkeypatch, tmp_path: Path):
     env_path = tmp_path / ".env"
     calls: list[tuple[str, ...]] = []
