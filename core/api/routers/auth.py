@@ -318,21 +318,24 @@ def _login_throttle_config() -> tuple[int, int, int]:
 
 def _throttle_key(
     username: str,
+    client_ip: str,
 ) -> str:
-    return username.strip().lower()[
-        :MAX_USERNAME_LEN
-    ]
+    normalized_user = username.strip().lower()[:MAX_USERNAME_LEN]
+    normalized_ip = str(client_ip).strip()[:128] or "unknown"
+    return f"{normalized_ip}|{normalized_user}"
 
 
 def _login_check_throttled(
     username: str,
+    client_ip: str,
 ) -> None:
     max_failures, window, lockout = (
         _login_throttle_config()
     )
 
     key = _throttle_key(
-        username
+        username,
+        client_ip,
     )
     now = time.monotonic()
     cutoff = now - max(
@@ -395,13 +398,15 @@ def _login_check_throttled(
 
 def _login_record_failure(
     username: str,
+    client_ip: str,
 ) -> None:
     _max_failures, window, lockout = (
         _login_throttle_config()
     )
 
     key = _throttle_key(
-        username
+        username,
+        client_ip,
     )
     now = time.monotonic()
     cutoff = now - max(
@@ -455,11 +460,13 @@ def _login_record_failure(
 
 def _login_clear(
     username: str,
+    client_ip: str,
 ) -> None:
     with _LOGIN_LOCK:
         _LOGIN_FAILURES.pop(
             _throttle_key(
-                username
+                username,
+                client_ip,
             ),
             None,
         )
@@ -1449,8 +1456,10 @@ async def login(
         request
     )
 
+    client_ip = client_ip_of(request)
     _login_check_throttled(
-        body.username
+        body.username,
+        client_ip,
     )
 
     try:
@@ -1467,13 +1476,15 @@ async def login(
             == status.HTTP_401_UNAUTHORIZED
         ):
             _login_record_failure(
-                body.username
+                body.username,
+                client_ip,
             )
 
         raise
 
     _login_clear(
-        body.username
+        body.username,
+        client_ip,
     )
 
     if user_id is not None:
