@@ -82,6 +82,7 @@ data:
   S43_ALLOWED_ORIGINS: "https://beta.example.invalid"   # CHANGEME -> https://<your host>
   S43_TLS_TERMINATED_AT_TRUSTED_EDGE: "true"
   S43_REJECT_LEGACY_AUTH: "true"
+  S43_OPEN_BETA_ENROLLMENT: "true"
   S43_HEART_ENABLED: "true"
   S43_HEART_REQUIRED: "true"
   S43_GOVERNANCE_ENABLED: "true"
