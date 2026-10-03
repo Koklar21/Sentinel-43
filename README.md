@@ -161,13 +161,16 @@ External effects must remain explicitly integrated and independently governed.
 
 Sentinel-43 distinguishes human identities from service identities.
 
-Human accounts use a deliberately narrow authority model:
+Human accounts use a deliberately narrow three-tier authority model:
 
 - the one-time bootstrap claim creates the deployment's **sole administrator**
-- every later human account is an **observer**
+- administrators may create trusted **observer** accounts
 - observers may review staged actions and submit human approve/veto decisions
-- only the sole administrator may create/disable observer accounts or reset their passwords
+- ordinary authenticated **client** accounts have no observer, approval, veto, orchestration, or account-administration authority
+- open-beta self-enrollment, when explicitly enabled with `S43_OPEN_BETA_ENROLLMENT=true`, always creates a client; callers cannot select a role
+- only the sole administrator may create/disable observer accounts or reset managed account passwords
 - administrator role is not promotable, demotable, or transferable through normal account-management APIs
+- account roles are fixed after creation; client enrollment cannot promote into observer/admin authority
 - authenticated sessions, refresh rotation, logout/revocation, and password reset remain governed
 
 Internal services use separate service credentials and cannot silently become human approvers.
