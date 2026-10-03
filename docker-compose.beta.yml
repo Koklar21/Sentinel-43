@@ -14,6 +14,9 @@ services:
     environment:
       # Session-only authentication: no per-request X-S43-Password fallback.
       S43_REJECT_LEGACY_AUTH: ${S43_REJECT_LEGACY_AUTH:?set S43_REJECT_LEGACY_AUTH=true in .env for a beta target}
+      # Open beta must be an explicit operator choice; this endpoint can only
+      # create non-governance client identities.
+      S43_OPEN_BETA_ENROLLMENT: ${S43_OPEN_BETA_ENROLLMENT:?set S43_OPEN_BETA_ENROLLMENT=true in .env for open beta}
       # Bind the unauthenticated first-admin route to deployment ownership.
       S43_BOOTSTRAP_CLAIM_TOKEN: ${S43_BOOTSTRAP_CLAIM_TOKEN:?set S43_BOOTSTRAP_CLAIM_TOKEN to a generated secret in .env for a beta target}
       # The Heart (human-governed threat staging) must be an explicit choice.
