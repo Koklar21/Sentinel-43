@@ -305,11 +305,17 @@ async def _authenticate_request(
 
 
 async def require_operator(request: Request) -> str:
-    """Require a valid Sentinel-43 observer/admin human authentication context."""
-    subject, _claims = await _authenticate_request(
+    """Require trusted observer/admin authority; clients are never operators."""
+    subject, claims = await _authenticate_request(
         request,
         legacy_metric_route="/v1",
     )
+    role = str(claims.get("role") or "").strip().lower()
+    if role not in {"observer", "admin", "operator"}:
+        raise HTTPException(
+            status_code=403,
+            detail="Observer or administrator role required",
+        )
     return subject
 
 
