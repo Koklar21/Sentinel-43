@@ -132,14 +132,36 @@ async def test_observer_active_change_rolls_back_atomically():
 
 
 @_t
-async def test_duplicate_username_raises_integrityerror_at_flush():
+async def test_duplicate_username_is_rejected_before_flush():
     async with _db() as sm:
         async with sm() as s:
             await create_user(s, username="dup", password="p" * 16)
             await s.commit()
         async with sm() as s:
-            with pytest.raises(IntegrityError):
+            with pytest.raises(UsernameTakenError):
                 await create_user(s, username="dup", password="p" * 16)
+
+
+@_t
+async def test_case_variant_username_is_same_identity_and_cannot_be_created():
+    async with _db() as sm:
+        async with sm() as s:
+            original = await create_user(
+                s, username="Victim", password="p" * 16
+            )
+            await s.commit()
+            original_id = original.user_id
+
+        async with sm() as s:
+            resolved = await get_user_by_username(s, "vIcTiM")
+            assert resolved is not None
+            assert resolved.user_id == original_id
+
+        async with sm() as s:
+            with pytest.raises(UsernameTakenError):
+                await create_user(
+                    s, username="VICTIM", password="q" * 16
+                )
 
 
 @_t
