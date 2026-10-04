@@ -95,7 +95,7 @@ def _is_explicitly_false(value: str) -> bool:
 
 # A value that looks like a stand-in rather than a real hostname / secret.
 PLACEHOLDER_RE = re.compile(
-    r"CHANGEME|<[^>]+>|\byour[-_.]|example\.(?:invalid|com|org|net)\b|"
+    r"CHANGE[_-]?ME|<[^>]+>|\byour[-_.]|example\.(?:invalid|com|org|net)\b|"
     r"(?:^|[^0-9A-Za-z.])(?:localhost|127\.0\.0\.1|0\.0\.0\.0|::1)(?:$|[^0-9A-Za-z.])",
     re.IGNORECASE,
 )
@@ -107,7 +107,7 @@ PLACEHOLDER_RE = re.compile(
 REQUIRED_SECRETS = [
     "S43_JWT_SECRET", "S43_BOOTSTRAP_CLAIM_TOKEN",
     "S43_AUTH_PEPPER", "S43_SESSION_HASH_PEPPER",
-    "POSTGRES_PASSWORD", "S43_WATCHTOWER_SERVICE_TOKEN",
+    "SENTINEL_LOG_SALT", "POSTGRES_PASSWORD", "S43_WATCHTOWER_SERVICE_TOKEN",
     "S43_OPERATOR_PASSWORD_HASH", "S43_SECRETS_ROTATED_AT",
     "SENTINEL_REMOTE_TOKEN_OWNER", "SENTINEL_REMOTE_TOKEN_ADMIN",
     "SENTINEL_REMOTE_TOKEN_AUDITOR", "S43_FENRIR_API_TOKEN",
@@ -741,6 +741,7 @@ def check_kube_prereqs(rep: Report, context: str, namespace: str) -> None:
             "S43_BOOTSTRAP_CLAIM_TOKEN",
             "S43_AUTH_PEPPER",
             "S43_SESSION_HASH_PEPPER",
+            "SENTINEL_LOG_SALT",
             "S43_AUDIT_HMAC_KEY",
             "S43_FENRIR_API_TOKEN",
             "S43_WATCHTOWER_SERVICE_TOKEN",
