@@ -85,6 +85,8 @@ function Read-Env {
 function Set-EnvValue {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [AllowEmptyString()]
         [System.Collections.Generic.List[string]]$Lines,
 
         [Parameter(Mandatory = $true)]
@@ -118,7 +120,10 @@ function Set-EnvValue {
 function Write-Utf8NoBom {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][System.Collections.Generic.List[string]]$Lines
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [AllowEmptyString()]
+        [System.Collections.Generic.List[string]]$Lines
     )
 
     $encoding = New-Object System.Text.UTF8Encoding($false)
