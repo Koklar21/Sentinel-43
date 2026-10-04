@@ -58,6 +58,7 @@ kubectl create secret generic sentinel43-secrets -n sentinel43 \
   --from-literal=S43_AUTH_PEPPER="$S43_AUTH_PEPPER" \
   --from-literal=S43_SESSION_HASH_PEPPER="$S43_SESSION_HASH_PEPPER" \
   --from-literal=S43_AUDIT_HMAC_KEY="$S43_AUDIT_HMAC_KEY" \
+  --from-literal=SENTINEL_LOG_SALT="$SENTINEL_LOG_SALT" \
   --from-literal=S43_FENRIR_API_TOKEN="$S43_FENRIR_API_TOKEN" \
   --from-literal=S43_WATCHTOWER_SERVICE_TOKEN="$S43_WATCHTOWER_SERVICE_TOKEN"
 ```
@@ -96,9 +97,10 @@ absent-means-disabled, and each fails closed rather than degrading:
 ```
 
 `REDIS_PASSWORD` / `REDIS_URL` are **no longer provisioned** — there is no
-Redis in this deployment (see "No Redis" below). `SENTINEL_LOG_SALT` is not
-provisioned either: `core/cli/generate_secrets.py` still generates both, but
-no module outside that generator reads either one.
+Redis in this deployment (see "No Redis" below). `SENTINEL_LOG_SALT` **is
+required**: the governed Shadow response engine uses it to pseudonymize targets
+in operational logs, and non-local startup rejects a missing or placeholder
+value.
 
 `S43_WATCHTOWER_SERVICE_TOKEN` is read by both `s43-api` and `s43-core` (both
 `envFrom` this Secret). The Watchtower core rejects every operational and
