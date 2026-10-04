@@ -56,22 +56,26 @@ Before starting, have ready:
   — this becomes `S43_TRUSTED_PROXIES`.
 - A container registry you can push to (GHCR, ECR, GCR, etc.) — **this repo
   does not provide one or push to one automatically for the beta overlay.**
-- 13 generated secret values (§4) — none ship with real values; the
-  checked-in examples are placeholders that must not reach a real
+- The deployment-consumed secret values listed in §4 — none ship with real
+  values; the checked-in examples are placeholders that must not reach a real
   deployment. The break-glass operator hash (§5) is **not** a beta input:
   that login is refused outside local/dev/test.
 
 ## 4. Secret generation and rotation
 
-Managed via `core/cli/generate_secrets.py`. It manages 13 keys:
-`S43_JWT_SECRET`, `S43_BOOTSTRAP_CLAIM_TOKEN`, `S43_AUTH_PEPPER`, `S43_SESSION_HASH_PEPPER`,
-`SENTINEL_LOG_SALT`, `SENTINEL_REMOTE_TOKEN_OWNER`,
+Managed via `core/cli/generate_secrets.py`. The generator still emits 13
+keys for compatibility, but the beta deployment contract consumes 11:
+`S43_JWT_SECRET`, `S43_BOOTSTRAP_CLAIM_TOKEN`, `S43_AUTH_PEPPER`,
+`S43_SESSION_HASH_PEPPER`, `SENTINEL_REMOTE_TOKEN_OWNER`,
 `SENTINEL_REMOTE_TOKEN_ADMIN`, `SENTINEL_REMOTE_TOKEN_AUDITOR`,
 `S43_FENRIR_API_TOKEN`, `S43_WATCHTOWER_SERVICE_TOKEN`,
-`S43_AUDIT_HMAC_KEY`, `POSTGRES_PASSWORD`, `REDIS_PASSWORD`.
-`DATABASE_URL` is deliberately **not** in this list — set it to your real
-Postgres connection string. Neither is `S43_OPERATOR_PASSWORD_HASH`, which
-only a local/dev/test stack uses (§5); leave it empty for beta.
+`S43_AUDIT_HMAC_KEY`, and `POSTGRES_PASSWORD`.
+`REDIS_PASSWORD` and `SENTINEL_LOG_SALT` are generated leftovers and are
+not required by Compose/Kubernetes preflight because neither deployment
+consumes them. `DATABASE_URL` is deliberately **not** in the generated-secret
+list — set it to your real Postgres connection string. Neither is
+`S43_OPERATOR_PASSWORD_HASH`, which only a local/dev/test stack uses (§5);
+leave it empty for beta.
 
 ```bash
 # Generate/add any missing managed secrets into a real .env file
@@ -87,11 +91,12 @@ python -m core.cli.generate_secrets --write .env --force
 python -m core.cli.generate_secrets --check .env
 ```
 
-For Kubernetes, the equivalent values go into the `sentinel43-secrets`
-Secret in the `sentinel43` namespace (see `deploy/kubernetes/base/secret.example.yaml`
-for the full key list and `deploy/kubernetes/README.md` for the
-`kubectl create secret` invocation) — the same 13 keys generated the same
-way, applied as a Secret instead of an `.env` file.
+For Kubernetes, the deployment-consumed subset goes into the
+`sentinel43-secrets` Secret in the `sentinel43` namespace (see
+`deploy/kubernetes/base/secret.example.yaml` and
+`deploy/kubernetes/README.md` for the authoritative key list and
+`kubectl create secret` invocation). Do not add `REDIS_PASSWORD` or
+`SENTINEL_LOG_SALT` merely because the compatibility generator emits them.
 
 `S43_SECRETS_ROTATED_AT` should be updated (ISO-8601 timestamp) whenever
 you rotate; `deploy_preflight.py` checks it isn't more than 90 days stale.
