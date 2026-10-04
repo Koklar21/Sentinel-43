@@ -86,6 +86,7 @@ OPTIONAL_SECRET_GENERATORS = {
     "S43_SPARTA_TOKEN_SECRET": lambda: secrets.token_urlsafe(32),
     "S43_SPARTA_NODE_TOKEN": lambda: secrets.token_urlsafe(32),
     "S43_EBPF_INGEST_TOKEN": lambda: secrets.token_urlsafe(32),
+    "S43_ROUTER_INGEST_TOKEN": lambda: secrets.token_urlsafe(32),
 }
 
 FEATURE_ENABLE_KEY = {
@@ -93,6 +94,7 @@ FEATURE_ENABLE_KEY = {
     "S43_SPARTA_TOKEN_SECRET": "S43_SPARTA_ENABLED",
     "S43_SPARTA_NODE_TOKEN": "S43_SPARTA_ENABLED",
     "S43_EBPF_INGEST_TOKEN": "S43_EBPF_ENABLED",
+    "S43_ROUTER_INGEST_TOKEN": "S43_ROUTER_ENABLED",
 }
 
 
