@@ -111,7 +111,7 @@ class _FakeUserStore:
         return sum(1 for u in self.users.values() if u.role == "admin" and u.is_active)
 
     async def bootstrap_claimed(self, session=None) -> bool:
-        return bool(self.users)
+        return any(u.role == "admin" for u in self.users.values())
 
     async def get_user_by_username(self, session, username: str) -> _FakeUser | None:
         return self.users.get(username)
