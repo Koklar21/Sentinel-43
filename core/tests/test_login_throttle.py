@@ -85,6 +85,24 @@ def test_lockout_is_per_username(client):
     assert _login(client, username="victim-b").status_code == 401
 
 
+def test_account_wide_lockout_survives_source_ip_rotation():
+    """Rotating source IPs must not reset the username-wide failure budget."""
+    for index in range(5):
+        auth_module._login_record_failure(
+            USERNAME,
+            f"198.51.100.{index + 1}",
+        )
+
+    with pytest.raises(Exception) as exc_info:
+        auth_module._login_check_throttled(
+            USERNAME,
+            "203.0.113.250",
+        )
+
+    exc = exc_info.value
+    assert getattr(exc, "status_code", None) == 429
+
+
 def test_successful_login_clears_the_counter(client):
     for _ in range(4):
         assert _login(client).status_code == 401
