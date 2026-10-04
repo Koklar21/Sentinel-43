@@ -66,7 +66,29 @@ def _env(name: str, default: str) -> str:
 
 
 SYSTEM_ID = _env("SENTINEL_SYSTEM_ID", "SENTINEL-43-NEXUS-01")
-LOG_SALT = _env("SENTINEL_LOG_SALT", "CHANGE_ME_IN_PROD")
+
+
+def _log_salt() -> str:
+    value = _env("SENTINEL_LOG_SALT", "").strip()
+    environment = (
+        os.getenv("SENTINEL_ENV")
+        or os.getenv("S43_ENV")
+        or "production"
+    ).strip().lower()
+    local = environment in {"development", "dev", "local", "test"}
+
+    if local:
+        return value or "CHANGE_ME_IN_PROD"
+
+    if not value or value in {"CHANGE_ME", "CHANGE_ME_IN_PROD"}:
+        raise RuntimeError(
+            "SENTINEL_LOG_SALT must be a generated secret outside local/test"
+        )
+
+    return value
+
+
+LOG_SALT = _log_salt()
 DEFAULT_DEDUPE_TTL_SECONDS = int(_env("SENTINEL_ACTION_DEDUPE_TTL", "60"))
 
 
