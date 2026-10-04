@@ -264,6 +264,13 @@ services:
       S43_EBPF_ENABLED: ${S43_EBPF_ENABLED:-false}
       S43_EBPF_INGEST_TOKEN: ${S43_EBPF_INGEST_TOKEN:-}
 
+      # Optional home-router telemetry ingress. A host-side collector receives
+      # router syslog and submits bounded observations through the HTTPS edge.
+      # The router is evidence-only and has no governance or enforcement authority.
+      S43_ROUTER_ENABLED: ${S43_ROUTER_ENABLED:-false}
+      S43_ROUTER_INGEST_TOKEN: ${S43_ROUTER_INGEST_TOKEN:-}
+      S43_ROUTER_SOURCE_IP: ${S43_ROUTER_SOURCE_IP:-}
+
       # FenrirHunter runs embedded in this container and reports back through
       # the API bridge under its OWN service identity (never the Watchtower
       # service token). Without these it reaches HUNTING but has no report
