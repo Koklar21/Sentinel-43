@@ -112,6 +112,7 @@ from .routers.bootstrap import router as bootstrap_router
 from .routers.ebpf import router as ebpf_router
 from .routers.enrollment import router as enrollment_router
 from .routers.remote_gateway import router as remote_gateway_router
+from .routers.router_telemetry import router as router_telemetry_router
 from .routers.routers import router as watchgate_router
 from .routers.users import router as users_router
 
@@ -1746,6 +1747,7 @@ async def _start_fenrir() -> None:
                     "agent_runtime": "sentinel-agent-runtime",
                     "sparta": "sentinel-sparta",
                     "remote_gateway": "sentinel-remote-gateway",
+                    "router": "sentinel-router",
                     "firewall": (
                         os.getenv(
                             "S43_FIREWALL_MONITORING_SOURCE",
@@ -5141,6 +5143,7 @@ app.include_router(bootstrap_router)
 app.include_router(ebpf_router)
 app.include_router(agent_runtime_router)
 app.include_router(remote_gateway_router)
+app.include_router(router_telemetry_router)
 
 # IMPORTANT:
 # watchgate_router previously advertised another top-level /health route.
