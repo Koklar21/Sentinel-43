@@ -171,9 +171,12 @@ def test_cors_and_websocket_share_the_canonical_effective_origin_set():
     assert "origin not in _ALLOWED_ORIGINS" in source
 
 
-def test_canonical_local_startup_writes_https_dashboard_origins():
+def test_canonical_local_startup_writes_and_verifies_https_dashboard_origins():
     source = START_LOCAL_FILE.read_text(encoding="utf-8")
 
     assert 'Set-EnvValue $lines "S43_ALLOWED_ORIGINS"' in source
+    assert "docker compose config --format json" in source
+    assert "effectiveOrigins" in source
+    assert "missingDashboardOrigins" in source
     assert "https://localhost" in source
     assert "https://127.0.0.1" in source
