@@ -48,6 +48,7 @@ _MALFORMED_SHAPE_VALID_HASH = "$argon2id$v=19$m=65536,t=3,p=4$$"
 
 def _cfg(monkeypatch, *, env, operator_hash):
     monkeypatch.setattr(m, "SENTINEL_ENV", env)
+    monkeypatch.setenv("SENTINEL_LOG_SALT", "a" * 64)
     # core.api.main freezes IS_LOCAL_ENV at import from SENTINEL_ENV;
     # _validate_security_config() gates the non-local checks on that frozen
     # value, so a test simulating production must patch it too.
