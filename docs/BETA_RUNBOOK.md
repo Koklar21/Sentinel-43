@@ -660,10 +660,12 @@ recovery without exposing a privileged network endpoint. What is enforced today:
   the claim commits in one transaction, so an interrupted claim leaves
   nothing behind and can be retried. Outside local/test, a backend that
   cannot serialize claims refuses with `503`.
-- **Closed for every application path.** Once any account exists,
+- **Closed by the administrator row.** Once the first administrator exists,
   `/bootstrap/admin` returns `409` and `/bootstrap/status` reports
-  `initialized: true`. Deactivating or demoting every admin, even directly
-  in the database, does not reopen it, and the API cannot delete an account.
+  `initialized: true`. Client enrollment is refused until that administrator
+  exists and is serialized against bootstrap with the same advisory lock.
+  Deactivating the administrator does not reopen bootstrap, and the API cannot
+  delete the administrator row.
   It is not yet a separate consumed-bootstrap marker: deleting every account
   row directly in the database reopens the claim. Anyone with that database
   access could already insert an admin row, so treat database write access
