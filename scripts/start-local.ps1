@@ -229,7 +229,7 @@ try {
         throw "Docker Compose rendered configuration inspection failed."
     }
 
-    $composeConfig = $composeConfigJson | ConvertFrom-Json
+    $composeConfig = ($composeConfigJson -join [Environment]::NewLine) | ConvertFrom-Json
     $effectiveOrigins = $composeConfig.services.'s43-api'.environment.S43_ALLOWED_ORIGINS
     if ([string]::IsNullOrWhiteSpace($effectiveOrigins)) {
         throw "Rendered Compose configuration is missing S43_ALLOWED_ORIGINS for s43-api."
