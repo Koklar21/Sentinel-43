@@ -26,8 +26,9 @@ Security invariants:
       nothing behind and may be retried
     - schema/model initialization is owned by application startup, not by an
       unauthenticated HTTP request
-    - bootstrap closes once the first account exists and no application path
-      reopens it: deactivating or demoting every admin does NOT. It is not a
+    - bootstrap closes once the administrator row exists and no application
+      path reopens it: deactivating the admin does NOT. Client/observer rows
+      cannot consume the first-admin claim. It is not a
       separate consumed-bootstrap marker -- deleting every account row
       directly in the database reopens it
 
