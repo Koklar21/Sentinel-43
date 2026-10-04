@@ -27,6 +27,8 @@ param(
 
     [switch]$RegenerateToken,
 
+    [switch]$OpenWindowsFirewall,
+
     [switch]$NoRestart
 )
 
@@ -152,11 +154,53 @@ function Get-EnvLines {
     return $lines
 }
 
+function Clear-RouterShellOverrides {
+    foreach ($key in @(
+        "S43_ROUTER_ENABLED",
+        "S43_ROUTER_INGEST_TOKEN",
+        "S43_ROUTER_SOURCE_IP"
+    )) {
+        Remove-Item "Env:$key" -ErrorAction SilentlyContinue
+    }
+}
+
+function Set-RouterFirewallRule {
+    param(
+        [Parameter(Mandatory = $true)][string]$RemoteAddress,
+        [Parameter(Mandatory = $true)][int]$Port
+    )
+
+    if (-not $OpenWindowsFirewall) {
+        return
+    }
+
+    if (-not (Get-Command New-NetFirewallRule -ErrorAction SilentlyContinue)) {
+        throw "Windows Firewall cmdlets are unavailable on this host."
+    }
+
+    $ruleName = "Sentinel-43 Router Syslog"
+    Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue |
+        Remove-NetFirewallRule -ErrorAction SilentlyContinue
+
+    New-NetFirewallRule `
+        -DisplayName $ruleName `
+        -Direction Inbound `
+        -Action Allow `
+        -Protocol UDP `
+        -LocalPort $Port `
+        -RemoteAddress $RemoteAddress `
+        -Profile Any | Out-Null
+
+    Write-Host "Windows Firewall rule '$ruleName' allows UDP $Port only from $RemoteAddress."
+}
+
 function Restart-RouterIngress {
     if ($NoRestart) {
         Write-Host "Router settings saved; s43-api was not recreated because -NoRestart was supplied."
         return
     }
+
+    Clear-RouterShellOverrides
 
     Push-Location $RepoRoot
     try {
@@ -236,6 +280,7 @@ switch ($Mode) {
         Write-Utf8NoBom -Path $EnvPath -Lines $lines
 
         [void](Read-Env -Path $EnvPath)
+        Set-RouterFirewallRule -RemoteAddress $effectiveRouterIp -Port $SyslogPort
         Restart-RouterIngress
 
         Write-Host ""
@@ -261,7 +306,9 @@ switch ($Mode) {
         Push-Location $RepoRoot
         try {
             & $python $CollectorPath --env-file $EnvPath
-            exit $LASTEXITCODE
+            if ($LASTEXITCODE -ne 0) {
+                throw "Router collector exited with code $LASTEXITCODE."
+            }
         }
         finally {
             Pop-Location
@@ -272,7 +319,9 @@ switch ($Mode) {
         Push-Location $RepoRoot
         try {
             & $python $CollectorPath --env-file $EnvPath --test-event "router telemetry test observation"
-            exit $LASTEXITCODE
+            if ($LASTEXITCODE -ne 0) {
+                throw "Router ingress test failed with code $LASTEXITCODE."
+            }
         }
         finally {
             Pop-Location
