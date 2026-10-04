@@ -42,6 +42,7 @@ from core.auth.users import (
     create_first_admin,
     create_user,
     get_user_by_id,
+    require_bootstrap_before_enrollment,
     set_user_active,
     set_user_password,
 )
@@ -212,6 +213,12 @@ class IdentityGovernanceService:
         email: str | None,
     ) -> User:
         """Create an untrusted client identity without governance authority."""
+        # Hold the same transaction-scoped lock used by first-admin bootstrap
+        # through client creation/commit. This makes "admin exists" and
+        # enrollment one serialized decision instead of a raceable pre-check.
+        await require_bootstrap_before_enrollment(
+            session
+        )
         self._authorize(
             operation="create_client_account",
             actor=actor,
