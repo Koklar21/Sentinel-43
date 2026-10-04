@@ -106,6 +106,7 @@ def run_live_suite(database_url: str, *, api_port: int = 18000, watchtower_port:
         # _start_audit_store()) -- the authoritative audit store cannot be
         # keyed without it.
         "S43_AUDIT_HMAC_KEY": audit_hmac_key,
+        "SENTINEL_LOG_SALT": secrets.token_hex(32),
         # core/api/main.py's _validate_security_config() added two more
         # non-local startup requirements after this script was last updated
         # for them: a Host allow-list, and an explicit assertion that TLS is
