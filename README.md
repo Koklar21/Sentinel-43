@@ -216,6 +216,32 @@ Direct `docker compose up` assumes that a valid environment already exists. For 
 
 For the controlled-beta Compose procedure, secret requirements, migration order, health checks, and verification steps, follow [docs/BETA_RUNBOOK.md](docs/BETA_RUNBOOK.md).
 
+### Local Router Telemetry
+
+For a local home-network deployment, Sentinel-43 can receive router syslog
+through a host-side evidence-only collector. Configure it from PowerShell:
+
+```powershell
+.\scripts\router-monitor.ps1 -Mode Configure -RouterIp <router-lan-ip>
+.\scripts\router-monitor.ps1 -Mode Test
+.\scripts\router-monitor.ps1 -Mode Listen
+```
+
+The default listener is UDP `5514`. Point the router's remote-syslog target
+at the Windows machine running the collector on that port. Use
+`-OpenWindowsFirewall` during `Configure` only when you deliberately want
+the script to add an inbound Windows Firewall rule; that rule is restricted to
+the configured router IP and UDP port.
+
+`Status`, `Disable`, `-SyslogPort`, `-MaxEventsPerSecond`,
+`-ApiUrl`, and `-CaCert` allow the local side to be changed without
+hand-editing the collector. The ingest token is stored in `.env` and is never
+printed by the status command.
+
+Router telemetry is observation-only. The collector cannot assign threat
+severity or perform enforcement; high-signal observations are classified by
+S43 and then enter the existing MonitoringManager/Fenrir/governance path.
+
 ### Kubernetes
 
 Kubernetes manifests live under:
