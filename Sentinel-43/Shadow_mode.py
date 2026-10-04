@@ -80,10 +80,8 @@ def _log_salt() -> str:
     if local:
         return value or "CHANGE_ME_IN_PROD"
 
-    if not value or value in {"CHANGE_ME", "CHANGE_ME_IN_PROD"}:
-        raise RuntimeError(
-            "SENTINEL_LOG_SALT must be a generated secret outside local/test"
-        )
+    if not value:
+        return "CHANGE_ME_IN_PROD"
 
     return value
 
@@ -275,6 +273,20 @@ def pseudonymize(value: str) -> str:
     raw = str(value or "").strip()
     if not raw:
         return "EMPTY"
+
+    environment = (
+        os.getenv("SENTINEL_ENV")
+        or os.getenv("S43_ENV")
+        or "production"
+    ).strip().lower()
+    if (
+        environment not in {"development", "dev", "local", "test"}
+        and LOG_SALT in {"", "CHANGE_ME", "CHANGE_ME_IN_PROD"}
+    ):
+        raise RuntimeError(
+            "SENTINEL_LOG_SALT must be a generated secret outside local/test"
+        )
+
     digest = hashlib.sha256(f"{LOG_SALT}:{raw}".encode("utf-8")).hexdigest()
     return digest[:16]
 
