@@ -40,10 +40,6 @@ DEFAULT_LOCAL_ALLOWED_ORIGINS = (
     "http://127.0.0.1:8000",
 )
 
-DEFAULT_LOCAL_ALLOWED_ORIGINS_CSV = ",".join(
-    DEFAULT_LOCAL_ALLOWED_ORIGINS
-)
-
 LOOPBACK_HTTP_ORIGIN_RE = re.compile(
     r"^http://(localhost|127\.0\.0\.1)(:\d+)?$"
 )
@@ -141,7 +137,6 @@ def require_state_change_origin(request: Request) -> None:
 
 __all__ = [
     "DEFAULT_LOCAL_ALLOWED_ORIGINS",
-    "DEFAULT_LOCAL_ALLOWED_ORIGINS_CSV",
     "LOCAL_ENVIRONMENTS",
     "LOOPBACK_HTTP_ORIGIN_RE",
     "configured_allowed_origins",
