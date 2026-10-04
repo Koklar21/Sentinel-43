@@ -178,6 +178,32 @@ def test_collector_extracts_bounded_router_facts():
     assert "severity" not in payload
 
 
+def test_collector_retries_transient_api_failure(monkeypatch, tmp_path: Path):
+    attempts = 0
+
+    def flaky_post(**kwargs):
+        nonlocal attempts
+        _ = kwargs
+        attempts += 1
+        if attempts < 3:
+            raise collector.CollectorError("temporarily unavailable")
+        return {"accepted": True}
+
+    monkeypatch.setattr(collector, "_post", flaky_post)
+    monkeypatch.setattr(collector.time, "sleep", lambda _seconds: None)
+
+    result = collector._post_with_retry(
+        api_url="https://localhost/internal/router/events",
+        token="t" * 48,
+        ca_cert=tmp_path / "unused.crt",
+        payload={"event_id": "retry-test"},
+    )
+
+    assert result == {"accepted": True}
+    assert attempts == 3
+
+
+
 def test_collector_reloads_router_token_after_env_rotation(tmp_path: Path):
     env_path = tmp_path / ".env"
     env_path.write_text(
