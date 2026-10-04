@@ -523,6 +523,13 @@ def _validate_security_config() -> None:
         )
 
     if not IS_LOCAL_ENV:
+        log_salt = _env_str("SENTINEL_LOG_SALT")
+        if not log_salt or log_salt in {"CHANGE_ME", "CHANGE_ME_IN_PROD"}:
+            raise RuntimeError(
+                "Non-local Sentinel-43 API requires a generated "
+                "SENTINEL_LOG_SALT; placeholder values are not accepted"
+            )
+
         if not JWT_SECRET:
             raise RuntimeError(
                 "Production Sentinel-43 API requires S43_JWT_SECRET"
