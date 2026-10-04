@@ -396,6 +396,7 @@ jobs:
             --from-literal=S43_AUTH_PEPPER="$(gen)" \
             --from-literal=S43_SESSION_HASH_PEPPER="$(gen)" \
             --from-literal=S43_AUDIT_HMAC_KEY="$(gen_hex)" \
+            --from-literal=SENTINEL_LOG_SALT="$(gen_hex)" \
             --from-literal=S43_WATCHTOWER_SERVICE_TOKEN="$(gen)" \
             --from-literal=S43_FENRIR_API_TOKEN="$(gen)"
           cd deploy/kubernetes/overlays/dev
