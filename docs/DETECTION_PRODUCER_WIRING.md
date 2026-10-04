@@ -27,6 +27,7 @@ fixed source label, while the caller supplies the in-process
 - `ebpf` -> `sentinel-ebpf`
 - `sparta` -> `sentinel-sparta`
 - `remote_gateway` -> `sentinel-remote-gateway` (security observations only)
+- `router` -> `sentinel-router` (authenticated home-router observations only)
 
 SpartaCore converts its internal integrity event names to canonical detection
 event types before ingestion:
@@ -44,10 +45,29 @@ Sparta is embedded in the API process, so its threat subject uses the existing
 assigned by Sparta's in-process monitoring bridge; arbitrary event payload text
 cannot override it.
 
+## Router telemetry boundary
+
+The optional local router collector receives UDP syslog on the host and
+forwards bounded observation facts to `/internal/router/events` over the
+existing HTTPS proxy. The API authenticates that collector with a dedicated
+`S43_ROUTER_INGEST_TOKEN` and requires the reported router address to match
+`S43_ROUTER_SOURCE_IP`.
+
+The collector does **not** choose a threat label, severity, or response.
+Sentinel-43 performs deterministic classification server-side. Explicit
+high-signal router messages such as port-scan, brute-force, authentication
+failure, malware/spyware, or exfiltration reports may enter Fenrir through the
+registered `router` producer. Routine DHCP/link events and ordinary firewall
+blocks are still scanned as monitoring observations but do not become trusted
+detector evidence merely because a router emitted them.
+
+The endpoint is evidence-only. It cannot change router policy, block a device,
+quarantine a host, approve a recommendation, or bypass Heart/human governance.
+
 ## Authority boundary
 
-Registration only allows evidence to reach the existing detector. Sparta,
-Watchtower, eBPF, Sigma, and Fenrir do not independently quarantine, terminate,
+Registration only allows evidence to reach the existing detector. Router
+telemetry, Sparta, Watchtower, eBPF, Sigma, and Fenrir do not independently quarantine, terminate,
 block, approve, modify policy, or bypass Heart/human gates. Runtime decisions
 remain owned by `Sentinel43RuntimeAuthority`.
 
