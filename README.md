@@ -231,7 +231,8 @@ The default listener is UDP `5514`. Point the router's remote-syslog target
 at the Windows machine running the collector on that port. Use
 `-OpenWindowsFirewall` during `Configure` only when you deliberately want
 the script to add an inbound Windows Firewall rule; that rule is restricted to
-the configured router IP and UDP port.
+the configured router IP and UDP port and requires an elevated PowerShell
+session.
 
 `Status`, `Disable`, `-SyslogPort`, `-MaxEventsPerSecond`,
 `-ApiUrl`, and `-CaCert` allow the local side to be changed without
