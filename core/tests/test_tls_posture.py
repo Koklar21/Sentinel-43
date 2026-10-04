@@ -36,6 +36,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 def _cfg(monkeypatch, *, env, origins, insecure=None):
     monkeypatch.setattr(m, "SENTINEL_ENV", env)
+    monkeypatch.setenv("SENTINEL_LOG_SALT", "a" * 64)
     # IS_LOCAL_ENV is frozen from SENTINEL_ENV at import; _validate_security_config()
     # gates the non-local checks on it, so a production simulation must patch it too.
     monkeypatch.setattr(m, "IS_LOCAL_ENV", env in m.LOCAL_TEST_ENVIRONMENTS)
