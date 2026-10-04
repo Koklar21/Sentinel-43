@@ -25,6 +25,7 @@ $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $EnvPath = Join-Path $RepoRoot ".env"
 $EnvExamplePath = Join-Path $RepoRoot ".env.example"
 $GeneratorPath = Join-Path $RepoRoot "core\scripts\generate_secrets.py"
+$CanonicalLocalOrigins = "https://localhost,https://127.0.0.1,http://localhost:5500,http://127.0.0.1:5500,http://localhost:8000,http://127.0.0.1:8000"
 
 function Get-PythonCommand {
     $python = Get-Command python -ErrorAction SilentlyContinue
@@ -187,7 +188,7 @@ try {
     # Canonical authentication / browser posture for the local HTTPS proxy.
     Set-EnvValue $lines "S43_REJECT_LEGACY_AUTH" "true"
     Set-EnvValue $lines "S43_WS_REQUIRE_AUTH" "true"
-    Set-EnvValue $lines "S43_ALLOWED_ORIGINS" "https://localhost,https://127.0.0.1,http://localhost:5500,http://127.0.0.1:5500,http://localhost:8000,http://127.0.0.1:8000"
+    Set-EnvValue $lines "S43_ALLOWED_ORIGINS" $CanonicalLocalOrigins
     Set-EnvValue $lines "S43_TLS_TERMINATED_AT_TRUSTED_EDGE" "false"
 
     # Local startup keeps authority features explicit and subordinate.
@@ -218,6 +219,44 @@ try {
     docker compose config --quiet
     if ($LASTEXITCODE -ne 0) {
         throw "Docker Compose configuration validation failed."
+    }
+
+    # Validate the effective Compose value, not only the .env text. Shell
+    # variables outrank .env during interpolation, so a stale exported value
+    # must be caught before containers start and strand the HTTPS dashboard.
+    $composeConfigJson = docker compose config --format json
+    if ($LASTEXITCODE -ne 0) {
+        throw "Docker Compose rendered configuration inspection failed."
+    }
+
+    $composeConfig = $composeConfigJson | ConvertFrom-Json
+    $effectiveOrigins = $composeConfig.services.'s43-api'.environment.S43_ALLOWED_ORIGINS
+    if ([string]::IsNullOrWhiteSpace($effectiveOrigins)) {
+        throw "Rendered Compose configuration is missing S43_ALLOWED_ORIGINS for s43-api."
+    }
+
+    $effectiveOriginSet = @(
+        $effectiveOrigins -split ',' |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ }
+    )
+
+    $requiredDashboardOrigins = @(
+        "https://localhost",
+        "https://127.0.0.1"
+    )
+    $missingDashboardOrigins = @(
+        $requiredDashboardOrigins |
+            Where-Object { $_ -notin $effectiveOriginSet }
+    )
+
+    if ($missingDashboardOrigins.Count -gt 0) {
+        $missing = $missingDashboardOrigins -join ", "
+        throw (
+            "Local dashboard origin contract failed. Effective Compose " +
+            "S43_ALLOWED_ORIGINS is missing: $missing. Remove stale shell " +
+            "overrides and run this launcher again."
+        )
     }
 
     if ($Build) {
