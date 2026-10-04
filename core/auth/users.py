@@ -233,6 +233,17 @@ class User(Base):
     )
 
 
+# Database-enforced canonical username identity. The exact-case UNIQUE
+# constraint on the column remains for compatibility, while this functional
+# index closes case-variant identities that would otherwise share auth-throttle
+# buckets.
+Index(
+    "uq_users_username_ci",
+    func.lower(User.username),
+    unique=True,
+)
+
+
 # =============================================================================
 # Environment / DB factory
 # =============================================================================
@@ -611,8 +622,8 @@ async def get_user_by_username(
         select(
             User
         ).where(
-            User.username
-            == username
+            func.lower(User.username)
+            == username.strip().lower()
         )
     )
 
@@ -754,8 +765,16 @@ async def create_user(
             "administrator role may only be created by first-run bootstrap"
         )
 
+    if await get_user_by_username(
+        session,
+        username,
+    ) is not None:
+        raise UsernameTakenError(
+            username
+        )
+
     user = User(
-        username=username,
+        username=username.strip(),
         email=email,
         password_hash=await hash_password_async(
             password
@@ -802,7 +821,7 @@ async def create_first_admin(
         )
 
     user = User(
-        username=username,
+        username=username.strip(),
         email=email,
         password_hash=await hash_password_async(
             password
