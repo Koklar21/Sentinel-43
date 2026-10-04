@@ -212,7 +212,7 @@ The base stack is defined in:
 - `docker-compose.yml`
 - `docker-compose.beta.yml` for controlled-beta overrides
 
-Direct `docker compose up` assumes that a valid environment already exists. For normal local Windows startup, prefer `.\scripts\start-local.ps1` so secret generation and environment validation happen before Compose interpolation.
+Direct `docker compose up` assumes that a valid environment already exists. For normal local Windows startup, prefer `.\scripts\start-local.ps1` so secret generation and environment validation happen before Compose interpolation. The launcher also verifies that the rendered API configuration still contains the canonical HTTPS dashboard origins after Compose precedence is applied. As a final local-only safety net, the API always adds the canonical loopback dashboard origins to any explicitly configured local origin set; stale local `.env` files therefore cannot strand first-admin bootstrap behind an obsolete HTTP-only allowlist. Non-local deployments do not receive this fallback and remain explicit/fail-closed.
 
 For the controlled-beta Compose procedure, secret requirements, migration order, health checks, and verification steps, follow [docs/BETA_RUNBOOK.md](docs/BETA_RUNBOOK.md).
 
