@@ -82,6 +82,9 @@ absent-means-disabled, and each fails closed rather than degrading:
   --from-literal=SENTINEL_REMOTE_TOKEN_OWNER="$SENTINEL_REMOTE_TOKEN_OWNER" \
   --from-literal=SENTINEL_REMOTE_TOKEN_ADMIN="$SENTINEL_REMOTE_TOKEN_ADMIN" \
   --from-literal=SENTINEL_REMOTE_TOKEN_AUDITOR="$SENTINEL_REMOTE_TOKEN_AUDITOR" \
+  # Only when you explicitly enable router telemetry in a Kubernetes overlay.
+  # Also set S43_ROUTER_ENABLED=true and S43_ROUTER_SOURCE_IP in that overlay.
+  --from-literal=S43_ROUTER_INGEST_TOKEN="$S43_ROUTER_INGEST_TOKEN" \
   # Only with S43_SPARTA_ENABLED="true" in the ConfigMap. Two distinct
   # credentials; generate them independently.
   --from-literal=S43_SPARTA_NODE_TOKEN="$S43_SPARTA_NODE_TOKEN" \
