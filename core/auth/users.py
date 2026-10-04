@@ -127,6 +127,10 @@ class BootstrapClaimUnavailableError(AccountError):
     """
 
 
+class EnrollmentBeforeBootstrapError(AccountError):
+    """Raised when client enrollment is attempted before an admin exists."""
+
+
 class UsernameTakenError(AccountError):
     def __init__(self, username: str) -> None:
         super().__init__(
@@ -576,20 +580,22 @@ async def count_active_admins(
 async def bootstrap_claimed(
     session: AsyncSession,
 ) -> bool:
-    """True once the first-admin claim has committed.
+    """True once the first administrator claim has committed.
 
-    The claim creates the first account in an empty store, and no code path
-    deletes accounts (they are deactivated or demoted instead), so "any
-    account exists" records that bootstrap has completed. Unlike the
-    active-admin count, it does not revert when every admin is deactivated --
-    that state is a lockout to recover, not a fresh install. It is not a
-    separate consumed-bootstrap marker: deleting every account row directly
-    in the database reopens bootstrap.
+    Bootstrap is claimed by the durable presence of the administrator row,
+    not by the presence of an arbitrary client/observer row. This keeps a
+    deactivated administrator from reopening bootstrap while allowing a
+    client-only store created by an interrupted/older enrollment path to
+    recover through the legitimate first-admin claim.
     """
     result = await session.execute(
         select(
             User.user_id
-        ).limit(
+        )
+        .where(
+            User.role == "admin"
+        )
+        .limit(
             1
         )
     )
@@ -684,6 +690,33 @@ async def _pg_advisory_xact_lock(
         },
     )
     return True
+
+
+# =============================================================================
+# Enrollment/bootstrap serialization
+# =============================================================================
+
+async def require_bootstrap_before_enrollment(
+    session: AsyncSession,
+) -> None:
+    """Serialize enrollment with bootstrap and require a committed admin.
+
+    The PostgreSQL advisory transaction lock is the same lock used by
+    create_first_admin(). Holding it until the caller commits prevents a
+    first client from racing the first-admin claim.
+    """
+    locked = await _pg_advisory_xact_lock(
+        session,
+        ADMIN_INVARIANT_LOCK_KEY,
+    )
+
+    if not locked and not _is_local():
+        raise BootstrapClaimUnavailableError()
+
+    if not await bootstrap_claimed(
+        session
+    ):
+        raise EnrollmentBeforeBootstrapError()
 
 
 # =============================================================================
@@ -879,6 +912,7 @@ __all__ = [
     "AdminRoleImmutableError",
     "Base",
     "BootstrapClaimUnavailableError",
+    "EnrollmentBeforeBootstrapError",
     "FirstAdminExistsError",
     "LastAdminError",
     "NAMING_CONVENTION",
@@ -901,6 +935,7 @@ __all__ = [
     "init_models",
     "is_valid_argon2id_hash",
     "list_users",
+    "require_bootstrap_before_enrollment",
     "record_login",
     "set_user_active",
     "set_user_password",
