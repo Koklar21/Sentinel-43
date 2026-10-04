@@ -41,6 +41,7 @@ def _base_env() -> dict[str, str]:
             "S43_JORM_ROOT_KEY": "3" * 64,
             "S43_SPARTA_ENABLED": "false",
             "S43_EBPF_ENABLED": "false",
+            "S43_ROUTER_ENABLED": "false",
         }
     )
     return values
@@ -90,6 +91,21 @@ def test_full_reset_rotates_durable_roots():
     assert "S43_AUDIT_HMAC_KEY" in rotated
     assert "S43_JORM_ROOT_KEY" in rotated
 
+
+
+def test_state_preserving_rotation_rotates_router_token_when_enabled():
+    existing = _base_env()
+    existing["S43_ROUTER_ENABLED"] = "true"
+    existing["S43_ROUTER_INGEST_TOKEN"] = "old-router-token-" + ("x" * 40)
+
+    replacements, rotated = rotate._build_replacements(
+        existing,
+        full_reset=False,
+    )
+
+    assert "S43_ROUTER_INGEST_TOKEN" in rotated
+    assert replacements["S43_ROUTER_INGEST_TOKEN"] != existing["S43_ROUTER_INGEST_TOKEN"]
+    assert len(replacements["S43_ROUTER_INGEST_TOKEN"]) >= 32
 
 def test_duplicate_env_assignments_are_rejected(tmp_path: Path):
     env_path = tmp_path / ".env"
