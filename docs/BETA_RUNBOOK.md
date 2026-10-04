@@ -63,15 +63,16 @@ Before starting, have ready:
 
 ## 4. Secret generation and rotation
 
-Managed via `core/cli/generate_secrets.py`. The generator still emits 13
-keys for compatibility, but the beta deployment contract consumes 11:
+Managed via `core/cli/generate_secrets.py`. The beta deployment contract consumes the generated operational secrets, including:
 `S43_JWT_SECRET`, `S43_BOOTSTRAP_CLAIM_TOKEN`, `S43_AUTH_PEPPER`,
 `S43_SESSION_HASH_PEPPER`, `SENTINEL_REMOTE_TOKEN_OWNER`,
 `SENTINEL_REMOTE_TOKEN_ADMIN`, `SENTINEL_REMOTE_TOKEN_AUDITOR`,
 `S43_FENRIR_API_TOKEN`, `S43_WATCHTOWER_SERVICE_TOKEN`,
-`S43_AUDIT_HMAC_KEY`, and `POSTGRES_PASSWORD`.
-`REDIS_PASSWORD` and `SENTINEL_LOG_SALT` are generated leftovers and are
-not required by Compose/Kubernetes preflight because neither deployment
+`S43_AUDIT_HMAC_KEY`, `SENTINEL_LOG_SALT`, and `POSTGRES_PASSWORD`.
+`SENTINEL_LOG_SALT` is required because Shadow-mode operational logs use it
+for target pseudonymization; a missing or placeholder value is rejected outside
+local/test. `REDIS_PASSWORD` remains a generated compatibility leftover and is
+not required by Compose/Kubernetes preflight because the deployment
 consumes them. `DATABASE_URL` is deliberately **not** in the generated-secret
 list — set it to your real Postgres connection string. Neither is
 `S43_OPERATOR_PASSWORD_HASH`, which only a local/dev/test stack uses (§5);
@@ -95,8 +96,7 @@ For Kubernetes, the deployment-consumed subset goes into the
 `sentinel43-secrets` Secret in the `sentinel43` namespace (see
 `deploy/kubernetes/base/secret.example.yaml` and
 `deploy/kubernetes/README.md` for the authoritative key list and
-`kubectl create secret` invocation). Do not add `REDIS_PASSWORD` or
-`SENTINEL_LOG_SALT` merely because the compatibility generator emits them.
+`kubectl create secret` invocation). Do not add `REDIS_PASSWORD` merely because the compatibility generator emits it.
 
 `S43_SECRETS_ROTATED_AT` should be updated (ISO-8601 timestamp) whenever
 you rotate; `deploy_preflight.py` checks it isn't more than 90 days stale.
