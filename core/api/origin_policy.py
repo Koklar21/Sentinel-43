@@ -63,26 +63,28 @@ def is_local_environment() -> bool:
 
 
 def configured_allowed_origins() -> frozenset[str]:
-    """Return the configured browser-origin set.
+    """Return the effective browser-origin set.
 
-    Local/dev/test may use the canonical loopback defaults when the variable
-    is absent or blank. Non-local environments remain fail-closed: absent or
-    blank configuration yields an empty set which startup/request validation
-    rejects explicitly.
+    Local/dev/test always includes the canonical loopback origins required by
+    the supported HTTPS Compose dashboard. Explicit local entries are additive,
+    so an older .env cannot accidentally remove https://localhost or
+    https://127.0.0.1 and strand first-admin bootstrap behind its own Origin
+    guard.
+
+    Non-local environments remain explicit and fail closed: absent or blank
+    configuration yields an empty set, and no localhost origin is injected.
     """
-    raw = os.getenv("S43_ALLOWED_ORIGINS")
-
-    if raw is None or not raw.strip():
-        if is_local_environment():
-            raw = DEFAULT_LOCAL_ALLOWED_ORIGINS_CSV
-        else:
-            return frozenset()
-
-    return frozenset(
+    raw = os.getenv("S43_ALLOWED_ORIGINS", "")
+    configured = frozenset(
         origin.strip()
         for origin in raw.split(",")
         if origin.strip()
     )
+
+    if is_local_environment():
+        return frozenset(DEFAULT_LOCAL_ALLOWED_ORIGINS) | configured
+
+    return configured
 
 
 def require_state_change_origin(request: Request) -> None:
