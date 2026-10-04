@@ -329,6 +329,9 @@ services:
       # Local-only test hook. Production bootstrap must reject true.
       S43_ENABLE_TEST_INJECTION: ${S43_ENABLE_TEST_INJECTION:-false}
 
+      # Log pseudonymization
+      SENTINEL_LOG_SALT: ${SENTINEL_LOG_SALT:?SENTINEL_LOG_SALT is required}
+
       # Audit authority
       S43_AUDIT_HMAC_KEY: ${S43_AUDIT_HMAC_KEY:?S43_AUDIT_HMAC_KEY is required}
 
