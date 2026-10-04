@@ -22,7 +22,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...auth.deps import get_db_session
-from ...auth.users import get_user_by_username
+from ...auth.users import (
+    BootstrapClaimUnavailableError,
+    EnrollmentBeforeBootstrapError,
+    get_user_by_username,
+)
 from ...security_context import client_ip_of
 from ..deps import get_runtime_authority
 from ..origin_policy import require_state_change_origin
@@ -100,6 +104,24 @@ async def enroll_client(
             password=body.password,
             email=body.email,
         )
+    except EnrollmentBeforeBootstrapError as exc:
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Enrollment is unavailable until first-admin bootstrap completes.",
+        ) from exc
+    except BootstrapClaimUnavailableError as exc:
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Enrollment serialization is unavailable.",
+        ) from exc
     except IntegrityError as exc:
         try:
             await session.rollback()
