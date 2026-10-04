@@ -145,6 +145,7 @@ def ingest_router_event(
         "source": "sentinel-router",
         "source_identity": "anonymous",
         "event_type": classification.event_type,
+        "success": classification.success,
         "source_ip": subject_ip,
         "indicators": _indicators(
             event,
@@ -159,7 +160,6 @@ def ingest_router_event(
         source_ip=subject_ip,
         source_identity="anonymous",
         trusted_producer=trusted_producer,
-        success=classification.success,
     )
 
     return {
