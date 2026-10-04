@@ -64,6 +64,16 @@ detector evidence merely because a router emitted them.
 The endpoint is evidence-only. It cannot change router policy, block a device,
 quarantine a host, approve a recommendation, or bypass Heart/human governance.
 
+The default home collector uses UDP syslog because that is the transport most
+consumer routers expose. UDP syslog is not cryptographically authenticated;
+the collector therefore restricts acceptance to the configured router source
+address and can install a Windows Firewall rule restricted to that address.
+The collector-to-S43 hop is independently authenticated and TLS-protected.
+Router evidence must still pass the normal detector/governance path and is
+never sufficient to create autonomous enforcement authority. A router that
+supports authenticated syslog/TLS can be adapted later without changing the
+S43 ingress contract.
+
 ## Authority boundary
 
 Registration only allows evidence to reach the existing detector. Router
