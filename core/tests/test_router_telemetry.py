@@ -168,6 +168,41 @@ def test_collector_extracts_bounded_router_facts():
     assert "severity" not in payload
 
 
+def test_collector_reloads_router_token_after_env_rotation(tmp_path: Path):
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "S43_ROUTER_ENABLED=true",
+                "S43_ROUTER_INGEST_TOKEN=" + ("a" * 48),
+                "S43_ROUTER_SOURCE_IP=192.168.1.1",
+                "S43_ROUTER_SYSLOG_PORT=5514",
+                "S43_ROUTER_MAX_EVENTS_PER_SECOND=50",
+                "S43_ROUTER_API_URL=https://localhost/internal/router/events",
+                "S43_ROUTER_CA_CERT=deploy/proxy/certs/s43.crt",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    settings = collector._settings(env_path)
+    assert collector._refresh_token_if_changed(settings) == "a" * 48
+
+    old_mtime = env_path.stat().st_mtime_ns
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8").replace("a" * 48, "b" * 48),
+        encoding="utf-8",
+    )
+    # Filesystems with coarse timestamp behavior still need an observable change.
+    if env_path.stat().st_mtime_ns == old_mtime:
+        import os
+        os.utime(env_path, ns=(old_mtime + 1_000_000_000, old_mtime + 1_000_000_000))
+
+    assert collector._refresh_token_if_changed(settings) == "b" * 48
+
+
+
 def test_main_registers_router_route_and_trusted_producer():
     source = _MAIN.read_text(encoding="utf-8")
 
