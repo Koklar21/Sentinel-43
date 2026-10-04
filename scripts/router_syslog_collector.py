@@ -178,6 +178,34 @@ def _post(
         raise CollectorError(f"S43 router ingress is unreachable: {exc.reason}") from exc
 
 
+def _post_with_retry(
+    *,
+    api_url: str,
+    token: str,
+    ca_cert: Path,
+    payload: dict[str, object],
+    attempts: int = 3,
+) -> dict[str, object]:
+    last_error: CollectorError | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return _post(
+                api_url=api_url,
+                token=token,
+                ca_cert=ca_cert,
+                payload=payload,
+            )
+        except CollectorError as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            time.sleep(0.5 * (2 ** (attempt - 1)))
+
+    assert last_error is not None
+    raise last_error
+
+
 def _settings(env_path: Path) -> dict[str, object]:
     values = _read_env(env_path)
 
@@ -300,12 +328,22 @@ def _run_listener(settings: dict[str, object], *, once: bool) -> int:
                 continue
 
             payload = _facts(message, router_ip)
-            result = _post(
-                api_url=str(settings["api_url"]),
-                token=_refresh_token_if_changed(settings),
-                ca_cert=settings["ca_cert"],
-                payload=payload,
-            )
+            try:
+                result = _post_with_retry(
+                    api_url=str(settings["api_url"]),
+                    token=_refresh_token_if_changed(settings),
+                    ca_cert=settings["ca_cert"],
+                    payload=payload,
+                )
+            except CollectorError as exc:
+                print(
+                    f"forward_failed event_id={payload['event_id']} error={exc}",
+                    file=sys.stderr,
+                )
+                if once:
+                    return 1
+                continue
+
             accepted += 1
             print(
                 "accepted "
@@ -354,7 +392,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.test_event:
             payload = _facts(args.test_event, str(settings["router_ip"]))
-            result = _post(
+            result = _post_with_retry(
                 api_url=str(settings["api_url"]),
                 token=_refresh_token_if_changed(settings),
                 ca_cert=settings["ca_cert"],
