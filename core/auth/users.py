@@ -783,8 +783,8 @@ async def create_first_admin(
         ADMIN_INVARIANT_LOCK_KEY,
     )
 
-    # Closed once any account exists -- not merely while an active admin
-    # exists -- so deactivating every admin cannot reopen it.
+    # Closed once the administrator row exists. Client/observer rows do not
+    # consume bootstrap; deactivating the administrator still cannot reopen it.
     if await bootstrap_claimed(
         session
     ):
