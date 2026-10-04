@@ -64,6 +64,16 @@ def test_classifier_extracts_subject_and_owns_port_scan_semantics():
     assert result.success is False
 
 
+def test_security_feature_status_is_not_misclassified_as_malware():
+    result = classify_router_event(
+        message="router malware protection enabled and signatures updated",
+    )
+
+    assert result.event_type == "router_observation"
+    assert result.detector_eligible is False
+
+
+
 def test_firewall_block_is_monitored_without_self_declaring_threat():
     result = classify_router_event(
         message="firewall SRC=198.51.100.7 DST=192.168.1.10",
