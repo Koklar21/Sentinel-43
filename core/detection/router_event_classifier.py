@@ -16,7 +16,7 @@ _SOURCE_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"\bsrc\s+([^\s,;]+)", re.IGNORECASE),
 )
 
-_PORT_SCAN_RE = re.compile(r"\b(?:port[-_ ]?scan|scan detected|nmap)\b", re.IGNORECASE)
+_PORT_SCAN_RE = re.compile(r"\b(?:port[-_ ]?scan|tcp[-_ ]?scan|udp[-_ ]?scan|nmap)\b", re.IGNORECASE)
 _BRUTE_FORCE_RE = re.compile(r"\b(?:brute[-_ ]?force|bruteforce)\b", re.IGNORECASE)
 _CREDENTIAL_STUFFING_RE = re.compile(r"\bcredential[-_ ]?stuffing\b", re.IGNORECASE)
 _AUTH_FAILURE_RE = re.compile(
@@ -24,8 +24,16 @@ _AUTH_FAILURE_RE = re.compile(
     re.IGNORECASE,
 )
 _EXFIL_RE = re.compile(r"\b(?:exfiltration|data exfil|exfil)\b", re.IGNORECASE)
-_SPYWARE_RE = re.compile(r"\bspyware\b", re.IGNORECASE)
-_MALWARE_RE = re.compile(r"\b(?:malware|virus)\b", re.IGNORECASE)
+_SPYWARE_RE = re.compile(
+    r"(?:\bspyware\b.{0,80}\b(?:detected|blocked|found|alert)\b|"
+    r"\b(?:detected|blocked|found|alert)\b.{0,80}\bspyware\b)",
+    re.IGNORECASE,
+)
+_MALWARE_RE = re.compile(
+    r"(?:\b(?:malware|virus)\b.{0,80}\b(?:detected|blocked|found|infected|alert)\b|"
+    r"\b(?:detected|blocked|found|infected|alert)\b.{0,80}\b(?:malware|virus)\b)",
+    re.IGNORECASE,
+)
 _BLOCK_ACTIONS: Final[frozenset[str]] = frozenset({"deny", "denied", "drop", "dropped", "block", "blocked", "reject", "rejected"})
 
 
