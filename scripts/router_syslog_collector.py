@@ -222,6 +222,8 @@ def _settings(env_path: Path) -> dict[str, object]:
     ca_cert = _resolve_path(ca_raw, base=_REPO_ROOT)
 
     return {
+        "env_path": env_path,
+        "env_mtime_ns": env_path.stat().st_mtime_ns,
         "token": token,
         "router_ip": router_ip,
         "api_url": api_url,
@@ -230,6 +232,27 @@ def _settings(env_path: Path) -> dict[str, object]:
         "max_eps": max_eps,
         "ca_cert": ca_cert,
     }
+
+
+def _refresh_token_if_changed(settings: dict[str, object]) -> str:
+    """Reload only the credential when secret rotation rewrites the env file."""
+    env_path = settings["env_path"]
+    if not isinstance(env_path, Path):
+        raise CollectorError("collector environment path is invalid")
+
+    current_mtime = env_path.stat().st_mtime_ns
+    if current_mtime != int(settings["env_mtime_ns"]):
+        values = _read_env(env_path)
+        token = values.get("S43_ROUTER_INGEST_TOKEN", "").strip()
+        if len(token) < 32:
+            raise CollectorError(
+                "rotated S43_ROUTER_INGEST_TOKEN is missing or too short"
+            )
+        settings["token"] = token
+        settings["env_mtime_ns"] = current_mtime
+        print("router ingest credential reloaded after environment update")
+
+    return str(settings["token"])
 
 
 def _run_listener(settings: dict[str, object], *, once: bool) -> int:
@@ -279,7 +302,7 @@ def _run_listener(settings: dict[str, object], *, once: bool) -> int:
             payload = _facts(message, router_ip)
             result = _post(
                 api_url=str(settings["api_url"]),
-                token=str(settings["token"]),
+                token=_refresh_token_if_changed(settings),
                 ca_cert=settings["ca_cert"],
                 payload=payload,
             )
@@ -333,7 +356,7 @@ def main(argv: list[str] | None = None) -> int:
             payload = _facts(args.test_event, str(settings["router_ip"]))
             result = _post(
                 api_url=str(settings["api_url"]),
-                token=str(settings["token"]),
+                token=_refresh_token_if_changed(settings),
                 ca_cert=settings["ca_cert"],
                 payload=payload,
             )
