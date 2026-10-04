@@ -81,7 +81,7 @@ def _expected_router_ip() -> str:
 
 def _authorize(authorization: str | None) -> None:
     token = _expected_token()
-    if not token:
+    if len(token) < 32:
         raise HTTPException(status_code=503, detail="router ingestion unconfigured")
 
     scheme, _, supplied = (authorization or "").partition(" ")
