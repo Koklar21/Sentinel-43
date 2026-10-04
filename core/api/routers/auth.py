@@ -316,146 +316,101 @@ def _login_throttle_config() -> tuple[int, int, int]:
     )
 
 
-def _throttle_key(
+def _throttle_keys(
     username: str,
     client_ip: str,
-) -> str:
+) -> tuple[str, str]:
+    """Return per-source and account-wide failure buckets."""
     normalized_user = username.strip().lower()[:MAX_USERNAME_LEN]
     normalized_ip = str(client_ip).strip()[:128] or "unknown"
-    return f"{normalized_ip}|{normalized_user}"
+    return (
+        f"source:{normalized_ip}|{normalized_user}",
+        f"account:{normalized_user}",
+    )
 
 
 def _login_check_throttled(
     username: str,
     client_ip: str,
 ) -> None:
-    max_failures, window, lockout = (
-        _login_throttle_config()
-    )
-
-    key = _throttle_key(
-        username,
-        client_ip,
-    )
+    max_failures, window, lockout = _login_throttle_config()
+    keys = _throttle_keys(username, client_ip)
     now = time.monotonic()
-    cutoff = now - max(
-        window,
-        lockout,
-    )
+    cutoff = now - max(window, lockout)
 
     with _LOGIN_LOCK:
-        bucket = _LOGIN_FAILURES.get(
-            key
-        )
+        for key in keys:
+            bucket = _LOGIN_FAILURES.get(key)
+            if not bucket:
+                continue
 
-        if not bucket:
-            return
+            while bucket and bucket[0] <= cutoff:
+                bucket.popleft()
 
-        while bucket and bucket[0] <= cutoff:
-            bucket.popleft()
+            if not bucket:
+                _LOGIN_FAILURES.pop(key, None)
+                continue
 
-        if not bucket:
-            _LOGIN_FAILURES.pop(
-                key,
-                None,
-            )
-            return
-
-        recent_failures = sum(
-            1
-            for timestamp in bucket
-            if timestamp >= now - window
-        )
-
-        if (
-            recent_failures >= max_failures
-            and now - bucket[-1] < lockout
-        ):
-            remaining = max(
-                1,
-                int(
-                    lockout
-                    - (
-                        now
-                        - bucket[-1]
-                    )
-                ),
+            recent_failures = sum(
+                1
+                for timestamp in bucket
+                if timestamp >= now - window
             )
 
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=(
-                    "Too many failed login attempts. "
-                    "Try again later."
-                ),
-                headers={
-                    "Retry-After": str(
-                        remaining
-                    )
-                },
-            )
+            if (
+                recent_failures >= max_failures
+                and now - bucket[-1] < lockout
+            ):
+                remaining = max(
+                    1,
+                    int(lockout - (now - bucket[-1])),
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail=(
+                        "Too many failed login attempts. "
+                        "Try again later."
+                    ),
+                    headers={"Retry-After": str(remaining)},
+                )
 
 
 def _login_record_failure(
     username: str,
     client_ip: str,
 ) -> None:
-    _max_failures, window, lockout = (
-        _login_throttle_config()
-    )
-
-    key = _throttle_key(
-        username,
-        client_ip,
-    )
+    _max_failures, window, lockout = _login_throttle_config()
+    keys = _throttle_keys(username, client_ip)
     now = time.monotonic()
-    cutoff = now - max(
-        window,
-        lockout,
-    )
+    cutoff = now - max(window, lockout)
 
     with _LOGIN_LOCK:
-        bucket = _LOGIN_FAILURES.setdefault(
-            key,
-            deque(maxlen=256),
-        )
-
-        bucket.append(
-            now
-        )
+        for key in keys:
+            bucket = _LOGIN_FAILURES.setdefault(
+                key,
+                deque(maxlen=256),
+            )
+            bucket.append(now)
 
         if len(_LOGIN_FAILURES) > 4096:
             stale_keys = [
                 candidate
                 for candidate, values in _LOGIN_FAILURES.items()
-                if not values
-                or values[-1] <= cutoff
+                if not values or values[-1] <= cutoff
             ]
-
             for candidate in stale_keys:
-                _LOGIN_FAILURES.pop(
-                    candidate,
-                    None,
-                )
+                _LOGIN_FAILURES.pop(candidate, None)
 
         while len(_LOGIN_FAILURES) > 4096:
             oldest = min(
                 _LOGIN_FAILURES,
                 key=lambda candidate: (
-                    _LOGIN_FAILURES[
-                        candidate
-                    ][-1]
-                    if _LOGIN_FAILURES[
-                        candidate
-                    ]
+                    _LOGIN_FAILURES[candidate][-1]
+                    if _LOGIN_FAILURES[candidate]
                     else float("-inf")
                 ),
             )
-
-            _LOGIN_FAILURES.pop(
-                oldest,
-                None,
-            )
+            _LOGIN_FAILURES.pop(oldest, None)
 
 
 def _login_clear(
@@ -463,13 +418,8 @@ def _login_clear(
     client_ip: str,
 ) -> None:
     with _LOGIN_LOCK:
-        _LOGIN_FAILURES.pop(
-            _throttle_key(
-                username,
-                client_ip,
-            ),
-            None,
-        )
+        for key in _throttle_keys(username, client_ip):
+            _LOGIN_FAILURES.pop(key, None)
 
 
 # =============================================================================
