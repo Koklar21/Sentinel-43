@@ -21,6 +21,7 @@ import os
 from typing import Generator
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from core.auth.users import hash_password
@@ -93,7 +94,7 @@ def test_account_wide_lockout_survives_source_ip_rotation():
             f"198.51.100.{index + 1}",
         )
 
-    with pytest.raises(Exception) as exc_info:
+    with pytest.raises(HTTPException) as exc_info:
         auth_module._login_check_throttled(
             USERNAME,
             "203.0.113.250",
