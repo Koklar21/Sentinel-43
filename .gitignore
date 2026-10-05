@@ -186,3 +186,20 @@ yarn-error.log*
 # Local process / audit scratch documents
 DEFECT_INVENTORY.md
 /agent-notes/
+
+# Public-release hygiene: local machine / deployment telemetry and captures
+local/
+.local/
+runtime-local/
+telemetry-local/
+captures/
+pcaps/
+*.pcap
+*.pcapng
+*.etl
+*.evtx
+
+# Local credential/config variants that should never become repository input
+*.local.env
+.env.local
+.env.*.local
