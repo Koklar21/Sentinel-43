@@ -31,7 +31,7 @@ repeated here; none were performed. See §14 unresolved unknowns / final stop st
 | Field | Value |
 |---|---|
 | Repository path | `C:\Users\heero\OneDrive\Documents\GitHub\Olympus_Complete_Dropin\Sentinel-43` |
-| Remote URL | `https://github.com/Koklar21/Sentinel-43.git` |
+| Remote URL | `<repository-remote>` |
 | Current branch | `main` |
 | Local HEAD SHA | `5a249e71cc46a6006eb884da9d16066057cf3d25` |
 | Freshly fetched `origin/main` SHA | `5a249e71cc46a6006eb884da9d16066057cf3d25` (identical — no divergence) |
