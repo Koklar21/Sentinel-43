@@ -3,8 +3,9 @@
 """Local UDP syslog collector for Sentinel-43 router telemetry.
 
 This process runs on the host, not inside the S43 authority boundary. It accepts
-UDP datagrams only from the configured router IP, extracts bounded observation
-facts, and forwards them to the authenticated /internal/router/events endpoint.
+UDP datagrams only from the configured trusted edge-source IP set, extracts
+bounded observation facts, and forwards them to the authenticated
+/internal/router/events endpoint.
 
 It never assigns a threat label, severity, governance decision, or enforcement
 action. Those semantics remain server-owned.
