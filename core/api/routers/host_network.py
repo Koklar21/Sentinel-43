@@ -21,7 +21,7 @@ class HostNetworkEvent(BaseModel):
 
     event_id: str = Field(min_length=1, max_length=128)
     host_ip: str = Field(min_length=1, max_length=64)
-    direction: str = Field(pattern=r"^(inbound|outbound)$")
+    direction: str = Field(pattern=r"^(inbound|outbound|unknown)$")
     protocol: str = Field(pattern=r"^(tcp|udp)$")
     local_ip: str = Field(min_length=1, max_length=64)
     local_port: int = Field(ge=0, le=65535)
