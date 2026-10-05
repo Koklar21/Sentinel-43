@@ -103,7 +103,8 @@ def _facts(message: str, router_ip: str) -> dict[str, object]:
 
     payload: dict[str, object] = {
         "event_id": str(uuid.uuid4()),
-        "router_ip": router_ip,
+        "router_ip": source_ips[0],
+        "source_ips": source_ips,
         "message": message[:_MAX_MESSAGE_CHARS],
         "protocol": (protocol_match.group(1).lower() if protocol_match else ""),
         "action": (action_match.group(1).lower() if action_match else ""),
@@ -216,9 +217,10 @@ def _settings(env_path: Path) -> dict[str, object]:
     if len(token) < 32:
         raise CollectorError("S43_ROUTER_INGEST_TOKEN is missing or too short")
 
-    router_ip = _normalize_ip(values.get("S43_ROUTER_SOURCE_IP", ""))
-    if not router_ip:
-        raise CollectorError("S43_ROUTER_SOURCE_IP is missing or invalid")
+    raw_sources = values.get("S43_EDGE_SOURCE_IPS", values.get("S43_ROUTER_SOURCE_IP", ""))
+    source_ips = tuple(filter(None, (_normalize_ip(item) for item in raw_sources.split(","))))
+    if not source_ips:
+        raise CollectorError("trusted edge source configuration is missing or invalid")
 
     api_url = values.get(
         "S43_ROUTER_API_URL",
