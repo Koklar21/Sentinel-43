@@ -66,17 +66,25 @@ def _expected_token() -> str:
     return os.getenv("S43_ROUTER_INGEST_TOKEN", "").strip()
 
 
-def _expected_router_ip() -> str:
-    raw = os.getenv("S43_ROUTER_SOURCE_IP", "").strip()
+def _expected_router_ips() -> frozenset[str]:
+    raw = os.getenv("S43_EDGE_SOURCE_IPS", "").strip()
     if not raw:
-        return ""
+        raw = os.getenv("S43_ROUTER_SOURCE_IP", "").strip()
+    if not raw:
+        return frozenset()
+
+    values: set[str] = set()
     try:
-        return str(ipaddress.ip_address(raw))
+        for item in raw.split(","):
+            cleaned = item.strip()
+            if cleaned:
+                values.add(str(ipaddress.ip_address(cleaned)))
     except ValueError as exc:
         raise HTTPException(
             status_code=503,
             detail="router ingestion has an invalid configured source IP",
         ) from exc
+    return frozenset(values)
 
 
 def _authorize(authorization: str | None) -> None:
@@ -119,13 +127,13 @@ def ingest_router_event(
 
     _authorize(authorization)
 
-    expected_router_ip = _expected_router_ip()
-    if not expected_router_ip:
+    expected_router_ips = _expected_router_ips()
+    if not expected_router_ips:
         raise HTTPException(
             status_code=503,
-            detail="router ingestion requires S43_ROUTER_SOURCE_IP",
+            detail="router ingestion requires a configured trusted edge source",
         )
-    if event.router_ip != expected_router_ip:
+    if event.router_ip not in expected_router_ips:
         raise HTTPException(status_code=403, detail="unexpected router source")
 
     manager = get_monitoring_manager()
