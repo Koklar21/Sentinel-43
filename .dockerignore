@@ -147,3 +147,17 @@ Sentinel-43/*
 # It is build output, never an input to the runtime image.
 # -----------------------------------------------------------------------------
 acceptance_out/
+
+# -----------------------------------------------------------------------------
+# Machine-local telemetry / packet and event captures
+# -----------------------------------------------------------------------------
+local/
+.local/
+runtime-local/
+telemetry-local/
+captures/
+pcaps/
+**/*.pcap
+**/*.pcapng
+**/*.etl
+**/*.evtx
