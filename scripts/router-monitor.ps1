@@ -230,9 +230,9 @@ function Start-Collector {
         return
     }
     $python=Get-PythonCommand
-    $quote={param([string]$Value) '"' + $Value.Replace('"','\"') + '"'}
-    $argsLine="& $(& $quote $CollectorPath) --env-file $(& $quote $EnvPath)"
-    $launched=Start-Process -FilePath $python -ArgumentList @("-c",("import runpy,sys; sys.argv=['router_syslog_collector.py','--env-file',r'''{0}''']; runpy.run_path(r'''{1}''',run_name='__main__')" -f $EnvPath.Replace("'","''"),$CollectorPath.Replace("'","''"))) -WorkingDirectory $RepoRoot -PassThru
+    $collectorArg='"'+$CollectorPath.Replace('"','\"')+'"'
+    $envArg='"'+$EnvPath.Replace('"','\"')+'"'
+    $launched=Start-Process -FilePath $python -ArgumentList @($collectorArg,"--env-file",$envArg) -WorkingDirectory $RepoRoot -PassThru
     $deadline=(Get-Date).AddSeconds(10); $started=$null
     do{$started=Test-PortOwner $SyslogPort;if($started){break};Start-Sleep -Milliseconds 250}while((Get-Date)-lt$deadline)
     if(-not$started){
