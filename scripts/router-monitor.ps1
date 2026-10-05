@@ -117,7 +117,11 @@ function Get-EdgeFingerprint([string[]]$Sources) {
 }
 function Resolve-TrustedSources($Network,[string[]]$Requested) {
     $sources=@($Requested|Where-Object{$_}|Select-Object -Unique)
-    if(-not$sources.Count){$sources=@($Network.Gateways)}
+    if(-not$sources.Count){
+        $gateways=@($Network.Gateways|Where-Object{$_}|Select-Object -Unique)
+        if($gateways.Count-gt1){throw "Multiple default gateways were identified: $($gateways-join', '). Refusing to trust them all automatically; supply -EdgeSource explicitly."}
+        $sources=$gateways
+    }
     if(-not$sources.Count){throw "No network edge/default gateway could be identified. Supply -EdgeSource explicitly."}
     foreach($ip in $sources){if(-not(Test-IpAddress $ip)){throw "Invalid edge source address: $ip"}}
     return $sources
@@ -140,7 +144,11 @@ function Set-EdgeFirewall([string[]]$Sources,[int]$Port) {
     New-NetFirewallRule -DisplayName $FirewallRuleName -Direction Inbound -Action Allow -Protocol UDP -LocalPort $Port -RemoteAddress $Sources -Profile Any -ErrorAction Stop|Out-Null
     $rule=Get-NetFirewallRule -DisplayName $FirewallRuleName -ErrorAction Stop
     $port=$rule|Get-NetFirewallPortFilter
+    $address=$rule|Get-NetFirewallAddressFilter
+    $actualSources=@($address.RemoteAddress|ForEach-Object{[string]$_}|Sort-Object -Unique)
+    $expectedSources=@($Sources|ForEach-Object{[string]$_}|Sort-Object -Unique)
     if($rule.Enabled-ne"True"-or$port.LocalPort-ne[string]$Port-or$port.Protocol-ne"UDP"){throw "Firewall rule verification failed."}
+    if((Compare-Object $expectedSources $actualSources).Count){throw "Firewall trusted-source read-back verification failed. Expected: $($expectedSources-join', '); actual: $($actualSources-join', ')"}
 }
 function Save-Configuration([string[]]$Sources) {
     $current=Read-Env $EnvPath
@@ -176,6 +184,14 @@ function Restart-Ingress {
         if($LASTEXITCODE-ne0){throw "Docker Compose validation failed."}
         docker compose --env-file $EnvPath up -d --force-recreate s43-api
         if($LASTEXITCODE-ne0){throw "s43-api recreation failed."}
+        $deadline=(Get-Date).AddSeconds(60)
+        do{
+            $state=(docker compose --env-file $EnvPath ps --format json s43-api 2>$null | Out-String)
+            if($LASTEXITCODE-ne0){throw "Unable to inspect s43-api readiness."}
+            if($state -match '"Health"s*:s*"healthy"' -or ($state -match '"State"s*:s*"running"' -and $state -notmatch '"Health"s*:s*"unhealthy"')){break}
+            Start-Sleep -Seconds 2
+        }while((Get-Date)-lt$deadline)
+        if((Get-Date)-ge$deadline){throw "s43-api did not become ready within 60 seconds."}
     }finally{Pop-Location}
 }
 function Test-Ingress {
@@ -199,7 +215,10 @@ function Start-Collector {
     $python=Get-PythonCommand
     Start-Process -FilePath $python -ArgumentList @($CollectorPath,"--env-file",$EnvPath) -WorkingDirectory $RepoRoot
     Start-Sleep -Seconds 1
-    if(-not(Test-PortOwner $SyslogPort)){throw "Collector did not bind UDP $SyslogPort."}
+    $started=Test-PortOwner $SyslogPort
+    if(-not$started){throw "Collector did not bind UDP $SyslogPort."}
+    $proc=Get-CimInstance Win32_Process -Filter "ProcessId = $($started.Pid)" -ErrorAction SilentlyContinue
+    if(-not$proc -or [string]::IsNullOrWhiteSpace([string]$proc.CommandLine) -or $proc.CommandLine -notmatch [regex]::Escape($CollectorPath)){throw "UDP $SyslogPort was claimed after collector start, but not by the Sentinel-43 collector."}
 }
 function Test-InternetPosture {
     $env=Read-Env $EnvPath; $issues=@()
@@ -248,7 +267,7 @@ switch($Mode){
 
     Write-Step "DEPLOY"
     Restart-Ingress
-    if($StartCollector){Start-Collector}else{Write-Host "Collector auto-start skipped; use -StartCollector when ready."}
+    Start-Collector
 
     Write-Step "VERIFY"
     Test-Ingress
