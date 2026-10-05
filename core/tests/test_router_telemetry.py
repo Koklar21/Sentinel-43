@@ -51,6 +51,7 @@ def _configure(monkeypatch) -> None:
     monkeypatch.setenv("S43_ROUTER_ENABLED", "true")
     monkeypatch.setenv("S43_ROUTER_INGEST_TOKEN", "r" * 48)
     monkeypatch.setenv("S43_ROUTER_SOURCE_IP", "192.168.1.1")
+    monkeypatch.delenv("S43_EDGE_SOURCE_IPS", raising=False)
 
 
 def test_classifier_extracts_subject_and_owns_port_scan_semantics():
@@ -143,6 +144,24 @@ def test_router_ingress_rejects_bad_token(monkeypatch):
         )
 
     assert exc_info.value.status_code == 401
+
+
+def test_router_ingress_accepts_secondary_configured_edge_source(monkeypatch):
+    _configure(monkeypatch)
+    monkeypatch.setenv("S43_EDGE_SOURCE_IPS", "192.168.1.1,192.168.1.254")
+    manager = _Manager()
+    monkeypatch.setattr(router_telemetry, "get_monitoring_manager", lambda: manager)
+
+    response = router_telemetry.ingest_router_event(
+        router_telemetry.RouterEvent(
+            event_id="router-event-secondary",
+            router_ip="192.168.1.254",
+            message="router observation",
+        ),
+        authorization="Bearer " + ("r" * 48),
+    )
+
+    assert response["accepted"] is True
 
 
 def test_router_ingress_rejects_unexpected_router(monkeypatch):
@@ -238,6 +257,39 @@ def test_collector_reloads_router_token_after_env_rotation(tmp_path: Path):
     assert collector._refresh_token_if_changed(settings) == "b" * 48
 
 
+def test_collector_reloads_trusted_sources_after_env_update(tmp_path: Path):
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "S43_ROUTER_ENABLED=true",
+                "S43_ROUTER_INGEST_TOKEN=" + ("a" * 48),
+                "S43_ROUTER_SOURCE_IP=192.168.1.1",
+                "S43_EDGE_SOURCE_IPS=192.168.1.1",
+                "S43_ROUTER_SYSLOG_PORT=5514",
+                "S43_ROUTER_MAX_EVENTS_PER_SECOND=50",
+                "S43_ROUTER_API_URL=https://localhost/internal/router/events",
+                "S43_ROUTER_CA_CERT=deploy/proxy/certs/s43.crt",
+            ]
+        ) + "\n",
+        encoding="utf-8",
+    )
+    settings = collector._settings(env_path)
+    old_mtime = env_path.stat().st_mtime_ns
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8").replace(
+            "S43_EDGE_SOURCE_IPS=192.168.1.1",
+            "S43_EDGE_SOURCE_IPS=192.168.1.1,192.168.1.254",
+        ),
+        encoding="utf-8",
+    )
+    if env_path.stat().st_mtime_ns == old_mtime:
+        import os
+        os.utime(env_path, ns=(old_mtime + 1_000_000_000, old_mtime + 1_000_000_000))
+
+    refreshed = collector._refresh_settings_if_changed(settings)
+    assert refreshed["source_ips"] == ("192.168.1.1", "192.168.1.254")
+
 
 def test_main_registers_router_route_and_trusted_producer():
     source = _MAIN.read_text(encoding="utf-8")
@@ -250,8 +302,8 @@ def test_main_registers_router_route_and_trusted_producer():
 def test_powershell_wrapper_keeps_token_out_of_status_output():
     source = _POWERSHELL.read_text(encoding="utf-8")
 
-    assert '[ValidateSet("Configure", "Listen", "Test", "Status", "Disable")]' in source
-    assert 'Write-Host "  token:        $tokenState"' in source
-    assert 'Write-Host "  token:        $token"' not in source
+    assert '[ValidateSet("Deploy", "Identify", "Status", "Listen", "Test", "Disable")]' in source
+    assert 'Write-Host "  token:   $token"' in source
+    assert 'S43_ROUTER_INGEST_TOKEN"]' not in source.split('function Show-Status', 1)[1].split('}', 1)[0]
     assert 'S43_ROUTER_INGEST_TOKEN' in source
     assert 'router_syslog_collector.py' in source
