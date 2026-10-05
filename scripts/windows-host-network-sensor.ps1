@@ -32,7 +32,10 @@ while ($true) {
 
         $processName = ""
         try { $processName = (Get-Process -Id $c.OwningProcess -ErrorAction Stop).ProcessName } catch {}
-        $direction = if ($c.LocalPort -lt 49152 -and $c.State -eq "Established") { "inbound" } else { "outbound" }
+        # Get-NetTCPConnection does not expose connection direction. Do not infer it
+        # from ephemeral-port ranges: services can use high ports and clients can
+        # bind low ports. "unknown" preserves the observation without inventing fact.
+        $direction = "unknown"
 
         $body = @{
             event_id = [guid]::NewGuid().ToString()
