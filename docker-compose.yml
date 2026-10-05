@@ -264,6 +264,12 @@ services:
       S43_EBPF_ENABLED: ${S43_EBPF_ENABLED:-false}
       S43_EBPF_INGEST_TOKEN: ${S43_EBPF_INGEST_TOKEN:-}
 
+      # Optional Windows host-network telemetry ingress. The sensor is
+      # evidence-only and submits bounded connection metadata; it has no
+      # governance or enforcement authority.
+      S43_HOST_NETWORK_ENABLED: ${S43_HOST_NETWORK_ENABLED:-false}
+      S43_HOST_NETWORK_INGEST_TOKEN: ${S43_HOST_NETWORK_INGEST_TOKEN:-}
+
       # Optional home-router telemetry ingress. A host-side collector receives
       # router syslog and submits bounded observations through the HTTPS edge.
       # The router is evidence-only and has no governance or enforcement authority.
