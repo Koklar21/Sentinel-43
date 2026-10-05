@@ -19,9 +19,10 @@ import urllib.request
 import uuid
 from dataclasses import dataclass
 
+from core.detection.process_exec_classification import classify_process_exec
+
 MAX_EVENTS_PER_SECOND = 200
 MAX_DELIVERY_QUEUE = 1024
-SUSPICIOUS_PREFIXES = ("/tmp/", "/var/tmp/", "/dev/shm/")
 LOSS_WARNING_INTERVAL_SECONDS = 30.0
 logger = logging.getLogger("sentinel43.ebpf_sensor")
 
@@ -69,16 +70,8 @@ class SensorConfig:
     max_events_per_second: int = MAX_EVENTS_PER_SECOND
 
 
-def classify_exec(filename: str) -> tuple[str, str, str]:
-    """Return (event_type, severity, reason) without taking any action."""
-    path = filename.strip()[:512]
-    if path.startswith(SUSPICIOUS_PREFIXES):
-        return (
-            "ebpf_suspicious_exec",
-            "medium",
-            "executable path is in a transient writable directory",
-        )
-    return ("ebpf_process_exec", "informational", "")
+# Backward-compatible alias for callers/tests that import the Linux adapter directly.
+classify_exec = classify_process_exec
 
 
 def build_payload(event: _ExecEvent, host_ip: str) -> dict[str, object]:
