@@ -1,5 +1,16 @@
 # eBPF runtime telemetry and detection
 
+## Platform boundary
+
+Sentinel-43 core is operating-system neutral. eBPF is an optional Linux telemetry
+adapter, not the host platform of Sentinel-43 itself. Other operating systems may
+supply equivalent bounded observations through their own adapters without
+changing RuntimeAuthority, MonitoringManager, Fenrir, Heart, governance, or the
+canonical evidence path.
+
+Platform adapters collect facts only. They do not acquire detection, response,
+governance, or enforcement authority.
+
 Phase 2 adds an **optional, observation-only Linux eBPF sensor**. It does not
 create a second Sentinel-43 authority and it cannot quarantine, kill, block,
 change policy, approve actions, or bypass Heart/human gates.
