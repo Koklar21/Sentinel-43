@@ -286,7 +286,7 @@ def _refresh_token_if_changed(settings: dict[str, object]) -> str:
 
 
 def _run_listener(settings: dict[str, object], *, once: bool) -> int:
-    router_ip = str(settings["router_ip"])
+    source_ips = {str(item) for item in settings.get("source_ips", (settings["router_ip"],))}
     listen_address = str(settings["listen_address"])
     listen_port = int(settings["listen_port"])
     max_eps = int(settings["max_eps"])
@@ -302,7 +302,7 @@ def _run_listener(settings: dict[str, object], *, once: bool) -> int:
 
     print(
         f"S43 router collector listening on {listen_address}:{listen_port}; "
-        f"accepting syslog only from {router_ip}"
+        "accepting syslog only from " + ", ".join(sorted(source_ips))
     )
 
     try:
@@ -313,7 +313,7 @@ def _run_listener(settings: dict[str, object], *, once: bool) -> int:
                 continue
 
             peer_ip = _normalize_ip(peer[0])
-            if peer_ip != router_ip:
+            if peer_ip not in source_ips:
                 ignored += 1
                 continue
 
@@ -329,7 +329,7 @@ def _run_listener(settings: dict[str, object], *, once: bool) -> int:
             if not message:
                 continue
 
-            payload = _facts(message, router_ip)
+            payload = _facts(message, peer_ip)
             try:
                 result = _post_with_retry(
                     api_url=str(settings["api_url"]),
