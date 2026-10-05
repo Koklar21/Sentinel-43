@@ -11,7 +11,7 @@ from typing import Any
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from core.detection.ebpf_agent import classify_exec
+from core.detection.process_exec_classification import classify_process_exec
 
 from core.monitoring import get_monitoring_manager
 
@@ -70,7 +70,7 @@ def ingest_ebpf_event(
 
     # Detection semantics are server-owned. The authenticated sensor reports
     # observation facts; it cannot choose its own threat label or severity.
-    event_type, severity, reason = classify_exec(event.filename)
+    event_type, severity, reason = classify_process_exec(event.filename)
 
     payload = {
         "kind": "runtime",
