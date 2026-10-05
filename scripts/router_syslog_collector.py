@@ -265,25 +265,26 @@ def _settings(env_path: Path) -> dict[str, object]:
     }
 
 
-def _refresh_token_if_changed(settings: dict[str, object]) -> str:
-    """Reload only the credential when secret rotation rewrites the env file."""
+def _refresh_settings_if_changed(settings: dict[str, object]) -> dict[str, object]:
+    """Reload mutable trust/credential settings when the environment changes."""
     env_path = settings["env_path"]
     if not isinstance(env_path, Path):
         raise CollectorError("collector environment path is invalid")
 
     current_mtime = env_path.stat().st_mtime_ns
     if current_mtime != int(settings["env_mtime_ns"]):
-        values = _read_env(env_path)
-        token = values.get("S43_ROUTER_INGEST_TOKEN", "").strip()
-        if len(token) < 32:
-            raise CollectorError(
-                "rotated S43_ROUTER_INGEST_TOKEN is missing or too short"
-            )
-        settings["token"] = token
-        settings["env_mtime_ns"] = current_mtime
-        print("router ingest credential reloaded after environment update")
+        refreshed = _settings(env_path)
+        for key in ("token", "router_ip", "source_ips", "api_url", "ca_cert", "max_eps"):
+            settings[key] = refreshed[key]
+        settings["env_mtime_ns"] = refreshed["env_mtime_ns"]
+        print("router collector trust/credential settings reloaded after environment update")
 
-    return str(settings["token"])
+    return settings
+
+
+def _refresh_token_if_changed(settings: dict[str, object]) -> str:
+    """Backward-compatible helper used by tests and one-shot ingress."""
+    return str(_refresh_settings_if_changed(settings)["token"])
 
 
 def _run_listener(settings: dict[str, object], *, once: bool) -> int:
@@ -312,6 +313,10 @@ def _run_listener(settings: dict[str, object], *, once: bool) -> int:
                 data, peer = sock.recvfrom(_MAX_DATAGRAM_BYTES)
             except socket.timeout:
                 continue
+
+            refreshed = _refresh_settings_if_changed(settings)
+            source_ips = {str(item) for item in refreshed.get("source_ips", ())}
+            max_eps = int(refreshed["max_eps"])
 
             peer_ip = _normalize_ip(peer[0])
             if peer_ip not in source_ips:
