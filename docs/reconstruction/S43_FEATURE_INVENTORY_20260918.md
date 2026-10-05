@@ -30,7 +30,7 @@ repeated here; none were performed. See §14 unresolved unknowns / final stop st
 
 | Field | Value |
 |---|---|
-| Repository path | `C:\Users\heero\OneDrive\Documents\GitHub\Olympus_Complete_Dropin\Sentinel-43` |
+| Repository path | `<local-checkout>/Sentinel-43` |
 | Remote URL | `<repository-remote>` |
 | Current branch | `main` |
 | Local HEAD SHA | `5a249e71cc46a6006eb884da9d16066057cf3d25` |
