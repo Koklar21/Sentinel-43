@@ -350,6 +350,10 @@ It is a defensive oversight, analysis, governance, and audit platform.
 
 ---
 
+## Independent Review
+
+Independent technical review is welcome. Reviewers should start with [REVIEWING.md](REVIEWING.md), which describes the architectural invariants, high-value review areas, safe testing boundaries, and a useful finding format.
+
 ## Documentation
 
 Useful starting points:
