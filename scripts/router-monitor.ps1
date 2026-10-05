@@ -147,8 +147,14 @@ function Set-EdgeFirewall([string[]]$Sources,[int]$Port) {
     $address=$rule|Get-NetFirewallAddressFilter
     $actualSources=@($address.RemoteAddress|ForEach-Object{[string]$_}|Sort-Object -Unique)
     $expectedSources=@($Sources|ForEach-Object{[string]$_}|Sort-Object -Unique)
-    if($rule.Enabled-ne"True"-or$port.LocalPort-ne[string]$Port-or$port.Protocol-ne"UDP"){throw "Firewall rule verification failed."}
-    if((Compare-Object $expectedSources $actualSources).Count){throw "Firewall trusted-source read-back verification failed. Expected: $($expectedSources-join', '); actual: $($actualSources-join', ')"}
+    if($rule.Enabled-ne"True"-or$port.LocalPort-ne[string]$Port-or$port.Protocol-ne"UDP"){
+        $rule|Remove-NetFirewallRule -ErrorAction SilentlyContinue
+        throw "Firewall rule verification failed; unexpected rule removed."
+    }
+    if((Compare-Object $expectedSources $actualSources).Count){
+        $rule|Remove-NetFirewallRule -ErrorAction SilentlyContinue
+        throw "Firewall trusted-source read-back verification failed; unexpected rule removed. Expected: $($expectedSources-join', '); actual: $($actualSources-join', ')"
+    }
 }
 function Save-Configuration([string[]]$Sources) {
     $current=Read-Env $EnvPath
@@ -188,7 +194,7 @@ function Restart-Ingress {
         do{
             $state=(docker compose --env-file $EnvPath ps --format json s43-api 2>$null | Out-String)
             if($LASTEXITCODE-ne0){throw "Unable to inspect s43-api readiness."}
-            if($state -match '"Health"s*:s*"healthy"' -or ($state -match '"State"s*:s*"running"' -and $state -notmatch '"Health"s*:s*"unhealthy"')){break}
+            if($state -match '"Health"\s*:\s*"healthy"'){break}
             Start-Sleep -Seconds 2
         }while((Get-Date)-lt$deadline)
         if((Get-Date)-ge$deadline){throw "s43-api did not become ready within 60 seconds."}
@@ -202,6 +208,17 @@ function Test-Ingress {
         if($LASTEXITCODE-ne0){throw "Authenticated S43 edge-ingress verification failed."}
     }finally{Pop-Location}
 }
+function Stop-Collector {
+    $owner=Test-PortOwner $SyslogPort
+    if(-not$owner){return}
+    $proc=Get-CimInstance Win32_Process -Filter "ProcessId = $($owner.Pid)" -ErrorAction SilentlyContinue
+    if($proc -and -not[string]::IsNullOrWhiteSpace([string]$proc.CommandLine) -and $proc.CommandLine -match [regex]::Escape($CollectorPath)){
+        Stop-Process -Id $owner.Pid -Force -ErrorAction Stop
+        $deadline=(Get-Date).AddSeconds(10)
+        while((Test-PortOwner $SyslogPort) -and (Get-Date)-lt$deadline){Start-Sleep -Milliseconds 250}
+        if(Test-PortOwner $SyslogPort){throw "Collector did not release UDP $SyslogPort after stop."}
+    }
+}
 function Start-Collector {
     $owner=Test-PortOwner $SyslogPort
     if($owner){
@@ -213,10 +230,15 @@ function Start-Collector {
         return
     }
     $python=Get-PythonCommand
-    Start-Process -FilePath $python -ArgumentList @($CollectorPath,"--env-file",$EnvPath) -WorkingDirectory $RepoRoot
-    Start-Sleep -Seconds 1
-    $started=Test-PortOwner $SyslogPort
-    if(-not$started){throw "Collector did not bind UDP $SyslogPort."}
+    $quote={param([string]$Value) '"' + $Value.Replace('"','\"') + '"'}
+    $argsLine="& $(& $quote $CollectorPath) --env-file $(& $quote $EnvPath)"
+    $launched=Start-Process -FilePath $python -ArgumentList @("-c",("import runpy,sys; sys.argv=['router_syslog_collector.py','--env-file',r'''{0}''']; runpy.run_path(r'''{1}''',run_name='__main__')" -f $EnvPath.Replace("'","''"),$CollectorPath.Replace("'","''"))) -WorkingDirectory $RepoRoot -PassThru
+    $deadline=(Get-Date).AddSeconds(10); $started=$null
+    do{$started=Test-PortOwner $SyslogPort;if($started){break};Start-Sleep -Milliseconds 250}while((Get-Date)-lt$deadline)
+    if(-not$started){
+        if($launched -and -not$launched.HasExited){Stop-Process -Id $launched.Id -Force -ErrorAction SilentlyContinue}
+        throw "Collector did not bind UDP $SyslogPort within 10 seconds."
+    }
     $proc=Get-CimInstance Win32_Process -Filter "ProcessId = $($started.Pid)" -ErrorAction SilentlyContinue
     if(-not$proc -or [string]::IsNullOrWhiteSpace([string]$proc.CommandLine) -or $proc.CommandLine -notmatch [regex]::Escape($CollectorPath)){throw "UDP $SyslogPort was claimed after collector start, but not by the Sentinel-43 collector."}
 }
@@ -288,6 +310,7 @@ switch($Mode){
 "Test"{Test-Ingress}
 "Status"{Show-Status}
 "Disable"{
+    Stop-Collector
     $lines=Get-EnvLines; Set-EnvValue $lines "S43_ROUTER_ENABLED" "false"; Write-EnvAtomic $lines
     if(Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue){Get-NetFirewallRule -DisplayName $FirewallRuleName -ErrorAction SilentlyContinue|Remove-NetFirewallRule -ErrorAction Stop}
     Restart-Ingress; Write-Host "Edge telemetry disabled; ingest credential retained."
