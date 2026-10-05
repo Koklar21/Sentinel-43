@@ -110,6 +110,7 @@ from .routers.agent_runtime import router as agent_runtime_router
 from .routers.auth import router as auth_router
 from .routers.bootstrap import router as bootstrap_router
 from .routers.ebpf import router as ebpf_router
+from .routers.host_network import router as host_network_router
 from .routers.enrollment import router as enrollment_router
 from .routers.remote_gateway import router as remote_gateway_router
 from .routers.router_telemetry import router as router_telemetry_router
@@ -1751,6 +1752,7 @@ async def _start_fenrir() -> None:
                 runtime.fenrir_instance.detector,
                 producers={
                     "ebpf": "sentinel-ebpf",
+                    "host_network": "sentinel-host-network",
                     "agent_runtime": "sentinel-agent-runtime",
                     "sparta": "sentinel-sparta",
                     "remote_gateway": "sentinel-remote-gateway",
@@ -5148,6 +5150,7 @@ app.include_router(enrollment_router)
 app.include_router(users_router)
 app.include_router(bootstrap_router)
 app.include_router(ebpf_router)
+app.include_router(host_network_router)
 app.include_router(agent_runtime_router)
 app.include_router(remote_gateway_router)
 app.include_router(router_telemetry_router)
