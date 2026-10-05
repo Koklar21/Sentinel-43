@@ -51,6 +51,8 @@ keys/
 # Local Compose / smoke overrides
 docker-compose.override.yml
 docker-compose.override.yaml
+docker-compose.*.override.yml
+docker-compose.*.override.yaml
 docker-compose.smoke.yml
 .env.smoke
 .env.browser
