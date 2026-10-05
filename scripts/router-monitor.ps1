@@ -188,7 +188,14 @@ function Test-Ingress {
 }
 function Start-Collector {
     $owner=Test-PortOwner $SyslogPort
-    if($owner){Write-Host "Collector/listener already owns UDP $SyslogPort (PID $($owner.Pid), $($owner.Name)); not starting a duplicate.";return}
+    if($owner){
+        $proc=Get-CimInstance Win32_Process -Filter "ProcessId = $($owner.Pid)" -ErrorAction SilentlyContinue
+        if(-not $proc -or [string]::IsNullOrWhiteSpace([string]$proc.CommandLine) -or $proc.CommandLine -notmatch [regex]::Escape($CollectorPath)){
+            throw "Port conflict: UDP $SyslogPort is owned by PID $($owner.Pid) ($($owner.Name)), not the Sentinel-43 edge collector."
+        }
+        Write-Host "Collector/listener already owns UDP $SyslogPort (PID $($owner.Pid), $($owner.Name)); not starting a duplicate."
+        return
+    }
     $python=Get-PythonCommand
     Start-Process -FilePath $python -ArgumentList @($CollectorPath,"--env-file",$EnvPath) -WorkingDirectory $RepoRoot
     Start-Sleep -Seconds 1
@@ -211,7 +218,9 @@ function Show-Status {
     Write-Host "  listen:  $($v['S43_ROUTER_LISTEN_ADDRESS']):$($v['S43_ROUTER_SYSLOG_PORT'])/udp"
     Write-Host "  api:     $($v['S43_ROUTER_API_URL'])"
     Write-Host "  token:   $token"
-    $owner=Test-PortOwner ([int]($v["S43_ROUTER_SYSLOG_PORT"] ?? $SyslogPort))
+    $statusPort=[string]$v["S43_ROUTER_SYSLOG_PORT"]
+    if([string]::IsNullOrWhiteSpace($statusPort)){$statusPort=[string]$SyslogPort}
+    $owner=Test-PortOwner ([int]$statusPort)
     if($owner){Write-Host "  listener: PID $($owner.Pid) $($owner.Name)"}else{Write-Host "  listener: stopped"}
 }
 
