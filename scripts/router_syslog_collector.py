@@ -216,9 +216,10 @@ def _settings(env_path: Path) -> dict[str, object]:
     if len(token) < 32:
         raise CollectorError("S43_ROUTER_INGEST_TOKEN is missing or too short")
 
-    router_ip = _normalize_ip(values.get("S43_ROUTER_SOURCE_IP", ""))
-    if not router_ip:
-        raise CollectorError("S43_ROUTER_SOURCE_IP is missing or invalid")
+    raw_sources = values.get("S43_EDGE_SOURCE_IPS", values.get("S43_ROUTER_SOURCE_IP", ""))
+    source_ips = tuple(filter(None, (_normalize_ip(item) for item in raw_sources.split(","))))
+    if not source_ips:
+        raise CollectorError("trusted edge source configuration is missing or invalid")
 
     api_url = values.get(
         "S43_ROUTER_API_URL",
@@ -253,7 +254,8 @@ def _settings(env_path: Path) -> dict[str, object]:
         "env_path": env_path,
         "env_mtime_ns": env_path.stat().st_mtime_ns,
         "token": token,
-        "router_ip": router_ip,
+        "router_ip": source_ips[0],
+        "source_ips": source_ips,
         "api_url": api_url,
         "listen_address": listen_address,
         "listen_port": listen_port,
@@ -284,7 +286,7 @@ def _refresh_token_if_changed(settings: dict[str, object]) -> str:
 
 
 def _run_listener(settings: dict[str, object], *, once: bool) -> int:
-    router_ip = str(settings["router_ip"])
+    source_ips = {str(item) for item in settings.get("source_ips", (settings["router_ip"],))}
     listen_address = str(settings["listen_address"])
     listen_port = int(settings["listen_port"])
     max_eps = int(settings["max_eps"])
@@ -300,7 +302,7 @@ def _run_listener(settings: dict[str, object], *, once: bool) -> int:
 
     print(
         f"S43 router collector listening on {listen_address}:{listen_port}; "
-        f"accepting syslog only from {router_ip}"
+        "accepting syslog only from " + ", ".join(sorted(source_ips))
     )
 
     try:
@@ -311,7 +313,7 @@ def _run_listener(settings: dict[str, object], *, once: bool) -> int:
                 continue
 
             peer_ip = _normalize_ip(peer[0])
-            if peer_ip != router_ip:
+            if peer_ip not in source_ips:
                 ignored += 1
                 continue
 
@@ -327,7 +329,7 @@ def _run_listener(settings: dict[str, object], *, once: bool) -> int:
             if not message:
                 continue
 
-            payload = _facts(message, router_ip)
+            payload = _facts(message, peer_ip)
             try:
                 result = _post_with_retry(
                     api_url=str(settings["api_url"]),
