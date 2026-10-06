@@ -1,7 +1,9 @@
 Sentinel-43 Security Platform
-Copyright (c) 2026 Justin
+Copyright (c) 2026 Justin Armstrong
 All rights reserved.
 
 This software is licensed under a dual-license model:
-- GNU Affero General Public License v3 (AGPLv3)
-- Commercial license available upon request
+- GNU Affero General Public License v3 or later (AGPL-3.0-or-later)
+- Sentinel-43 Commercial License (see COMMERCIAL_LICENSE.md)
+
+SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Sentinel-Commercial
