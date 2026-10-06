@@ -279,13 +279,10 @@ def pseudonymize(value: str) -> str:
         or os.getenv("S43_ENV")
         or "production"
     ).strip().lower()
-    if (
-        environment not in {"development", "dev", "local", "test"}
-        and LOG_SALT in {"", "CHANGE_ME", "CHANGE_ME_IN_PROD"}
-    ):
-        raise RuntimeError(
-            "SENTINEL_LOG_SALT must be a generated secret outside local/test"
-        )
+    if environment not in {"development", "dev", "local", "test"}:
+        from core.security.secret_validation import require_generated_secret
+
+        require_generated_secret("SENTINEL_LOG_SALT", LOG_SALT)
 
     digest = hashlib.sha256(f"{LOG_SALT}:{raw}".encode("utf-8")).hexdigest()
     return digest[:16]
