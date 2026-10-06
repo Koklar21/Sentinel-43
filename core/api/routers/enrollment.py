@@ -25,6 +25,7 @@ from ...auth.deps import get_db_session
 from ...auth.users import (
     BootstrapClaimUnavailableError,
     EnrollmentBeforeBootstrapError,
+    UsernameTakenError,
     get_user_by_username,
 )
 from ...security_context import client_ip_of
@@ -122,7 +123,7 @@ async def enroll_client(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Enrollment serialization is unavailable.",
         ) from exc
-    except IntegrityError as exc:
+    except (UsernameTakenError, IntegrityError) as exc:
         try:
             await session.rollback()
         except Exception:
