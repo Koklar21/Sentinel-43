@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -304,6 +305,30 @@ def test_powershell_wrapper_keeps_token_out_of_status_output():
 
     assert '[ValidateSet("Deploy", "Identify", "Status", "Listen", "Test", "Disable")]' in source
     assert 'Write-Host "  token:   $token"' in source
-    assert 'S43_ROUTER_INGEST_TOKEN"]' not in source.split('function Show-Status', 1)[1].split('}', 1)[0]
+    # Include the whole function: the first `}` closes the configured branch,
+    # not Show-Status. Reading the secret to compute a marker is legitimate;
+    # forwarding the credential (or the whole environment map) is not.
+    status = source.split('function Show-Status {', 1)[1].split('\n}', 1)[0]
+    projection = '$token=if(([string]$v["S43_ROUTER_INGEST_TOKEN"]).Length-ge32){"configured"}else{"missing"}'
+    assert status.count(projection) == 1
+    remainder = status.replace(projection, '', 1)
+    assert 'S43_ROUTER_INGEST_TOKEN' not in remainder
+    assert len(re.findall(r'\$token\b', remainder, re.IGNORECASE)) == 1
+    assert 'Write-Host "  token:   $token"' in remainder
+
+    # Only individually selected, non-credential fields may leave the map.
+    # Reject a bare $v (for example Write-Host $v), dynamic indexing, or a new
+    # credential-field lookup anywhere in the remainder of the function.
+    assert remainder.count('$v=Read-Env $EnvPath;') == 1
+    remainder = remainder.replace('$v=Read-Env $EnvPath;', '', 1)
+    allowed_fields = (
+        'S43_ROUTER_ENABLED', 'S43_EDGE_SOURCE_IPS',
+        'S43_ROUTER_LISTEN_ADDRESS', 'S43_ROUTER_SYSLOG_PORT',
+        'S43_ROUTER_API_URL',
+    )
+    for field in allowed_fields:
+        for quote in ('"', "'"):
+            remainder = remainder.replace(f'$v[{quote}{field}{quote}]', '')
+    assert re.search(r'\$v\b', remainder, re.IGNORECASE) is None
     assert 'S43_ROUTER_INGEST_TOKEN' in source
     assert 'router_syslog_collector.py' in source

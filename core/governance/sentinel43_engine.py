@@ -71,7 +71,7 @@ _ENGINE_MODULE_NAME = "sentinel43_owner_shadow_mode"
 #: that must update this pin in the same change, and
 #: test_owner_engine_integrity.py fails until it does.
 EXPECTED_ENGINE_SHA256 = (
-    "7e4e57d9c33c1f27617841665872c4ae92cf5b7dfcc43f329ac232a161fdd05c"
+    "74247d1ae5eb6dde674d9bea723b02d85b99a51665ff46322a8d717573114fa8"
 )
 
 
