@@ -40,6 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ...auth.deps import get_db_session
 from ...auth.users import (
     User,
+    UsernameTakenError,
     get_user_by_username,
     list_users,
 )
@@ -231,7 +232,7 @@ async def create_account(
             email=body.email,
         )
 
-    except IntegrityError as exc:
+    except (UsernameTakenError, IntegrityError) as exc:
         await _rollback_safely(session)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
