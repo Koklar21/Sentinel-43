@@ -71,11 +71,11 @@ SYSTEM_ID = _env("SENTINEL_SYSTEM_ID", "SENTINEL-43-NEXUS-01")
 def _log_salt() -> str:
     value = _env("SENTINEL_LOG_SALT", "").strip()
     environment = (
-        os.getenv("SENTINEL_ENV")
-        or os.getenv("S43_ENV")
+        os.getenv("SENTINEL_ENV", "").strip()
+        or os.getenv("S43_ENV", "").strip()
         or "production"
-    ).strip().lower()
-    local = environment in {"development", "dev", "local", "test"}
+    ).lower()
+    local = environment in {"development", "dev", "local", "test", "testing"}
 
     if local:
         return value or "CHANGE_ME_IN_PROD"
@@ -275,11 +275,11 @@ def pseudonymize(value: str) -> str:
         return "EMPTY"
 
     environment = (
-        os.getenv("SENTINEL_ENV")
-        or os.getenv("S43_ENV")
+        os.getenv("SENTINEL_ENV", "").strip()
+        or os.getenv("S43_ENV", "").strip()
         or "production"
-    ).strip().lower()
-    if environment not in {"development", "dev", "local", "test"}:
+    ).lower()
+    if environment not in {"development", "dev", "local", "test", "testing"}:
         from core.security.secret_validation import require_generated_secret
 
         require_generated_secret("SENTINEL_LOG_SALT", LOG_SALT)
