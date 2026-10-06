@@ -2,339 +2,343 @@
 
 **Sentinel-43 is a human-gated defensive cybersecurity oversight platform.**
 
-It watches security activity, turns observations into structured threat context and recommendations, routes those recommendations through governance, and preserves an auditable record of what happened and why.
+It observes security activity, correlates evidence, classifies suspicious behavior, produces deterministic response recommendations, routes those recommendations through explicit governance, and records the resulting decisions in an auditable trail.
 
-Sentinel-43 is designed around one rule:
+Its governing principle is simple:
 
 > **Deterministic. Advisory. Never Autonomous.**
 
-The system can analyze and recommend. A human remains the final authority for operational decisions.
+Sentinel-43 is built to help a human operator answer four questions quickly:
 
-> **Current status:** Controlled Beta Candidate. Repository closure is revision-scoped: a revision is repository-cleared only when its required PR-CI acceptance gate passes. A specific deployment becomes an accepted controlled-beta target only after the exact deployed revision also passes the evidence gates in the [Beta Runbook](docs/BETA_RUNBOOK.md). Production readiness is not established.
+1. **What happened?**
+2. **Why does it matter?**
+3. **What response is justified by the evidence?**
+4. **Who authorized what happened next?**
 
-For controlled-beta deployment requirements, use the authoritative [Beta Runbook](docs/BETA_RUNBOOK.md).
+The system deliberately separates observation, detection, recommendation, governance, and external enforcement. Detection components can identify suspicious behavior and construct evidence. The response engine can plan and stage recommendations. Governance can approve or veto staged decisions. None of those layers silently becomes an unrestricted execution authority.
 
----
+Sentinel-43 also watches its own operating state. Runtime health, subsystem state, audit integrity, authenticated sessions, service identity, and deployment boundaries are treated as part of the security problem rather than as unrelated plumbing.
 
-## What Sentinel-43 Does
+The operator-facing dashboard exposes the governed system through authenticated API and WebSocket paths. It provides security visibility, recommendation state, audit information, subsystem health, runtime provenance, and account administration without becoming a second control plane.
 
-Sentinel-43 brings several defensive functions into one governed workflow:
-
-- receives and normalizes security observations
-- detects and correlates suspicious activity
-- builds threat context and supporting evidence
-- produces deterministic recommendations
-- routes recommendations through human governance
-- tracks pending, approved, vetoed, expired, and staged decisions
-- records significant security and governance activity in an audit trail
-- exposes live operational state through an authenticated dashboard
-- monitors its own runtime health and supporting services
-
-The result is not a machine that decides what to do on its own. It is a system that helps an operator understand **what happened, why it matters, what could be done, and who authorized the next step**.
+In short, Sentinel-43 is not intended to replace the human responsible for a system. It is intended to give that human a coherent, explainable, security-focused view of what is happening and a controlled mechanism for deciding what should happen next.
 
 ---
 
-## How It Works
+# Technical Reference
 
-The normal Sentinel-43 flow is:
+## Architectural Rule
+
+Sentinel-43 has one top-level runtime authority: `Sentinel43RuntimeAuthority`.
+
+Subsystems provide evidence, analysis, storage, health information, recommendations, or governed interfaces beneath that authority. They do not independently create competing control planes.
+
+The primary flow is:
 
 ```text
-Observe
-  ↓
-Detect / Analyze
-  ↓
-Correlate Evidence
-  ↓
-Generate Recommendation
-  ↓
-Human Governance
-  ↓
-Approved External Integration
-  ↓
+Observation
+    ↓
+Detection and Classification
+    ↓
+Evidence Correlation
+    ↓
+Response Planning
+    ↓
+Governance
+    ↓
+Human Decision
+    ↓
+Explicit External Integration Boundary
+    ↓
 Audit
 ```
 
-Analysis, governance, and enforcement are deliberately separate.
+Analysis and approval are not execution. Approval records a governed human decision. External effects require an explicitly integrated enforcement boundary.
 
-The live runtime supports two governance modes:
+## Governance Modes
 
-| Mode | Purpose |
+The owner response engine supports two governed modes:
+
+| Mode | Behavior |
 | --- | --- |
-| `SHADOW` | Observe, analyze, recommend, and record without approving operational action. |
-| `HUMAN_GATED` | Require an authenticated human decision before a recommendation can proceed through the governed workflow. |
+| `SHADOW` | Analyze, recommend, stage observational results, and record without granting operational execution. |
+| `HUMAN_GATED` | Stage recommendations for an authenticated human approval or veto decision. |
 
-Autonomous enforcement modes are not part of the live Sentinel-43 runtime.
+There is no unrestricted autonomous enforcement mode in the owner response engine.
 
----
+## Owner Runtime Sources
 
-## Main Components
+The owner-designated runtime sources are under `Sentinel-43/`.
 
-### Sentinel-43 Runtime Authority
+### `Shadow_mode.py`
 
-`Sentinel43RuntimeAuthority` is the single top-level runtime authority.
+The owner response-planning and staging engine.
 
-It owns the governed composition of the system and keeps subordinate components from becoming independent control planes.
+Responsibilities include:
 
-The owner-designated runtime sources are under `Sentinel-43/`:
+- mapping threat assessments into response directives
+- deterministic response-action selection
+- recommendation staging
+- deduplication of repeated directives
+- SHADOW behavior
+- HUMAN_GATED approval and veto transitions
+- target sanitization and pseudonymized security logging
 
-- `Shadow_mode.py` — response/recommendation engine
-- `Sentinel_Nexus.py` — governed integration and recommendation boundary
-- `Sentinel_core.py` — node/runtime reporting contract
-- `sentinel_AI_escalation.py` — threat-evidence and escalation contract
+It does not own a standalone database, executor thread, external integration authority, API authentication system, or independent lifecycle.
+
+The governed loader verifies the canonical content digest of this file before loading it. A changed or unreviewed owner engine is refused rather than silently accepted.
+
+### `Sentinel_Nexus.py`
+
+Defines the governed integration and recommendation boundary between owner runtime behavior and the surrounding Sentinel-43 system.
+
+### `Sentinel_core.py`
+
+Provides owner runtime and node reporting contracts used by the governed composition.
+
+### `sentinel_AI_escalation.py`
+
+Handles owner-designated threat evidence and escalation contracts. It contributes evidence and escalation context without owning governance or external enforcement.
+
+## Runtime Authority and Governance
+
+The governance implementation lives under `core/governance/`.
+
+### Runtime Authority
+
+`runtime_authority.py` composes the authoritative runtime and exposes governed subsystem capabilities to the API and other trusted callers.
+
+### Orchestrator
+
+`orchestrator.py` coordinates governed recommendation lifecycle. It is the authority that may stage or resolve recommendations produced from Heart and detection evidence.
+
+### Governed Owner Engine Adapter
+
+`sentinel43_engine.py` loads the owner-designated Shadow engine, verifies its canonical integrity digest, and adapts it to Sentinel-43's authoritative storage and authenticated governance context.
+
+The adapter intentionally does not add an execution path to the owner engine.
+
+### Identity Governance
+
+`identity.py` enforces account-management and identity rules at the governance boundary, including administrator protections, account lifecycle operations, and separation of human authority from service identity.
+
+## Heart
+
+Heart is the governed recommendation-lifecycle and recovery component.
+
+It reports evidence and lifecycle state into the governance system. Heart does not independently approve, veto, stage, or execute operational action. When Heart is enabled, the governance authority must also be enabled; the runtime refuses a configuration that would leave Heart without its governing authority.
+
+## Detection
+
+Detection components live primarily under `core/detection/`.
 
 ### Fenrir
 
 Fenrir is the threat-hunting and behavioral-analysis layer.
 
-It helps answer:
+It combines deterministic scoring and correlation mechanisms to decide whether observed activity deserves attention. Its evidence can include:
 
-> **Does this activity deserve attention?**
+- threat kind and severity
+- behavioral indicators
+- source classification
+- bounded statistical anomaly information
+- agent-sequence evidence
+- supported Sigma-compatible rule matches
+- evidence provenance
+- AI-automation pattern indicators
 
-Fenrir produces evidence and threat observations. It combines deterministic threshold scoring, an optional bounded Sigma-compatible rule matcher, agent-sequence correlation, and a bounded statistical anomaly baseline; that baseline advances only on newer detector evidence, so repeated polling or retries cannot manufacture anomaly pressure. The deterministic detector preserves the original AI-threat distinction by pairing `AI_AUTOMATION_LIKELY` source classification with malware/virus, spyware, exfiltration, credential, or intrusion kinds and records the explainable basis in `ai_pattern_profile`. The owner AI-escalation component fingerprints that canonical assessment before Heart/audit. Sigma rules are parsed with pySigma and limited to the event-local S43 telemetry subset documented in [docs/SIGMA_DETECTION.md](docs/SIGMA_DETECTION.md). Detection and AI escalation do not own governance or enforcement.
+Fenrir produces evidence. It does not own governance or enforcement.
 
-### Heart
+### Sentinel Threat Detector
 
-Heart manages governed recommendation lifecycle and recovery state.
+`sentinel_threat_detector.py` normalizes and classifies threat observations into the canonical detection contract used by downstream escalation and governance.
 
-It stages and resolves recommendations through the runtime authority rather than bypassing it.
+The detector preserves the distinction between ordinary human-likely activity, likely automated or AI-driven activity, and mixed or unknown sources. Classification is evidence-bearing rather than a grant of authority.
 
-### Watchtower
+### Agent Sequence Detection
 
-Watchtower provides system-health and oversight signals.
+`agent_sequence_detector.py` correlates bounded sequences of observed behavior so suspicious multi-step activity can be evaluated as a pattern rather than as isolated events.
 
-It helps answer:
+### Sigma Detection
 
-> **Is Sentinel-43 itself operating correctly?**
+`sigma_detector.py` provides a bounded Sigma-compatible rule path for supported Sentinel-43 telemetry. Rule matching contributes evidence to the existing detection pipeline rather than bypassing it.
 
-### Sparta
+### eBPF Agent
 
-Sparta monitors selected integrity and runtime conditions and reports them into the governed system.
+`ebpf_agent.py` supports host-level observation inputs where the deployment provides the required platform capabilities. Those observations still enter the governed detection path.
 
-### Audit
+## Watchtower
 
-The audit layer preserves authoritative security and governance records with integrity checking.
+Watchtower provides runtime-health and oversight signals.
 
-It is intended to answer:
+Its job is to help determine whether Sentinel-43 and its supporting components are operating as expected. Health reporting is separate from threat authority: a subsystem reporting a fault does not gain permission to take unrelated operational action.
 
-> **What happened, when, why, and under whose authority?**
+## Sparta
 
-### Dashboard
+Sparta monitors selected integrity and runtime conditions and reports those observations into Sentinel-43's governed monitoring path.
 
-The authenticated web dashboard is the operator-facing control and visibility surface.
+Like other monitoring components, Sparta reports evidence. It is not an independent enforcement authority.
 
-It provides access to:
+## Audit
 
-- system and subsystem health
-- threat and monitoring information
-- governance state
-- pending actions
-- audit information
-- runtime provenance
-- administrator account management
-- first-administrator onboarding
-- live WebSocket updates
+The audit subsystem under `core/audit/` preserves authoritative security, governance, and operator-decision records.
 
-The dashboard consumes the same governed API boundaries as other clients. It does not create its own authority.
+The audit design is intended to preserve answers to:
 
----
+- what occurred
+- when it occurred
+- which subsystem produced the event
+- what evidence or context accompanied it
+- which authenticated authority made a governed decision
 
-## Human Authority
+Integrity-sensitive audit configuration is validated fail-closed where required.
 
-Human authority is a hard design boundary, not a presentation preference.
+## Authentication and Human Identity
 
-Sentinel-43 may:
+Human accounts and service identities are separate concepts.
 
-- analyze
-- classify
-- recommend
-- explain
-- stage a decision
-- record a decision
+Human authority follows a narrow model:
 
-Sentinel-43 does not grant its advisory core unrestricted autonomous authority to modify infrastructure, quarantine systems, suspend accounts, alter firewall policy, or perform other external enforcement.
+- initial deployment ownership is established through the one-time administrator claim
+- the deployment retains a single administrator under normal account-management rules
+- the administrator may create and manage trusted observer accounts
+- observer authority is limited to the governed capabilities assigned to that role
+- ordinary client accounts do not inherit observer or administrator authority
+- account roles cannot be silently promoted through client-facing enrollment
+- password changes and security-sensitive account changes revoke affected sessions as required
+- authenticated session state, refresh rotation, logout, and revocation are handled by the authentication subsystem
 
-External effects must remain explicitly integrated and independently governed.
+Service credentials authenticate machine-to-machine responsibilities. A service identity does not become a human approver merely because it is authenticated.
 
----
+## API
 
-## Authentication and Administration
+The API under `core/api/` exposes Sentinel-43's authenticated application boundary.
 
-Sentinel-43 distinguishes human identities from service identities.
+Its responsibilities include:
 
-Human accounts use a deliberately narrow three-tier authority model:
+- authentication and session handling
+- first-administrator bootstrap
+- governed account management
+- optional client enrollment
+- audit access
+- monitoring and runtime information
+- governed recommendation and decision interfaces
+- remote-gateway boundaries
+- router telemetry ingestion
+- authenticated WebSocket state delivery
+- security headers, origin policy, trusted-host policy, and proxy-aware request handling
 
-- the one-time bootstrap claim creates the deployment's **sole administrator**
-- administrators may create trusted **observer** accounts
-- observers may review staged actions and submit human approve/veto decisions
-- ordinary authenticated **client** accounts have no observer, approval, veto, orchestration, or account-administration authority
-- open-beta self-enrollment, when explicitly enabled with `S43_OPEN_BETA_ENROLLMENT=true`, always creates a client; callers cannot select a role
-- only the sole administrator may create/disable observer accounts or reset managed account passwords
-- administrator role is not promotable, demotable, or transferable through normal account-management APIs
-- account roles are fixed after creation; client enrollment cannot promote into observer/admin authority
-- authenticated sessions, refresh rotation, logout/revocation, and password reset remain governed
-
-Internal services use separate service credentials and cannot silently become human approvers.
-
-### First Administrator
-
-An empty deployment supports a one-time first-administrator claim. That claim is the only normal path that creates an administrator account. The database also enforces at most one administrator row; initialized deployments are expected to retain exactly one.
-
-Outside local/dev/test, that claim must be authorized with the deployment-owned `S43_BOOTSTRAP_CLAIM_TOKEN`.
-
-After the first account exists, normal account-management rules apply.
-
-Emergency administrator recovery is intentionally an exec-only deployment operation rather than a privileged network endpoint. See [Beta Runbook §16a](docs/BETA_RUNBOOK.md) for the current procedure.
-
----
-
-## Running Sentinel-43
-
-Sentinel-43 supports Docker Compose for local and controlled-beta work, with Kubernetes manifests available for controlled deployment validation.
-
-### Configuration
-
-For local Docker Compose work on Windows/PowerShell, use the canonical local startup wrapper:
-
-```powershell
-.\scripts\start-local.ps1
-```
-
-On the first run, the wrapper creates `.env` from `.env.example`, generates the managed secrets before Compose evaluates the file, derives `DATABASE_URL` from `POSTGRES_PASSWORD`, validates the resulting environment, and then starts the stack. On later runs it preserves existing secrets and only adds managed secrets that are missing. Ordinary startup never rotates existing credentials.
-
-Use the explicit secret-generator `--force` mode only for an intentional rotation. A rotation of `POSTGRES_PASSWORD`, the audit HMAC key, JWT secret, or session/auth peppers has state consequences and is deliberately separate from startup.
-
-Do not commit your real `.env`, credentials, certificates, or generated secrets.
-
-### Docker Compose
-
-The base stack is defined in:
-
-- `docker-compose.yml`
-- `docker-compose.beta.yml` for controlled-beta overrides
-
-Direct `docker compose up` assumes that a valid environment already exists. For normal local Windows startup, prefer `.\scripts\start-local.ps1` so secret generation and environment validation happen before Compose interpolation. The launcher also verifies that the rendered API configuration still contains the canonical HTTPS dashboard origins after Compose precedence is applied. As a final local-only safety net, the API always adds the canonical loopback dashboard origins to any explicitly configured local origin set; stale local `.env` files therefore cannot strand first-admin bootstrap behind an obsolete HTTP-only allowlist. Non-local deployments do not receive this fallback and remain explicit/fail-closed.
-
-For the controlled-beta Compose procedure, secret requirements, migration order, health checks, and verification steps, follow [docs/BETA_RUNBOOK.md](docs/BETA_RUNBOOK.md).
-
-### Local Router Telemetry
-
-For a local network deployment, Sentinel-43 can receive edge-device syslog
-through a host-side evidence-only collector. The universal PowerShell
-orchestrator discovers the default gateway when it is unambiguous, persists the
-trusted source configuration, applies the source-restricted firewall rule,
-starts the collector, and verifies the authenticated collector-to-API path:
-
-```powershell
-.\scripts\router-monitor.ps1 -Mode Deploy
-.\scripts\router-monitor.ps1 -Mode Status
-```
-
-If more than one viable gateway exists, deployment fails closed instead of
-trusting them all. Supply the intended source explicitly:
-
-```powershell
-.\scripts\router-monitor.ps1 -Mode Deploy -EdgeSource <edge-lan-ip>
-```
-
-Multiple explicitly trusted sources may be supplied to `-EdgeSource`. The
-default listener is UDP `5514`; configure each supported edge device to send
-its syslog/telemetry to the Windows host on that port. Firewall configuration is
-automatic and restricted to the trusted source set unless `-SkipFirewall` is
-deliberately supplied.
-
-`Identify`, `Status`, `Test`, `Listen`, `Disable`, `-SyslogPort`,
-`-MaxEventsPerSecond`, `-ApiUrl`, and `-CaCert` provide the standalone
-control surface. The ingest token is stored in `.env` and status reports only
-whether it is configured; it never prints the credential.
-
-Router telemetry is observation-only. The collector cannot assign threat
-severity or perform enforcement; high-signal observations are classified by
-S43 and then enter the existing MonitoringManager/Fenrir/governance path.
-
-### Kubernetes
-
-Kubernetes manifests live under:
-
-```text
-deploy/kubernetes/
-```
-
-They include base resources plus development and beta overlays.
-
-The beta overlay intentionally ships with invalid placeholder deployment values for items that must be supplied by the operator, including real registry/image information and environment-specific network/TLS configuration.
-
-See [deploy/kubernetes/README.md](deploy/kubernetes/README.md).
-
----
+Security-sensitive non-local configuration is validated fail-closed. Known placeholder values are not accepted as deployment secrets where a generated secret is required.
 
 ## Dashboard
 
-When the API is running, the served dashboard is:
+The live operator interface is:
 
 ```text
 dashboard/sentinel_43_dashboard.html
 ```
 
-with its live assets under:
+with browser assets under:
 
 ```text
 dashboard/assets/
 ```
 
-The API serves this SPA directly.
+The API serves the dashboard as a single-page application.
 
-The previous unused Python dashboard scaffold has been removed so there is now one dashboard implementation in the repository.
+The dashboard is a client of the governed API. It does not own security authority, duplicate governance logic, or create a separate backend decision system.
 
----
+Its operator surfaces include:
+
+- subsystem health
+- threat and monitoring information
+- staged recommendation state
+- pending human decisions
+- audit information
+- runtime provenance
+- administrator account management
+- first-administrator onboarding
+- authenticated live updates
+
+## Security Boundaries
+
+Sentinel-43 repeatedly applies the following boundaries:
+
+- security-critical configuration fails closed when invalid or missing
+- human identities and machine identities remain distinct
+- observation does not imply authority
+- detection does not imply enforcement
+- recommendation does not imply execution
+- one runtime authority governs subordinate components
+- administrative operations require explicit authenticated authority
+- credentials and secret material are kept out of source control and routine logs
+- sensitive log targets are pseudonymized with deployment-owned secret material
+- forwarded network identity is trusted only through explicitly configured proxy boundaries
+- browser origins and host handling are restricted outside local environments
+- non-local browser transport is expected to use TLS-protected HTTP and WebSocket paths
+- owner-engine integrity is verified before the governed engine is loaded
+
+No real credentials, generated secret values, private keys, tokens, or deployment-specific secret material belong in this README.
+
+## Router Telemetry
+
+Sentinel-43 can receive observation-only edge-device telemetry through its router monitoring path.
+
+The collector restricts trusted sources, forwards authenticated observations into the API, and keeps classification inside Sentinel-43. The collector itself does not assign final threat severity or perform enforcement.
+
+High-signal router observations enter the same monitoring, detection, evidence, and governance path as other supported inputs.
+
+## Deployment Surfaces
+
+### Docker Compose
+
+The repository includes Docker Compose definitions for local and configured multi-service operation.
+
+The local startup wrapper prepares required environment state before Compose interpolation and preserves existing deployment secrets unless an operator deliberately performs a rotation.
+
+Direct Compose startup assumes the required environment has already been configured correctly.
+
+### Kubernetes
+
+Kubernetes resources live under:
+
+```text
+deploy/kubernetes/
+```
+
+The manifests define the application and supporting service topology while leaving deployment-owned credentials, certificates, registry details, network policy choices, and environment-specific values to the operator.
+
+Template placeholder values are not credentials and must not be treated as valid non-local runtime secrets.
 
 ## Repository Layout
 
 ```text
-Sentinel-43/                 owner-designated runtime sources
-core/                        API, governance, detection, audit, auth, monitoring
-dashboard/                   live HTML/CSS/JavaScript operator dashboard
-browser_tests/               real-browser SPA acceptance coverage
-deploy/kubernetes/           Kubernetes base and overlays
-migrations/                  database migrations
-scripts/                     deployment, acceptance, and operational tooling
-docs/                        operator, security, and beta documentation
-docs/reconstruction/         historical reconstruction/verification records
+Sentinel-43/          owner-designated runtime sources
+core/api/             authenticated API and request boundaries
+core/auth/            users, sessions, and authentication persistence
+core/audit/           authoritative audit storage and integrity
+core/detection/       threat detection and evidence production
+core/governance/      runtime authority, Heart, identity, and orchestration
+core/monitoring/      runtime and subsystem monitoring
+core/security/        shared security primitives and validation
+dashboard/            operator-facing web application
+deploy/               deployment definitions
+migrations/           database schema migrations
+scripts/              operational and deployment tooling
+docs/                 detailed technical and operator documentation
 ```
 
-Historical reconstruction documents are retained for provenance. They are not the current source of truth for runtime capability or beta readiness.
+## Operational Documentation
 
----
+Detailed procedures and environment-specific operating instructions belong under `docs/` and the deployment directories rather than in this README.
 
-## Security Model
+Useful technical references include:
 
-Sentinel-43 is designed around several recurring security rules:
-
-- fail closed when security-critical configuration is invalid or missing
-- keep human and machine identities separate
-- keep analysis separate from enforcement
-- keep one top-level runtime authority
-- require explicit authorization for administrative operations
-- preserve authoritative audit records
-- avoid exposing internal services unnecessarily
-- trust forwarded network identity only through configured trusted proxies
-- keep credentials out of URLs, logs, and source control
-- use HTTPS/WSS for non-local browser deployments
-
-The current security and deployment requirements are documented in the [Beta Runbook](docs/BETA_RUNBOOK.md), not duplicated here line by line.
-
----
-
-## Deployment Status
-
-Sentinel-43 is currently a **Controlled Beta Candidate**.
-
-The repository-level beta-closure work is complete: the runtime authority is consolidated, human and service identities are separated, session authentication and administrator recovery are closed, audit/readiness behavior is wired, the real dashboard is the only operator UI, deployment definitions are present, and live verification tooling exists for endpoint, browser, and endurance checks.
-
-This status does **not** declare every deployment a controlled beta automatically. A specific target must still produce the required deployment evidence, including its real TLS/hostname and trusted-proxy posture, target browser/WSS acceptance, the strict `final-beta` acceptance verdict, and any deployment-path prerequisites in the [Beta Runbook](docs/BETA_RUNBOOK.md).
-
-Production and public-sector readiness remain separate tiers and are not established by beta closure.
-
----
+- `REVIEWING.md` for architecture-review guidance
+- `docs/security/` for security-specific documentation
+- `docs/SIGMA_DETECTION.md` for the supported Sigma detection contract
+- `deploy/kubernetes/README.md` for Kubernetes-specific configuration
+- `Sentinel-43/README.md` for owner runtime source details
 
 ## What Sentinel-43 Is Not
 
@@ -346,25 +350,7 @@ Sentinel-43 is not:
 - a hidden enforcement system
 - a substitute for human operational authority
 
-It is a defensive oversight, analysis, governance, and audit platform.
-
----
-
-## Independent Review
-
-Independent technical review is welcome. Reviewers should start with [REVIEWING.md](REVIEWING.md), which describes the architectural invariants, high-value review areas, safe testing boundaries, and a useful finding format.
-
-## Documentation
-
-Useful starting points:
-
-- [Controlled Beta Runbook](docs/BETA_RUNBOOK.md)
-- [Kubernetes Deployment Guide](deploy/kubernetes/README.md)
-- [Trusted Proxy Handling](docs/security/trusted_proxy_handling.md)
-- [Owner Runtime Sources](Sentinel-43/README.md)
-- [Historical Reconstruction Records](docs/reconstruction/)
-
----
+It is a defensive observation, analysis, recommendation, governance, and audit platform.
 
 ## Licensing
 
@@ -373,14 +359,10 @@ Sentinel-43 is dual-licensed:
 1. **AGPL-3.0-or-later**
 2. **Commercial license**
 
-See [LICENSE](LICENSE) and [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md) for the authoritative terms.
-
----
+See `LICENSE` and `COMMERCIAL_LICENSE.md` for the authoritative terms.
 
 ## Disclaimer
 
-Sentinel-43 is currently Controlled Beta Candidate software.
-
-It is provided **AS IS**, without warranty of any kind. Interfaces, deployment behavior, and internal implementation may still change during controlled-beta validation.
+Sentinel-43 is provided **AS IS**, without warranty of any kind.
 
 Use it only on systems and environments you own or are explicitly authorized to operate.
