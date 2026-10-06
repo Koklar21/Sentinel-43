@@ -1,8 +1,8 @@
-# Sentinel Commercial License Agreement
+# Sentinel-43 Commercial License Agreement
 
 ## Overview
 
-Sentinel is dual-licensed software.
+Sentinel-43 is dual-licensed software.
 
 You may use Sentinel either:
 1. Under the terms of the GNU Affero General Public License v3 (AGPLv3), or
@@ -16,7 +16,7 @@ This document governs commercial and proprietary use of Sentinel.
 
 Subject to the terms of this agreement, the Licensor grants the Licensee
 a non-exclusive, non-transferable, non-sublicensable commercial license
-to use, modify, and deploy Sentinel in closed-source, proprietary, or
+to use, modify, and deploy Sentinel-43 in closed-source, proprietary, or
 commercial environments.
 
 ---
@@ -25,11 +25,11 @@ commercial environments.
 
 Under this commercial license, the Licensee may:
 
-- Use Sentinel internally without publishing source code
-- Modify Sentinel without releasing modifications publicly
-- Deploy Sentinel as part of a proprietary system or service
-- Embed Sentinel into commercial products or platforms
-- Offer Sentinel-based services without AGPLv3 obligations
+- Use Sentinel-43 internally without publishing source code
+- Modify Sentinel-43 without releasing modifications publicly
+- Deploy Sentinel-43 as part of a proprietary system or service
+- Embed Sentinel-43 into commercial products or platforms
+- Offer Sentinel-43-based services without AGPLv3 obligations
 
 ---
 
@@ -37,9 +37,9 @@ Under this commercial license, the Licensee may:
 
 The Licensee may NOT:
 
-- Redistribute Sentinel source code publicly under this license
+- Redistribute Sentinel-43 source code publicly under this license
 - Remove copyright or license notices
-- Represent Sentinel as their own original work
+- Represent Sentinel-43 as their own original work
 - Sub-license Sentinel to third parties
 - Circumvent license enforcement or attribution mechanisms
 
@@ -47,16 +47,16 @@ The Licensee may NOT:
 
 ## Ownership
 
-Sentinel and all associated intellectual property remain the exclusive
+Sentinel-43 and all associated intellectual property remain the exclusive
 property of the Licensor.
 
-This agreement does not transfer ownership of Sentinel or its code.
+This agreement does not transfer ownership of Sentinel-43 or its code.
 
 ---
 
 ## Warranty Disclaimer
 
-Sentinel is provided "AS IS", without warranty of any kind, express or
+Sentinel-43 is provided "AS IS", without warranty of any kind, express or
 implied, including but not limited to warranties of merchantability,
 fitness for a particular purpose, or non-infringement.
 
@@ -65,7 +65,7 @@ fitness for a particular purpose, or non-infringement.
 ## Limitation of Liability
 
 In no event shall the Licensor be liable for any damages arising from
-the use or inability to use Sentinel, including but not limited to
+the use or inability to use Sentinel-43, including but not limited to
 loss of data, loss of profits, or business interruption.
 
 ---
@@ -93,7 +93,7 @@ law principles.
 
 For commercial licensing inquiries, pricing, or terms, contact:
 
-[INSERT CONTACT EMAIL OR ENTITY NAME HERE]
+Contact the Sentinel-43 repository owner through the repository's documented private contact or security-reporting channel.
 
 ---
 
