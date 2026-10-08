@@ -52,6 +52,12 @@ services:
       dockerfile: core/api/Dockerfile
 
     restart: unless-stopped
+    # Match the existing restricted Kubernetes workload posture.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
 
     command:
       - uvicorn
@@ -100,6 +106,12 @@ services:
       - head
 
     restart: "no"
+    # Match the existing restricted Kubernetes workload posture.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
 
     environment:
       S43_ENV: ${S43_ENV:-production}
@@ -124,6 +136,12 @@ services:
       dockerfile: core/api/Dockerfile
 
     restart: unless-stopped
+    # Match the existing restricted Kubernetes workload posture.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
 
     command:
       - uvicorn
