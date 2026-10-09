@@ -18,7 +18,10 @@
       "python": "main",
       "description": "core unit/in-process suites (no live service, no PostgreSQL)",
       "paths": [
-        "core/tests"
+        "core/tests",
+        "tests/test_install_phase_1.py",
+        "tests/test_install_phase_2.py",
+        "tests/test_install_phase_3.py"
       ],
       "ignore": [
         "core/tests/test_bootstrap.py",
@@ -48,7 +51,10 @@
       "python": "main",
       "description": "the same core-isolated suite executed inside the runtime container's test stage (python:3.13-alpine)",
       "paths": [
-        "core/tests"
+        "core/tests",
+        "tests/test_install_phase_1.py",
+        "tests/test_install_phase_2.py",
+        "tests/test_install_phase_3.py"
       ],
       "ignore": [
         "core/tests/test_bootstrap.py",
