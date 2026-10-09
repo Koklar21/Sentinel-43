@@ -10,7 +10,7 @@
 [CmdletBinding()]
 param(
     [ValidateSet("Deploy", "Identify", "Status", "Listen", "Test", "Disable")]
-    [string]$Mode = "Deploy",
+    [string]$Mode = "Identify",
 
     [string[]]$EdgeSource = @(),
     [ValidateRange(1, 65535)][int]$SyslogPort = 5514,
@@ -140,7 +140,10 @@ function Set-EdgeFirewall([string[]]$Sources,[int]$Port) {
     if($SkipFirewall){return}
     if(-not(Test-Admin)){throw "Administrator privileges are required to configure the Windows firewall."}
     if(-not(Get-Command New-NetFirewallRule -ErrorAction SilentlyContinue)){throw "Windows Firewall cmdlets are unavailable."}
-    Get-NetFirewallRule -DisplayName $FirewallRuleName -ErrorAction SilentlyContinue|Remove-NetFirewallRule -ErrorAction Stop
+    # Never delete an existing operator firewall rule as part of an automatic deploy.
+    # Reconfiguration requires an explicit, separately reviewed firewall change.
+    $existing = @(Get-NetFirewallRule -DisplayName $FirewallRuleName -ErrorAction SilentlyContinue)
+    if($existing.Count -gt 0){throw "Existing Sentinel-43 firewall rule preserved. Review and reconfigure it explicitly before deployment."}
     New-NetFirewallRule -DisplayName $FirewallRuleName -Direction Inbound -Action Allow -Protocol UDP -LocalPort $Port -RemoteAddress $Sources -Profile Any -ErrorAction Stop|Out-Null
     $rule=Get-NetFirewallRule -DisplayName $FirewallRuleName -ErrorAction Stop
     $port=$rule|Get-NetFirewallPortFilter
