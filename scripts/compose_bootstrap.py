@@ -37,11 +37,11 @@ def main(argv: list[str] | None = None) -> int:
     # A fresh installation may be provisioned. Existing installations may
     # gain missing keys, but an existing DB URL is never silently rewritten.
     before = parse_env_file(path)
-    if before and "POSTGRES_PASSWORD" not in before:
+    if path.exists() and "POSTGRES_PASSWORD" not in before:
         parser.error("Existing environment lacks POSTGRES_PASSWORD; provision/repair manually to avoid DB lockout")
-    if before and not before.get("DATABASE_URL"):
+    if path.exists() and not before.get("DATABASE_URL"):
         parser.error("Existing environment lacks DATABASE_URL; configure it manually")
-    if before and "POSTGRES_PASSWORD" in before and "DATABASE_URL" in before:
+    if path.exists() and "POSTGRES_PASSWORD" in before and "DATABASE_URL" in before:
         # No implicit database credential migration. Existing URL remains authoritative.
         from urllib.parse import urlsplit
         try:
@@ -67,6 +67,9 @@ def main(argv: list[str] | None = None) -> int:
     _, missing, invalid = check_env_file(path)
     if missing or invalid:
         parser.error("Secret provisioning incomplete: " + ", ".join(missing + list(invalid)))
+    final = parse_env_file(path)
+    if not final.get("DATABASE_URL") or not final.get("POSTGRES_PASSWORD"):
+        parser.error("Database configuration incomplete")
     print("Deployment secrets provisioned and validated; existing values preserved.")
     if not args.start:
         print("Docker not started. Pass --start when ready.")
