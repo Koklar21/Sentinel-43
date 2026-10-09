@@ -415,9 +415,9 @@ def parse_rotated_at(value: str, now: dt.datetime | None = None):
         when = dt.datetime.fromisoformat((value or "").strip().replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return INCOMPLETE, f"not an ISO-8601 timestamp: {value!r}"
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=dt.timezone.utc)
-    delta = now - when
+    if when.tzinfo is None or when.utcoffset() is None:
+        return FAIL, "rotation timestamp must include an explicit UTC offset"
+    delta = now.astimezone(dt.timezone.utc) - when.astimezone(dt.timezone.utc)
     age_seconds = delta.total_seconds()
     if age_seconds < 0:
         return FAIL, "rotation timestamp is in the future"
