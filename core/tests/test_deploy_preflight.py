@@ -207,8 +207,11 @@ def test_narrow_trusted_proxies_pass(value):
 def test_rotated_at_handles_future_and_naive_and_stale():
     now = dt.datetime(2026, 9, 3, tzinfo=dt.timezone.utc)
     assert dp.parse_rotated_at("2026-12-01T00:00:00Z", now)[0] == dp.FAIL      # future
-    assert dp.parse_rotated_at("2026-09-01", now)[0] == dp.PASS               # naive, recent
-    assert dp.parse_rotated_at("2026-01-01T00:00:00+00:00", now)[0] == dp.FAIL  # > 90d
+    assert dp.parse_rotated_at("2026-09-01", now)[0] == dp.FAIL               # 48 hours old
+    assert dp.parse_rotated_at("2026-01-01T00:00:00+00:00", now)[0] == dp.FAIL  # stale
+    assert dp.parse_rotated_at("2026-09-02T00:00:00Z", now)[0] == dp.PASS  # exactly 24h
+    assert dp.parse_rotated_at("2026-09-01T23:59:59Z", now)[0] == dp.FAIL  # 24h + 1s
+    assert dp.parse_rotated_at("2026-09-03T00:00:01Z", now)[0] == dp.FAIL  # future
     assert dp.parse_rotated_at("garbage", now)[0] == dp.INCOMPLETE
 
 
