@@ -20,7 +20,7 @@ def inspect():
         return {"status": "invalid-output", "services": []}
     by_name = {s.get("Service"): s for s in services if isinstance(s, dict)}
     required = {"s43-db", "s43-core", "s43-api", "s43-proxy"}
-    healthy = all(by_name.get(name, {}).get("State") == "running" and by_name[name].get("Health") == "healthy" for name in required if name in by_name)
+    healthy = all(by_name.get(name, {}).get("State") == "running" and by_name[name].get("Health") in ("healthy", "") for name in required)
     present = required <= by_name.keys()
     migration = by_name.get("s43-migrate", {})
     migrated = migration.get("State") == "exited" and str(migration.get("ExitCode")) == "0"
