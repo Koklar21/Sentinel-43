@@ -1,4 +1,4 @@
-"""Produce a minimal local installation report without reading secrets."""
+"""Redacted local deployment diagnostics; not a security acceptance certificate."""
 from __future__ import annotations
 import json
 import subprocess
@@ -17,7 +17,7 @@ def report():
             checks[name] = "pass" if p.returncode == 0 else "fail"
         except (OSError, subprocess.TimeoutExpired):
             checks[name] = "incomplete"
-    return {"generated_at_utc": datetime.now(timezone.utc).isoformat(), "checks": checks, "beta_accepted": False, "note": "Read-only local diagnostics, not security or external-network acceptance."}
+    return {"generated_at_utc": datetime.now(timezone.utc).isoformat(), "checks": checks, "beta_accepted": False, "note": "Read-only local diagnostics; does not establish governed readiness or external-network acceptance."}
 
 if __name__ == "__main__":
     result = report()
