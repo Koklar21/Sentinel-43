@@ -40,6 +40,8 @@ on:
       - "acceptance/**"
       - "scripts/acceptance*.py"
       - "scripts/deploy_preflight.py"
+      - "scripts/install_*.py"
+      - "tests/test_install_phase_*.py"
       - "scripts/k8s-validate.ps1"
       - ".github/workflows/k8s.yml"
   push:
@@ -58,6 +60,8 @@ on:
       - "docker-compose*.yml"
       - "scripts/k8s_policy_check.py"
       - "scripts/deploy_preflight.py"
+      - "scripts/install_*.py"
+      - "tests/test_install_phase_*.py"
       - "scripts/k8s-validate.ps1"
       - ".github/workflows/k8s.yml"
   workflow_dispatch: {}
