@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
 
 def inspect():
     try:
-        p = subprocess.run(["docker", "compose", "ps", "--all", "--format", "json"], capture_output=True, text=True, timeout=20, check=False)
+        p = subprocess.run(["docker", "compose", "ps", "--all", "--format", "json"], cwd=ROOT, capture_output=True, text=True, timeout=20, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return {"status": "unavailable", "services": []}
     if p.returncode:
