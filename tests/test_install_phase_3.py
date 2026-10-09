@@ -13,3 +13,13 @@ class ComposeStatusTests(unittest.TestCase):
     def test_malformed_output(self, run):
         run.return_value = Mock(returncode=0, stdout="invalid json")
         self.assertEqual(install_compose_status.inspect()["status"], "invalid-output")
+
+    @patch("scripts.install_compose_status.subprocess.run")
+    def test_unhashable_service_name_is_invalid_output(self, run):
+        run.return_value = Mock(returncode=0, stdout=json.dumps([{"Service": ["s43-db"], "State": "running"}]))
+        self.assertEqual(install_compose_status.inspect()["status"], "invalid-output")
+
+    @patch("scripts.install_compose_status.subprocess.run")
+    def test_non_object_record_is_invalid_output(self, run):
+        run.return_value = Mock(returncode=0, stdout=json.dumps([{"Service": "s43-db"}, 123]))
+        self.assertEqual(install_compose_status.inspect()["status"], "invalid-output")
