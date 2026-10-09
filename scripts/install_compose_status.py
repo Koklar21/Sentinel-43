@@ -21,7 +21,9 @@ def inspect():
             raise ValueError("invalid Compose output")
     except (ValueError, TypeError):
         return {"status": "invalid-output", "services": []}
-    by_name = {s.get("Service"): s for s in services if isinstance(s, dict)}
+    if any(not isinstance(s, dict) or not isinstance(s.get("Service"), str) or not s["Service"] for s in services):
+        return {"status": "invalid-output", "services": []}
+    by_name = {s["Service"]: s for s in services}
     required = {"s43-db", "s43-core", "s43-api", "s43-proxy"}
     healthy = all(by_name.get(name, {}).get("State") == "running" and by_name[name].get("Health") in ("healthy", "") for name in required)
     present = required <= by_name.keys()
