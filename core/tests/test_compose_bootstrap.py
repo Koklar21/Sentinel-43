@@ -78,10 +78,14 @@ def test_invalid_existing_password_not_rotated(tmp_path: Path) -> None:
 def test_compose_config_failure_blocks_up(tmp_path: Path) -> None:
     env = tmp_path / ".env"
     assert compose_bootstrap.main(["--env-file", str(env)]) == 0
-    with patch.object(compose_bootstrap.subprocess, "run") as run, patch.object(
-        compose_bootstrap.subprocess, "call"
-    ) as call:
-        run.return_value.returncode = 1
-        assert compose_bootstrap.main(["--env-file", str(env), "--start"]) == 1
-        assert run.call_args.args[0][-2:] == ["config", "--quiet"]
-        call.assert_not_called()
+    # The bootstrap correctly rejects inherited secrets that conflict with the
+    # chosen env file. Isolate this test from host/earlier-test credentials so
+    # it exercises Compose validation rather than that unrelated safety gate.
+    with patch.dict(compose_bootstrap.os.environ, compose_bootstrap.parse_env_file(env)):
+        with patch.object(compose_bootstrap.subprocess, "run") as run, patch.object(
+            compose_bootstrap.subprocess, "call"
+        ) as call:
+            run.return_value.returncode = 1
+            assert compose_bootstrap.main(["--env-file", str(env), "--start"]) == 1
+            assert run.call_args.args[0][-2:] == ["config", "--quiet"]
+            call.assert_not_called()
