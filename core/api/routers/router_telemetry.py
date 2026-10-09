@@ -89,11 +89,11 @@ def _expected_router_ips() -> frozenset[str]:
 
 def _authorize(authorization: str | None) -> None:
     token = _expected_token()
-    if len(token) < 32:
+    if len(token) < 32 or not token.isascii():
         raise HTTPException(status_code=503, detail="router ingestion unconfigured")
 
     scheme, _, supplied = (authorization or "").partition(" ")
-    if scheme.lower() != "bearer" or not secrets.compare_digest(supplied, token):
+    if scheme.lower() != "bearer" or not supplied.isascii() or not secrets.compare_digest(supplied, token):
         raise HTTPException(status_code=401, detail="invalid router service token")
 
 
