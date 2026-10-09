@@ -418,12 +418,12 @@ def parse_rotated_at(value: str, now: dt.datetime | None = None):
     if when.tzinfo is None:
         when = when.replace(tzinfo=dt.timezone.utc)
     delta = now - when
-    if delta.total_seconds() < -86400:
-        return FAIL, f"timestamp is in the future ({when.date()})"
-    days = max(delta.days, 0)
-    if days > 90:
-        return FAIL, f"{days} days ago (> 90)"
-    return PASS, f"{days} days ago"
+    age_seconds = delta.total_seconds()
+    if age_seconds < 0:
+        return FAIL, "rotation timestamp is in the future"
+    if age_seconds > 24 * 60 * 60:
+        return FAIL, "last recorded rotation is older than 24 hours"
+    return PASS, "last recorded rotation is within 24 hours"
 
 
 _DIGEST_RE = re.compile(
@@ -685,7 +685,7 @@ def check_compose_config(rep: Report, env_file: str, hostname: str,
             rep.record(PASS, f"{key} present", f"{len(val)} chars")
 
     status, detail = parse_rotated_at(env.get("S43_SECRETS_ROTATED_AT", ""))
-    rep.record(status, "secrets rotated within 90 days", detail)
+    rep.record(status, "secrets rotated within 24 hours", detail)
 
     senv = env.get("SENTINEL_ENV", "")
     rep.record(PASS if senv and senv.lower() not in {"development", "dev", "local", "test"}
