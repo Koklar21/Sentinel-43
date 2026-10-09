@@ -27,6 +27,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--beta", action="store_true", help="Include controlled-beta Compose override")
     args = parser.parse_args(argv)
     path = args.env_file.resolve()
+    if args.beta and not args.start:
+        parser.error("--beta requires --start")
     if path.is_symlink():
         parser.error("Refusing symlinked secret environment file")
     if path.exists() and not path.is_file():
