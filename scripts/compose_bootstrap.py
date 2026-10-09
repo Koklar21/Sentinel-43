@@ -26,11 +26,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--start", action="store_true", help="Start Docker Compose after provisioning")
     parser.add_argument("--beta", action="store_true", help="Include controlled-beta Compose override")
     args = parser.parse_args(argv)
-    path = args.env_file.resolve()
     if args.beta and not args.start:
         parser.error("--beta requires --start")
-    if path.is_symlink():
+    if args.env_file.is_symlink():
         parser.error("Refusing symlinked secret environment file")
+    path = args.env_file.resolve()
     if path.exists() and not path.is_file():
         parser.error("Secret environment path is not a regular file")
     if path.exists() and path.stat().st_size == 0:
@@ -86,10 +86,18 @@ def main(argv: list[str] | None = None) -> int:
     cmd = ["docker", "compose", "--env-file", str(path), "-f", str(ROOT / "docker-compose.yml")]
     if args.beta:
         cmd += ["-f", str(ROOT / "docker-compose.beta.yml")]
-    # Do not print expanded Compose configuration, which can contain secrets.
-    cmd += ["up", "-d", "--build"]
+    # Validate the complete Compose model without emitting interpolated secrets.
+    # Keep subprocess output private: Compose diagnostics may contain env values.
     try:
-        return subprocess.call(cmd, cwd=ROOT, env=os.environ.copy())
+        validation = subprocess.run(cmd + ["config", "--quiet"], cwd=ROOT,
+                                    env=os.environ.copy(), capture_output=True, timeout=60)
+        if validation.returncode:
+            print("Docker Compose configuration validation failed; no containers started.", file=sys.stderr)
+            return validation.returncode
+        return subprocess.call(cmd + ["up", "-d", "--build"], cwd=ROOT, env=os.environ.copy())
+    except subprocess.TimeoutExpired:
+        print("Docker Compose validation timed out; no containers started.", file=sys.stderr)
+        return 124
     except FileNotFoundError:
         print("Docker executable not found; no containers started.", file=sys.stderr)
         return 127
