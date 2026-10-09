@@ -75,6 +75,12 @@ def main(argv: list[str] | None = None) -> int:
         print("Docker not started. Pass --start when ready.")
         return 0
 
+    # Compose interpolates process environment ahead of --env-file. Reject
+    # conflicting inherited values so the checked file is authoritative.
+    for key in final:
+        if key in os.environ and os.environ[key] != final[key]:
+            parser.error("Conflicting inherited environment variable: " + key)
+
     cmd = ["docker", "compose", "--env-file", str(path), "-f", str(ROOT / "docker-compose.yml")]
     if args.beta:
         cmd += ["-f", str(ROOT / "docker-compose.beta.yml")]
