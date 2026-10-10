@@ -205,3 +205,10 @@ pcaps/
 *.local.env
 .env.local
 .env.*.local
+
+# ACME client state and issued certificate directories are private local material.
+# File-extension filters above do not cover account.conf, http.header, or ca/.
+deploy/proxy/certs/account.conf
+deploy/proxy/certs/http.header
+deploy/proxy/certs/ca/
+deploy/proxy/certs/*_ecc/
