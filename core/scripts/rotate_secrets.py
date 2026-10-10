@@ -525,14 +525,17 @@ def _state_preserving_rotation(
         _wait_for_postgres(env_path)
 
         db_role_changed = False
-        env_changed = False
+        env_update_attempted = False
 
         try:
             _alter_postgres_role(env_path, replacements["POSTGRES_PASSWORD"])
             db_role_changed = True
 
+            # The atomic writer can raise after os.replace succeeds (for
+            # example during the final permission check). Restore the env
+            # even when the writer itself did not return successfully.
+            env_update_attempted = True
             _atomic_update_env(env_path, replacements)
-            env_changed = True
 
             _validate_env(env_path)
             _compose(env_path, "config", "--quiet")
@@ -540,7 +543,7 @@ def _state_preserving_rotation(
         except Exception:
             # Before services consume the new values, restore the two coupled
             # credential stores together.
-            if env_changed:
+            if env_update_attempted:
                 _restore_env(backup, env_path)
 
             if db_role_changed:
