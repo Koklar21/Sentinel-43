@@ -291,3 +291,52 @@ def test_stop_failure_aborts_before_postgres_password_change(monkeypatch, tmp_pa
 
     assert postgres_changed is False
     assert env_path.read_text(encoding="utf-8").startswith("S43_JWT_SECRET=")
+
+
+def test_rotation_restores_env_if_writer_raises_after_replace(monkeypatch, tmp_path: Path):
+    """A post-replace failure must not leave the DB and env passwords split."""
+    env_path = tmp_path / ".env"
+    existing = _base_env()
+    _write_env(env_path, existing)
+    original = env_path.read_bytes()
+    replacements = dict(existing)
+    replacements["POSTGRES_PASSWORD"] = "9" * 64
+    replacements["DATABASE_URL"] = rotate._database_url_with_password(
+        existing["DATABASE_URL"], replacements["POSTGRES_PASSWORD"]
+    )
+
+    monkeypatch.setattr(
+        rotate, "_build_replacements",
+        lambda current, *, full_reset: (replacements, ["POSTGRES_PASSWORD"]),
+    )
+    monkeypatch.setattr(rotate, "_print_plan", lambda **kwargs: None)
+    monkeypatch.setattr(rotate, "_stop_callers", lambda path: None)
+    monkeypatch.setattr(rotate, "_wait_for_postgres", lambda path: None)
+    monkeypatch.setattr(
+        rotate, "_compose",
+        lambda path, *args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    )
+
+    password_changes = []
+    monkeypatch.setattr(
+        rotate, "_alter_postgres_role",
+        lambda path, password: password_changes.append(password),
+    )
+    real_update = rotate._atomic_update_env
+
+    def update_then_fail(path, values):
+        real_update(path, values)
+        raise OSError("simulated post-replace failure")
+
+    monkeypatch.setattr(rotate, "_atomic_update_env", update_then_fail)
+
+    with pytest.raises(OSError, match="post-replace failure"):
+        rotate._state_preserving_rotation(
+            env_path, dry_run=False, no_restart=False
+        )
+
+    assert password_changes == [
+        replacements["POSTGRES_PASSWORD"], existing["POSTGRES_PASSWORD"]
+    ]
+    assert env_path.read_bytes() == original
+    assert not list(tmp_path.glob(".s43-rotation-*"))
