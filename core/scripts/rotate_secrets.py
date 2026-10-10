@@ -544,7 +544,16 @@ def _state_preserving_rotation(
             # Before services consume the new values, restore the two coupled
             # credential stores together.
             if env_update_attempted:
-                _restore_env(backup, env_path)
+                try:
+                    _restore_env(backup, env_path)
+                except Exception as rollback_exc:
+                    # Attempt the database rollback even if restoring the file
+                    # fails. Do not silently replace the original exception.
+                    print(
+                        "WARNING: environment credential rollback also failed: "
+                        f"{rollback_exc}",
+                        file=sys.stderr,
+                    )
 
             if db_role_changed:
                 try:
