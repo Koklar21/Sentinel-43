@@ -340,3 +340,51 @@ def test_rotation_restores_env_if_writer_raises_after_replace(monkeypatch, tmp_p
     ]
     assert env_path.read_bytes() == original
     assert not list(tmp_path.glob(".s43-rotation-*"))
+
+
+def test_rotation_attempts_db_rollback_when_env_restore_fails(
+    monkeypatch, tmp_path: Path, capsys
+):
+    env_path = tmp_path / ".env"
+    existing = _base_env()
+    _write_env(env_path, existing)
+    replacements = dict(existing)
+    replacements["POSTGRES_PASSWORD"] = "9" * 64
+    replacements["DATABASE_URL"] = rotate._database_url_with_password(
+        existing["DATABASE_URL"], replacements["POSTGRES_PASSWORD"]
+    )
+    monkeypatch.setattr(
+        rotate, "_build_replacements",
+        lambda current, *, full_reset: (replacements, ["POSTGRES_PASSWORD"]),
+    )
+    monkeypatch.setattr(rotate, "_print_plan", lambda **kwargs: None)
+    monkeypatch.setattr(rotate, "_stop_callers", lambda path: None)
+    monkeypatch.setattr(rotate, "_wait_for_postgres", lambda path: None)
+    monkeypatch.setattr(
+        rotate, "_compose",
+        lambda path, *args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    )
+    password_changes = []
+    monkeypatch.setattr(
+        rotate, "_alter_postgres_role",
+        lambda path, password: password_changes.append(password),
+    )
+    def broken_update(path, values):
+        raise OSError("write failure")
+
+    def broken_restore(backup, path):
+        raise OSError("restore failure")
+
+    monkeypatch.setattr(rotate, "_atomic_update_env", broken_update)
+    monkeypatch.setattr(rotate, "_restore_env", broken_restore)
+
+    with pytest.raises(OSError, match="write failure"):
+        rotate._state_preserving_rotation(
+            env_path, dry_run=False, no_restart=False
+        )
+
+    assert password_changes == [
+        replacements["POSTGRES_PASSWORD"], existing["POSTGRES_PASSWORD"]
+    ]
+    assert "environment credential rollback also failed" in capsys.readouterr().err
+    assert not list(tmp_path.glob(".s43-rotation-*"))
