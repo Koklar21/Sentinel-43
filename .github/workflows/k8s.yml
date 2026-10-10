@@ -43,6 +43,8 @@ on:
       - "scripts/install_*.py"
       - "tests/test_install_phase_*.py"
       - "scripts/k8s-validate.ps1"
+      # Release-gate policy changes must receive the full CI evidence, too.
+      - "docs/security/public-beta-reopening-gate.md"
       - ".github/workflows/k8s.yml"
   push:
     branches: [main]
@@ -63,6 +65,8 @@ on:
       - "scripts/install_*.py"
       - "tests/test_install_phase_*.py"
       - "scripts/k8s-validate.ps1"
+      # Release-gate policy changes must receive the full CI evidence, too.
+      - "docs/security/public-beta-reopening-gate.md"
       - ".github/workflows/k8s.yml"
   workflow_dispatch: {}
 
