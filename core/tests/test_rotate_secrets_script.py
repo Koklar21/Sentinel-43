@@ -144,7 +144,7 @@ def test_atomic_env_replacement_is_owner_only_even_under_common_umask(tmp_path: 
 
 def test_rotation_rollback_backup_is_ephemeral(tmp_path: Path):
     env_path = tmp_path / ".env"
-    env_path.write_text("SECRET=value\\n", encoding="utf-8")
+    env_path.write_text("SECRET=value\n", encoding="utf-8")
     with rotate._temporary_env_backup(env_path) as backup:
         assert backup.read_bytes() == env_path.read_bytes()
         assert backup.name == "rollback.env"
@@ -153,14 +153,14 @@ def test_rotation_rollback_backup_is_ephemeral(tmp_path: Path):
             assert stat.S_IMODE(backup.stat().st_mode) == 0o600
         rotate._atomic_update_env(env_path, {"SECRET": "changed"})
         rotate._restore_env(backup, env_path)
-        assert env_path.read_text(encoding="utf-8") == "SECRET=value\\n"
+        assert env_path.read_text(encoding="utf-8") == "SECRET=value\n"
     assert not backup.exists()
     assert not backup.parent.exists()
 
 
 def test_rotation_rollback_backup_removed_after_exception(tmp_path: Path):
     env_path = tmp_path / ".env"
-    env_path.write_text("SECRET=value\\n", encoding="utf-8")
+    env_path.write_text("SECRET=value\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="simulated failure"):
         with rotate._temporary_env_backup(env_path) as backup:
             raise RuntimeError("simulated failure")
