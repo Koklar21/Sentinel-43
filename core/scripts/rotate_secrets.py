@@ -45,8 +45,10 @@ secret. Generate it separately with the canonical --password-hash flow.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import os
 import secrets
+import tempfile
 import subprocess
 import sys
 import time
@@ -301,11 +303,17 @@ def _atomic_update_env(path: Path, replacements: dict[str, str]) -> None:
     _atomic_replace_owner_only(path, payload)
 
 
-def _backup_env(path: Path) -> Path:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    backup = path.with_name(f"{path.name}.rotation-backup.{stamp}")
-    _atomic_replace_owner_only(backup, path.read_bytes())
-    return backup
+@contextmanager
+def _temporary_env_backup(path: Path):
+    """Keep rollback bytes only for the duration of the rotation.
+
+    A temporary, owner-restricted file avoids accumulating timestamped copies
+    of credentials. It is removed on both success and ordinary exceptions.
+    """
+    with tempfile.TemporaryDirectory(prefix=".s43-rotation-", dir=path.parent) as directory:
+        backup = Path(directory) / "rollback.env"
+        _atomic_replace_owner_only(backup, path.read_bytes())
+        yield backup
 
 
 def _restore_env(backup: Path, path: Path) -> None:
@@ -508,55 +516,54 @@ def _state_preserving_rotation(
         print("Dry run only; no files, database roles, or containers were changed.")
         return
 
-    backup = _backup_env(env_path)
-    print(f"Environment backup: {backup}")
+    with _temporary_env_backup(env_path) as backup:
 
-    # Keep the database available but fail closed unless every credential
-    # consumer is stopped before the shared PostgreSQL password changes.
-    _stop_callers(env_path)
-    _compose(env_path, "up", "-d", "s43-db")
-    _wait_for_postgres(env_path)
+        # Keep the database available but fail closed unless every credential
+        # consumer is stopped before the shared PostgreSQL password changes.
+        _stop_callers(env_path)
+        _compose(env_path, "up", "-d", "s43-db")
+        _wait_for_postgres(env_path)
 
-    db_role_changed = False
-    env_changed = False
+        db_role_changed = False
+        env_changed = False
 
-    try:
-        _alter_postgres_role(env_path, replacements["POSTGRES_PASSWORD"])
-        db_role_changed = True
+        try:
+            _alter_postgres_role(env_path, replacements["POSTGRES_PASSWORD"])
+            db_role_changed = True
 
-        _atomic_update_env(env_path, replacements)
-        env_changed = True
+            _atomic_update_env(env_path, replacements)
+            env_changed = True
 
-        _validate_env(env_path)
-        _compose(env_path, "config", "--quiet")
+            _validate_env(env_path)
+            _compose(env_path, "config", "--quiet")
 
-    except Exception:
-        # Before services consume the new values, restore the two coupled
-        # credential stores together.
-        if env_changed:
-            _restore_env(backup, env_path)
+        except Exception:
+            # Before services consume the new values, restore the two coupled
+            # credential stores together.
+            if env_changed:
+                _restore_env(backup, env_path)
 
-        if db_role_changed:
-            try:
-                _alter_postgres_role(env_path, old_pg_password)
-            except Exception as rollback_exc:
-                print(
-                    "WARNING: PostgreSQL credential rollback also failed: "
-                    f"{rollback_exc}",
-                    file=sys.stderr,
-                )
+            if db_role_changed:
+                try:
+                    _alter_postgres_role(env_path, old_pg_password)
+                except Exception as rollback_exc:
+                    print(
+                        "WARNING: PostgreSQL credential rollback also failed: "
+                        f"{rollback_exc}",
+                        file=sys.stderr,
+                    )
 
-        raise
+            raise
 
-    if no_restart:
-        print(
-            "Rotation committed. Services were not restarted because --no-restart "
-            "was supplied."
-        )
-        return
+        if no_restart:
+            print(
+                "Rotation committed. Services were not restarted because --no-restart "
+                "was supplied."
+            )
+            return
 
-    _compose(env_path, "up", "-d", "--force-recreate")
-    print("Rotation complete. Compose services recreated with the new credentials.")
+        _compose(env_path, "up", "-d", "--force-recreate")
+        print("Rotation complete. Compose services recreated with the new credentials.")
 
 
 def _full_reset_rotation(
@@ -590,32 +597,31 @@ def _full_reset_rotation(
         print("Dry run only; no files, volumes, or containers were changed.")
         return
 
-    backup = _backup_env(env_path)
-    print(f"Environment backup: {backup}")
+    with _temporary_env_backup(env_path) as backup:
 
-    # Validate the future environment BEFORE deleting state.
-    try:
-        _atomic_update_env(env_path, replacements)
-        _validate_env(env_path)
-        _compose(env_path, "config", "--quiet")
-    except Exception:
-        _restore_env(backup, env_path)
-        raise
+        # Validate the future environment BEFORE deleting state.
+        try:
+            _atomic_update_env(env_path, replacements)
+            _validate_env(env_path)
+            _compose(env_path, "config", "--quiet")
+        except Exception:
+            _restore_env(backup, env_path)
+            raise
 
-    _compose(env_path, "down", "-v", "--remove-orphans")
+        _compose(env_path, "down", "-v", "--remove-orphans")
 
-    if no_restart:
+        if no_restart:
+            print(
+                "Full rotation committed and persistent volumes removed. "
+                "Services were not restarted because --no-restart was supplied."
+            )
+            return
+
+        _compose(env_path, "up", "-d", "--force-recreate")
         print(
-            "Full rotation committed and persistent volumes removed. "
-            "Services were not restarted because --no-restart was supplied."
+            "Full rotation complete. Fresh persistent state was created under the "
+            "new credential and integrity roots."
         )
-        return
-
-    _compose(env_path, "up", "-d", "--force-recreate")
-    print(
-        "Full rotation complete. Fresh persistent state was created under the "
-        "new credential and integrity roots."
-    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
